@@ -144,6 +144,21 @@ pub enum DomainEvent {
         revision: LeaseRevision,
         lease_expiry_ms: u64,
     },
+    ClaimCleared {
+        activation: ActivationId,
+    },
+    ReconciliationRecorded {
+        run: RunId,
+        activation: ActivationId,
+        outcome: ReconcileOutcome,
+        output: Option<Value>,
+        probes: u32,
+    },
+    InterventionRequired {
+        run: RunId,
+        activation: ActivationId,
+        reason: String,
+    },
     RunSucceeded {
         run: RunId,
         output: Value,
@@ -233,6 +248,23 @@ pub enum CommandBody {
         generation: OwnerGeneration,
         revision: LeaseRevision,
     },
+    Reconcile {
+        run: RunId,
+        activation: ActivationId,
+        session: WorkerSessionId,
+        generation: OwnerGeneration,
+        revision: LeaseRevision,
+        outcome: ReconcileOutcome,
+        output: Option<Value>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileOutcome {
+    Applied,
+    NotApplied,
+    Unknown,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -343,6 +375,10 @@ pub struct ClaimState {
     pub lease_expiry_ms: u64,
     pub attempt_deadline_ms: u64,
     pub effect_key: EffectKey,
+    #[serde(default)]
+    pub role: ExecutionRole,
+    #[serde(default)]
+    pub probes: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -419,6 +455,8 @@ pub struct State {
     pub sessions: HashMap<WorkerSessionId, WorkerSession>,
     #[serde(default)]
     pub next_generation: u64,
+    #[serde(default)]
+    pub interventions: HashMap<ActivationId, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -509,6 +547,26 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             *session,
             *generation,
             *revision,
+            command.time,
+            &mut ids,
+        ),
+        CommandBody::Reconcile {
+            run,
+            activation,
+            session,
+            generation,
+            revision,
+            outcome,
+            output,
+        } => decide_reconcile(
+            state,
+            *run,
+            *activation,
+            *session,
+            *generation,
+            *revision,
+            *outcome,
+            output.clone(),
             command.time,
             &mut ids,
         ),
@@ -682,9 +740,18 @@ fn decide_claim(
             let lease_expiry_ms = time
                 .as_millis()
                 .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64);
-            let attempt_deadline_ms = time
-                .as_millis()
-                .saturating_add(crate::policy::FORWARD_ATTEMPT_TIMEOUT.as_millis() as u64);
+            let role = grant_role(state, act, time);
+            let timeout = match role {
+                ExecutionRole::Reconciliation => crate::policy::RECONCILIATION_ATTEMPT_TIMEOUT,
+                ExecutionRole::Compensation => crate::policy::COMPENSATION_ATTEMPT_TIMEOUT,
+                ExecutionRole::Forward => crate::policy::FORWARD_ATTEMPT_TIMEOUT,
+            };
+            let attempt_deadline_ms = time.as_millis().saturating_add(timeout.as_millis() as u64);
+            let effect_key = act
+                .claim
+                .as_ref()
+                .map(|claim| claim.effect_key)
+                .unwrap_or_else(|| EffectKey::from_bytes(ids.next_bytes()));
             events.push(DomainEvent::ClaimGranted {
                 run,
                 activation,
@@ -695,8 +762,8 @@ fn decide_claim(
                 revision: LeaseRevision::new(1),
                 lease_expiry_ms,
                 attempt_deadline_ms,
-                effect_key: EffectKey::from_bytes(ids.next_bytes()),
-                role: act.role,
+                effect_key,
+                role,
             });
             granted += 1;
         }
@@ -800,13 +867,127 @@ fn decide_report_assigned(
             "claim expired",
         ));
     }
+    if claim.role == ExecutionRole::Reconciliation {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "reconciliation claim must use reconcile",
+        ));
+    }
     report_success(state, run, activation, output, ids)
+}
+
+fn grant_role(state: &State, act: &ActivationState, time: EngineTime) -> ExecutionRole {
+    if act.role == ExecutionRole::Compensation {
+        return ExecutionRole::Compensation;
+    }
+    let expired = act
+        .claim
+        .as_ref()
+        .is_some_and(|claim| time.as_millis() >= claim.lease_expiry_ms);
+    if !expired {
+        return ExecutionRole::Forward;
+    }
+    let Some(run) = state.runs.get(&act.run) else {
+        return ExecutionRole::Forward;
+    };
+    let Some(Node::Activity { activity, .. }) =
+        lookup_region(state, act.scope).and_then(|region| region.nodes.get(act.node.as_str()))
+    else {
+        return ExecutionRole::Forward;
+    };
+    let Ok(contract) = run.catalog.activity(activity) else {
+        return ExecutionRole::Forward;
+    };
+    if contract.recovery == crate::catalog::Recovery::Manual && contract.reconciler.is_some() {
+        ExecutionRole::Reconciliation
+    } else {
+        ExecutionRole::Forward
+    }
+}
+
+fn decide_reconcile(
+    state: &State,
+    run: RunId,
+    activation: ActivationId,
+    session: WorkerSessionId,
+    generation: OwnerGeneration,
+    revision: LeaseRevision,
+    outcome: ReconcileOutcome,
+    output: Option<Value>,
+    time: EngineTime,
+    ids: &mut IdGen,
+) -> Result<Decision> {
+    let act = state
+        .activations
+        .get(&activation)
+        .ok_or_else(|| Error::invalid("unknown activation"))?;
+    if act.run != run {
+        return Err(Error::invalid("activation does not belong to run"));
+    }
+    if act.status != ActivationStatus::Ready {
+        return Err(Error::invalid("activation is not awaiting a result"));
+    }
+    let Some(claim) = &act.claim else {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "no claim",
+        ));
+    };
+    if claim.session != session || claim.generation != generation || claim.revision != revision {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "stale claim",
+        ));
+    }
+    if claim.role != ExecutionRole::Reconciliation {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "claim is not a reconciliation probe",
+        ));
+    }
+    if time.as_millis() >= claim.lease_expiry_ms || time.as_millis() >= claim.attempt_deadline_ms {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "claim expired",
+        ));
+    }
+    let probes = claim.probes.saturating_add(1);
+    let mut events = vec![DomainEvent::ReconciliationRecorded {
+        run,
+        activation,
+        outcome,
+        output: output.clone(),
+        probes,
+    }];
+    match outcome {
+        ReconcileOutcome::Applied => {
+            let value = output.unwrap_or(Value::Null);
+            events.extend(report_success(state, run, activation, value, ids)?.events);
+        }
+        ReconcileOutcome::NotApplied => {
+            events.push(DomainEvent::ClaimCleared { activation });
+        }
+        ReconcileOutcome::Unknown => {
+            if probes >= crate::policy::RECONCILIATION_PROBES {
+                events.push(DomainEvent::InterventionRequired {
+                    run,
+                    activation,
+                    reason: "reconciliation probes exhausted".to_owned(),
+                });
+                events.push(DomainEvent::ClaimCleared { activation });
+            }
+        }
+    }
+    Ok(Decision { events })
 }
 
 fn unclaimed_ready(state: &State, run: RunId, time: EngineTime) -> Vec<ActivationId> {
     ready_activations(state, run)
         .into_iter()
         .filter(|id| {
+            if state.interventions.contains_key(id) {
+                return false;
+            }
             let Some(act) = state.activations.get(id) else {
                 return false;
             };
@@ -2289,10 +2470,13 @@ fn event_run(event: &DomainEvent) -> Option<RunId> {
         | DomainEvent::RunSucceeded { run, .. }
         | DomainEvent::RunFailed { run, .. }
         | DomainEvent::ObligationReleased { run, .. }
-        | DomainEvent::ClaimGranted { run, .. } => *run,
+        | DomainEvent::ClaimGranted { run, .. }
+        | DomainEvent::ReconciliationRecorded { run, .. }
+        | DomainEvent::InterventionRequired { run, .. } => *run,
         DomainEvent::ObligationTransferred { .. }
         | DomainEvent::SessionRegistered { .. }
-        | DomainEvent::ClaimRenewed { .. } => {
+        | DomainEvent::ClaimRenewed { .. }
+        | DomainEvent::ClaimCleared { .. } => {
             return None;
         }
     })
@@ -2653,6 +2837,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             lease_expiry_ms,
             attempt_deadline_ms,
             effect_key,
+            role,
             ..
         } => {
             state.next_generation = state.next_generation.saturating_add(1);
@@ -2664,6 +2849,8 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     lease_expiry_ms: *lease_expiry_ms,
                     attempt_deadline_ms: *attempt_deadline_ms,
                     effect_key: *effect_key,
+                    role: *role,
+                    probes: 0,
                 });
             }
         }
@@ -2679,6 +2866,25 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     claim.lease_expiry_ms = *lease_expiry_ms;
                 }
             }
+        }
+        DomainEvent::ClaimCleared { activation } => {
+            if let Some(act) = state.activations.get_mut(activation) {
+                act.claim = None;
+            }
+        }
+        DomainEvent::ReconciliationRecorded {
+            activation, probes, ..
+        } => {
+            if let Some(act) = state.activations.get_mut(activation) {
+                if let Some(claim) = &mut act.claim {
+                    claim.probes = *probes;
+                }
+            }
+        }
+        DomainEvent::InterventionRequired {
+            activation, reason, ..
+        } => {
+            state.interventions.insert(*activation, reason.clone());
         }
         DomainEvent::RunSucceeded { run, output } => {
             if let Some(run_state) = state.runs.get_mut(run) {
@@ -2847,6 +3053,25 @@ pub struct AssignmentView {
 
 pub fn activity_key(state: &State, activation: ActivationId) -> Option<(String, u32, Value)> {
     let act = state.activations.get(&activation)?;
+    if act
+        .claim
+        .as_ref()
+        .is_some_and(|claim| claim.role == ExecutionRole::Reconciliation)
+    {
+        let region = lookup_region(state, act.scope)?;
+        let Node::Activity {
+            activity, input, ..
+        } = region.nodes.get(act.node.as_str())?
+        else {
+            return None;
+        };
+        let scope = state.scopes.get(&act.scope)?;
+        let bound = eval_binding(input, &eval_ctx(state, scope)).ok()?;
+        let run = state.runs.get(&act.run)?;
+        let contract = run.catalog.activity(activity).ok()?;
+        let recon = contract.reconciler.as_ref()?;
+        return Some((recon.name.clone(), recon.version, bound));
+    }
     if act.role == ExecutionRole::Compensation {
         let obligation = state.obligations.iter().find(|item| {
             matches!(
@@ -3463,5 +3688,268 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+    }
+
+    fn manual_yaml() -> &'static str {
+        r#"
+dsl: graphrun/v1
+id: manual_probe
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: step
+nodes:
+  step:
+    kind: activity
+    activity: {name: test.manual, version: 1}
+    input: {from: workflow.input}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.step.output}
+"#
+    }
+
+    #[test]
+    fn expired_manual_claim_is_reconciled() {
+        let catalog = catalog();
+        let definition = compile_yaml(manual_yaml(), &catalog).unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        let input = Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(2))]));
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input,
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let session = WorkerSessionId::generate();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Claim {
+                    session,
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        assert_eq!(
+            state.activations[&activation].claim.as_ref().unwrap().role,
+            ExecutionRole::Forward
+        );
+        let later = crate::policy::SESSION_LEASE.as_millis() as u64 + 2;
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(later),
+                body: CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(later),
+                body: CommandBody::Claim {
+                    session,
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        let claim = state.activations[&activation].claim.clone().unwrap();
+        assert_eq!(claim.role, ExecutionRole::Reconciliation);
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(crate::policy::SESSION_LEASE.as_millis() as u64 + 2),
+                body: CommandBody::Reconcile {
+                    run,
+                    activation,
+                    session,
+                    generation: claim.generation,
+                    revision: claim.revision,
+                    outcome: ReconcileOutcome::Applied,
+                    output: Some(Value::Object(BTreeMap::from([(
+                        "value".to_owned(),
+                        Value::Int(2),
+                    )]))),
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(crate::policy::SESSION_LEASE.as_millis() as u64 + 3),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            run_output(&state, run)
+                .unwrap()
+                .pointer("/value")
+                .unwrap()
+                .as_i64(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn unknown_probes_enter_intervention() {
+        let catalog = catalog();
+        let definition = compile_yaml(manual_yaml(), &catalog).unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(1))])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let session = WorkerSessionId::generate();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Claim {
+                    session,
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        let later = crate::policy::SESSION_LEASE.as_millis() as u64 + 2;
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(later),
+                body: CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(later),
+                body: CommandBody::Claim {
+                    session,
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            let (generation, revision) = {
+                let claim = state.activations[&activation].claim.clone().unwrap();
+                (claim.generation, claim.revision)
+            };
+            apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(
+                        crate::policy::SESSION_LEASE.as_millis() as u64 + 2,
+                    ),
+                    body: CommandBody::Reconcile {
+                        run,
+                        activation,
+                        session,
+                        generation,
+                        revision,
+                        outcome: ReconcileOutcome::Unknown,
+                        output: None,
+                    },
+                },
+            )
+            .unwrap();
+        }
+        assert!(state.interventions.contains_key(&activation));
+        assert!(state.activations[&activation].claim.is_none());
     }
 }

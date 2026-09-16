@@ -72,7 +72,18 @@ pub fn inject_cut(point: &'static str) {
 }
 
 fn after_persist(point: &'static str) -> std::result::Result<(), StoErr> {
-    if CUT.lock().unwrap().as_deref() == Some(point) {
+    let cut = CUT.lock().unwrap().as_deref() == Some(point);
+    let env_hit = {
+        #[cfg(feature = "fault-injection")]
+        {
+            std::env::var("GRAPHUN_FAULT").ok().as_deref() == Some(point)
+        }
+        #[cfg(not(feature = "fault-injection"))]
+        {
+            false
+        }
+    };
+    if cut || env_hit {
         *CUT.lock().unwrap() = None;
         return Err(sto_err(ErrorVerb::Write, format!("fault cut {point}")));
     }
@@ -150,6 +161,15 @@ impl StorageHandle {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(Req::QueryState(tx));
         rx.await.unwrap_or_default()
+    }
+
+    pub async fn last_applied_index(&self) -> u64 {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(Req::AppliedState(tx));
+        match rx.await {
+            Ok(Ok((Some(id), _))) => id.index,
+            _ => 0,
+        }
     }
 
     pub fn shutdown(&self) {

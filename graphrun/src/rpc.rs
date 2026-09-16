@@ -352,13 +352,46 @@ impl WorkerSvc for GraphServices {
         .map(|_| self.notify.notify_one()))
     }
 
-    async fn reconcile(
-        &self,
-        _request: Request<ReconcileRequest>,
-    ) -> Result<Response<Ack>, Status> {
-        Ok(Response::new(Ack {
-            error: "reconciliation probes are not implemented".to_owned(),
-        }))
+    async fn reconcile(&self, request: Request<ReconcileRequest>) -> Result<Response<Ack>, Status> {
+        let req = request.into_inner();
+        let outcome = match req.outcome.as_str() {
+            "applied" => crate::domain::ReconcileOutcome::Applied,
+            "not_applied" => crate::domain::ReconcileOutcome::NotApplied,
+            "unknown" => crate::domain::ReconcileOutcome::Unknown,
+            other => {
+                return Ok(Response::new(Ack {
+                    error: format!("unknown outcome {other}"),
+                }));
+            }
+        };
+        let output = if req.output_json.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice(&req.output_json)
+                    .map_err(|err| Status::invalid_argument(err.to_string()))?,
+            )
+        };
+        ack(write_raft(
+            &self.raft,
+            Command {
+                id: parse_command_id(&req.command_id)?,
+                time: now(),
+                body: CommandBody::Reconcile {
+                    run: parse_run(&req.run_id)?,
+                    activation: ActivationId::from_hex(&req.activation_id)
+                        .map_err(Status::invalid_argument)?,
+                    session: WorkerSessionId::from_hex(&req.session_id)
+                        .map_err(Status::invalid_argument)?,
+                    generation: OwnerGeneration::new(req.generation),
+                    revision: LeaseRevision::new(req.revision),
+                    outcome,
+                    output,
+                },
+            },
+        )
+        .await
+        .map(|_| self.notify.notify_one()))
     }
 }
 

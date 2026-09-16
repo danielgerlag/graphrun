@@ -138,6 +138,8 @@ message ReconcileRequest {
   string activation_id = 4;
   string outcome = 5;
   bytes output_json = 6;
+  uint64 generation = 7;
+  uint64 revision = 8;
 }
 
 service Worker {

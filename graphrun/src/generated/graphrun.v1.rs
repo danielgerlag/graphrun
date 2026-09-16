@@ -187,6 +187,10 @@ pub struct ReconcileRequest {
     pub outcome: ::prost::alloc::string::String,
     #[prost(bytes = "vec", tag = "6")]
     pub output_json: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "7")]
+    pub generation: u64,
+    #[prost(uint64, tag = "8")]
+    pub revision: u64,
 }
 /// Generated client implementations.
 pub mod raft_client {

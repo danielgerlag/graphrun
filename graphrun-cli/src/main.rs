@@ -1,6 +1,7 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use graphrun::{
-    Catalog, ControlRequest, Engine, EventId, RunId, Value, compile_yaml, connect_control, replay,
+    Catalog, ControlRequest, Engine, EventId, GrpcClient, RunId, TlsMaterial, Value, compile_yaml,
+    connect_control, replay,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -11,6 +12,22 @@ use std::time::Duration;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ConnectArgs {
+    #[arg(long)]
+    local_dir: Option<PathBuf>,
+    #[arg(long)]
+    endpoint: Option<String>,
+    #[arg(long)]
+    ca: Option<PathBuf>,
+    #[arg(long)]
+    cert: Option<PathBuf>,
+    #[arg(long)]
+    key: Option<PathBuf>,
+    #[arg(long)]
+    server_name: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -38,8 +55,8 @@ enum Commands {
         catalog: PathBuf,
         #[arg(long)]
         input: PathBuf,
-        #[arg(long)]
-        local_dir: Option<PathBuf>,
+        #[command(flatten)]
+        connect: ConnectArgs,
         #[arg(long, default_value_t = 60_000)]
         wait_ms: u64,
         #[arg(long, default_value_t = false)]
@@ -56,32 +73,32 @@ enum Commands {
         event_id: String,
         #[arg(long)]
         payload: PathBuf,
-        #[arg(long)]
-        local_dir: Option<PathBuf>,
+        #[command(flatten)]
+        connect: ConnectArgs,
     },
     Cancel {
         #[arg(long)]
         run: String,
         #[arg(long)]
         reason: String,
-        #[arg(long)]
-        local_dir: Option<PathBuf>,
+        #[command(flatten)]
+        connect: ConnectArgs,
     },
     Inspect {
         #[arg(long)]
         run: String,
-        #[arg(long)]
-        local_dir: Option<PathBuf>,
+        #[command(flatten)]
+        connect: ConnectArgs,
     },
     List {
-        #[arg(long)]
-        local_dir: Option<PathBuf>,
+        #[command(flatten)]
+        connect: ConnectArgs,
     },
     History {
         #[arg(long)]
         run: String,
-        #[arg(long)]
-        local_dir: Option<PathBuf>,
+        #[command(flatten)]
+        connect: ConnectArgs,
     },
     Replay {
         #[arg(long)]
@@ -120,8 +137,8 @@ enum Commands {
 #[derive(Subcommand, Debug)]
 enum ClusterCommands {
     Health {
-        #[arg(long)]
-        local_dir: Option<PathBuf>,
+        #[command(flatten)]
+        connect: ConnectArgs,
     },
     Join,
     Promote,
@@ -154,15 +171,24 @@ async fn run() -> Result<(), String> {
             definition,
             catalog,
             input,
-            local_dir,
+            connect,
             wait_ms,
             no_wait,
         } => {
-            let local_dir = require_local(local_dir)?;
             let yaml = load_workflow(workflow, definition)?;
             let catalog = load_catalog(&catalog)?;
             let input = load_value(&input)?;
             let wait = if no_wait { None } else { Some(wait_ms) };
+            if let Some(mut client) = grpc_client(&connect).await? {
+                let run = client
+                    .start(&yaml, &catalog, &input)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                let body = serde_json::json!({"run": run.to_hex(), "status": "started"});
+                println!("{body}");
+                return Ok(());
+            }
+            let local_dir = require_local(connect.local_dir)?;
             let body = dispatch(
                 &local_dir,
                 ControlRequest::Start {
@@ -183,10 +209,20 @@ async fn run() -> Result<(), String> {
             key,
             event_id,
             payload,
-            local_dir,
+            connect,
         } => {
-            let local_dir = require_local(local_dir)?;
             let payload = load_value(&payload)?;
+            if let Some(mut client) = grpc_client(&connect).await? {
+                let id = RunId::from_hex(&run)?;
+                let event = EventId::from_hex(&event_id)?;
+                client
+                    .signal(id, event, &name, &key, &payload)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                println!("{}", serde_json::json!({"status":"ok"}));
+                return Ok(());
+            }
+            let local_dir = require_local(connect.local_dir)?;
             let body = dispatch(
                 &local_dir,
                 ControlRequest::Signal {
@@ -205,27 +241,56 @@ async fn run() -> Result<(), String> {
         Commands::Cancel {
             run,
             reason,
-            local_dir,
+            connect,
         } => {
-            let local_dir = require_local(local_dir)?;
+            if let Some(mut client) = grpc_client(&connect).await? {
+                client
+                    .cancel(RunId::from_hex(&run)?, &reason)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                println!("{}", serde_json::json!({"status":"ok"}));
+                return Ok(());
+            }
+            let local_dir = require_local(connect.local_dir)?;
             let body = dispatch(&local_dir, ControlRequest::Cancel { run, reason }, false).await?;
             println!("{body}");
             Ok(())
         }
-        Commands::Inspect { run, local_dir } => {
-            let local_dir = require_local(local_dir)?;
+        Commands::Inspect { run, connect } => {
+            if let Some(mut client) = grpc_client(&connect).await? {
+                let view = client
+                    .inspect(RunId::from_hex(&run)?)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                println!("{view}");
+                return Ok(());
+            }
+            let local_dir = require_local(connect.local_dir)?;
             let body = dispatch(&local_dir, ControlRequest::Inspect { run }, false).await?;
             println!("{body}");
             Ok(())
         }
-        Commands::List { local_dir } => {
-            let local_dir = require_local(local_dir)?;
+        Commands::List { connect } => {
+            if let Some(mut client) = grpc_client(&connect).await? {
+                let view = client.list().await.map_err(|err| err.to_string())?;
+                println!("{view}");
+                return Ok(());
+            }
+            let local_dir = require_local(connect.local_dir)?;
             let body = dispatch(&local_dir, ControlRequest::List, false).await?;
             println!("{body}");
             Ok(())
         }
-        Commands::History { run, local_dir } => {
-            let local_dir = require_local(local_dir)?;
+        Commands::History { run, connect } => {
+            if let Some(mut client) = grpc_client(&connect).await? {
+                let view = client
+                    .history(RunId::from_hex(&run)?)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                println!("{view}");
+                return Ok(());
+            }
+            let local_dir = require_local(connect.local_dir)?;
             let body = dispatch(&local_dir, ControlRequest::History { run }, false).await?;
             println!("{body}");
             Ok(())
@@ -318,9 +383,14 @@ async fn run() -> Result<(), String> {
             Ok(())
         }
         Commands::Cluster {
-            command: ClusterCommands::Health { local_dir },
+            command: ClusterCommands::Health { connect },
         } => {
-            let local_dir = require_local(local_dir)?;
+            if let Some(mut client) = grpc_client(&connect).await? {
+                let view = client.list().await.map_err(|err| err.to_string())?;
+                println!("{}", serde_json::json!({"status":"ok","runs": view}));
+                return Ok(());
+            }
+            let local_dir = require_local(connect.local_dir)?;
             let body = dispatch(&local_dir, ControlRequest::Health, false).await?;
             println!("{body}");
             Ok(())
@@ -332,7 +402,39 @@ async fn run() -> Result<(), String> {
 }
 
 fn require_local(local_dir: Option<PathBuf>) -> Result<PathBuf, String> {
-    local_dir.ok_or_else(|| "--local-dir is required".to_owned())
+    local_dir.ok_or_else(|| "--local-dir or --endpoint is required".to_owned())
+}
+
+async fn grpc_client(connect: &ConnectArgs) -> Result<Option<GrpcClient>, String> {
+    let Some(endpoint) = &connect.endpoint else {
+        return Ok(None);
+    };
+    let ca = connect
+        .ca
+        .as_ref()
+        .ok_or_else(|| "--ca is required with --endpoint".to_owned())?;
+    let cert = connect
+        .cert
+        .as_ref()
+        .ok_or_else(|| "--cert is required with --endpoint".to_owned())?;
+    let key = connect
+        .key
+        .as_ref()
+        .ok_or_else(|| "--key is required with --endpoint".to_owned())?;
+    let server_name = connect
+        .server_name
+        .clone()
+        .ok_or_else(|| "--server-name is required with --endpoint".to_owned())?;
+    let tls = TlsMaterial {
+        ca_pem: std::fs::read_to_string(ca).map_err(|err| err.to_string())?,
+        cert_pem: std::fs::read_to_string(cert).map_err(|err| err.to_string())?,
+        key_pem: std::fs::read_to_string(key).map_err(|err| err.to_string())?,
+        server_name,
+    };
+    GrpcClient::connect(endpoint, &tls)
+        .await
+        .map(Some)
+        .map_err(|err| err.to_string())
 }
 
 fn load_workflow(workflow: Option<String>, definition: Option<PathBuf>) -> Result<String, String> {

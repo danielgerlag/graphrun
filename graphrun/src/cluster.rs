@@ -219,6 +219,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grpc_client_starts_sequence() {
+        let ca = generate_ca().unwrap();
+        let addr = unused_addr();
+        let tls = issue_node(&ca, 1).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::member(MemberConfig {
+            data_dir: dir.path().to_path_buf(),
+            node_id: 1,
+            bind: addr,
+            peers: BTreeMap::new(),
+            tls: tls.clone(),
+            host_activities: true,
+            initialize: true,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut client = crate::client::GrpcClient::connect(&format!("https://{addr}"), &tls)
+            .await
+            .unwrap();
+        let catalog = Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let run = client
+            .start(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                &catalog,
+                &Value::Object(
+                    [
+                        ("order_id".to_owned(), Value::String("o1".to_owned())),
+                        ("amount".to_owned(), Value::Int(1000)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            )
+            .await
+            .unwrap();
+        let output = engine
+            .wait_terminal(run, Duration::from_secs(20))
+            .await
+            .unwrap();
+        assert_eq!(
+            output.pointer("/payment_id").unwrap().as_str(),
+            Some("pay-1")
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn independent_worker_completes_sequence() {
         let ca = generate_ca().unwrap();
         let addr = unused_addr();

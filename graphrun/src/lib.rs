@@ -6,6 +6,7 @@
 pub mod binding;
 pub mod builder;
 pub mod catalog;
+pub mod client;
 pub mod cluster;
 pub mod compiler;
 pub mod domain;
@@ -30,6 +31,7 @@ pub use builder::{
     RegionGraphBuilder, SignalRef, TerminalRef, TimedWaitRef, ValueRef, WorkflowBuilder,
 };
 pub use catalog::Catalog;
+pub use client::GrpcClient;
 pub use cluster::MemberConfig;
 pub use compiler::compile_yaml;
 pub use domain::{State, reconstruct, run_events, run_output};

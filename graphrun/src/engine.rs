@@ -31,6 +31,7 @@ pub struct Engine {
     worker: Option<tokio::task::JoinHandle<()>>,
     control: tokio::task::JoinHandle<()>,
     raft_server: Option<tokio::task::JoinHandle<()>>,
+    snapshot_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -121,6 +122,10 @@ impl Engine {
             storage.clone(),
             notify.clone(),
         ));
+        let snapshot_task = Some(tokio::spawn(snapshot_controller(
+            raft.clone(),
+            storage.clone(),
+        )));
         Ok(Self {
             raft,
             storage,
@@ -130,6 +135,7 @@ impl Engine {
             worker: Some(worker),
             control,
             raft_server: None,
+            snapshot_task,
         })
     }
 
@@ -213,6 +219,10 @@ impl Engine {
             storage.clone(),
             notify.clone(),
         ));
+        let snapshot_task = Some(tokio::spawn(snapshot_controller(
+            raft.clone(),
+            storage.clone(),
+        )));
         Ok(Self {
             raft,
             storage,
@@ -222,6 +232,7 @@ impl Engine {
             worker,
             control,
             raft_server: Some(raft_server),
+            snapshot_task,
         })
     }
 
@@ -375,6 +386,30 @@ impl Engine {
             for assignment in claimed.assignments {
                 let input: Value =
                     serde_json::from_slice(&assignment.input_json).unwrap_or(Value::Null);
+                if assignment.role.contains("reconcil") {
+                    let outcome = builtin_reconcile(&assignment.activity_name, &input);
+                    let tag = match outcome.0 {
+                        crate::domain::ReconcileOutcome::Applied => "applied",
+                        crate::domain::ReconcileOutcome::NotApplied => "not_applied",
+                        crate::domain::ReconcileOutcome::Unknown => "unknown",
+                    };
+                    let _ = client
+                        .reconcile(crate::generated::ReconcileRequest {
+                            command_id: CommandId::generate().to_hex(),
+                            session_id: session.to_hex(),
+                            run_id: assignment.run_id,
+                            activation_id: assignment.activation_id,
+                            outcome: tag.to_owned(),
+                            output_json: outcome
+                                .1
+                                .map(|value| serde_json::to_vec(&value).unwrap_or_default())
+                                .unwrap_or_default(),
+                            generation: assignment.generation,
+                            revision: assignment.revision,
+                        })
+                        .await;
+                    continue;
+                }
                 let Ok(output) = builtin_handler(&assignment.activity_name, &input) else {
                     continue;
                 };
@@ -450,6 +485,9 @@ impl Engine {
         if let Some(server) = &self.raft_server {
             server.abort();
         }
+        if let Some(task) = &self.snapshot_task {
+            task.abort();
+        }
         let _ = self.raft.shutdown().await;
         self.storage.shutdown();
         if let Some(thread) = self.storage_thread.lock().unwrap().take() {
@@ -472,6 +510,9 @@ impl Drop for Engine {
         self.control.abort();
         if let Some(server) = &self.raft_server {
             server.abort();
+        }
+        if let Some(task) = &self.snapshot_task {
+            task.abort();
         }
         self.storage.shutdown();
         if let Some(thread) = self.storage_thread.lock().unwrap().take() {
@@ -802,6 +843,30 @@ async fn wait_via_raft(
     }
 }
 
+pub fn should_snapshot(applied: u64, last_snapshot: u64, elapsed: Duration) -> bool {
+    applied.saturating_sub(last_snapshot) >= 20_000
+        || (elapsed >= Duration::from_secs(30 * 60) && applied > last_snapshot)
+}
+
+async fn snapshot_controller(raft: Raft<TypeConfig>, storage: StorageHandle) {
+    let mut last_snapshot = 0u64;
+    let mut last_change = tokio::time::Instant::now();
+    let mut last_seen = 0u64;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let applied = storage.last_applied_index().await;
+        if applied > last_seen {
+            last_seen = applied;
+            last_change = tokio::time::Instant::now();
+        }
+        if should_snapshot(applied, last_snapshot, last_change.elapsed()) {
+            if raft.trigger().snapshot().await.is_ok() {
+                last_snapshot = applied;
+            }
+        }
+    }
+}
+
 async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc<Notify>) {
     let session = crate::ids::WorkerSessionId::generate();
     let _ = write_raft(
@@ -859,35 +924,57 @@ async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc
                         ))
                 })
                 .is_some_and(|contract| contract.execution == ExecutionKind::Blocking);
-            let output = if blocking {
-                let name = assignment.activity_name.clone();
-                let input = assignment.input.clone();
-                match tokio::task::spawn_blocking(move || builtin_handler(&name, &input)).await {
-                    Ok(Ok(output)) => output,
-                    _ => continue,
-                }
-            } else {
-                match builtin_handler(&assignment.activity_name, &assignment.input) {
-                    Ok(output) => output,
-                    Err(_) => continue,
-                }
-            };
-            let _ = write_raft(
-                &raft,
-                Command {
-                    id: CommandId::generate(),
-                    time: now(),
-                    body: CommandBody::ReportAssigned {
-                        run: assignment.run,
-                        activation: assignment.activation,
-                        output,
-                        session: assignment.session,
-                        generation: assignment.generation,
-                        revision: assignment.revision,
+            if assignment.role == crate::ids::ExecutionRole::Reconciliation {
+                let outcome = builtin_reconcile(&assignment.activity_name, &assignment.input);
+                let _ = write_raft(
+                    &raft,
+                    Command {
+                        id: CommandId::generate(),
+                        time: now(),
+                        body: CommandBody::Reconcile {
+                            run: assignment.run,
+                            activation: assignment.activation,
+                            session: assignment.session,
+                            generation: assignment.generation,
+                            revision: assignment.revision,
+                            outcome: outcome.0,
+                            output: outcome.1,
+                        },
                     },
-                },
-            )
-            .await;
+                )
+                .await;
+            } else {
+                let output = if blocking {
+                    let name = assignment.activity_name.clone();
+                    let input = assignment.input.clone();
+                    match tokio::task::spawn_blocking(move || builtin_handler(&name, &input)).await
+                    {
+                        Ok(Ok(output)) => output,
+                        _ => continue,
+                    }
+                } else {
+                    match builtin_handler(&assignment.activity_name, &assignment.input) {
+                        Ok(output) => output,
+                        Err(_) => continue,
+                    }
+                };
+                let _ = write_raft(
+                    &raft,
+                    Command {
+                        id: CommandId::generate(),
+                        time: now(),
+                        body: CommandBody::ReportAssigned {
+                            run: assignment.run,
+                            activation: assignment.activation,
+                            output,
+                            session: assignment.session,
+                            generation: assignment.generation,
+                            revision: assignment.revision,
+                        },
+                    },
+                )
+                .await;
+            }
             did_work = true;
         }
         if did_work {
@@ -958,7 +1045,21 @@ pub fn builtin_handler(name: &str, input: &Value) -> Result<Value> {
         )]))),
         "remote.echo" | "test.gate" => Ok(input.clone()),
         "inventory.release" | "payment.refund" => Ok(Value::Null),
+        "test.manual" => Ok(input.clone()),
         _ => Ok(input.clone()),
+    }
+}
+
+pub fn builtin_reconcile(
+    name: &str,
+    input: &Value,
+) -> (crate::domain::ReconcileOutcome, Option<Value>) {
+    match name {
+        "test.lookup" | "inventory.lookup" | "payment.lookup" => (
+            crate::domain::ReconcileOutcome::Applied,
+            Some(input.clone()),
+        ),
+        _ => (crate::domain::ReconcileOutcome::Unknown, None),
     }
 }
 
@@ -1085,5 +1186,13 @@ mod tests {
             .map(|entries| entries.filter_map(|e| e.ok()).count())
             .unwrap_or(0);
         assert!(found > 0, "expected snapshot file in {}", snaps.display());
+    }
+
+    #[test]
+    fn snapshot_controller_threshold() {
+        assert!(!should_snapshot(10, 0, Duration::from_secs(1)));
+        assert!(should_snapshot(20_000, 0, Duration::from_secs(1)));
+        assert!(should_snapshot(5, 0, Duration::from_secs(30 * 60)));
+        assert!(!should_snapshot(0, 0, Duration::from_secs(30 * 60)));
     }
 }
