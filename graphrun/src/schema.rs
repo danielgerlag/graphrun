@@ -1,12 +1,25 @@
 use crate::error::{Error, Result};
 use crate::ids::valid_ascii_name;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SchemaKey {
     pub name: String,
     pub version: u32,
+}
+
+impl Serialize for SchemaKey {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_stable_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for SchemaKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        SchemaKey::parse(&text).map_err(serde::de::Error::custom)
+    }
 }
 
 impl SchemaKey {

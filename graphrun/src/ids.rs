@@ -164,9 +164,10 @@ branded_u64!(
     WaitRevision
 );
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionRole {
+    #[default]
     Forward,
     Compensation,
     Reconciliation,
@@ -187,7 +188,7 @@ impl DefinitionId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ActivityKey {
     pub name: String,
     pub version: u32,
@@ -199,6 +200,39 @@ impl ActivityKey {
             name: name.into(),
             version,
         }
+    }
+
+    pub fn as_stable_name(&self) -> String {
+        format!("{}/v{}", self.name, self.version)
+    }
+
+    pub fn parse(raw: &str) -> std::result::Result<Self, String> {
+        let (name, version) = raw
+            .rsplit_once("/v")
+            .ok_or_else(|| format!("activity {raw} must look like name/vN"))?;
+        let version: u32 = version
+            .parse()
+            .map_err(|_| format!("activity {raw} has a non-integer version"))?;
+        Ok(Self::new(name, version))
+    }
+}
+
+impl Serialize for ActivityKey {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_stable_name())
+    }
+}
+
+impl<'de> Deserialize<'de> for ActivityKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        ActivityKey::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for ActivityKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.as_stable_name())
     }
 }
 

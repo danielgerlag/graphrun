@@ -62,7 +62,7 @@ pub struct ReconcilerContract {
     pub forward: ActivityKey,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
     pub schemas: BTreeMap<SchemaKey, serde_json::Value>,
     pub activities: BTreeMap<ActivityKey, ActivityContract>,

@@ -10,6 +10,7 @@ use crate::policy::CapturedRunPolicy;
 use crate::time::EngineTime;
 use crate::value::Value;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as ShaDigest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +101,24 @@ pub enum DomainEvent {
         handler_version: u32,
         input: Value,
     },
+    CompensationStarted {
+        run: RunId,
+        saga: ActivationId,
+        forward: ActivationId,
+        activation: ActivationId,
+        handler: String,
+        handler_version: u32,
+        input: Value,
+        error: FailError,
+    },
+    ObligationTransferred {
+        forward: ActivationId,
+        from_saga: ActivationId,
+        to_saga: ActivationId,
+    },
+    ObligationReleased {
+        forward: ActivationId,
+    },
     RunSucceeded {
         run: RunId,
         output: Value,
@@ -135,7 +154,7 @@ pub enum ScopeRole {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CommandBody {
     Start {
         run: RunId,
@@ -162,23 +181,61 @@ pub enum CommandBody {
     Progress {
         run: RunId,
     },
+    Cancel {
+        run: RunId,
+        reason: String,
+    },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Command {
     pub id: CommandId,
     pub body: CommandBody,
     pub time: EngineTime,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+struct IdGen {
+    command: CommandId,
+    n: u32,
+}
+
+impl IdGen {
+    fn new(command: CommandId) -> Self {
+        Self { command, n: 0 }
+    }
+
+    fn next_bytes(&mut self) -> [u8; 16] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.command.as_bytes());
+        hasher.update(self.n.to_le_bytes());
+        self.n += 1;
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes
+    }
+
+    fn scope(&mut self) -> ScopeId {
+        ScopeId::from_bytes(self.next_bytes())
+    }
+
+    fn activation(&mut self) -> ActivationId {
+        ActivationId::from_bytes(self.next_bytes())
+    }
+
+    fn wait(&mut self) -> WaitId {
+        WaitId::from_bytes(self.next_bytes())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunStatus {
     Active,
     Succeeded { output: Value },
     Failed { error: FailError },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunState {
     pub id: RunId,
     pub definition: Definition,
@@ -190,14 +247,14 @@ pub struct RunState {
     pub next_sequence: RunSequence,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScopeStatus {
     Open,
     Completed { output: Value },
     Failed { error: FailError },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScopeState {
     pub id: ScopeId,
     pub run: RunId,
@@ -209,7 +266,7 @@ pub struct ScopeState {
     pub current: Option<NodeKey>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActivationStatus {
     Open,
     Ready,
@@ -217,16 +274,38 @@ pub enum ActivationStatus {
     Failed,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActivationState {
     pub id: ActivationId,
     pub run: RunId,
     pub scope: ScopeId,
     pub node: NodeKey,
     pub status: ActivationStatus,
+    #[serde(default)]
+    pub role: ExecutionRole,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObligationStatus {
+    Open,
+    Compensating { activation: ActivationId },
+    Compensated,
+    Released,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Obligation {
+    pub forward: ActivationId,
+    pub run: RunId,
+    pub owner: ActivationId,
+    pub handler: String,
+    pub handler_version: u32,
+    pub input: Value,
+    pub status: ObligationStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WaitState {
     pub id: WaitId,
     pub run: RunId,
@@ -239,7 +318,7 @@ pub struct WaitState {
     pub pending: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InboxEntry {
     pub event_id: EventId,
     pub signal: String,
@@ -250,7 +329,7 @@ pub struct InboxEntry {
     pub consumed: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
     pub runs: HashMap<RunId, RunState>,
     pub scopes: HashMap<ScopeId, ScopeState>,
@@ -260,8 +339,14 @@ pub struct State {
     pub commands: HashMap<CommandId, Vec<DomainEvent>>,
     pub loop_carry: HashMap<ActivationId, (Value, u32)>,
     pub foreach_items: HashMap<ActivationId, Vec<Value>>,
-    pub foreach_done: HashMap<ActivationId, BTreeMap<u32, Value>>,
+    pub foreach_done: HashMap<ActivationId, Vec<(u32, Value)>>,
     pub parallel_done: HashMap<ActivationId, BTreeMap<String, Value>>,
+    #[serde(default)]
+    pub history: HashMap<RunId, Vec<DomainEvent>>,
+    #[serde(default)]
+    pub obligations: Vec<Obligation>,
+    #[serde(default)]
+    pub saga_errors: HashMap<ActivationId, FailError>,
 }
 
 #[derive(Clone, Debug)]
@@ -275,18 +360,19 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             events: events.clone(),
         });
     }
+    let mut ids = IdGen::new(command.id);
     match &command.body {
         CommandBody::Start {
             run,
             definition,
             input,
             catalog: _,
-        } => decide_start(*run, definition, input.clone()),
+        } => decide_start(*run, definition, input.clone(), &mut ids),
         CommandBody::ReportLeaf {
             run,
             activation,
             output,
-        } => decide_report(state, *run, *activation, output.clone()),
+        } => decide_report(state, *run, *activation, output.clone(), &mut ids),
         CommandBody::Signal {
             run,
             event_id,
@@ -301,15 +387,24 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             key,
             payload.clone(),
             command.time,
+            &mut ids,
         ),
-        CommandBody::ResolveTimer { run, wait } => decide_timer(state, *run, *wait, command.time),
-        CommandBody::Progress { run } => decide_progress(state, *run, command.time),
+        CommandBody::ResolveTimer { run, wait } => {
+            decide_timer(state, *run, *wait, command.time, &mut ids)
+        }
+        CommandBody::Progress { run } => decide_progress(state, *run, command.time, &mut ids),
+        CommandBody::Cancel { run, reason } => decide_cancel(state, *run, reason, &mut ids),
     }
 }
 
-fn decide_start(run: RunId, definition: &Definition, input: Value) -> Result<Decision> {
-    let root = ScopeId::generate();
-    let start_act = ActivationId::generate();
+fn decide_start(
+    run: RunId,
+    definition: &Definition,
+    input: Value,
+    ids: &mut IdGen,
+) -> Result<Decision> {
+    let root = ids.scope();
+    let start_act = ids.activation();
     let start = definition.root.start.as_str().to_owned();
     Ok(Decision {
         events: vec![
@@ -343,6 +438,7 @@ fn decide_report(
     run: RunId,
     activation: ActivationId,
     output: Value,
+    ids: &mut IdGen,
 ) -> Result<Decision> {
     let act = state
         .activations
@@ -353,6 +449,9 @@ fn decide_report(
     }
     if act.status != ActivationStatus::Ready {
         return Err(Error::invalid("activation is not awaiting a result"));
+    }
+    if act.role == ExecutionRole::Compensation {
+        return decide_compensation_result(state, run, activation, output);
     }
     let mut events = vec![DomainEvent::LeafSucceeded {
         run,
@@ -370,7 +469,78 @@ fn decide_report(
     if let Some(comp) = compensation_for(state, act, &output) {
         events.push(comp);
     }
-    events.extend(follow_next(state, act.scope, &act.node, &output)?);
+    events.extend(follow_next(state, act.scope, &act.node, &output, ids)?);
+    Ok(Decision { events })
+}
+
+fn decide_compensation_result(
+    state: &State,
+    run: RunId,
+    activation: ActivationId,
+    output: Value,
+) -> Result<Decision> {
+    let Some(obligation) = state.obligations.iter().find(|item| {
+        matches!(
+            item.status,
+            ObligationStatus::Compensating { activation: current } if current == activation
+        )
+    }) else {
+        return Err(Error::invalid("compensation activation has no obligation"));
+    };
+    if obligation.run != run {
+        return Err(Error::invalid("compensation does not belong to run"));
+    }
+    Ok(Decision {
+        events: vec![DomainEvent::LeafSucceeded {
+            run,
+            activation,
+            attempt: AttemptNo::new(1),
+            output,
+            role: ExecutionRole::Compensation,
+        }],
+    })
+}
+
+fn decide_cancel(state: &State, run: RunId, reason: &str, ids: &mut IdGen) -> Result<Decision> {
+    let run_state = state
+        .runs
+        .get(&run)
+        .ok_or_else(|| Error::invalid("unknown run"))?;
+    if !matches!(run_state.status, RunStatus::Active) {
+        return Err(Error::invalid("run is not active"));
+    }
+    let error = FailError {
+        code: "run.cancelled".to_owned(),
+        message: reason.to_owned(),
+    };
+    let mut events = Vec::new();
+    let sagas: Vec<ActivationId> = state
+        .activations
+        .values()
+        .filter(|act| {
+            act.run == run
+                && matches!(
+                    region_for_scope(state, act.scope)
+                        .and_then(|region| region.nodes.get(act.node.as_str())),
+                    Some(Node::Saga { .. })
+                )
+                && act.status == ActivationStatus::Open
+        })
+        .map(|act| act.id)
+        .collect();
+    if sagas.is_empty() {
+        if let Some(root) = state
+            .scopes
+            .values()
+            .find(|scope| scope.run == run && matches!(scope.role, ScopeRole::Root))
+        {
+            events.extend(fail_scope(state, root.id, error)?);
+        }
+        return Ok(Decision { events });
+    }
+    for saga in sagas {
+        events.extend(compensate_or_fail(state, saga, error.clone(), ids)?);
+    }
     Ok(Decision { events })
 }
 
@@ -415,6 +585,7 @@ fn decide_signal(
     key: &str,
     payload: Value,
     _time: EngineTime,
+    ids: &mut IdGen,
 ) -> Result<Decision> {
     let run_state = state
         .runs
@@ -467,7 +638,7 @@ fn decide_signal(
             output: payload.clone(),
         });
         let act = state.activations.get(&wait.activation).unwrap();
-        events.extend(follow_next(state, act.scope, &act.node, &payload)?);
+        events.extend(follow_next(state, act.scope, &act.node, &payload, ids)?);
     }
     Ok(Decision { events })
 }
@@ -484,7 +655,13 @@ fn pending_wait<'a>(
         .find(|wait| wait.run == run && wait.pending && wait.signal == signal && wait.key == key)
 }
 
-fn decide_timer(state: &State, run: RunId, wait: WaitId, time: EngineTime) -> Result<Decision> {
+fn decide_timer(
+    state: &State,
+    run: RunId,
+    wait: WaitId,
+    time: EngineTime,
+    ids: &mut IdGen,
+) -> Result<Decision> {
     let wait_state = state
         .waits
         .get(&wait)
@@ -516,13 +693,19 @@ fn decide_timer(state: &State, run: RunId, wait: WaitId, time: EngineTime) -> Re
                 },
             ]
             .into_iter()
-            .chain(follow_next(state, act.scope, &act.node, &entry.payload)?)
+            .chain(follow_next(
+                state,
+                act.scope,
+                &act.node,
+                &entry.payload,
+                ids,
+            )?)
             .collect(),
         });
     }
     let act = state.activations.get(&wait_state.activation).unwrap();
     let mut events = vec![DomainEvent::WaitTimedOut { run, wait }];
-    events.extend(follow_timeout(state, act)?);
+    events.extend(follow_timeout(state, act, ids)?);
     Ok(Decision { events })
 }
 
@@ -538,7 +721,11 @@ fn reserved_or_eligible<'a>(state: &'a State, wait: &WaitState) -> Option<&'a In
     })
 }
 
-fn follow_timeout(state: &State, act: &ActivationState) -> Result<Vec<DomainEvent>> {
+fn follow_timeout(
+    state: &State,
+    act: &ActivationState,
+    ids: &mut IdGen,
+) -> Result<Vec<DomainEvent>> {
     let region =
         region_for_scope(state, act.scope).ok_or_else(|| Error::invalid("missing region"))?;
     let Node::WaitSignal {
@@ -548,14 +735,19 @@ fn follow_timeout(state: &State, act: &ActivationState) -> Result<Vec<DomainEven
     else {
         return Err(Error::invalid("wait has no timeout edge"));
     };
-    open_node(state, act.scope, next)
+    open_node(state, act.scope, next, ids)
 }
 
-fn decide_progress(state: &State, run: RunId, time: EngineTime) -> Result<Decision> {
+fn decide_progress(
+    state: &State,
+    run: RunId,
+    time: EngineTime,
+    ids: &mut IdGen,
+) -> Result<Decision> {
     let mut events = Vec::new();
     let mut working = state.clone();
     for _ in 0..crate::limits::PROGRESS_BATCH {
-        let Some(next) = next_progress(&working, run, time)? else {
+        let Some(next) = next_progress(&working, run, time, ids)? else {
             break;
         };
         apply_events(&mut working, &next);
@@ -564,14 +756,25 @@ fn decide_progress(state: &State, run: RunId, time: EngineTime) -> Result<Decisi
     Ok(Decision { events })
 }
 
-fn next_progress(state: &State, run: RunId, time: EngineTime) -> Result<Option<Vec<DomainEvent>>> {
+fn next_progress(
+    state: &State,
+    run: RunId,
+    time: EngineTime,
+    ids: &mut IdGen,
+) -> Result<Option<Vec<DomainEvent>>> {
     let Some(run_state) = state.runs.get(&run) else {
         return Ok(None);
     };
     if !matches!(run_state.status, RunStatus::Active) {
         return Ok(None);
     }
+    if let Some(events) = due_wait(state, run, time, ids)? {
+        return Ok(Some(events));
+    }
     for act in state.activations.values().filter(|act| act.run == run) {
+        if act.role != ExecutionRole::Forward {
+            continue;
+        }
         if act.status != ActivationStatus::Open {
             continue;
         }
@@ -595,11 +798,26 @@ fn next_progress(state: &State, run: RunId, time: EngineTime) -> Result<Option<V
                 return Ok(Some(fail_scope(state, act.scope, error.clone())?));
             }
             Node::Delay { duration, next } => {
+                if state
+                    .waits
+                    .values()
+                    .any(|wait| wait.activation == act.id && wait.pending)
+                {
+                    continue;
+                }
                 let scope = state.scopes.get(&act.scope).unwrap();
                 let ms = eval_duration_ms(duration, &eval_ctx(state, scope))?;
-                if time.as_millis() >= ms {
-                    return Ok(Some(open_node(state, act.scope, next)?));
-                }
+                let wait = ids.wait();
+                let _ = next;
+                return Ok(Some(vec![DomainEvent::WaitOpened {
+                    run,
+                    wait,
+                    activation: act.id,
+                    signal: "__timer".to_owned(),
+                    key: act.id.to_hex(),
+                    deadline_ms: Some(time.as_millis().saturating_add(ms)),
+                    consume_from: ConsumeFrom::AfterActivation,
+                }]));
             }
             Node::WaitUntil { at, next } => {
                 let scope = state.scopes.get(&act.scope).unwrap();
@@ -612,11 +830,11 @@ fn next_progress(state: &State, run: RunId, time: EngineTime) -> Result<Option<V
                     }
                 };
                 if time.as_millis() >= at {
-                    return Ok(Some(open_node(state, act.scope, next)?));
+                    return Ok(Some(open_node(state, act.scope, next, ids)?));
                 }
             }
             Node::WaitSignal { .. } => {
-                return Ok(Some(open_wait(state, act, time)?));
+                return Ok(Some(open_wait(state, act, time, ids)?));
             }
             Node::While {
                 state: st,
@@ -635,6 +853,7 @@ fn next_progress(state: &State, run: RunId, time: EngineTime) -> Result<Option<V
                     body,
                     next,
                     false,
+                    ids,
                 )?;
                 if events.is_empty() {
                     continue;
@@ -649,8 +868,17 @@ fn next_progress(state: &State, run: RunId, time: EngineTime) -> Result<Option<V
                 next,
                 ..
             } => {
-                let events =
-                    progress_while(state, act, st, condition, *max_iterations, body, next, true)?;
+                let events = progress_while(
+                    state,
+                    act,
+                    st,
+                    condition,
+                    *max_iterations,
+                    body,
+                    next,
+                    true,
+                    ids,
+                )?;
                 if events.is_empty() {
                     continue;
                 }
@@ -664,7 +892,8 @@ fn next_progress(state: &State, run: RunId, time: EngineTime) -> Result<Option<V
                 next,
                 ..
             } => {
-                let events = progress_repeat(state, act, count, st, *max_iterations, body, next)?;
+                let events =
+                    progress_repeat(state, act, count, st, *max_iterations, body, next, ids)?;
                 if events.is_empty() {
                     continue;
                 }
@@ -678,15 +907,23 @@ fn next_progress(state: &State, run: RunId, time: EngineTime) -> Result<Option<V
                 next,
                 ..
             } => {
-                let events =
-                    progress_foreach(state, act, items, *max_items, *max_concurrency, body, next)?;
+                let events = progress_foreach(
+                    state,
+                    act,
+                    items,
+                    *max_items,
+                    *max_concurrency,
+                    body,
+                    next,
+                    ids,
+                )?;
                 if events.is_empty() {
                     continue;
                 }
                 return Ok(Some(events));
             }
             Node::Parallel { branches, next } => {
-                let events = progress_parallel(state, act, branches, next)?;
+                let events = progress_parallel(state, act, branches, next, ids)?;
                 if events.is_empty() {
                     continue;
                 }
@@ -698,14 +935,14 @@ fn next_progress(state: &State, run: RunId, time: EngineTime) -> Result<Option<V
                 default,
                 next,
             } => {
-                let events = progress_choose(state, act, input, cases, default, next)?;
+                let events = progress_choose(state, act, input, cases, default, next, ids)?;
                 if events.is_empty() {
                     continue;
                 }
                 return Ok(Some(events));
             }
             Node::Saga { input, body, next } => {
-                let events = progress_saga(state, act, input, body, next)?;
+                let events = progress_saga(state, act, input, body, next, ids)?;
                 if events.is_empty() {
                     continue;
                 }
@@ -716,7 +953,71 @@ fn next_progress(state: &State, run: RunId, time: EngineTime) -> Result<Option<V
     Ok(None)
 }
 
-fn open_wait(state: &State, act: &ActivationState, time: EngineTime) -> Result<Vec<DomainEvent>> {
+fn due_wait(
+    state: &State,
+    run: RunId,
+    time: EngineTime,
+    ids: &mut IdGen,
+) -> Result<Option<Vec<DomainEvent>>> {
+    let mut due: Vec<&WaitState> = state
+        .waits
+        .values()
+        .filter(|wait| {
+            wait.run == run
+                && wait.pending
+                && wait
+                    .deadline_ms
+                    .is_some_and(|deadline| time.as_millis() >= deadline)
+        })
+        .collect();
+    due.sort_by_key(|wait| wait.deadline_ms.unwrap_or(0));
+    let Some(wait) = due.first().copied() else {
+        return Ok(None);
+    };
+    if let Some(entry) = reserved_or_eligible(state, wait) {
+        let act = state.activations.get(&wait.activation).unwrap();
+        let mut events = vec![
+            DomainEvent::WaitSatisfied {
+                run,
+                wait: wait.id,
+                event_id: entry.event_id,
+                payload: entry.payload.clone(),
+            },
+            DomainEvent::NodeOutputRecorded {
+                run,
+                scope: act.scope,
+                node: act.node.as_str().to_owned(),
+                output: entry.payload.clone(),
+            },
+        ];
+        events.extend(follow_next(
+            state,
+            act.scope,
+            &act.node,
+            &entry.payload,
+            ids,
+        )?);
+        return Ok(Some(events));
+    }
+    let act = state.activations.get(&wait.activation).unwrap();
+    if wait.signal == "__timer" {
+        let region = region_for_scope(state, act.scope).unwrap();
+        let Node::Delay { next, .. } = region.nodes.get(act.node.as_str()).unwrap() else {
+            return Err(Error::invalid("timer wait is not a delay"));
+        };
+        let mut events = vec![DomainEvent::WaitTimedOut { run, wait: wait.id }];
+        events.extend(open_node(state, act.scope, next, ids)?);
+        return Ok(Some(events));
+    }
+    Ok(Some(decide_timer(state, run, wait.id, time, ids)?.events))
+}
+
+fn open_wait(
+    state: &State,
+    act: &ActivationState,
+    time: EngineTime,
+    ids: &mut IdGen,
+) -> Result<Vec<DomainEvent>> {
     let region = region_for_scope(state, act.scope).unwrap();
     let Node::WaitSignal {
         signal,
@@ -734,7 +1035,7 @@ fn open_wait(state: &State, act: &ActivationState, time: EngineTime) -> Result<V
         .as_str()
         .ok_or_else(|| Error::invalid("wait key must be a string"))?
         .to_owned();
-    let wait = WaitId::generate();
+    let wait = ids.wait();
     let deadline = timeout_ms.map(|ms| time.as_millis().saturating_add(ms));
     let mut events = vec![DomainEvent::WaitOpened {
         run: act.run,
@@ -769,7 +1070,13 @@ fn open_wait(state: &State, act: &ActivationState, time: EngineTime) -> Result<V
             node: act.node.as_str().to_owned(),
             output: entry.payload.clone(),
         });
-        events.extend(follow_next(state, act.scope, &act.node, &entry.payload)?);
+        events.extend(follow_next(
+            state,
+            act.scope,
+            &act.node,
+            &entry.payload,
+            ids,
+        )?);
     }
     Ok(events)
 }
@@ -783,6 +1090,7 @@ fn progress_while(
     body: &Region,
     next: &NodeKey,
     do_while: bool,
+    ids: &mut IdGen,
 ) -> Result<Vec<DomainEvent>> {
     let scope = state.scopes.get(&act.scope).unwrap();
     let (mut carry, completed) = state.loop_carry.get(&act.id).cloned().unwrap_or_else(|| {
@@ -816,7 +1124,7 @@ fn progress_while(
                         node: act.node.as_str().to_owned(),
                         output: carry.clone(),
                     });
-                    events.extend(follow_next(state, act.scope, &act.node, &carry)?);
+                    events.extend(follow_next(state, act.scope, &act.node, &carry, ids)?);
                     return Ok(events);
                 }
                 if completed >= max_iterations {
@@ -829,7 +1137,7 @@ fn progress_while(
                         },
                     );
                 }
-                events.extend(open_loop_body(act, body, carry, completed)?);
+                events.extend(open_loop_body(act, body, carry, completed, ids)?);
                 return Ok(events);
             }
         }
@@ -853,14 +1161,14 @@ fn progress_while(
                 node: act.node.as_str().to_owned(),
                 output: carry.clone(),
             });
-            events.extend(follow_next(state, act.scope, &act.node, &carry)?);
+            events.extend(follow_next(state, act.scope, &act.node, &carry, ids)?);
             return Ok(events);
         }
-        events.extend(open_loop_body(act, body, carry, 0)?);
+        events.extend(open_loop_body(act, body, carry, 0, ids)?);
         return Ok(events);
     }
     if completed == 0 && do_while {
-        return open_loop_body(act, body, carry, 0);
+        return open_loop_body(act, body, carry, 0, ids);
     }
     let _ = next;
     Ok(Vec::new())
@@ -871,9 +1179,10 @@ fn open_loop_body(
     body: &Region,
     carry: Value,
     index: u32,
+    ids: &mut IdGen,
 ) -> Result<Vec<DomainEvent>> {
-    let scope = ScopeId::generate();
-    let start = ActivationId::generate();
+    let scope = ids.scope();
+    let start = ids.activation();
     Ok(vec![
         DomainEvent::ScopeOpened {
             run: act.run,
@@ -902,6 +1211,7 @@ fn progress_repeat(
     max_iterations: u32,
     body: &Region,
     next: &NodeKey,
+    ids: &mut IdGen,
 ) -> Result<Vec<DomainEvent>> {
     let scope = state.scopes.get(&act.scope).unwrap();
     let ctx = eval_ctx(state, scope);
@@ -924,7 +1234,7 @@ fn progress_repeat(
             node: act.node.as_str().to_owned(),
             output: carry.clone(),
         }];
-        events.extend(follow_next(state, act.scope, &act.node, &carry)?);
+        events.extend(follow_next(state, act.scope, &act.node, &carry, ids)?);
         return Ok(events);
     }
     if let Some(child) = child_of(state, act.id) {
@@ -939,18 +1249,18 @@ fn progress_repeat(
                         node: act.node.as_str().to_owned(),
                         output: output.clone(),
                     }];
-                    events.extend(follow_next(state, act.scope, &act.node, output)?);
+                    events.extend(follow_next(state, act.scope, &act.node, output, ids)?);
                     return Ok(events);
                 }
                 if completed as i64 > count_n {
                     return Ok(Vec::new());
                 }
-                return open_loop_body(act, body, output.clone(), completed);
+                return open_loop_body(act, body, output.clone(), completed, ids);
             }
         }
     }
     let _ = next;
-    open_loop_body(act, body, carry, completed)
+    open_loop_body(act, body, carry, completed, ids)
 }
 
 fn progress_foreach(
@@ -961,6 +1271,7 @@ fn progress_foreach(
     max_concurrency: u32,
     body: &Region,
     next: &NodeKey,
+    ids: &mut IdGen,
 ) -> Result<Vec<DomainEvent>> {
     let scope = state.scopes.get(&act.scope).unwrap();
     let value = eval_binding(items, &eval_ctx(state, scope))?;
@@ -978,14 +1289,14 @@ fn progress_foreach(
             node: act.node.as_str().to_owned(),
             output: empty.clone(),
         }];
-        events.extend(follow_next(state, act.scope, &act.node, &empty)?);
+        events.extend(follow_next(state, act.scope, &act.node, &empty, ids)?);
         return Ok(events);
     }
     let done = state.foreach_done.get(&act.id).cloned().unwrap_or_default();
     if done.len() == list.len() {
         let mut ordered = Vec::new();
         for i in 0..list.len() {
-            ordered.push(done.get(&(i as u32)).cloned().unwrap());
+            ordered.push(foreach_get(&done, i as u32).cloned().unwrap());
         }
         let output = Value::Array(ordered);
         let mut events = vec![DomainEvent::NodeOutputRecorded {
@@ -994,7 +1305,7 @@ fn progress_foreach(
             node: act.node.as_str().to_owned(),
             output: output.clone(),
         }];
-        events.extend(follow_next(state, act.scope, &act.node, &output)?);
+        events.extend(follow_next(state, act.scope, &act.node, &output, ids)?);
         return Ok(events);
     }
     let open_children = children_of(state, act.id)
@@ -1012,14 +1323,14 @@ fn progress_foreach(
             _ => None,
         })
         .collect();
-    while taken.contains(&next_index) || done.contains_key(&next_index) {
+    while taken.contains(&next_index) || foreach_has(&done, next_index) {
         next_index += 1;
     }
     if next_index as usize >= list.len() {
         return Ok(Vec::new());
     }
-    let scope_id = ScopeId::generate();
-    let start = ActivationId::generate();
+    let scope_id = ids.scope();
+    let start = ids.activation();
     let _ = next;
     Ok(vec![
         DomainEvent::ScopeOpened {
@@ -1046,6 +1357,7 @@ fn progress_parallel(
     act: &ActivationState,
     branches: &[crate::ir::ParallelBranch],
     next: &NodeKey,
+    ids: &mut IdGen,
 ) -> Result<Vec<DomainEvent>> {
     let done = state
         .parallel_done
@@ -1064,7 +1376,7 @@ fn progress_parallel(
             node: act.node.as_str().to_owned(),
             output: output.clone(),
         }];
-        events.extend(follow_next(state, act.scope, &act.node, &output)?);
+        events.extend(follow_next(state, act.scope, &act.node, &output, ids)?);
         return Ok(events);
     }
     let existing: Vec<String> = children_of(state, act.id)
@@ -1082,8 +1394,8 @@ fn progress_parallel(
                 continue;
             }
             let input = eval_binding(&branch.input, &ctx)?;
-            let scope_id = ScopeId::generate();
-            let start = ActivationId::generate();
+            let scope_id = ids.scope();
+            let start = ids.activation();
             return Ok(vec![
                 DomainEvent::ScopeOpened {
                     run: act.run,
@@ -1123,6 +1435,7 @@ fn progress_choose(
     cases: &[crate::ir::ChooseCase],
     default: &Region,
     next: &NodeKey,
+    ids: &mut IdGen,
 ) -> Result<Vec<DomainEvent>> {
     if let Some(child) = child_of(state, act.id) {
         return match &child.status {
@@ -1135,7 +1448,7 @@ fn progress_choose(
                     node: act.node.as_str().to_owned(),
                     output: output.clone(),
                 }];
-                events.extend(follow_next(state, act.scope, &act.node, output)?);
+                events.extend(follow_next(state, act.scope, &act.node, output, ids)?);
                 Ok(events)
             }
         };
@@ -1152,8 +1465,8 @@ fn progress_choose(
             break;
         }
     }
-    let scope_id = ScopeId::generate();
-    let start = ActivationId::generate();
+    let scope_id = ids.scope();
+    let start = ids.activation();
     let _ = next;
     Ok(vec![
         DomainEvent::ScopeOpened {
@@ -1181,27 +1494,36 @@ fn progress_saga(
     input: &Binding,
     body: &Region,
     next: &NodeKey,
+    ids: &mut IdGen,
 ) -> Result<Vec<DomainEvent>> {
+    if compensating_in_flight(state, act.id) {
+        return Ok(Vec::new());
+    }
     if let Some(child) = child_of(state, act.id) {
         return match &child.status {
             ScopeStatus::Open => Ok(Vec::new()),
-            ScopeStatus::Failed { error } => fail_scope(state, act.scope, error.clone()),
+            ScopeStatus::Failed { error } => compensate_or_fail(state, act.id, error.clone(), ids),
             ScopeStatus::Completed { output } => {
-                let mut events = vec![DomainEvent::NodeOutputRecorded {
+                let mut events = settle_saga_success(state, act.id);
+                events.push(DomainEvent::NodeOutputRecorded {
                     run: act.run,
                     scope: act.scope,
                     node: act.node.as_str().to_owned(),
                     output: output.clone(),
-                }];
-                events.extend(follow_next(state, act.scope, &act.node, output)?);
+                });
+                events.extend(follow_next(state, act.scope, &act.node, output, ids)?);
                 Ok(events)
             }
         };
     }
+    if state.saga_errors.contains_key(&act.id) {
+        let error = state.saga_errors.get(&act.id).unwrap().clone();
+        return compensate_or_fail(state, act.id, error, ids);
+    }
     let scope = state.scopes.get(&act.scope).unwrap();
     let captured = eval_binding(input, &eval_ctx(state, scope))?;
-    let scope_id = ScopeId::generate();
-    let start = ActivationId::generate();
+    let scope_id = ids.scope();
+    let start = ids.activation();
     let _ = next;
     Ok(vec![
         DomainEvent::ScopeOpened {
@@ -1220,11 +1542,100 @@ fn progress_saga(
     ])
 }
 
+fn compensating_in_flight(state: &State, saga: ActivationId) -> bool {
+    state.obligations.iter().any(|item| {
+        item.owner == saga && matches!(item.status, ObligationStatus::Compensating { .. })
+    })
+}
+
+fn compensate_or_fail(
+    state: &State,
+    saga: ActivationId,
+    error: FailError,
+    ids: &mut IdGen,
+) -> Result<Vec<DomainEvent>> {
+    let Some(act) = state.activations.get(&saga) else {
+        return Err(Error::invalid("unknown saga"));
+    };
+    let pending: Vec<&Obligation> = state
+        .obligations
+        .iter()
+        .filter(|item| item.owner == saga && matches!(item.status, ObligationStatus::Open))
+        .collect();
+    if pending.is_empty() {
+        return fail_scope(state, act.scope, error);
+    }
+    let obligation = pending[pending.len() - 1];
+    Ok(vec![DomainEvent::CompensationStarted {
+        run: act.run,
+        saga,
+        forward: obligation.forward,
+        activation: ids.activation(),
+        handler: obligation.handler.clone(),
+        handler_version: obligation.handler_version,
+        input: obligation.input.clone(),
+        error,
+    }])
+}
+
+fn settle_saga_success(state: &State, saga: ActivationId) -> Vec<DomainEvent> {
+    let owned: Vec<ActivationId> = state
+        .obligations
+        .iter()
+        .filter(|item| item.owner == saga && matches!(item.status, ObligationStatus::Open))
+        .map(|item| item.forward)
+        .collect();
+    if let Some(parent) = parent_saga(state, saga) {
+        owned
+            .into_iter()
+            .map(|forward| DomainEvent::ObligationTransferred {
+                forward,
+                from_saga: saga,
+                to_saga: parent,
+            })
+            .collect()
+    } else {
+        owned
+            .into_iter()
+            .map(|forward| DomainEvent::ObligationReleased { forward })
+            .collect()
+    }
+}
+
+fn parent_saga(state: &State, saga: ActivationId) -> Option<ActivationId> {
+    let act = state.activations.get(&saga)?;
+    saga_owner_from_scope(state, act.scope, Some(saga))
+}
+
+fn saga_owner(state: &State, forward: ActivationId) -> Option<ActivationId> {
+    let act = state.activations.get(&forward)?;
+    saga_owner_from_scope(state, act.scope, None)
+}
+
+fn saga_owner_from_scope(
+    state: &State,
+    mut scope_id: ScopeId,
+    skip: Option<ActivationId>,
+) -> Option<ActivationId> {
+    loop {
+        let scope = state.scopes.get(&scope_id)?;
+        if let ScopeRole::SagaBody { activation } = scope.role {
+            if skip != Some(activation) {
+                return Some(activation);
+            }
+        }
+        let parent_act = scope.parent?;
+        let parent = state.activations.get(&parent_act)?;
+        scope_id = parent.scope;
+    }
+}
+
 fn follow_next(
     state: &State,
     scope: ScopeId,
     node: &NodeKey,
     _output: &Value,
+    ids: &mut IdGen,
 ) -> Result<Vec<DomainEvent>> {
     let region = region_for_scope(state, scope).ok_or_else(|| Error::invalid("missing region"))?;
     let Some((_, next)) = region
@@ -1237,15 +1648,20 @@ fn follow_next(
     else {
         return Ok(Vec::new());
     };
-    open_node(state, scope, next)
+    open_node(state, scope, next, ids)
 }
 
-fn open_node(state: &State, scope: ScopeId, node: &NodeKey) -> Result<Vec<DomainEvent>> {
+fn open_node(
+    state: &State,
+    scope: ScopeId,
+    node: &NodeKey,
+    ids: &mut IdGen,
+) -> Result<Vec<DomainEvent>> {
     let run = state.scopes.get(&scope).unwrap().run;
     Ok(vec![DomainEvent::ActivationOpened {
         run,
         scope,
-        activation: ActivationId::generate(),
+        activation: ids.activation(),
         node: node.as_str().to_owned(),
     }])
 }
@@ -1274,6 +1690,9 @@ fn complete_scope(_state: &State, scope: &ScopeState, output: Value) -> Result<V
 
 fn fail_scope(state: &State, scope: ScopeId, error: FailError) -> Result<Vec<DomainEvent>> {
     let scope_state = state.scopes.get(&scope).unwrap();
+    if matches!(scope_state.status, ScopeStatus::Failed { .. }) {
+        return Ok(Vec::new());
+    }
     let mut events = vec![DomainEvent::ScopeFailed {
         run: scope_state.run,
         scope,
@@ -1309,6 +1728,16 @@ fn children_of(state: &State, parent: ActivationId) -> Vec<&ScopeState> {
         .values()
         .filter(|scope| scope.parent == Some(parent))
         .collect()
+}
+
+fn foreach_get(done: &[(u32, Value)], index: u32) -> Option<&Value> {
+    done.iter()
+        .find(|(i, _)| *i == index)
+        .map(|(_, value)| value)
+}
+
+fn foreach_has(done: &[(u32, Value)], index: u32) -> bool {
+    done.iter().any(|(i, _)| *i == index)
 }
 
 fn region_for_scope(state: &State, scope: ScopeId) -> Option<&Region> {
@@ -1486,8 +1915,35 @@ fn eval_duration_ms(binding: &Binding, ctx: &EvalCtx) -> Result<u64> {
 
 pub fn apply_events(state: &mut State, events: &[DomainEvent]) {
     for event in events {
+        if let Some(run) = event_run(event) {
+            state.history.entry(run).or_default().push(event.clone());
+        }
         evolve(state, event);
     }
+}
+
+fn event_run(event: &DomainEvent) -> Option<RunId> {
+    Some(match event {
+        DomainEvent::RunAdmitted { run, .. }
+        | DomainEvent::ScopeOpened { run, .. }
+        | DomainEvent::ScopeCompleted { run, .. }
+        | DomainEvent::ScopeFailed { run, .. }
+        | DomainEvent::ActivationOpened { run, .. }
+        | DomainEvent::NodeOutputRecorded { run, .. }
+        | DomainEvent::GuardRecorded { run, .. }
+        | DomainEvent::LeafSucceeded { run, .. }
+        | DomainEvent::WaitOpened { run, .. }
+        | DomainEvent::WaitSatisfied { run, .. }
+        | DomainEvent::WaitTimedOut { run, .. }
+        | DomainEvent::EventAccepted { run, .. }
+        | DomainEvent::ObligationRegistered { run, .. }
+        | DomainEvent::CompensationStarted { run, .. }
+        | DomainEvent::RunSucceeded { run, .. }
+        | DomainEvent::RunFailed { run, .. } => *run,
+        DomainEvent::ObligationTransferred { .. } | DomainEvent::ObligationReleased { .. } => {
+            return None;
+        }
+    })
 }
 
 pub fn evolve(state: &mut State, event: &DomainEvent) {
@@ -1544,11 +2000,12 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     output: output.clone(),
                 };
                 if let ScopeRole::ForeachItem { activation, index } = scope_state.role {
-                    state
-                        .foreach_done
-                        .entry(activation)
-                        .or_default()
-                        .insert(index, output.clone());
+                    let slot = state.foreach_done.entry(activation).or_default();
+                    if let Some(existing) = slot.iter_mut().find(|(i, _)| *i == index) {
+                        existing.1 = output.clone();
+                    } else {
+                        slot.push((index, output.clone()));
+                    }
                 }
                 if let ScopeRole::ParallelBranch { activation, name } = &scope_state.role {
                     state
@@ -1569,6 +2026,11 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 scope_state.status = ScopeStatus::Failed {
                     error: error.clone(),
                 };
+            }
+            for act in state.activations.values_mut() {
+                if act.scope == *scope && act.status != ActivationStatus::Succeeded {
+                    act.status = ActivationStatus::Failed;
+                }
             }
         }
         DomainEvent::ActivationOpened {
@@ -1607,6 +2069,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     } else {
                         ActivationStatus::Open
                     },
+                    role: ExecutionRole::Forward,
                 },
             );
             if let Some(scope_state) = state.scopes.get_mut(scope) {
@@ -1641,9 +2104,21 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 .loop_carry
                 .insert(*activation, (carry.clone(), *index));
         }
-        DomainEvent::LeafSucceeded { activation, .. } => {
+        DomainEvent::LeafSucceeded {
+            activation, role, ..
+        } => {
             if let Some(act) = state.activations.get_mut(activation) {
                 act.status = ActivationStatus::Succeeded;
+            }
+            if *role == ExecutionRole::Compensation {
+                if let Some(obligation) = state.obligations.iter_mut().find(|item| {
+                    matches!(
+                        item.status,
+                        ObligationStatus::Compensating { activation: current } if current == *activation
+                    )
+                }) {
+                    obligation.status = ObligationStatus::Compensated;
+                }
             }
         }
         DomainEvent::WaitOpened {
@@ -1722,7 +2197,84 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 run.next_sequence = RunSequence::new(sequence + 1);
             }
         }
-        DomainEvent::ObligationRegistered { .. } => {}
+        DomainEvent::ObligationRegistered {
+            run,
+            forward,
+            handler,
+            handler_version,
+            input,
+        } => {
+            let owner = saga_owner(state, *forward).unwrap_or(*forward);
+            state.obligations.push(Obligation {
+                forward: *forward,
+                run: *run,
+                owner,
+                handler: handler.clone(),
+                handler_version: *handler_version,
+                input: input.clone(),
+                status: ObligationStatus::Open,
+            });
+        }
+        DomainEvent::CompensationStarted {
+            run,
+            saga,
+            forward,
+            activation,
+            handler,
+            handler_version,
+            input,
+            error,
+        } => {
+            state.saga_errors.insert(*saga, error.clone());
+            if let Some(obligation) = state
+                .obligations
+                .iter_mut()
+                .find(|item| item.forward == *forward)
+            {
+                obligation.status = ObligationStatus::Compensating {
+                    activation: *activation,
+                };
+            }
+            let scope = state
+                .activations
+                .get(saga)
+                .map(|act| act.scope)
+                .or_else(|| state.scopes.values().find(|s| s.run == *run).map(|s| s.id));
+            if let Some(scope) = scope {
+                state.activations.insert(
+                    *activation,
+                    ActivationState {
+                        id: *activation,
+                        run: *run,
+                        scope,
+                        node: NodeKey("__compensate".to_owned()),
+                        status: ActivationStatus::Ready,
+                        role: ExecutionRole::Compensation,
+                    },
+                );
+            }
+            let _ = (handler, handler_version, input);
+        }
+        DomainEvent::ObligationTransferred {
+            forward, to_saga, ..
+        } => {
+            if let Some(obligation) = state
+                .obligations
+                .iter_mut()
+                .find(|item| item.forward == *forward)
+            {
+                obligation.owner = *to_saga;
+            }
+        }
+        DomainEvent::ObligationReleased { forward } => {
+            if let Some(obligation) = state
+                .obligations
+                .iter_mut()
+                .find(|item| item.forward == *forward)
+            {
+                obligation.status = ObligationStatus::Released;
+            }
+        }
         DomainEvent::RunSucceeded { run, output } => {
             if let Some(run_state) = state.runs.get_mut(run) {
                 run_state.status = RunStatus::Succeeded {
@@ -1782,6 +2334,42 @@ pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEv
     Ok(decision.events)
 }
 
+pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainEvent>> {
+    if let CommandBody::Start {
+        run,
+        definition,
+        catalog,
+        ..
+    } = &command.body
+    {
+        if !state.runs.contains_key(run) {
+            state.runs.insert(
+                *run,
+                RunState {
+                    id: *run,
+                    definition: (**definition).clone(),
+                    catalog: (**catalog).clone(),
+                    input: Value::Null,
+                    policy: CapturedRunPolicy::defaults(None),
+                    status: RunStatus::Active,
+                    root: ScopeId::from_bytes([0; 16]),
+                    next_sequence: RunSequence::new(1),
+                },
+            );
+        }
+    }
+    apply_command(state, command)
+}
+
+pub fn active_runs(state: &State) -> Vec<RunId> {
+    state
+        .runs
+        .values()
+        .filter(|run| matches!(run.status, RunStatus::Active))
+        .map(|run| run.id)
+        .collect()
+}
+
 pub fn ready_activations(state: &State, run: RunId) -> Vec<ActivationId> {
     state
         .activations
@@ -1799,6 +2387,19 @@ pub fn ready_activations(state: &State, run: RunId) -> Vec<ActivationId> {
 
 pub fn activity_key(state: &State, activation: ActivationId) -> Option<(String, u32, Value)> {
     let act = state.activations.get(&activation)?;
+    if act.role == ExecutionRole::Compensation {
+        let obligation = state.obligations.iter().find(|item| {
+            matches!(
+                item.status,
+                ObligationStatus::Compensating { activation: current } if current == activation
+            )
+        })?;
+        return Some((
+            obligation.handler.clone(),
+            obligation.handler_version,
+            obligation.input.clone(),
+        ));
+    }
     let region = lookup_region(state, act.scope)?;
     let Node::Activity {
         activity, input, ..
@@ -1809,6 +2410,43 @@ pub fn activity_key(state: &State, activation: ActivationId) -> Option<(String, 
     let scope = state.scopes.get(&act.scope)?;
     let bound = eval_binding(input, &eval_ctx(state, scope)).ok()?;
     Some((activity.name.clone(), activity.version, bound))
+}
+
+pub fn run_events(state: &State, run: RunId) -> &[DomainEvent] {
+    state.history.get(&run).map(Vec::as_slice).unwrap_or(&[])
+}
+
+pub fn reconstruct(
+    definition: Definition,
+    catalog: Catalog,
+    events: &[DomainEvent],
+) -> Result<State> {
+    let Some(DomainEvent::RunAdmitted {
+        run,
+        input,
+        root,
+        policy,
+        ..
+    }) = events.first()
+    else {
+        return Err(Error::invalid("history must start with run admission"));
+    };
+    let mut state = State::default();
+    state.runs.insert(
+        *run,
+        RunState {
+            id: *run,
+            definition,
+            catalog,
+            input: input.clone(),
+            policy: policy.clone(),
+            status: RunStatus::Active,
+            root: *root,
+            next_sequence: RunSequence::new(1),
+        },
+    );
+    apply_events(&mut state, events);
+    Ok(state)
 }
 
 fn lookup_region(state: &State, scope: ScopeId) -> Option<&Region> {
@@ -1924,6 +2562,7 @@ mod tests {
                 Value::Object(BTreeMap::from([("cents".to_owned(), Value::Int(500))]))
             }
             "remote.echo" | "test.gate" => input.clone(),
+            "inventory.release" | "payment.refund" => Value::Null,
             _ => input.clone(),
         }
     }
@@ -1949,17 +2588,17 @@ mod tests {
             catalog,
         )
         .unwrap();
-        for _ in 0..64 {
+        for i in 0..64 {
             apply_command(
                 &mut state,
                 Command {
                     id: CommandId::generate(),
-                    time: EngineTime::from_millis(1_000),
+                    time: EngineTime::from_millis(1_000_000 + i * 1_000),
                     body: CommandBody::Progress { run },
                 },
             )
             .unwrap();
-            if run_output(&state, run).is_some() {
+            if !matches!(state.runs.get(&run).unwrap().status, RunStatus::Active) {
                 break;
             }
             let ready = ready_activations(&state, run);
@@ -1975,7 +2614,7 @@ mod tests {
                     &mut state,
                     Command {
                         id: CommandId::generate(),
-                        time: EngineTime::from_millis(1_000),
+                        time: EngineTime::from_millis(1_000_000),
                         body: CommandBody::ReportLeaf {
                             run,
                             activation,
@@ -2107,6 +2746,147 @@ mod tests {
         assert_eq!(
             output.pointer("/payment_id").unwrap().as_str(),
             Some("pay-1")
+        );
+    }
+
+    fn drive_state(yaml: &str, input: Value) -> State {
+        let catalog = catalog();
+        let definition = compile_yaml(yaml, &catalog).unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input,
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        for i in 0..64 {
+            apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1_000_000 + i * 1_000),
+                    body: CommandBody::Progress { run },
+                },
+            )
+            .unwrap();
+            if !matches!(state.runs.get(&run).unwrap().status, RunStatus::Active) {
+                break;
+            }
+            for activation in ready_activations(&state, run) {
+                let Some((name, _, input)) = activity_key(&state, activation) else {
+                    continue;
+                };
+                let output = handler(&name, &input);
+                apply_command(
+                    &mut state,
+                    Command {
+                        id: CommandId::generate(),
+                        time: EngineTime::from_millis(1_000_000),
+                        body: CommandBody::ReportLeaf {
+                            run,
+                            activation,
+                            output,
+                        },
+                    },
+                )
+                .unwrap();
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn saga_failure_compensates_in_reverse() {
+        let state = drive_state(
+            include_str!("../../docs/specs/v1/examples/saga.yaml"),
+            Value::Object(BTreeMap::from([
+                ("order_id".to_owned(), Value::String("o1".to_owned())),
+                ("amount".to_owned(), Value::Int(1000)),
+                ("fail_after_payment".to_owned(), Value::Bool(true)),
+            ])),
+        );
+        let run = *state.runs.keys().next().unwrap();
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Failed { .. }
+        ));
+        let handlers: Vec<_> = state
+            .history
+            .get(&run)
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                DomainEvent::CompensationStarted { handler, .. } => Some(handler.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(handlers, ["payment.refund", "inventory.release"]);
+        assert!(
+            state
+                .obligations
+                .iter()
+                .all(|item| matches!(item.status, ObligationStatus::Compensated))
+        );
+    }
+
+    #[test]
+    fn nested_saga_transfers_then_compensates() {
+        let state = drive_state(
+            include_str!("../../docs/specs/v1/examples/nested-saga.yaml"),
+            Value::Object(BTreeMap::from([
+                ("order_id".to_owned(), Value::String("o1".to_owned())),
+                ("amount".to_owned(), Value::Int(1000)),
+            ])),
+        );
+        let run = *state.runs.keys().next().unwrap();
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Failed { .. }
+        ));
+        let handlers: Vec<_> = state
+            .history
+            .get(&run)
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                DomainEvent::CompensationStarted { handler, .. } => Some(handler.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(handlers, ["payment.refund", "inventory.release"]);
+    }
+
+    #[test]
+    fn reconstruct_matches_live_state() {
+        let live = drive_state(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            Value::Object(BTreeMap::from([
+                ("order_id".to_owned(), Value::String("o1".to_owned())),
+                ("amount".to_owned(), Value::Int(1000)),
+            ])),
+        );
+        let run = *live.runs.keys().next().unwrap();
+        let run_state = live.runs.get(&run).unwrap();
+        let rebuilt = reconstruct(
+            run_state.definition.clone(),
+            run_state.catalog.clone(),
+            live.history.get(&run).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            run_output(&live, run).unwrap(),
+            run_output(&rebuilt, run).unwrap()
         );
     }
 
