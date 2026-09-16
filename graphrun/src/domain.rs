@@ -3690,6 +3690,92 @@ mod tests {
         assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
     }
 
+    fn manual_recon_claim() -> (State, RunId, ActivationId, WorkerSessionId) {
+        let catalog = catalog();
+        let definition = compile_yaml(manual_yaml(), &catalog).unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(2))])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let session = WorkerSessionId::generate();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Claim {
+                    session,
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        let later = crate::policy::SESSION_LEASE.as_millis() as u64 + 2;
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(later),
+                body: CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(later),
+                body: CommandBody::Claim {
+                    session,
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        (state, run, activation, session)
+    }
+
     fn manual_yaml() -> &'static str {
         r#"
 dsl: graphrun/v1
@@ -3951,5 +4037,83 @@ nodes:
         }
         assert!(state.interventions.contains_key(&activation));
         assert!(state.activations[&activation].claim.is_none());
+    }
+
+    #[test]
+    fn not_applied_clears_claim_and_allows_forward_retry() {
+        let (mut state, run, activation, session) = manual_recon_claim();
+        let claim = state.activations[&activation].claim.clone().unwrap();
+        assert_eq!(claim.role, ExecutionRole::Reconciliation);
+        let later = crate::policy::SESSION_LEASE.as_millis() as u64 + 2;
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(later),
+                body: CommandBody::Reconcile {
+                    run,
+                    activation,
+                    session,
+                    generation: claim.generation,
+                    revision: claim.revision,
+                    outcome: ReconcileOutcome::NotApplied,
+                    output: None,
+                },
+            },
+        )
+        .unwrap();
+        assert!(state.activations[&activation].claim.is_none());
+        assert_eq!(
+            state.activations[&activation].status,
+            ActivationStatus::Ready
+        );
+        assert!(!state.interventions.contains_key(&activation));
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(later),
+                body: CommandBody::Claim {
+                    session,
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        let retry = state.activations[&activation].claim.clone().unwrap();
+        assert_eq!(retry.role, ExecutionRole::Forward);
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(later),
+                body: CommandBody::ReportAssigned {
+                    run,
+                    activation,
+                    output: Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(2))])),
+                    session,
+                    generation: retry.generation,
+                    revision: retry.revision,
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(later + 1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            run_output(&state, run)
+                .unwrap()
+                .pointer("/value")
+                .unwrap()
+                .as_i64(),
+            Some(2)
+        );
     }
 }

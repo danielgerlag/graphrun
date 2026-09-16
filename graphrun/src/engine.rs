@@ -440,6 +440,19 @@ impl Engine {
             .map_err(|err| Error::invalid(err.to_string()))
     }
 
+    pub async fn last_applied_index(&self) -> u64 {
+        self.storage.last_applied_index().await
+    }
+
+    pub fn raft_applied_index(&self) -> u64 {
+        self.raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|id| id.index)
+            .unwrap_or(0)
+    }
+
     pub async fn wait_terminal(&self, run: RunId, timeout: Duration) -> Result<Value> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -467,14 +480,18 @@ impl Engine {
     }
 
     pub async fn progress(&self, run: RunId) -> Result<()> {
+        self.commit_progress(run).await?;
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    pub async fn commit_progress(&self, run: RunId) -> Result<()> {
         let command = Command {
             id: CommandId::generate(),
             time: now(),
             body: CommandBody::Progress { run },
         };
-        self.write(command).await?;
-        self.notify.notify_one();
-        Ok(())
+        self.write(command).await
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -843,25 +860,29 @@ async fn wait_via_raft(
     }
 }
 
-pub fn should_snapshot(applied: u64, last_snapshot: u64, elapsed: Duration) -> bool {
-    applied.saturating_sub(last_snapshot) >= 20_000
-        || (elapsed >= Duration::from_secs(30 * 60) && applied > last_snapshot)
+pub const SNAPSHOT_ENTRY_THRESHOLD: u64 = 20_000;
+pub const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+pub fn should_snapshot(applied: u64, last_snapshot: u64, since_snapshot: Duration) -> bool {
+    applied.saturating_sub(last_snapshot) >= SNAPSHOT_ENTRY_THRESHOLD
+        || (since_snapshot >= SNAPSHOT_INTERVAL && applied > last_snapshot)
 }
 
-async fn snapshot_controller(raft: Raft<TypeConfig>, storage: StorageHandle) {
+async fn snapshot_controller(raft: Raft<TypeConfig>, _storage: StorageHandle) {
     let mut last_snapshot = 0u64;
-    let mut last_change = tokio::time::Instant::now();
-    let mut last_seen = 0u64;
+    let mut since_snapshot = tokio::time::Instant::now();
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let applied = storage.last_applied_index().await;
-        if applied > last_seen {
-            last_seen = applied;
-            last_change = tokio::time::Instant::now();
-        }
-        if should_snapshot(applied, last_snapshot, last_change.elapsed()) {
+        let applied = raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|id| id.index)
+            .unwrap_or(0);
+        if should_snapshot(applied, last_snapshot, since_snapshot.elapsed()) {
             if raft.trigger().snapshot().await.is_ok() {
                 last_snapshot = applied;
+                since_snapshot = tokio::time::Instant::now();
             }
         }
     }
@@ -1191,8 +1212,80 @@ mod tests {
     #[test]
     fn snapshot_controller_threshold() {
         assert!(!should_snapshot(10, 0, Duration::from_secs(1)));
-        assert!(should_snapshot(20_000, 0, Duration::from_secs(1)));
-        assert!(should_snapshot(5, 0, Duration::from_secs(30 * 60)));
-        assert!(!should_snapshot(0, 0, Duration::from_secs(30 * 60)));
+        assert!(should_snapshot(
+            SNAPSHOT_ENTRY_THRESHOLD,
+            0,
+            Duration::from_secs(1)
+        ));
+        assert!(should_snapshot(5, 0, SNAPSHOT_INTERVAL));
+        assert!(!should_snapshot(0, 0, SNAPSHOT_INTERVAL));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "applies 20_000 raft entries"]
+    async fn snapshot_controller_fires_at_20000_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/events.yaml"),
+                &catalog(),
+                Value::Object(BTreeMap::from([(
+                    "key".to_owned(),
+                    Value::String("k1".to_owned()),
+                )])),
+            )
+            .await
+            .unwrap();
+        let mut writes = 0u64;
+        while engine.raft_applied_index() < SNAPSHOT_ENTRY_THRESHOLD {
+            engine.commit_progress(run).await.unwrap();
+            writes += 1;
+            if writes == 32 {
+                assert!(
+                    engine.raft_applied_index() > 0,
+                    "raft applied index stayed 0 after {writes} writes"
+                );
+            }
+            if writes.is_multiple_of(2_000) {
+                eprintln!(
+                    "snapshot fill writes={writes} applied={}",
+                    engine.raft_applied_index()
+                );
+            }
+            if writes > SNAPSHOT_ENTRY_THRESHOLD + 256 {
+                break;
+            }
+        }
+        let applied = engine.raft_applied_index();
+        assert!(
+            applied >= SNAPSHOT_ENTRY_THRESHOLD,
+            "applied {applied} below threshold"
+        );
+        let snaps = dir.path().join("snapshots");
+        let mut found = 0;
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            found = snaps
+                .read_dir()
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|entry| {
+                            entry.path().extension().and_then(|ext| ext.to_str()) == Some("snap")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if found > 0 {
+                break;
+            }
+        }
+        engine.shutdown().await.unwrap();
+        assert!(
+            found > 0,
+            "controller did not write a snapshot after {applied} applied entries in {}",
+            snaps.display()
+        );
     }
 }
