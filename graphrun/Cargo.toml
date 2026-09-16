@@ -1,0 +1,40 @@
+[package]
+name = "graphrun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Durable workflow engine library"
+
+[lib]
+name = "graphrun"
+path = "src/lib.rs"
+
+[features]
+default = []
+fault-injection = []
+
+[dependencies]
+bytes.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+indexmap.workspace = true
+jsonschema.workspace = true
+openraft.workspace = true
+prost.workspace = true
+redb.workspace = true
+rustls.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+yaml-rust2.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+trybuild.workspace = true

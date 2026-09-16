@@ -1,0 +1,38 @@
+dsl: graphrun/v1
+id: correlated_approvals
+version: 1
+input_schema: {array: event_request/v1}
+output_schema: {array: approval/v1}
+signals:
+  approval: {schema: approval/v1}
+start: approvals
+nodes:
+  approvals:
+    kind: foreach
+    items: {from: workflow.input}
+    item_schema: event_request/v1
+    max_items: 100
+    max_concurrency: 4
+    body:
+      input_schema: event_request/v1
+      output_schema: approval/v1
+      start: wait
+      nodes:
+        wait:
+          kind: wait_signal
+          signal: approval
+          key: {from: scope.input, path: /key}
+          consume_from: buffered
+          timeout: "5m"
+          next: done
+          on_timeout: expired
+        done:
+          kind: complete
+          output: {from: nodes.wait.output}
+        expired:
+          kind: fail
+          error: {code: approval.expired, message: An item approval expired.}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.approvals.output}

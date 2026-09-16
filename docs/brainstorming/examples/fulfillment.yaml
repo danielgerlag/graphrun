@@ -1,0 +1,34 @@
+dsl: graphrun/v1
+id: fulfillment
+version: 1
+input_schema: order/v1
+output_schema: receipt/v1
+start: reserve_stock
+nodes:
+  reserve_stock:
+    kind: activity
+    activity:
+      name: inventory.reserve
+      version: 1
+    input:
+      from: workflow.input
+    retry:
+      errors: [inventory.unavailable]
+      max_attempts: 4
+      backoff:
+        initial: "1s"
+        multiplier: 2
+        max: "30s"
+    next: charge
+  charge:
+    kind: activity
+    activity:
+      name: payment.charge
+      version: 1
+    input:
+      from: nodes.reserve_stock.output
+    next: finish
+  finish:
+    kind: complete
+    output:
+      from: nodes.charge.output

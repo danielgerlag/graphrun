@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["graphrun", "graphrun-cli", "graphrun-e2e"]
+default-members = ["graphrun", "graphrun-cli", "graphrun-e2e"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90.0"
+publish = false
+
+[workspace.dependencies]
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.3"
+hex = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+jsonschema = "=0.56.0"
+openraft = { version = "=0.9.25", default-features = false, features = ["serde", "storage-v2"] }
+proptest = "1"
+prost = "0.14"
+redb = "=4.3.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+schemars = "=1.2.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "process", "fs", "signal"] }
+tonic = "=0.14.6"
+tracing = "0.1"
+trybuild = "1"
+yaml-rust2 = "=0.13.0"
+
+[profile.release]
+lto = false
+codegen-units = 16

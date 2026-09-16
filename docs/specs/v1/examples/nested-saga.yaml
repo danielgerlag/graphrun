@@ -1,0 +1,52 @@
+dsl: graphrun/v1
+id: nested_compensation
+version: 1
+input_schema: order/v1
+output_schema: receipt/v1
+start: outer
+nodes:
+  outer:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: receipt/v1
+      start: reserve
+      nodes:
+        reserve:
+          kind: activity
+          activity: {name: inventory.reserve, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: inventory.release, version: 1}
+            input: {from: forward.output}
+          next: inner
+        inner:
+          kind: saga
+          input: {from: nodes.reserve.output}
+          body:
+            input_schema: reserved_order/v1
+            output_schema: receipt/v1
+            start: charge
+            nodes:
+              charge:
+                kind: activity
+                activity: {name: payment.charge, version: 1}
+                input: {from: scope.input}
+                compensation:
+                  kind: activity
+                  activity: {name: payment.refund, version: 1}
+                  input: {from: forward.output}
+                next: done
+              done:
+                kind: complete
+                output: {from: nodes.charge.output}
+          next: fail_outer
+        fail_outer:
+          kind: fail
+          error: {code: fixture.outer_failed, message: Outer failure after inner success.}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.outer.output}

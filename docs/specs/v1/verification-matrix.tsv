@@ -1,0 +1,86 @@
+id	requirement	layer	scenario	pass_criterion
+POLICY-001	REQ-DURABILITY	unit	Normative defaults and policy capture	Timeout/retry/retention/checkpoint defaults expand from the specified policy; later changes do not shorten captured promises
+API-005	REQ-RUST-BUILDER	integration	Finite wait with recovery path and shared tail	YAML and explicit Rust construction normalize identically; timeout has no success payload and invalid cross-edge use is rejected
+ACT-007	REQ-ACTIVITIES	unit	Fixed attempt timeout across renewal and retry	Renewal never extends execution/run deadlines; new attempts receive fixed deadlines and short timeouts retain usable dispatch windows
+ACT-008	REQ-ACTIVITIES	integration	Settlement and cleanup after a forward run deadline	No new forward claim starts; authorized settlement and cleanup use their own valid attempt deadlines
+EVT-007	REQ-EVENTS	integration	Reserved pre-deadline input survives deferred processing and TTL	Reservation survives restart and cleanup ordering; timeout honors it while unreserved expired input does not qualify
+EVT-008	REQ-EVENTS	unit	Cancellation releases a reservation without refreshing input	Original sequence and expiry remain; expired releases expire and consumed messages never re-enter the inbox
+SAGA-012	REQ-SAGA	integration	Compensation binding failure after valid forward success	Success and blocked-input obligation commit together; accepted receipt and duplicate results never repeat the forward effect
+SAGA-013	REQ-SAGA	integration	Compensation reported-error policy	Default code selection, explicit subset/empty list, terminal errors, and exhaustion obey compensation policy and block rather than skip undo
+SAGA-014	REQ-SAGA	integration	Operator resolves blocked compensation input	Validated supplied input preserves evidence and handler identity; other blockers and stop intents remain effective
+CLUSTER-006	REQ-CLUSTER	integration	Fresh renewal after expiry before expiry processing	Expired sessions/claims reject renewal at equality and afterward; valid renewal invalidates old lease timers but never the fixed attempt timeout
+DOM-001	REQ-DURABILITY	unit	Event application and materialized state	Every accepted lifecycle change is event-derived and replay agrees with the expected state
+DOM-002	REQ-DURABILITY	property	Duplicate and rejected commands	No duplicate event ranges, scopes, activations, obligations, or effect identities
+DOM-003	REQ-PARALLEL	unit	Nested region completion	Child complete never prematurely completes a container or root run
+DOM-004	REQ-DURABILITY	property	Generated bounded nested workflows	Independent expected outcomes and ordering invariants hold for recorded seeds
+DSL-001	REQ-YAML	unit	All node variants and schema constructors	Valid YAML normalizes and unknown/malformed fields fail with source context
+DSL-002	REQ-YAML	unit	Invalid graph and scope references	Cycles outside loops, missing targets, duplicate keys, and cross-region reads are rejected
+DSL-003	REQ-YAML	unit	Bindings and typed conditions	Missing/null/type/tuple/array cases match the language specification without coercion
+DSL-004	REQ-YAML	unit	Immutable publication and normalized digests	Equivalent source republishes idempotently and changed semantics conflict under one version
+API-001	REQ-RUST-BUILDER	compile	Every primitive through the Rust builder	Examples compile and express nested controls without serialized runtime closures
+API-002	REQ-RUST-BUILDER	compile	Incompatible whole-value edges and loop carry	Compile-fail examples reject incompatible Rust types
+API-003	REQ-RUST-BUILDER	integration	YAML and Rust normalization parity	Equivalent definitions have equal execution-relevant IR and outputs
+API-004	REQ-RUST-BUILDER	unit	Field paths and lexical scope	Unsupported string projections or cross-scope handles return clear build errors
+ACT-001	REQ-ACTIVITIES	integration	Async local activity	Owned input/output, errors, cancellation, and stable effect key work through real execution
+ACT-002	REQ-ACTIVITIES	integration	Blocking local activity	Bounded pool does not starve consensus and cancellation never falsely proves thread/effect termination
+ACT-003	REQ-ACTIVITIES	e2e	Remote worker contract	An independent process executes assignments and forged/stale/schema-invalid results cannot advance state
+ACT-004	REQ-ACTIVITIES	integration	Retryable, terminal, and ambiguous failures	Policies and attempt budgets apply without treating storage failures as business retries
+ACT-005	REQ-ACTIVITIES	e2e	Reconciliation outcomes	Applied, conclusive NotApplied, and Unknown produce their specified continuations
+ACT-006	REQ-ACTIVITIES	e2e	Idempotent external effect after lost result	Physical retries use the same key and provider records one logical effect
+LOOP-001	REQ-LOOPS	unit	While zero, one, and many iterations	Initial false guard executes no body and successful carry is exact
+LOOP-002	REQ-LOOPS	unit	Do-while ordering	First body always runs once and post-body guard sees the accepted new carry
+LOOP-003	REQ-LOOPS	unit	Repeat zero, positive, and invalid counts	Captured count controls exact execution count and invalid bounds fail before effects
+LOOP-004	REQ-LOOPS	unit	Loop limit boundary	False at the boundary succeeds and true continuation at the limit fails without another iteration
+LOOP-005	REQ-LOOPS	integration	Loop body retries and restart	An attempt retry is not another iteration and completed iterations never rerun
+LOOP-006	REQ-LOOPS	integration	Foreach empty, duplicates, and reversed completion	Every input index is distinct and outputs remain in input order
+LOOP-007	REQ-LOOPS	integration	Foreach concurrency window	Open body scopes respect the configured window and containers do not hold leaf permits
+LOOP-008	REQ-LOOPS	e2e	Nested loop, foreach, and parallel after leader loss	Scope identity, carry, scheduling cursor, and outputs survive across processes
+PAR-001	REQ-PARALLEL	unit	Frozen branch set and all-join	Join waits for exactly the declared children and preserves declaration-order output
+PAR-002	REQ-PARALLEL	property	Duplicate and simultaneous final results	Exactly one join result and successor are created
+PAR-003	REQ-PARALLEL	integration	One branch fails while another runs	Siblings settle/cancel and the parent does not finish while effects remain uncertain
+PAR-004	REQ-PARALLEL	integration	Per-run fairness and nested limits	One wide run cannot consume all capacity while compatible other runs wait
+PAR-005	REQ-PARALLEL	e2e	Snapshot with unfinished branches	Expected child set and accepted outcomes survive installation without duplicate branches
+EVT-001	REQ-EVENTS	integration	Event arrives before wait	Durable buffered input satisfies the correct later correlation address once
+EVT-002	REQ-EVENTS	unit	Event identity and FIFO order	Same ID deduplicates, conflicting ID payload rejects, and distinct messages preserve accepted order
+EVT-003	REQ-EVENTS	integration	Repeated waits and concurrent keys	Loops can reuse names, distinct scopes use keys, and conflicting active addresses fail deterministically
+EVT-004	REQ-EVENTS	integration	Deadline and delayed matching	Eligible pre-deadline input wins even if matching is delayed; late input does not revive a timed-out wait
+EVT-005	REQ-EVENTS	e2e	Event wait across restart and leader change	Accepted event and consumption are not lost or duplicated
+EVT-006	REQ-EVENTS	unit	Inbox expiry and capacity	Quota rejection is explicit and expiry does not silently remove retained historical evidence
+SAGA-001	REQ-SAGA	unit	Atomic obligation registration	Forward success and its compensation/irreversible record commit together
+SAGA-002	REQ-SAGA	integration	Sequential saga failure	Known completed effects compensate in reverse causal order
+SAGA-003	REQ-SAGA	integration	Parallel effects and deterministic compensation	Independent branch order is deterministic and no compensation starts before settlement
+SAGA-004	REQ-SAGA	integration	Nested saga success then outer failure	Transferred obligations compensate once in the correct nested group position
+SAGA-005	REQ-SAGA	integration	Nested saga abort	Already compensated inner work is not compensated again by its parent
+SAGA-006	REQ-SAGA	e2e	Crash during compensation	Recorded completed obligations do not repeat and remaining obligations resume
+SAGA-007	REQ-SAGA	e2e	Delayed forward effect and reconciliation	No undo races an effect that can still apply; Unknown blocks until conclusive resolution
+SAGA-008	REQ-SAGA	integration	Compensation retry/manual recovery	Independent budgets and effect keys hold and failures are never labelled rollback success
+SAGA-009	REQ-SAGA	integration	Irreversible effect and operator abandonment	Outcome explicitly reports irreversible or unresolved work
+SAGA-010	REQ-SAGA	e2e	Cancellation during saga	Forward dispatch stops, authorized results settle, and required cleanup remains durable
+SAGA-011	REQ-SAGA	integration	Successful outermost saga followed by later failure	Released obligations do not reopen; an enclosing outer saga changes that ownership explicitly
+STORE-001	REQ-DURABILITY	storage	OpenRaft storage conformance	Real redb adapter satisfies the upstream storage suite
+STORE-002	REQ-DURABILITY	fault	Vote/log/flush acknowledgement cuts	No false durable acknowledgement and no visible log holes
+STORE-003	REQ-DURABILITY	fault	Event/state/index/applied commit cuts	Recovery observes the full old or new transaction, never a mixture
+STORE-004	REQ-DURABILITY	fault	Snapshot file and generation activation cuts	Registry authority and old/new generation consistency survive every cut
+STORE-005	REQ-DURABILITY	fault	Log truncation, purge, and compaction	No resurrection of invisible entries and no pruning of required domain history
+STORE-006	REQ-DURABILITY	integration	Unapplied credits and large snapshot	Memory/disk admission is bounded without incomplete log-read responses
+STORE-007	REQ-CLUSTER	e2e	Learner catch-up and voter replacement	Identity/membership semantics preserve an available majority and accepted state
+STORE-008	REQ-CLUSTER	e2e	Backup and controlled disaster restore	New cluster authority is explicit and active scopes/obligations remain suspended until authorized
+CLUSTER-001	REQ-CLUSTER	e2e	Three voters and independent workers	Work runs through real mTLS transport and the committed command path
+CLUSTER-002	REQ-CLUSTER	e2e	Leader failure and old-owner return	Current generations fence old results and valid claims are not reset merely by election
+CLUSTER-003	REQ-CLUSTER	e2e	Quorum loss	No new authority is invented and uncertain results remain explicit
+CLUSTER-004	REQ-CLUSTER	integration	Clock fault, rollback, suspend, and recovery	Time-dependent work fails closed under the declared clock policy without follower-local decisions
+CLUSTER-005	REQ-CLUSTER	e2e	Worker scaling without voter changes	Compute capacity changes without altering membership or opening another authoritative store
+SEC-001	REQ-CLUSTER	protocol	Wrong CA, principal, role, cluster, or member	Caches and mutation paths do not bypass authentication or authorization
+SEC-002	REQ-YAML	unit	Malicious or oversized definition inputs	Tags/includes/recursive references/excessive structures reject without external I/O
+LOCAL-001	REQ-LOCAL	e2e	Production local startup and control	Only the application is required and the private local control interface works
+LOCAL-002	REQ-LOCAL	e2e	Durable local restart	Loops, waits, joins, history, and compensation survive the same member directory
+LOCAL-003	REQ-LOCAL	integration	Duplicate directory ownership and identity	Second owner rejects and restart does not bootstrap another group
+REPLAY-001	REQ-REPLAY	property	Pure reconstruction	Logical state agrees with events/artifacts and independently expected results
+REPLAY-002	REQ-REPLAY	e2e	Replay historical ready/loop/compensation states	No command, claim, provider effect, or live scheduler wake occurs
+REPLAY-003	REQ-REPLAY	integration	Retention and versioned readers	Unavailable ranges report honestly and retained artifacts remain readable
+REPLAY-004	REQ-REPLAY	integration	Raft snapshot/log compaction versus domain history	Retained workflow history remains reconstructible independently of old Raft entries
+E2E-001	REQ-E2E	e2e	Complete YAML and Rust-built application	All required primitives execute through production artifact paths with expected outputs
+E2E-002	REQ-E2E	e2e	No periodic runnable discovery	Quiescent ready-index reads do not recur during the 60-second observation window
+E2E-003	REQ-E2E	e2e	Report completeness and child cleanup	Every matrix ID has evidence and all owned processes are reaped with no silent skips
+PERF-001	REQ-E2E	performance	Command/compile/local-ready targets	Reference workload measurements are recorded and targets pass or are explicitly blocked
+PERF-002	REQ-E2E	performance	History, nesting, concurrency, and snapshot cost	Resource growth and configured limits are measured on representative retained state

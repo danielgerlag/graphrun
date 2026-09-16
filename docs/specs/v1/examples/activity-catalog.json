@@ -1,0 +1,95 @@
+{
+  "format": "graphrun.catalog/v1",
+  "schemas": {
+    "unit/v1": {"type": "null"},
+    "counter/v1": {
+      "type": "object",
+      "required": ["value"],
+      "additionalProperties": false,
+      "properties": {"value": {"type": "integer"}}
+    },
+    "repeat_request/v1": {
+      "type": "object",
+      "required": ["count", "counter"],
+      "additionalProperties": false,
+      "properties": {
+        "count": {"type": "integer", "minimum": 0},
+        "counter": {
+          "type": "object",
+          "required": ["value"],
+          "additionalProperties": false,
+          "properties": {"value": {"type": "integer"}}
+        }
+      }
+    },
+    "order/v1": {
+      "type": "object",
+      "required": ["order_id", "amount"],
+      "additionalProperties": false,
+      "properties": {
+        "order_id": {"type": "string"},
+        "amount": {"type": "integer", "minimum": 0},
+        "fail_after_payment": {"type": "boolean"}
+      }
+    },
+    "reserved_order/v1": {
+      "type": "object",
+      "required": ["order_id", "amount", "reservation_id"],
+      "additionalProperties": false,
+      "properties": {
+        "order_id": {"type": "string"},
+        "amount": {"type": "integer"},
+        "reservation_id": {"type": "string"}
+      }
+    },
+    "receipt/v1": {
+      "type": "object",
+      "required": ["order_id", "amount", "payment_id"],
+      "additionalProperties": false,
+      "properties": {
+        "order_id": {"type": "string"},
+        "amount": {"type": "integer"},
+        "payment_id": {"type": "string"}
+      }
+    },
+    "tax/v1": {
+      "type": "object",
+      "required": ["cents"],
+      "additionalProperties": false,
+      "properties": {"cents": {"type": "integer"}}
+    },
+    "shipping/v1": {
+      "type": "object",
+      "required": ["cents"],
+      "additionalProperties": false,
+      "properties": {"cents": {"type": "integer"}}
+    },
+    "event_request/v1": {
+      "type": "object",
+      "required": ["key"],
+      "additionalProperties": false,
+      "properties": {"key": {"type": "string"}}
+    },
+    "approval/v1": {
+      "type": "object",
+      "required": ["approved"],
+      "additionalProperties": false,
+      "properties": {"approved": {"type": "boolean"}}
+    }
+  },
+  "activities": [
+    {"name": "counter.increment", "version": 1, "input_schema": "counter/v1", "output_schema": "counter/v1", "execution": "async", "effects": "pure", "recovery": "RetrySafe", "error_codes": []},
+    {"name": "remote.echo", "version": 1, "input_schema": "counter/v1", "output_schema": "counter/v1", "execution": "async", "effects": "pure", "recovery": "RetrySafe", "error_codes": []},
+    {"name": "test.gate", "version": 1, "input_schema": "event_request/v1", "output_schema": "event_request/v1", "execution": "async", "effects": "pure", "recovery": "RetrySafe", "error_codes": []},
+    {"name": "tax.quote", "version": 1, "input_schema": "order/v1", "output_schema": "tax/v1", "execution": "async", "effects": "pure", "recovery": "RetrySafe", "error_codes": []},
+    {"name": "shipping.quote", "version": 1, "input_schema": "order/v1", "output_schema": "shipping/v1", "execution": "blocking", "effects": "pure", "recovery": "RetrySafe", "error_codes": []},
+    {"name": "inventory.reserve", "version": 1, "input_schema": "order/v1", "output_schema": "reserved_order/v1", "execution": "async", "effects": "external", "recovery": "RetrySafe", "error_codes": [{"code": "inventory.unavailable", "retryable": true}], "reconciler": {"name": "inventory.lookup", "version": 1}},
+    {"name": "inventory.release", "version": 1, "input_schema": "reserved_order/v1", "output_schema": "unit/v1", "execution": "async", "effects": "external", "recovery": "RetrySafe", "error_codes": [{"code": "inventory.release_unavailable", "retryable": true}, {"code": "inventory.release_rejected", "retryable": false}]},
+    {"name": "payment.charge", "version": 1, "input_schema": "reserved_order/v1", "output_schema": "receipt/v1", "execution": "async", "effects": "external", "recovery": "RetrySafe", "error_codes": [{"code": "payment.declined", "retryable": false}], "reconciler": {"name": "payment.lookup", "version": 1}},
+    {"name": "payment.refund", "version": 1, "input_schema": "receipt/v1", "output_schema": "unit/v1", "execution": "async", "effects": "external", "recovery": "RetrySafe", "error_codes": [{"code": "payment.refund_unavailable", "retryable": true}, {"code": "payment.refund_rejected", "retryable": false}]}
+  ],
+  "reconcilers": [
+    {"name": "inventory.lookup", "version": 1, "forward_activity": {"name": "inventory.reserve", "version": 1}},
+    {"name": "payment.lookup", "version": 1, "forward_activity": {"name": "payment.charge", "version": 1}}
+  ]
+}

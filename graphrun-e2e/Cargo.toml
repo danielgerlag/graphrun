@@ -1,0 +1,23 @@
+[package]
+name = "graphrun-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Graphrun verification driver and fixture processes"
+
+[[bin]]
+name = "graphrun-e2e"
+path = "src/main.rs"
+
+[features]
+default = []
+fault-injection = ["graphrun/fault-injection"]
+
+[dependencies]
+clap.workspace = true
+graphrun = { path = "../graphrun" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

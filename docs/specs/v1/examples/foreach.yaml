@@ -1,0 +1,30 @@
+dsl: graphrun/v1
+id: foreach_counter
+version: 1
+input_schema: {array: counter/v1}
+output_schema: {array: counter/v1}
+start: increment_all
+nodes:
+  increment_all:
+    kind: foreach
+    items: {from: workflow.input}
+    item_schema: counter/v1
+    max_items: 100
+    max_concurrency: 4
+    body:
+      input_schema: counter/v1
+      output_schema: counter/v1
+      start: increment
+      nodes:
+        increment:
+          kind: activity
+          activity: {name: counter.increment, version: 1}
+          input: {from: item.value}
+          next: done
+        done:
+          kind: complete
+          output: {from: nodes.increment.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.increment_all.output}

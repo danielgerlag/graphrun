@@ -1,0 +1,18 @@
+dsl: graphrun/v1
+id: durable_timers
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: absolute
+nodes:
+  absolute:
+    kind: wait_until
+    at: {literal: 0}
+    next: relative
+  relative:
+    kind: delay
+    duration: "10ms"
+    next: finish
+  finish:
+    kind: complete
+    output: {literal: null}

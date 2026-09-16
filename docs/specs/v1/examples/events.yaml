@@ -1,0 +1,28 @@
+dsl: graphrun/v1
+id: external_approval
+version: 1
+input_schema: event_request/v1
+output_schema: approval/v1
+signals:
+  approval: {schema: approval/v1}
+start: gate
+nodes:
+  gate:
+    kind: activity
+    activity: {name: test.gate, version: 1}
+    input: {from: workflow.input}
+    next: approval
+  approval:
+    kind: wait_signal
+    signal: approval
+    key: {from: workflow.input, path: /key}
+    consume_from: buffered
+    timeout: "5m"
+    next: finish
+    on_timeout: expired
+  finish:
+    kind: complete
+    output: {from: nodes.approval.output}
+  expired:
+    kind: fail
+    error: {code: approval.expired, message: Approval expired.}

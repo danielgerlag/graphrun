@@ -1,0 +1,62 @@
+dsl: graphrun/v1
+id: approved_fulfillment
+version: 1
+input_schema: order/v1
+output_schema: receipt/v1
+signals:
+  approval:
+    schema: approval/v1
+start: await_approval
+nodes:
+  await_approval:
+    kind: wait_signal
+    signal: approval
+    timeout: "7d"
+    next: decide
+    on_timeout: reject
+  decide:
+    kind: choose
+    cases:
+      - when:
+          eq:
+            - from: nodes.await_approval.output
+              path: /approved
+            - literal: true
+        next: cool_down
+    default: reject
+  cool_down:
+    kind: delay
+    duration: "1s"
+    next: reserve_stock
+  reserve_stock:
+    kind: activity
+    activity:
+      name: inventory.reserve
+      version: 1
+    input:
+      from: workflow.input
+    retry:
+      errors: [inventory.unavailable]
+      max_attempts: 4
+      backoff:
+        initial: "1s"
+        multiplier: 2
+        max: "30s"
+    next: charge
+  charge:
+    kind: activity
+    activity:
+      name: payment.charge
+      version: 1
+    input:
+      from: nodes.reserve_stock.output
+    next: finish
+  finish:
+    kind: complete
+    output:
+      from: nodes.charge.output
+  reject:
+    kind: fail
+    error:
+      code: approval.rejected
+      message: Approval was rejected or expired.

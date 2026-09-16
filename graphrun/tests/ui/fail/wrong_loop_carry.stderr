@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/fail/wrong_loop_carry.rs:35:56
+   |
+35 |     let _ = root.repeat("repeat", count, root.input(), body, 10);
+   |                  ------                                ^^^^ expected `Region<Order, Order>`, found `Region<Counter, Counter>`
+   |                  |
+   |                  arguments to this method are incorrect
+   |
+   = note: expected struct `graphrun::Region<Order, Order>`
+              found struct `graphrun::Region<Counter, Counter>`
+note: method defined here
+  --> src/builder.rs
+   |
+   |     pub fn repeat<S: DurablePayload>(
+   |            ^^^^^^

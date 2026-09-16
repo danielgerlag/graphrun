@@ -1,0 +1,15 @@
+dsl: graphrun/v1
+id: external_worker_echo
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: remote
+nodes:
+  remote:
+    kind: activity
+    activity: {name: remote.echo, version: 1}
+    input: {from: workflow.input}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.remote.output}
