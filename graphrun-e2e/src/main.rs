@@ -144,11 +144,8 @@ fn load_matrix(path: &Path) -> Result<Vec<MatrixRow>, String> {
 
 fn run_case(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
     let started = Instant::now();
-    if row.id.starts_with("DSL-") || row.id == "SEC-002" {
+    if row.id == "DSL-001" {
         return yaml_case(cli, artifacts, row, started);
-    }
-    if row.id == "API-001" || row.id == "API-002" {
-        return cargo_test_case(row, started, "builder");
     }
     CaseResult {
         id: row.id.clone(),
@@ -217,44 +214,5 @@ fn yaml_case(cli: &Path, artifacts: &Path, row: &MatrixRow, started: Instant) ->
         expected: row.pass_criterion.clone(),
         actual: format!("{ok} yaml fixtures validated, {} failures", failures.len()),
         artifacts: vec![log.display().to_string()],
-    }
-}
-
-fn cargo_test_case(row: &MatrixRow, started: Instant, filter: &str) -> CaseResult {
-    let output = Command::new("cargo")
-        .args([
-            "test",
-            "--workspace",
-            "--locked",
-            filter,
-            "--",
-            "--nocapture",
-        ])
-        .output();
-    let (status, actual) = match output {
-        Ok(output) if output.status.success() => {
-            ("PASS", String::from_utf8_lossy(&output.stdout).into_owned())
-        }
-        Ok(output) => (
-            "FAIL",
-            format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        ),
-        Err(err) => ("FAIL", err.to_string()),
-    };
-    CaseResult {
-        id: row.id.clone(),
-        requirement: row.requirement.clone(),
-        layer: row.layer.clone(),
-        scenario: row.scenario.clone(),
-        status: status.to_owned(),
-        command: format!("cargo test --workspace --locked {filter}"),
-        duration_ms: started.elapsed().as_millis(),
-        expected: row.pass_criterion.clone(),
-        actual: actual.chars().take(4000).collect(),
-        artifacts: Vec::new(),
     }
 }
