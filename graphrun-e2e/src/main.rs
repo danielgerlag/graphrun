@@ -186,26 +186,30 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
     let result = match row.id.as_str() {
         "DSL-001" => yaml_validate_all(cli, artifacts, row),
         "DSL-002" => invalid_graph(cli, artifacts, row),
-        "DSL-003" => from_test(evidence, row, "yaml::tests::rejects_duplicate_keys"),
+        "DSL-003" => fail(
+            row,
+            "unimplemented",
+            "duplicate-key parse is not the binding/condition matrix",
+        ),
         "DSL-004" => from_test(evidence, row, "compiler::tests::digest_is_stable"),
         "SEC-002" => oversized_definition(cli, artifacts, row),
         "API-001" => from_flag(row, evidence.api_ok, "cargo test --test api"),
         "API-002" => from_flag(row, evidence.ui_ok, "cargo test --test ui"),
-        "API-003" => from_test(evidence, row, "compiler::tests::compiles_all_fixtures"),
-        "API-004" => from_flag(row, evidence.api_ok, "cargo test --test api"),
-        "API-005" => from_flag(row, evidence.ui_ok, "cargo test --test ui"),
+        "API-003" | "API-004" | "API-005" => fail(
+            row,
+            "unimplemented",
+            "YAML/Rust parity and field-path cases are not this test",
+        ),
         "DOM-001" => from_test(
             evidence,
             row,
             "domain::tests::reconstruct_matches_live_state",
         ),
-        "DOM-002" => from_test(evidence, row, "domain::tests::sequence_fixture_completes"),
-        "DOM-003" => from_test(
-            evidence,
+        "DOM-002" | "DOM-003" | "DOM-004" => fail(
             row,
-            "domain::tests::nested_saga_transfers_then_compensates",
+            "unimplemented",
+            "duplicate-command, nested-completion, and generated-workflow properties are not covered",
         ),
-        "DOM-004" => from_test(evidence, row, "domain::tests::foreach_preserves_order"),
         "LOOP-001" => local_start(cli, artifacts, row, "while.yaml", r#"{"value":0}"#, "3"),
         "LOOP-002" => local_start(cli, artifacts, row, "do-while.yaml", r#"{"value":0}"#, "3"),
         "LOOP-003" => local_start(
@@ -216,11 +220,10 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             r#"{"count":3,"counter":{"value":1}}"#,
             "4",
         ),
-        "LOOP-004" => from_test(evidence, row, "domain::tests::while_already_done"),
-        "LOOP-005" => from_test(
-            evidence,
+        "LOOP-004" | "LOOP-005" => fail(
             row,
-            "engine::tests::local_sequence_survives_restart",
+            "unimplemented",
+            "loop limit boundary and retry-vs-iteration are not covered",
         ),
         "LOOP-006" => local_start(
             cli,
@@ -230,8 +233,11 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             r#"[{"value":3},{"value":1},{"value":3}]"#,
             "4",
         ),
-        "LOOP-007" => from_test(evidence, row, "domain::tests::foreach_preserves_order"),
-        "LOOP-008" => from_test(evidence, row, "cluster::tests::three_voters_run_sequence"),
+        "LOOP-007" | "LOOP-008" => fail(
+            row,
+            "unimplemented",
+            "foreach concurrency window and leader-loss nested controls are not covered",
+        ),
         "PAR-001" => local_start(
             cli,
             artifacts,
@@ -240,7 +246,11 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             r#"{"order_id":"o1","amount":1000}"#,
             "100",
         ),
-        "PAR-002" => from_test(evidence, row, "domain::tests::parallel_quotes"),
+        "PAR-002" => fail(
+            row,
+            "unimplemented",
+            "duplicate/simultaneous join property is not covered",
+        ),
         "PAR-003" => fail(
             row,
             "unimplemented",
@@ -252,24 +262,16 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             "unimplemented",
             "snapshot of unfinished parallel branches is not covered",
         ),
-        "EVT-001" | "EVT-005" => {
-            from_test(evidence, row, "engine::tests::event_wait_survives_restart")
-        }
-        "EVT-002" | "EVT-003" | "EVT-004" | "EVT-006" | "EVT-007" | "EVT-008" => fail(
+        "EVT-001" | "EVT-002" | "EVT-003" | "EVT-004" | "EVT-005" | "EVT-006" | "EVT-007"
+        | "EVT-008" => fail(
             row,
             "unimplemented",
-            "event reservation/TTL cases are incomplete",
+            "buffered-before-wait, reservation, and leader-change event cases are not covered",
         ),
-        "SAGA-001" => from_test(evidence, row, "domain::tests::saga_success_path"),
-        "SAGA-002" => from_test(
-            evidence,
+        "SAGA-001" | "SAGA-002" | "SAGA-004" | "SAGA-005" => fail(
             row,
-            "domain::tests::saga_failure_compensates_in_reverse",
-        ),
-        "SAGA-004" | "SAGA-005" => from_test(
-            evidence,
-            row,
-            "domain::tests::nested_saga_transfers_then_compensates",
+            "unimplemented",
+            "saga tests exist in-process but do not meet the integration/e2e criterion",
         ),
         "SAGA-003" | "SAGA-006" | "SAGA-007" | "SAGA-008" | "SAGA-009" | "SAGA-010"
         | "SAGA-011" | "SAGA-012" | "SAGA-013" | "SAGA-014" => fail(
@@ -285,29 +287,37 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             r#"{"order_id":"o1","amount":1000}"#,
             "pay-1",
         ),
-        "ACT-002" => local_start(
-            cli,
-            artifacts,
+        "ACT-002" => fail(
             row,
-            "parallel.yaml",
-            r#"{"order_id":"o1","amount":1000}"#,
-            "500",
+            "unimplemented",
+            "blocking-pool isolation and cancel-vs-termination are not covered",
         ),
         "ACT-003" | "ACT-004" | "ACT-005" | "ACT-006" | "ACT-007" | "ACT-008" => fail(
             row,
             "unimplemented",
             "worker claim/lease/reconciliation protocol is incomplete",
         ),
-        "POLICY-001" => from_test(evidence, row, "compiler::tests::digest_is_stable"),
+        "POLICY-001" => fail(
+            row,
+            "unimplemented",
+            "captured policy defaults are not asserted against later changes",
+        ),
         "STORE-001" => from_test(evidence, row, "storage::tests::openraft_storage_suite"),
         "STORE-002" | "STORE-003" | "STORE-004" | "STORE-005" | "STORE-006" => fail(
             row,
             "unimplemented",
             "storage fault-cut fixtures are not wired",
         ),
-        "STORE-007" => from_test(evidence, row, "cluster::tests::three_voters_run_sequence"),
-        "STORE-008" => backup_restore(cli, artifacts, row),
-        "CLUSTER-001" => from_test(evidence, row, "cluster::tests::three_voters_run_sequence"),
+        "STORE-007" | "STORE-008" => fail(
+            row,
+            "unimplemented",
+            "learner replacement and disaster restore are not covered",
+        ),
+        "CLUSTER-001" => fail(
+            row,
+            "unimplemented",
+            "three-voter mTLS exists in-process; independent worker processes and Tonic are missing",
+        ),
         "CLUSTER-002" | "CLUSTER-003" | "CLUSTER-004" | "CLUSTER-005" | "CLUSTER-006" => {
             fail(row, "unimplemented", "cluster fault cases are not covered")
         }
@@ -324,42 +334,41 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             r#"{"order_id":"o1","amount":1000}"#,
             "pay-1",
         ),
-        "LOCAL-002" => local_restart(cli, artifacts, row),
+        "LOCAL-002" => fail(
+            row,
+            "unimplemented",
+            "restart of in-flight loops/waits/joins/compensation is not this completed-sequence replay",
+        ),
         "LOCAL-003" => from_test(
             evidence,
             row,
             "engine::tests::second_local_owner_is_rejected",
         ),
-        "REPLAY-001" => from_test(
-            evidence,
+        "REPLAY-001" | "REPLAY-002" | "REPLAY-003" | "REPLAY-004" => fail(
             row,
-            "domain::tests::reconstruct_matches_live_state",
+            "unimplemented",
+            "replay compares run_output in-process and is not a live-effect-free reconstruction gate",
         ),
-        "REPLAY-002" => local_replay(cli, artifacts, row),
-        "REPLAY-003" | "REPLAY-004" => local_replay(cli, artifacts, row),
-        "E2E-001" => local_start(
-            cli,
-            artifacts,
+        "E2E-001" => fail(
             row,
-            "sequence.yaml",
-            r#"{"order_id":"o1","amount":1000}"#,
-            "pay-1",
+            "unimplemented",
+            "only sequence.yaml is driven through the production CLI",
         ),
         "E2E-002" => fail(
             row,
             "unimplemented",
             "60-second quiescent ready-index observation is not run",
         ),
-        "E2E-003" => pass_note(row, "matrix driver emits one artifact per ID"),
-        "PERF-001" => local_start(
-            cli,
-            artifacts,
+        "E2E-003" => fail(
             row,
-            "sequence.yaml",
-            r#"{"order_id":"o1","amount":1000}"#,
-            "pay-1",
+            "unimplemented",
+            "owned fixture processes are not launched or reaped",
         ),
-        "PERF-002" => from_test(evidence, row, "domain::tests::foreach_preserves_order"),
+        "PERF-001" | "PERF-002" => fail(
+            row,
+            "unimplemented",
+            "reference-workload measurements are not recorded",
+        ),
         _ => fail(row, "unimplemented", "no implementation evidence yet"),
     };
     CaseResult {
@@ -550,101 +559,6 @@ fn local_start(
     }
 }
 
-fn local_restart(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
-    let first = local_start(
-        cli,
-        artifacts,
-        row,
-        "sequence.yaml",
-        r#"{"order_id":"o1","amount":1000}"#,
-        "pay-1",
-    );
-    if first.status != "PASS" {
-        return first;
-    }
-    let dir = artifacts.join(format!("{}-data", row.id));
-    let replay = Command::new(cli)
-        .args(["replay", "--local-dir", dir.to_str().unwrap()])
-        .output();
-    match replay {
-        Ok(output) if output.status.success() => finish(
-            row,
-            "PASS",
-            "start then replay",
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            vec![dir],
-        ),
-        Ok(output) => finish(
-            row,
-            "FAIL",
-            "start then replay",
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-            vec![dir],
-        ),
-        Err(err) => fail(row, "replay", err.to_string()),
-    }
-}
-
-fn local_replay(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
-    local_restart(cli, artifacts, row)
-}
-
-fn backup_restore(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
-    let start = local_start(
-        cli,
-        artifacts,
-        row,
-        "sequence.yaml",
-        r#"{"order_id":"o1","amount":1000}"#,
-        "pay-1",
-    );
-    if start.status != "PASS" {
-        return start;
-    }
-    let src = artifacts.join(format!("{}-data", row.id));
-    let bak = artifacts.join(format!("{}-backup", row.id));
-    let restored = artifacts.join(format!("{}-restored", row.id));
-    let backup = Command::new(cli)
-        .args([
-            "backup",
-            "--local-dir",
-            src.to_str().unwrap(),
-            "--out",
-            bak.to_str().unwrap(),
-        ])
-        .output();
-    if !backup.as_ref().is_ok_and(|o| o.status.success()) {
-        return fail(row, "backup", "backup failed");
-    }
-    let restore = Command::new(cli)
-        .args([
-            "restore",
-            "--from",
-            bak.to_str().unwrap(),
-            "--local-dir",
-            restored.to_str().unwrap(),
-            "--confirm",
-            "--reason",
-            "e2e",
-        ])
-        .output();
-    match restore {
-        Ok(output) if output.status.success() => finish(
-            row,
-            "PASS",
-            "backup/restore",
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            vec![bak, restored],
-        ),
-        Ok(output) => fail(
-            row,
-            "restore",
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ),
-        Err(err) => fail(row, "restore", err.to_string()),
-    }
-}
-
 fn from_test(evidence: &Evidence, row: &MatrixRow, name: &str) -> CaseResult {
     from_flag(row, test_ok(evidence, name), format!("cargo test {name}"))
 }
@@ -661,10 +575,6 @@ fn from_flag(row: &MatrixRow, ok: bool, command: impl Into<String>) -> CaseResul
         },
         Vec::new(),
     )
-}
-
-fn pass_note(row: &MatrixRow, actual: &str) -> CaseResult {
-    finish(row, "PASS", "observation", actual.to_owned(), Vec::new())
 }
 
 fn fail(row: &MatrixRow, command: &str, actual: impl Into<String>) -> CaseResult {
