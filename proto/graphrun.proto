@@ -1,0 +1,149 @@
+syntax = "proto3";
+package graphrun.v1;
+
+message Blob {
+  bytes json = 1;
+}
+
+service Raft {
+  rpc AppendEntries(Blob) returns (Blob);
+  rpc Vote(Blob) returns (Blob);
+  rpc InstallSnapshot(Blob) returns (Blob);
+}
+
+message Ack {
+  string error = 1;
+}
+
+message StartRequest {
+  string command_id = 1;
+  string yaml = 2;
+  bytes catalog_json = 3;
+  bytes input_json = 4;
+}
+
+message StartResponse {
+  string run_id = 1;
+  string error = 2;
+}
+
+message SignalRequest {
+  string command_id = 1;
+  string run_id = 2;
+  string event_id = 3;
+  string name = 4;
+  string key = 5;
+  bytes payload_json = 6;
+}
+
+message CancelRequest {
+  string command_id = 1;
+  string run_id = 2;
+  string reason = 3;
+}
+
+message InspectRequest {
+  string run_id = 1;
+}
+
+message InspectResponse {
+  bytes view_json = 1;
+  string error = 2;
+}
+
+message ListRequest {}
+
+message ListResponse {
+  bytes runs_json = 1;
+}
+
+message HistoryRequest {
+  string run_id = 1;
+}
+
+message HistoryResponse {
+  bytes events_json = 1;
+  string error = 2;
+}
+
+service Client {
+  rpc Start(StartRequest) returns (StartResponse);
+  rpc Signal(SignalRequest) returns (Ack);
+  rpc Cancel(CancelRequest) returns (Ack);
+  rpc Inspect(InspectRequest) returns (InspectResponse);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc History(HistoryRequest) returns (HistoryResponse);
+}
+
+message RegisterRequest {
+  string session_id = 1;
+  repeated string activities = 2;
+  uint32 capacity = 3;
+}
+
+message ClaimRequest {
+  string command_id = 1;
+  string session_id = 2;
+  uint32 capacity = 3;
+}
+
+message Assignment {
+  string run_id = 1;
+  string activation_id = 2;
+  string activity_name = 3;
+  uint32 activity_version = 4;
+  bytes input_json = 5;
+  string role = 6;
+  string effect_key = 7;
+  uint64 generation = 8;
+  uint64 revision = 9;
+  uint64 lease_expiry_ms = 10;
+  uint64 attempt_deadline_ms = 11;
+  string session_id = 12;
+}
+
+message ClaimResponse {
+  repeated Assignment assignments = 1;
+  string error = 2;
+}
+
+message RenewRequest {
+  string command_id = 1;
+  string session_id = 2;
+  string activation_id = 3;
+  uint64 generation = 4;
+  uint64 revision = 5;
+}
+
+message RenewResponse {
+  uint64 revision = 1;
+  uint64 lease_expiry_ms = 2;
+  string error = 3;
+}
+
+message ReportRequest {
+  string command_id = 1;
+  string session_id = 2;
+  string run_id = 3;
+  string activation_id = 4;
+  uint64 generation = 5;
+  uint64 revision = 6;
+  bytes output_json = 7;
+}
+
+message ReconcileRequest {
+  string command_id = 1;
+  string session_id = 2;
+  string run_id = 3;
+  string activation_id = 4;
+  string outcome = 5;
+  bytes output_json = 6;
+}
+
+service Worker {
+  rpc Register(RegisterRequest) returns (Ack);
+  rpc Claim(ClaimRequest) returns (ClaimResponse);
+  rpc Renew(RenewRequest) returns (RenewResponse);
+  rpc Report(ReportRequest) returns (Ack);
+  rpc Reconcile(ReconcileRequest) returns (Ack);
+}

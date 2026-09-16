@@ -34,6 +34,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tonic.workspace = true
+tonic-prost.workspace = true
 tracing.workspace = true
 yaml-rust2.workspace = true
 

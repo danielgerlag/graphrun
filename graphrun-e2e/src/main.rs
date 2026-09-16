@@ -23,9 +23,39 @@ enum Commands {
         artifacts: PathBuf,
     },
     #[command(name = "fixture-member")]
-    FixtureMember,
+    FixtureMember {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        bind: String,
+        #[arg(long)]
+        node_id: u64,
+        #[arg(long)]
+        ca: PathBuf,
+        #[arg(long)]
+        cert: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        server_name: String,
+        #[arg(long, default_value_t = true)]
+        initialize: bool,
+        #[arg(long, default_value_t = false)]
+        host_activities: bool,
+    },
     #[command(name = "fixture-worker")]
-    FixtureWorker,
+    FixtureWorker {
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        ca: PathBuf,
+        #[arg(long)]
+        cert: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        server_name: String,
+    },
     #[command(name = "fixture-provider")]
     FixtureProvider,
 }
@@ -51,8 +81,36 @@ fn main() -> ExitCode {
             matrix,
             artifacts,
         } => verify(&cli, &matrix, &artifacts),
-        Commands::FixtureMember | Commands::FixtureWorker | Commands::FixtureProvider => {
-            eprintln!("fixture subprocesses are not implemented yet");
+        Commands::FixtureMember {
+            data_dir,
+            bind,
+            node_id,
+            ca,
+            cert,
+            key,
+            server_name,
+            initialize,
+            host_activities,
+        } => fixture_member(
+            data_dir,
+            bind,
+            node_id,
+            ca,
+            cert,
+            key,
+            server_name,
+            initialize,
+            host_activities,
+        ),
+        Commands::FixtureWorker {
+            endpoint,
+            ca,
+            cert,
+            key,
+            server_name,
+        } => fixture_worker(endpoint, ca, cert, key, server_name),
+        Commands::FixtureProvider => {
+            eprintln!("fixture-provider is not implemented yet");
             ExitCode::from(2)
         }
     }
@@ -603,4 +661,107 @@ fn finish(
             .map(|path| path.display().to_string())
             .collect(),
     }
+}
+
+fn read_tls(
+    ca: PathBuf,
+    cert: PathBuf,
+    key: PathBuf,
+    server_name: String,
+) -> Result<graphrun::TlsMaterial, String> {
+    Ok(graphrun::TlsMaterial {
+        ca_pem: fs::read_to_string(ca).map_err(|err| err.to_string())?,
+        cert_pem: fs::read_to_string(cert).map_err(|err| err.to_string())?,
+        key_pem: fs::read_to_string(key).map_err(|err| err.to_string())?,
+        server_name,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixture_member(
+    data_dir: PathBuf,
+    bind: String,
+    node_id: u64,
+    ca: PathBuf,
+    cert: PathBuf,
+    key: PathBuf,
+    server_name: String,
+    initialize: bool,
+    host_activities: bool,
+) -> ExitCode {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(2);
+        }
+    };
+    rt.block_on(async move {
+        let tls = match read_tls(ca, cert, key, server_name) {
+            Ok(tls) => tls,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::from(2);
+            }
+        };
+        let bind = match bind.parse() {
+            Ok(bind) => bind,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::from(2);
+            }
+        };
+        match graphrun::Engine::member(graphrun::MemberConfig {
+            data_dir,
+            node_id,
+            bind,
+            peers: std::collections::BTreeMap::new(),
+            tls,
+            host_activities,
+            initialize,
+        })
+        .await
+        {
+            Ok(engine) => loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let _ = &engine;
+            },
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::from(2)
+            }
+        }
+    })
+}
+
+fn fixture_worker(
+    endpoint: String,
+    ca: PathBuf,
+    cert: PathBuf,
+    key: PathBuf,
+    server_name: String,
+) -> ExitCode {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(2);
+        }
+    };
+    rt.block_on(async move {
+        let tls = match read_tls(ca, cert, key, server_name) {
+            Ok(tls) => tls,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::from(2);
+            }
+        };
+        match graphrun::Engine::run_worker(endpoint, tls).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::from(2)
+            }
+        }
+    })
 }

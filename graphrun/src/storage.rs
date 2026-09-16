@@ -18,11 +18,13 @@ use redb::{
     Database, Durability, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt::Debug;
 use std::io::{self, Cursor, Seek, SeekFrom};
 use std::ops::Bound;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use tokio::sync::oneshot;
@@ -60,6 +62,21 @@ type StoErr = StorageError<u64>;
 
 fn sto_err(verb: ErrorVerb, err: impl std::fmt::Display) -> StoErr {
     StorageIOError::new(ErrorSubject::Store, verb, AnyError::error(err.to_string())).into()
+}
+
+static CUT: Mutex<Option<&'static str>> = Mutex::new(None);
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn inject_cut(point: &'static str) {
+    *CUT.lock().unwrap() = Some(point);
+}
+
+fn after_persist(point: &'static str) -> std::result::Result<(), StoErr> {
+    if CUT.lock().unwrap().as_deref() == Some(point) {
+        *CUT.lock().unwrap() = None;
+        return Err(sto_err(ErrorVerb::Write, format!("fault cut {point}")));
+    }
+    Ok(())
 }
 
 enum Req {
@@ -169,6 +186,10 @@ fn storage_thread(
     let mut last_membership: MembershipT = load_json(&db, "membership")
         .unwrap_or_else(|| StoredMembership::new(None, Membership::new(vec![], None)));
     let mut domain: State = load_json(&db, "domain").unwrap_or_default();
+    let snapshot_dir = path
+        .parent()
+        .map(|parent| parent.join("snapshots"))
+        .unwrap_or_else(|| PathBuf::from("snapshots"));
     let mut snapshot: Option<(SnapMeta, Vec<u8>)> = match (
         load_json(&db, "snapshot_meta"),
         load_bytes(&db, "snapshot_data"),
@@ -218,6 +239,7 @@ fn storage_thread(
             Req::BuildSnapshot(tx) => {
                 let res = build_snapshot(last_applied, last_membership.clone(), &domain);
                 if let Ok(ref snap) = res {
+                    let _ = write_snapshot_file(&snapshot_dir, &snap.meta, snap.snapshot.get_ref());
                     snapshot = Some((snap.meta.clone(), snap.snapshot.get_ref().clone()));
                     let _ = put_json(&db, "snapshot_meta", &snap.meta);
                     let _ = put_bytes(&db, "snapshot_data", snap.snapshot.get_ref());
@@ -309,6 +331,18 @@ fn append_logs(db: &Database, entries: &[EntryT]) -> std::result::Result<(), Sto
         }
     }
     txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    after_persist("after-log")?;
+    Ok(())
+}
+
+fn write_snapshot_file(dir: &Path, meta: &SnapMeta, data: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let digest = hex::encode(Sha256::digest(data));
+    let take = digest.len().min(16);
+    let name = format!("{}-{}.snap", meta.snapshot_id, &digest[..take]);
+    let tmp = dir.join(format!("{name}.tmp"));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(tmp, dir.join(name))?;
     Ok(())
 }
 
@@ -773,5 +807,27 @@ mod tests {
             tempfile::TempDir,
         >::test_all(RedbStoreBuilder)
         .unwrap();
+    }
+
+    #[test]
+    fn log_cut_after_persist_keeps_entries() {
+        inject_cut("after-log");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = redb::Database::create(&path).unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            let _ = txn.open_table(LOG);
+            let _ = txn.open_table(META);
+            txn.commit().unwrap();
+        }
+        let entry = Entry::<TypeConfig> {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Blank,
+        };
+        let err = append_logs(&db, &[entry]).unwrap_err();
+        assert!(err.to_string().contains("fault cut"));
+        let loaded = get_logs(&db, 1, 2).unwrap();
+        assert_eq!(loaded.len(), 1);
     }
 }

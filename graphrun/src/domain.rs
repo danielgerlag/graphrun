@@ -2,8 +2,8 @@ use crate::binding::{Binding, Condition, Reference};
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::ids::{
-    ActivationId, AttemptNo, CommandId, EventId, ExecutionRole, NodeKey, RunId, RunSequence,
-    ScopeId, WaitId,
+    ActivationId, AttemptNo, CommandId, EffectKey, EventId, ExecutionRole, LeaseRevision, NodeKey,
+    OwnerGeneration, RunId, RunSequence, ScopeId, WaitId, WorkerSessionId,
 };
 use crate::ir::{ConsumeFrom, Definition, FailError, Node, Region};
 use crate::policy::CapturedRunPolicy;
@@ -117,7 +117,32 @@ pub enum DomainEvent {
         to_saga: ActivationId,
     },
     ObligationReleased {
+        run: RunId,
         forward: ActivationId,
+    },
+    SessionRegistered {
+        session: WorkerSessionId,
+        activities: Vec<String>,
+        capacity: u32,
+        expires_ms: u64,
+    },
+    ClaimGranted {
+        run: RunId,
+        activation: ActivationId,
+        session: WorkerSessionId,
+        generation: OwnerGeneration,
+        revision: LeaseRevision,
+        lease_expiry_ms: u64,
+        attempt_deadline_ms: u64,
+        effect_key: EffectKey,
+        role: ExecutionRole,
+    },
+    ClaimRenewed {
+        activation: ActivationId,
+        session: WorkerSessionId,
+        generation: OwnerGeneration,
+        revision: LeaseRevision,
+        lease_expiry_ms: u64,
     },
     RunSucceeded {
         run: RunId,
@@ -184,6 +209,29 @@ pub enum CommandBody {
     Cancel {
         run: RunId,
         reason: String,
+    },
+    RegisterSession {
+        session: WorkerSessionId,
+        activities: Vec<String>,
+        capacity: u32,
+    },
+    Claim {
+        session: WorkerSessionId,
+        capacity: u32,
+    },
+    Renew {
+        session: WorkerSessionId,
+        activation: ActivationId,
+        generation: OwnerGeneration,
+        revision: LeaseRevision,
+    },
+    ReportAssigned {
+        run: RunId,
+        activation: ActivationId,
+        output: Value,
+        session: WorkerSessionId,
+        generation: OwnerGeneration,
+        revision: LeaseRevision,
     },
 }
 
@@ -283,6 +331,26 @@ pub struct ActivationState {
     pub status: ActivationStatus,
     #[serde(default)]
     pub role: ExecutionRole,
+    #[serde(default)]
+    pub claim: Option<ClaimState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClaimState {
+    pub session: WorkerSessionId,
+    pub generation: OwnerGeneration,
+    pub revision: LeaseRevision,
+    pub lease_expiry_ms: u64,
+    pub attempt_deadline_ms: u64,
+    pub effect_key: EffectKey,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerSession {
+    pub id: WorkerSessionId,
+    pub activities: Vec<String>,
+    pub capacity: u32,
+    pub expires_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,6 +415,10 @@ pub struct State {
     pub obligations: Vec<Obligation>,
     #[serde(default)]
     pub saga_errors: HashMap<ActivationId, FailError>,
+    #[serde(default)]
+    pub sessions: HashMap<WorkerSessionId, WorkerSession>,
+    #[serde(default)]
+    pub next_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -372,7 +444,14 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             run,
             activation,
             output,
-        } => decide_report(state, *run, *activation, output.clone(), &mut ids),
+        } => decide_report(
+            state,
+            *run,
+            *activation,
+            output.clone(),
+            command.time,
+            &mut ids,
+        ),
         CommandBody::Signal {
             run,
             event_id,
@@ -394,6 +473,45 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
         }
         CommandBody::Progress { run } => decide_progress(state, *run, command.time, &mut ids),
         CommandBody::Cancel { run, reason } => decide_cancel(state, *run, reason, &mut ids),
+        CommandBody::RegisterSession {
+            session,
+            activities,
+            capacity,
+        } => decide_register(state, *session, activities, *capacity, command.time),
+        CommandBody::Claim { session, capacity } => {
+            decide_claim(state, *session, *capacity, command.time, &mut ids)
+        }
+        CommandBody::Renew {
+            session,
+            activation,
+            generation,
+            revision,
+        } => decide_renew(
+            state,
+            *session,
+            *activation,
+            *generation,
+            *revision,
+            command.time,
+        ),
+        CommandBody::ReportAssigned {
+            run,
+            activation,
+            output,
+            session,
+            generation,
+            revision,
+        } => decide_report_assigned(
+            state,
+            *run,
+            *activation,
+            output.clone(),
+            *session,
+            *generation,
+            *revision,
+            command.time,
+            &mut ids,
+        ),
     }
 }
 
@@ -438,6 +556,7 @@ fn decide_report(
     run: RunId,
     activation: ActivationId,
     output: Value,
+    time: EngineTime,
     ids: &mut IdGen,
 ) -> Result<Decision> {
     let act = state
@@ -450,6 +569,28 @@ fn decide_report(
     if act.status != ActivationStatus::Ready {
         return Err(Error::invalid("activation is not awaiting a result"));
     }
+    if let Some(claim) = &act.claim {
+        if time.as_millis() < claim.lease_expiry_ms {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "activation is claimed",
+            ));
+        }
+    }
+    report_success(state, run, activation, output, ids)
+}
+
+fn report_success(
+    state: &State,
+    run: RunId,
+    activation: ActivationId,
+    output: Value,
+    ids: &mut IdGen,
+) -> Result<Decision> {
+    let act = state
+        .activations
+        .get(&activation)
+        .ok_or_else(|| Error::invalid("unknown activation"))?;
     if act.role == ExecutionRole::Compensation {
         return decide_compensation_result(state, run, activation, output);
     }
@@ -471,6 +612,210 @@ fn decide_report(
     }
     events.extend(follow_next(state, act.scope, &act.node, &output, ids)?);
     Ok(Decision { events })
+}
+
+fn decide_register(
+    state: &State,
+    session: WorkerSessionId,
+    activities: &[String],
+    capacity: u32,
+    time: EngineTime,
+) -> Result<Decision> {
+    if capacity == 0 || capacity > crate::limits::CLAIM_BATCH {
+        return Err(Error::invalid("invalid worker capacity"));
+    }
+    if let Some(existing) = state.sessions.get(&session) {
+        if existing.expires_ms > time.as_millis() {
+            return Ok(Decision { events: Vec::new() });
+        }
+    }
+    let expires_ms = time
+        .as_millis()
+        .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64);
+    Ok(Decision {
+        events: vec![DomainEvent::SessionRegistered {
+            session,
+            activities: activities.to_vec(),
+            capacity,
+            expires_ms,
+        }],
+    })
+}
+
+fn decide_claim(
+    state: &State,
+    session: WorkerSessionId,
+    capacity: u32,
+    time: EngineTime,
+    ids: &mut IdGen,
+) -> Result<Decision> {
+    let worker = state
+        .sessions
+        .get(&session)
+        .ok_or_else(|| Error::new(crate::error::ErrorKind::Unauthenticated, "unknown session"))?;
+    if time.as_millis() >= worker.expires_ms {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "session expired",
+        ));
+    }
+    let cap = capacity
+        .min(worker.capacity)
+        .min(crate::limits::CLAIM_BATCH);
+    let mut events = Vec::new();
+    let mut granted = 0u32;
+    let mut runs = active_runs(state);
+    runs.sort();
+    for run in runs {
+        if granted >= cap {
+            break;
+        }
+        let mut ready = unclaimed_ready(state, run, time);
+        ready.sort();
+        for activation in ready {
+            if granted >= cap {
+                break;
+            }
+            let Some(act) = state.activations.get(&activation) else {
+                continue;
+            };
+            let lease_expiry_ms = time
+                .as_millis()
+                .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64);
+            let attempt_deadline_ms = time
+                .as_millis()
+                .saturating_add(crate::policy::FORWARD_ATTEMPT_TIMEOUT.as_millis() as u64);
+            events.push(DomainEvent::ClaimGranted {
+                run,
+                activation,
+                session,
+                generation: OwnerGeneration::new(
+                    state.next_generation.saturating_add(u64::from(granted) + 1),
+                ),
+                revision: LeaseRevision::new(1),
+                lease_expiry_ms,
+                attempt_deadline_ms,
+                effect_key: EffectKey::from_bytes(ids.next_bytes()),
+                role: act.role,
+            });
+            granted += 1;
+        }
+    }
+    Ok(Decision { events })
+}
+
+fn decide_renew(
+    state: &State,
+    session: WorkerSessionId,
+    activation: ActivationId,
+    generation: OwnerGeneration,
+    revision: LeaseRevision,
+    time: EngineTime,
+) -> Result<Decision> {
+    let worker = state
+        .sessions
+        .get(&session)
+        .ok_or_else(|| Error::new(crate::error::ErrorKind::Unauthenticated, "unknown session"))?;
+    if time.as_millis() >= worker.expires_ms {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "session expired",
+        ));
+    }
+    let act = state
+        .activations
+        .get(&activation)
+        .ok_or_else(|| Error::invalid("unknown activation"))?;
+    let Some(claim) = &act.claim else {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "no claim",
+        ));
+    };
+    if claim.session != session || claim.generation != generation {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "stale claim",
+        ));
+    }
+    if claim.revision != revision {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "stale revision",
+        ));
+    }
+    if time.as_millis() >= claim.lease_expiry_ms || time.as_millis() >= claim.attempt_deadline_ms {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "claim expired",
+        ));
+    }
+    let lease_expiry_ms = time
+        .as_millis()
+        .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64);
+    Ok(Decision {
+        events: vec![DomainEvent::ClaimRenewed {
+            activation,
+            session,
+            generation,
+            revision: revision.next(),
+            lease_expiry_ms,
+        }],
+    })
+}
+
+fn decide_report_assigned(
+    state: &State,
+    run: RunId,
+    activation: ActivationId,
+    output: Value,
+    session: WorkerSessionId,
+    generation: OwnerGeneration,
+    revision: LeaseRevision,
+    time: EngineTime,
+    ids: &mut IdGen,
+) -> Result<Decision> {
+    let act = state
+        .activations
+        .get(&activation)
+        .ok_or_else(|| Error::invalid("unknown activation"))?;
+    if act.status != ActivationStatus::Ready {
+        return Err(Error::invalid("activation is not awaiting a result"));
+    }
+    let Some(claim) = &act.claim else {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "no claim",
+        ));
+    };
+    if claim.session != session || claim.generation != generation || claim.revision != revision {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "stale claim",
+        ));
+    }
+    if time.as_millis() >= claim.lease_expiry_ms || time.as_millis() >= claim.attempt_deadline_ms {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "claim expired",
+        ));
+    }
+    report_success(state, run, activation, output, ids)
+}
+
+fn unclaimed_ready(state: &State, run: RunId, time: EngineTime) -> Vec<ActivationId> {
+    ready_activations(state, run)
+        .into_iter()
+        .filter(|id| {
+            let Some(act) = state.activations.get(id) else {
+                return false;
+            };
+            match &act.claim {
+                None => true,
+                Some(claim) => time.as_millis() >= claim.lease_expiry_ms,
+            }
+        })
+        .collect()
 }
 
 fn decide_compensation_result(
@@ -1579,6 +1924,7 @@ fn compensate_or_fail(
 }
 
 fn settle_saga_success(state: &State, saga: ActivationId) -> Vec<DomainEvent> {
+    let run = state.activations.get(&saga).map(|act| act.run);
     let owned: Vec<ActivationId> = state
         .obligations
         .iter()
@@ -1594,11 +1940,13 @@ fn settle_saga_success(state: &State, saga: ActivationId) -> Vec<DomainEvent> {
                 to_saga: parent,
             })
             .collect()
-    } else {
+    } else if let Some(run) = run {
         owned
             .into_iter()
-            .map(|forward| DomainEvent::ObligationReleased { forward })
+            .map(|forward| DomainEvent::ObligationReleased { run, forward })
             .collect()
+    } else {
+        Vec::new()
     }
 }
 
@@ -1939,8 +2287,12 @@ fn event_run(event: &DomainEvent) -> Option<RunId> {
         | DomainEvent::ObligationRegistered { run, .. }
         | DomainEvent::CompensationStarted { run, .. }
         | DomainEvent::RunSucceeded { run, .. }
-        | DomainEvent::RunFailed { run, .. } => *run,
-        DomainEvent::ObligationTransferred { .. } | DomainEvent::ObligationReleased { .. } => {
+        | DomainEvent::RunFailed { run, .. }
+        | DomainEvent::ObligationReleased { run, .. }
+        | DomainEvent::ClaimGranted { run, .. } => *run,
+        DomainEvent::ObligationTransferred { .. }
+        | DomainEvent::SessionRegistered { .. }
+        | DomainEvent::ClaimRenewed { .. } => {
             return None;
         }
     })
@@ -2070,6 +2422,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                         ActivationStatus::Open
                     },
                     role: ExecutionRole::Forward,
+                    claim: None,
                 },
             );
             if let Some(scope_state) = state.scopes.get_mut(scope) {
@@ -2250,6 +2603,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                         node: NodeKey("__compensate".to_owned()),
                         status: ActivationStatus::Ready,
                         role: ExecutionRole::Compensation,
+                        claim: None,
                     },
                 );
             }
@@ -2266,13 +2620,64 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 obligation.owner = *to_saga;
             }
         }
-        DomainEvent::ObligationReleased { forward } => {
+        DomainEvent::ObligationReleased { forward, .. } => {
             if let Some(obligation) = state
                 .obligations
                 .iter_mut()
                 .find(|item| item.forward == *forward)
             {
                 obligation.status = ObligationStatus::Released;
+            }
+        }
+        DomainEvent::SessionRegistered {
+            session,
+            activities,
+            capacity,
+            expires_ms,
+        } => {
+            state.sessions.insert(
+                *session,
+                WorkerSession {
+                    id: *session,
+                    activities: activities.clone(),
+                    capacity: *capacity,
+                    expires_ms: *expires_ms,
+                },
+            );
+        }
+        DomainEvent::ClaimGranted {
+            activation,
+            session,
+            generation,
+            revision,
+            lease_expiry_ms,
+            attempt_deadline_ms,
+            effect_key,
+            ..
+        } => {
+            state.next_generation = state.next_generation.saturating_add(1);
+            if let Some(act) = state.activations.get_mut(activation) {
+                act.claim = Some(ClaimState {
+                    session: *session,
+                    generation: *generation,
+                    revision: *revision,
+                    lease_expiry_ms: *lease_expiry_ms,
+                    attempt_deadline_ms: *attempt_deadline_ms,
+                    effect_key: *effect_key,
+                });
+            }
+        }
+        DomainEvent::ClaimRenewed {
+            activation,
+            revision,
+            lease_expiry_ms,
+            ..
+        } => {
+            if let Some(act) = state.activations.get_mut(activation) {
+                if let Some(claim) = &mut act.claim {
+                    claim.revision = *revision;
+                    claim.lease_expiry_ms = *lease_expiry_ms;
+                }
             }
         }
         DomainEvent::RunSucceeded { run, output } => {
@@ -2328,6 +2733,9 @@ pub fn start_run(
 }
 
 pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEvent>> {
+    if let Some(events) = state.commands.get(&command.id) {
+        return Ok(events.clone());
+    }
     let decision = decide(state, &command)?;
     apply_events(state, &decision.events);
     state.commands.insert(command.id, decision.events.clone());
@@ -2383,6 +2791,58 @@ pub fn ready_activations(state: &State, run: RunId) -> Vec<ActivationId> {
         })
         .map(|act| act.id)
         .collect()
+}
+
+pub fn assignments_from(state: &State, events: &[DomainEvent]) -> Vec<AssignmentView> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            DomainEvent::ClaimGranted {
+                run,
+                activation,
+                session,
+                generation,
+                revision,
+                lease_expiry_ms,
+                attempt_deadline_ms,
+                effect_key,
+                role,
+            } => {
+                let (name, version, input) = activity_key(state, *activation)?;
+                Some(AssignmentView {
+                    run: *run,
+                    activation: *activation,
+                    activity_name: name,
+                    activity_version: version,
+                    input,
+                    role: *role,
+                    effect_key: *effect_key,
+                    generation: *generation,
+                    revision: *revision,
+                    lease_expiry_ms: *lease_expiry_ms,
+                    attempt_deadline_ms: *attempt_deadline_ms,
+                    session: *session,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+pub struct AssignmentView {
+    pub run: RunId,
+    pub activation: ActivationId,
+    pub activity_name: String,
+    pub activity_version: u32,
+    pub input: Value,
+    pub role: ExecutionRole,
+    pub effect_key: EffectKey,
+    pub generation: OwnerGeneration,
+    pub revision: LeaseRevision,
+    pub lease_expiry_ms: u64,
+    pub attempt_deadline_ms: u64,
+    pub session: WorkerSessionId,
 }
 
 pub fn activity_key(state: &State, activation: ActivationId) -> Option<(String, u32, Value)> {
@@ -2900,5 +3360,108 @@ mod tests {
             panic!("counter");
         };
         assert_eq!(fields.get("value").unwrap().as_i64(), Some(5));
+    }
+
+    #[test]
+    fn duplicate_command_does_not_reapply() {
+        let mut state = drive_state(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            Value::Object(BTreeMap::from([
+                ("order_id".to_owned(), Value::String("o1".to_owned())),
+                ("amount".to_owned(), Value::Int(1000)),
+            ])),
+        );
+        let run = *state.runs.keys().next().unwrap();
+        let command = Command {
+            id: CommandId::generate(),
+            time: EngineTime::from_millis(1_000_000),
+            body: CommandBody::Progress { run },
+        };
+        let first = apply_command(&mut state, command.clone()).unwrap();
+        let count = state.history.get(&run).map(Vec::len).unwrap_or(0);
+        let second = apply_command(&mut state, command).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(count, state.history.get(&run).map(Vec::len).unwrap_or(0));
+    }
+
+    #[test]
+    fn claimed_activation_rejects_unassigned_report() {
+        let mut state = State::default();
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([
+                        ("order_id".to_owned(), Value::String("o1".to_owned())),
+                        ("amount".to_owned(), Value::Int(1000)),
+                    ])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let session = WorkerSessionId::generate();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Claim {
+                    session,
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        let err = apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::ReportLeaf {
+                    run,
+                    activation,
+                    output: Value::Null,
+                },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
     }
 }

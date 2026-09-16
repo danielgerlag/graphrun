@@ -11,15 +11,18 @@ pub mod compiler;
 pub mod domain;
 pub mod engine;
 pub mod error;
+pub mod generated;
 pub mod ids;
 pub mod ir;
 pub mod limits;
 pub mod policy;
+pub mod rpc;
 pub mod schema;
 pub mod storage;
 pub mod time;
 pub mod tls;
 pub mod value;
+pub mod write;
 pub mod yaml;
 
 pub use builder::{

@@ -1,23 +1,23 @@
 use crate::catalog::{Catalog, ExecutionKind};
-use crate::cluster::{ClusterNetwork, MemberConfig, serve_raft};
+use crate::cluster::{ClusterNetwork, MemberConfig};
 use crate::compiler::compile_yaml;
 use crate::domain::{
-    Command, CommandBody, ObligationStatus, RunStatus, State, active_runs, activity_key,
-    ready_activations, reconstruct, run_events, run_output,
+    Command, CommandBody, RunStatus, State, active_runs, reconstruct, run_events, run_output,
 };
 use crate::error::{Error, ErrorKind, Result};
 use crate::ids::{CommandId, EventId, RunId};
 use crate::ir::Definition;
-use crate::storage::{LocalNetwork, RaftRequest, StorageHandle, TypeConfig, load_domain_readonly};
-use crate::time::EngineTime;
+use crate::rpc::serve_grpc;
+use crate::storage::{LocalNetwork, StorageHandle, TypeConfig, load_domain_readonly};
 use crate::value::Value;
+use crate::write::{inspect_view, now, write_raft};
 use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
@@ -164,12 +164,15 @@ impl Engine {
         )
         .await
         .map_err(|err| Error::invalid(err.to_string()))?;
+        let notify = Arc::new(Notify::new());
         let raft_server = {
             let raft = raft.clone();
             let bind = config.bind;
             let tls = config.tls.clone();
+            let storage = storage.clone();
+            let notify = notify.clone();
             tokio::spawn(async move {
-                let _ = serve_raft(bind, tls, raft).await;
+                let _ = serve_grpc(bind, tls, raft, storage, notify).await;
             })
         };
         if config.initialize {
@@ -192,7 +195,6 @@ impl Engine {
                 .await
                 .map_err(|err| Error::invalid(err.to_string()))?;
         }
-        let notify = Arc::new(Notify::new());
         let worker = if config.host_activities {
             Some(tokio::spawn(worker_loop(
                 raft.clone(),
@@ -332,6 +334,67 @@ impl Engine {
     pub async fn history(&self, run: RunId) -> Result<Vec<crate::domain::DomainEvent>> {
         let state = self.inspect(run).await?;
         Ok(run_events(&state, run).to_vec())
+    }
+
+    pub async fn run_worker(endpoint: String, tls: crate::tls::TlsMaterial) -> Result<()> {
+        crate::tls::install_provider();
+        let session = crate::ids::WorkerSessionId::generate();
+        let channel = tonic::transport::Channel::from_shared(endpoint)
+            .map_err(|err| Error::invalid(err.to_string()))?
+            .tls_config(crate::rpc::client_tls(&tls)?)
+            .map_err(|err| Error::invalid(err.to_string()))?
+            .connect()
+            .await
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        let mut client = crate::generated::worker_client::WorkerClient::new(channel);
+        let reg = client
+            .register(crate::generated::RegisterRequest {
+                session_id: session.to_hex(),
+                activities: vec!["*".to_owned()],
+                capacity: crate::limits::CLAIM_BATCH,
+            })
+            .await
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        if !reg.into_inner().error.is_empty() {
+            return Err(Error::invalid("worker register failed"));
+        }
+        loop {
+            let claimed = client
+                .claim(crate::generated::ClaimRequest {
+                    command_id: CommandId::generate().to_hex(),
+                    session_id: session.to_hex(),
+                    capacity: crate::limits::CLAIM_BATCH,
+                })
+                .await
+                .map_err(|err| Error::invalid(err.to_string()))?
+                .into_inner();
+            if !claimed.error.is_empty() || claimed.assignments.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            for assignment in claimed.assignments {
+                let input: Value =
+                    serde_json::from_slice(&assignment.input_json).unwrap_or(Value::Null);
+                let Ok(output) = builtin_handler(&assignment.activity_name, &input) else {
+                    continue;
+                };
+                let _ = client
+                    .report(crate::generated::ReportRequest {
+                        command_id: CommandId::generate().to_hex(),
+                        session_id: session.to_hex(),
+                        run_id: assignment.run_id,
+                        activation_id: assignment.activation_id,
+                        generation: assignment.generation,
+                        revision: assignment.revision,
+                        output_json: serde_json::to_vec(&output).unwrap_or_default(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    pub fn is_leader(&self) -> bool {
+        self.raft.metrics().borrow().state == ServerState::Leader
     }
 
     pub async fn snapshot(&self) -> Result<()> {
@@ -476,25 +539,6 @@ fn write_identity(dir: &Path) -> Result<()> {
     });
     std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap())
         .map_err(|err| Error::invalid(err.to_string()))
-}
-
-fn now() -> EngineTime {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    EngineTime::from_millis(ms)
-}
-
-async fn write_raft(raft: &Raft<TypeConfig>, command: Command) -> Result<()> {
-    let resp = raft
-        .client_write(RaftRequest { command })
-        .await
-        .map_err(|err| Error::invalid(err.to_string()))?;
-    if let Some(err) = resp.data.error {
-        return Err(Error::invalid(err));
-    }
-    Ok(())
 }
 
 async fn control_loop(
@@ -758,67 +802,21 @@ async fn wait_via_raft(
     }
 }
 
-fn inspect_view(state: &State, run: RunId) -> serde_json::Value {
-    let Some(run_state) = state.runs.get(&run) else {
-        return serde_json::json!({"error": "unknown run"});
-    };
-    let waits: Vec<_> = state
-        .waits
-        .values()
-        .filter(|wait| wait.run == run && wait.pending)
-        .map(|wait| {
-            serde_json::json!({
-                "id": wait.id.to_hex(),
-                "signal": wait.signal,
-                "key": wait.key,
-                "deadline_ms": wait.deadline_ms,
-            })
-        })
-        .collect();
-    let obligations: Vec<_> = state
-        .obligations
-        .iter()
-        .filter(|item| item.run == run)
-        .map(|item| {
-            serde_json::json!({
-                "forward": item.forward.to_hex(),
-                "handler": item.handler,
-                "status": match item.status {
-                    ObligationStatus::Open => "open",
-                    ObligationStatus::Compensating { .. } => "compensating",
-                    ObligationStatus::Compensated => "compensated",
-                    ObligationStatus::Released => "released",
-                },
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "run": run.to_hex(),
-        "definition": run_state.definition.id,
-        "version": run_state.definition.version,
-        "status": match &run_state.status {
-            RunStatus::Active => "active",
-            RunStatus::Succeeded { .. } => "succeeded",
-            RunStatus::Failed { .. } => "failed",
-        },
-        "output": match &run_state.status {
-            RunStatus::Succeeded { output } => Some(output.clone()),
-            _ => None,
-        },
-        "error": match &run_state.status {
-            RunStatus::Failed { error } => Some(serde_json::json!({
-                "code": error.code,
-                "message": error.message
-            })),
-            _ => None,
-        },
-        "pending_waits": waits,
-        "obligations": obligations,
-        "event_count": run_events(state, run).len(),
-    })
-}
-
 async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc<Notify>) {
+    let session = crate::ids::WorkerSessionId::generate();
+    let _ = write_raft(
+        &raft,
+        Command {
+            id: CommandId::generate(),
+            time: now(),
+            body: CommandBody::RegisterSession {
+                session,
+                activities: vec!["*".to_owned()],
+                capacity: crate::limits::CLAIM_BATCH,
+            },
+        },
+    )
+    .await;
     loop {
         notify.notified().await;
         let state = storage.query_state().await;
@@ -832,49 +830,68 @@ async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc
                 },
             )
             .await;
-            let state = storage.query_state().await;
-            for activation in ready_activations(&state, run) {
-                let Some((name, version, input)) = activity_key(&state, activation) else {
-                    continue;
-                };
-                let blocking = state
-                    .runs
-                    .get(&run)
-                    .and_then(|run_state| {
-                        run_state
-                            .catalog
-                            .activities
-                            .get(&crate::ids::ActivityKey::new(&name, version))
-                    })
-                    .is_some_and(|contract| contract.execution == ExecutionKind::Blocking);
-                let output = if blocking {
-                    let name = name.clone();
-                    let input = input.clone();
-                    match tokio::task::spawn_blocking(move || builtin_handler(&name, &input)).await
-                    {
-                        Ok(Ok(output)) => output,
-                        _ => continue,
-                    }
-                } else {
-                    match builtin_handler(&name, &input) {
-                        Ok(output) => output,
-                        Err(_) => continue,
-                    }
-                };
-                let _ = write_raft(
-                    &raft,
-                    Command {
-                        id: CommandId::generate(),
-                        time: now(),
-                        body: CommandBody::ReportLeaf {
-                            run,
-                            activation,
-                            output,
-                        },
+        }
+        let claim = Command {
+            id: CommandId::generate(),
+            time: now(),
+            body: CommandBody::Claim {
+                session,
+                capacity: crate::limits::CLAIM_BATCH,
+            },
+        };
+        if write_raft(&raft, claim.clone()).await.is_err() {
+            continue;
+        }
+        let mut did_work = false;
+        let state = storage.query_state().await;
+        let events = state.commands.get(&claim.id).cloned().unwrap_or_default();
+        for assignment in crate::domain::assignments_from(&state, &events) {
+            let blocking = state
+                .runs
+                .get(&assignment.run)
+                .and_then(|run_state| {
+                    run_state
+                        .catalog
+                        .activities
+                        .get(&crate::ids::ActivityKey::new(
+                            &assignment.activity_name,
+                            assignment.activity_version,
+                        ))
+                })
+                .is_some_and(|contract| contract.execution == ExecutionKind::Blocking);
+            let output = if blocking {
+                let name = assignment.activity_name.clone();
+                let input = assignment.input.clone();
+                match tokio::task::spawn_blocking(move || builtin_handler(&name, &input)).await {
+                    Ok(Ok(output)) => output,
+                    _ => continue,
+                }
+            } else {
+                match builtin_handler(&assignment.activity_name, &assignment.input) {
+                    Ok(output) => output,
+                    Err(_) => continue,
+                }
+            };
+            let _ = write_raft(
+                &raft,
+                Command {
+                    id: CommandId::generate(),
+                    time: now(),
+                    body: CommandBody::ReportAssigned {
+                        run: assignment.run,
+                        activation: assignment.activation,
+                        output,
+                        session: assignment.session,
+                        generation: assignment.generation,
+                        revision: assignment.revision,
                     },
-                )
-                .await;
-            }
+                },
+            )
+            .await;
+            did_work = true;
+        }
+        if did_work {
+            notify.notify_one();
         }
     }
 }
@@ -1044,5 +1061,29 @@ mod tests {
             .unwrap();
         assert_eq!(output.pointer("/approved").unwrap(), &Value::Bool(true));
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_writes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                &catalog(),
+                order(),
+            )
+            .await
+            .unwrap();
+        let _ = engine.wait_terminal(run, Duration::from_secs(10)).await;
+        engine.snapshot().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        engine.shutdown().await.unwrap();
+        let snaps = dir.path().join("snapshots");
+        let found = snaps
+            .read_dir()
+            .map(|entries| entries.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+        assert!(found > 0, "expected snapshot file in {}", snaps.display());
     }
 }
