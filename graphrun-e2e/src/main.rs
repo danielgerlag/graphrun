@@ -2173,9 +2173,26 @@ fn cluster_nested_survives_leader_kill(
     if let Err(err) = wait_inspect(cli, &cluster, &run, "succeeded", Duration::from_secs(25)) {
         return fail(row, "nested complete", err);
     }
+    let replicated = Instant::now() + Duration::from_secs(30);
+    let mut last = String::new();
+    loop {
+        let mut ok = 0;
+        for node in 0..cluster.addrs.len() {
+            last = cluster_inspect(cli, &cluster, node, &run);
+            if last.contains("succeeded") {
+                ok += 1;
+            }
+        }
+        if ok >= 2 {
+            break;
+        }
+        if Instant::now() >= replicated {
+            return fail(row, "replicate nested before kill", last);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     terminate(&mut cluster.members[2].0);
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut last = String::new();
     while Instant::now() < deadline {
         for node in 1..cluster.addrs.len() {
             last = cluster_inspect(cli, &cluster, node, &run);
