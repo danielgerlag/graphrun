@@ -16,8 +16,9 @@ use crate::ids::{
 use crate::storage::{StorageHandle, TypeConfig};
 use crate::tls::TlsMaterial;
 use crate::value::Value;
-use crate::write::{inspect_view, now, write_raft};
+use crate::write::{admit_unapplied, inspect_view, now, write_raft};
 use openraft::Raft;
+use openraft::raft::AppendEntriesRequest;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -44,8 +45,32 @@ impl GraphServices {
 #[tonic::async_trait]
 impl RaftSvc for GraphServices {
     async fn append_entries(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
-        let rpc = serde_json::from_slice(&request.into_inner().json)
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let rpc: AppendEntriesRequest<TypeConfig> =
+            serde_json::from_slice(&request.into_inner().json)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        if !rpc.entries.is_empty() {
+            let metrics = self.raft.metrics().borrow().clone();
+            let last_log = metrics.last_log_index.unwrap_or(0);
+            let applied = metrics.last_applied.map(|id| id.index).unwrap_or(0);
+            let incoming = rpc.entries.len() as u64;
+            let incoming_bytes: u64 = rpc
+                .entries
+                .iter()
+                .map(|entry| {
+                    serde_json::to_vec(entry)
+                        .map(|bytes| bytes.len() as u64)
+                        .unwrap_or(0)
+                })
+                .sum();
+            let pending = last_log.saturating_sub(applied);
+            admit_unapplied(
+                pending.saturating_add(incoming),
+                pending
+                    .saturating_add(1)
+                    .saturating_mul(incoming_bytes.max(1)),
+            )
+            .map_err(|err| Status::resource_exhausted(err.to_string()))?;
+        }
         let resp = self
             .raft
             .append_entries(rpc)

@@ -7,20 +7,95 @@ use crate::domain::{
 use crate::error::{Error, ErrorKind, Result};
 use crate::ids::{CommandId, EventId, RunId};
 use crate::ir::Definition;
+use crate::limits;
 use crate::rpc::serve_grpc;
 use crate::storage::{LocalNetwork, StorageHandle, TypeConfig, load_domain_readonly};
 use crate::value::Value;
-use crate::write::{inspect_view, now, write_raft};
-use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy};
+use crate::write::{health_view, inspect_view, now, write_raft};
+use openraft::{BasicNode, ChangeMembers, Config, Raft, ServerState, SnapshotPolicy};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
+
+fn wake(notify: &Notify) {
+    notify.notify_waiters();
+    notify.notify_one();
+}
+
+pub static BLOCKING_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+pub static SLOW_RELEASE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Debug)]
+pub struct LedgerEntry {
+    pub physical: u32,
+    pub output: Value,
+}
+
+static EFFECT_LEDGER: LazyLock<Mutex<HashMap<String, LedgerEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn ledger_apply(key: &str, compute: impl FnOnce() -> Value) -> Value {
+    let mut guard = EFFECT_LEDGER.lock().unwrap();
+    if let Some(row) = guard.get_mut(key) {
+        row.physical = row.physical.saturating_add(1);
+        return row.output.clone();
+    }
+    let output = compute();
+    guard.insert(
+        key.to_owned(),
+        LedgerEntry {
+            physical: 1,
+            output: output.clone(),
+        },
+    );
+    output
+}
+
+pub fn ledger_get(key: &str) -> Option<LedgerEntry> {
+    EFFECT_LEDGER.lock().unwrap().get(key).cloned()
+}
+
+pub fn ledger_clear() {
+    EFFECT_LEDGER.lock().unwrap().clear();
+}
+
+fn keyed_output(key: Option<&str>, kind: &str, compute: impl FnOnce() -> Value) -> Result<Value> {
+    match key {
+        Some(key) if !key.is_empty() => apply_keyed(key, kind, compute()),
+        _ => Ok(compute()),
+    }
+}
+
+fn apply_keyed(key: &str, kind: &str, output: Value) -> Result<Value> {
+    if let Some(url) = crate::provider::provider_url() {
+        let resp = crate::provider::apply_effect(&url, key, kind, &output)?;
+        match resp.status {
+            crate::provider::EffectStatus::Applied => Ok(resp.output.unwrap_or(output)),
+            crate::provider::EffectStatus::Pending => Err(Error::new(
+                crate::error::ErrorKind::Unavailable,
+                "provider effect pending",
+            )),
+            crate::provider::EffectStatus::NotApplied => Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "provider effect not applied",
+            )),
+            crate::provider::EffectStatus::Unknown => Err(Error::new(
+                crate::error::ErrorKind::Unavailable,
+                "provider effect unknown",
+            )),
+        }
+    } else {
+        Ok(ledger_apply(key, || output))
+    }
+}
 
 pub struct Engine {
     raft: Raft<TypeConfig>,
@@ -29,9 +104,11 @@ pub struct Engine {
     data_dir: PathBuf,
     notify: Arc<Notify>,
     worker: Option<tokio::task::JoinHandle<()>>,
+    scheduler: Option<tokio::task::JoinHandle<()>>,
     control: tokio::task::JoinHandle<()>,
     raft_server: Option<tokio::task::JoinHandle<()>>,
     snapshot_task: Option<tokio::task::JoinHandle<()>>,
+    cluster_net: Option<ClusterNetwork>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,6 +140,32 @@ pub enum ControlRequest {
     },
     Snapshot,
     Health,
+    Acknowledge {
+        reason: String,
+    },
+    ResolveBlocked {
+        run: String,
+        forward: String,
+        input: Value,
+    },
+    Abandon {
+        run: String,
+        reason: String,
+    },
+    Join {
+        node_id: u64,
+        addr: String,
+        ca_pem: String,
+        cert_pem: String,
+        key_pem: String,
+        server_name: String,
+    },
+    Promote {
+        node_id: u64,
+    },
+    Remove {
+        node_id: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,6 +182,15 @@ impl Engine {
         write_identity(&data_dir)?;
         let db_path = data_dir.join("member.redb");
         let (storage, storage_thread) = StorageHandle::open(&db_path)?;
+        let restored_path = data_dir.join("restored-domain.json");
+        if restored_path.exists() {
+            let bytes =
+                std::fs::read(&restored_path).map_err(|err| Error::invalid(err.to_string()))?;
+            let domain: State =
+                serde_json::from_slice(&bytes).map_err(|err| Error::invalid(err.to_string()))?;
+            storage.install_domain(domain).await?;
+            let _ = std::fs::remove_file(&restored_path);
+        }
         let log_store = storage.log_store();
         let state_machine = storage.state_machine();
         let config = Config {
@@ -112,6 +224,11 @@ impl Engine {
             .await
             .map_err(|err| Error::invalid(err.to_string()))?;
         let notify = Arc::new(Notify::new());
+        let scheduler = Some(tokio::spawn(scheduler_loop(
+            raft.clone(),
+            storage.clone(),
+            notify.clone(),
+        )));
         let worker = tokio::spawn(worker_loop(raft.clone(), storage.clone(), notify.clone()));
         let sock = data_dir.join("control.sock");
         let _ = std::fs::remove_file(&sock);
@@ -121,6 +238,7 @@ impl Engine {
             raft.clone(),
             storage.clone(),
             notify.clone(),
+            None,
         ));
         let snapshot_task = Some(tokio::spawn(snapshot_controller(
             raft.clone(),
@@ -133,9 +251,11 @@ impl Engine {
             data_dir,
             notify,
             worker: Some(worker),
+            scheduler,
             control,
             raft_server: None,
             snapshot_task,
+            cluster_net: None,
         })
     }
 
@@ -164,13 +284,18 @@ impl Engine {
         let raft = Raft::<TypeConfig>::new(
             config.node_id,
             Arc::new(raft_config),
-            network,
+            network.clone(),
             log_store,
             state_machine,
         )
         .await
         .map_err(|err| Error::invalid(err.to_string()))?;
         let notify = Arc::new(Notify::new());
+        let scheduler = Some(tokio::spawn(scheduler_loop(
+            raft.clone(),
+            storage.clone(),
+            notify.clone(),
+        )));
         let raft_server = {
             let raft = raft.clone();
             let bind = config.bind;
@@ -218,6 +343,7 @@ impl Engine {
             raft.clone(),
             storage.clone(),
             notify.clone(),
+            Some(network.clone()),
         ));
         let snapshot_task = Some(tokio::spawn(snapshot_controller(
             raft.clone(),
@@ -230,9 +356,11 @@ impl Engine {
             data_dir,
             notify,
             worker,
+            scheduler,
             control,
             raft_server: Some(raft_server),
             snapshot_task,
+            cluster_net: Some(network),
         })
     }
 
@@ -262,7 +390,7 @@ impl Engine {
             },
         };
         self.write(command).await?;
-        self.notify.notify_one();
+        wake(&self.notify);
         Ok(run)
     }
 
@@ -291,7 +419,7 @@ impl Engine {
             },
         };
         self.write(command).await?;
-        self.notify.notify_one();
+        wake(&self.notify);
         Ok(())
     }
 
@@ -305,7 +433,7 @@ impl Engine {
             },
         };
         self.write(command).await?;
-        self.notify.notify_one();
+        wake(&self.notify);
         Ok(())
     }
 
@@ -320,6 +448,18 @@ impl Engine {
     pub async fn inspect_json(&self, run: RunId) -> Result<serde_json::Value> {
         let state = self.inspect(run).await?;
         Ok(inspect_view(&state, run))
+    }
+
+    pub async fn health(&self) -> serde_json::Value {
+        let metrics = self.raft.metrics().borrow().clone();
+        let state = self.storage.query_state().await;
+        health_view(
+            format!("{:?}", metrics.state),
+            metrics.last_applied.map(|id| id.index),
+            metrics.last_log_index,
+            metrics.membership_config.voter_ids().collect(),
+            &state,
+        )
     }
 
     pub async fn list(&self) -> serde_json::Value {
@@ -344,7 +484,7 @@ impl Engine {
 
     pub async fn history(&self, run: RunId) -> Result<Vec<crate::domain::DomainEvent>> {
         let state = self.inspect(run).await?;
-        Ok(run_events(&state, run).to_vec())
+        Ok(crate::domain::history_or_unavailable(&state, run, now())?.to_vec())
     }
 
     pub async fn run_worker(endpoint: String, tls: crate::tls::TlsMaterial) -> Result<()> {
@@ -387,7 +527,11 @@ impl Engine {
                 let input: Value =
                     serde_json::from_slice(&assignment.input_json).unwrap_or(Value::Null);
                 if assignment.role.contains("reconcil") {
-                    let outcome = builtin_reconcile(&assignment.activity_name, &input);
+                    let outcome = builtin_reconcile(
+                        &assignment.activity_name,
+                        &input,
+                        Some(assignment.effect_key.as_str()),
+                    );
                     let tag = match outcome.0 {
                         crate::domain::ReconcileOutcome::Applied => "applied",
                         crate::domain::ReconcileOutcome::NotApplied => "not_applied",
@@ -410,7 +554,11 @@ impl Engine {
                         .await;
                     continue;
                 }
-                let Ok(output) = builtin_handler(&assignment.activity_name, &input) else {
+                let Ok(output) = dispatch_handler(
+                    &assignment.activity_name,
+                    &input,
+                    Some(&assignment.effect_key),
+                ) else {
                     continue;
                 };
                 let _ = client
@@ -430,6 +578,164 @@ impl Engine {
 
     pub fn is_leader(&self) -> bool {
         self.raft.metrics().borrow().state == ServerState::Leader
+    }
+
+    pub fn voter_ids(&self) -> Vec<u64> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .voter_ids()
+            .collect()
+    }
+
+    pub fn insert_peer(&self, id: u64, addr: SocketAddr, tls: crate::tls::TlsMaterial) {
+        if let Some(net) = &self.cluster_net {
+            net.insert_peer(id, addr, tls);
+        }
+    }
+
+    pub async fn add_learner(&self, id: u64, addr: SocketAddr) -> Result<()> {
+        self.raft
+            .add_learner(id, BasicNode::new(addr.to_string()), true)
+            .await
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn add_voter(&self, id: u64) -> Result<()> {
+        self.raft
+            .change_membership(
+                ChangeMembers::AddVoterIds(std::iter::once(id).collect()),
+                true,
+            )
+            .await
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn remove_voter(&self, id: u64) -> Result<()> {
+        self.raft
+            .change_membership(
+                ChangeMembers::RemoveVoters(std::iter::once(id).collect()),
+                false,
+            )
+            .await
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn abandon_compensation(&self, run: RunId, reason: &str) -> Result<()> {
+        let command = Command {
+            id: CommandId::generate(),
+            time: now(),
+            body: CommandBody::AbandonCompensation {
+                run,
+                reason: reason.to_owned(),
+            },
+        };
+        self.write(command).await?;
+        wake(&self.notify);
+        Ok(())
+    }
+
+    pub async fn resolve_blocked(
+        &self,
+        run: RunId,
+        forward: crate::ids::ActivationId,
+        input: Value,
+    ) -> Result<()> {
+        let command = Command {
+            id: CommandId::generate(),
+            time: now(),
+            body: CommandBody::ResolveBlocked {
+                run,
+                forward,
+                input,
+            },
+        };
+        self.write(command).await?;
+        wake(&self.notify);
+        Ok(())
+    }
+
+    pub async fn acknowledge_recovery(&self, reason: &str) -> Result<()> {
+        let command = Command {
+            id: CommandId::generate(),
+            time: now(),
+            body: CommandBody::AcknowledgeRecovery {
+                reason: reason.to_owned(),
+            },
+        };
+        self.write(command).await?;
+        wake(&self.notify);
+        Ok(())
+    }
+
+    pub fn backup(data_dir: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<()> {
+        let out = out.as_ref();
+        std::fs::create_dir_all(out).map_err(|err| Error::invalid(err.to_string()))?;
+        let state = load_domain_readonly(data_dir.as_ref().join("member.redb"))?;
+        let body =
+            serde_json::to_vec_pretty(&state).map_err(|err| Error::invalid(err.to_string()))?;
+        std::fs::write(out.join("domain.json"), body)
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        let manifest = serde_json::json!({
+            "format": "graphrun.backup/v1",
+            "kind": "logical-domain",
+        });
+        std::fs::write(
+            out.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .map_err(|err| Error::invalid(err.to_string()))?;
+        Ok(())
+    }
+
+    pub fn restore(from: impl AsRef<Path>, dest: impl AsRef<Path>, reason: &str) -> Result<()> {
+        if reason.is_empty() {
+            return Err(Error::invalid("restore requires a reason"));
+        }
+        let from = from.as_ref();
+        let dest = dest.as_ref();
+        let bytes = std::fs::read(from.join("domain.json"))
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        let mut domain: State =
+            serde_json::from_slice(&bytes).map_err(|err| Error::invalid(err.to_string()))?;
+        domain.recovery = Some(crate::domain::RecoveryHold {
+            reason: reason.to_owned(),
+            authorized: false,
+        });
+        for act in domain.activations.values_mut() {
+            if act.status == crate::domain::ActivationStatus::Ready {
+                domain
+                    .interventions
+                    .insert(act.id, "restored active scope".to_owned());
+            }
+            act.claim = None;
+        }
+        std::fs::create_dir_all(dest).map_err(|err| Error::invalid(err.to_string()))?;
+        let cluster = format!(
+            "graphrun-restored-{}",
+            crate::ids::CommandId::generate().to_hex()
+        );
+        let identity = serde_json::json!({
+            "mode": "local",
+            "node_id": 1u64,
+            "cluster_name": cluster,
+            "restored": true,
+        });
+        std::fs::write(
+            dest.join("identity.json"),
+            serde_json::to_vec_pretty(&identity).unwrap(),
+        )
+        .map_err(|err| Error::invalid(err.to_string()))?;
+        std::fs::write(
+            dest.join("restored-domain.json"),
+            serde_json::to_vec(&domain).unwrap(),
+        )
+        .map_err(|err| Error::invalid(err.to_string()))?;
+        Ok(())
     }
 
     pub async fn snapshot(&self) -> Result<()> {
@@ -481,7 +787,7 @@ impl Engine {
 
     pub async fn progress(&self, run: RunId) -> Result<()> {
         self.commit_progress(run).await?;
-        self.notify.notify_one();
+        wake(&self.notify);
         Ok(())
     }
 
@@ -497,6 +803,9 @@ impl Engine {
     pub async fn shutdown(&self) -> Result<()> {
         if let Some(worker) = &self.worker {
             worker.abort();
+        }
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.abort();
         }
         self.control.abort();
         if let Some(server) = &self.raft_server {
@@ -523,6 +832,9 @@ impl Drop for Engine {
     fn drop(&mut self) {
         if let Some(worker) = &self.worker {
             worker.abort();
+        }
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.abort();
         }
         self.control.abort();
         if let Some(server) = &self.raft_server {
@@ -604,6 +916,7 @@ async fn control_loop(
     raft: Raft<TypeConfig>,
     storage: StorageHandle,
     notify: Arc<Notify>,
+    cluster_net: Option<ClusterNetwork>,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -612,8 +925,9 @@ async fn control_loop(
         let raft = raft.clone();
         let storage = storage.clone();
         let notify = notify.clone();
+        let cluster_net = cluster_net.clone();
         tokio::spawn(async move {
-            let _ = handle_control(stream, raft, storage, notify).await;
+            let _ = handle_control(stream, raft, storage, notify, cluster_net).await;
         });
     }
 }
@@ -623,6 +937,7 @@ async fn handle_control(
     raft: Raft<TypeConfig>,
     storage: StorageHandle,
     notify: Arc<Notify>,
+    cluster_net: Option<ClusterNetwork>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -632,7 +947,7 @@ async fn handle_control(
         .map_err(|err| Error::invalid(err.to_string()))?;
     let req: ControlRequest =
         serde_json::from_str(&line).map_err(|err| Error::invalid(err.to_string()))?;
-    let resp = dispatch_control(req, &raft, &storage, &notify).await;
+    let resp = dispatch_control(req, &raft, &storage, &notify, cluster_net.as_ref()).await;
     let mut out = serde_json::to_string(&resp).unwrap();
     out.push('\n');
     let mut stream = reader.into_inner();
@@ -648,9 +963,20 @@ async fn dispatch_control(
     raft: &Raft<TypeConfig>,
     storage: &StorageHandle,
     notify: &Notify,
+    cluster_net: Option<&ClusterNetwork>,
 ) -> ControlResponse {
     let result = match req {
-        ControlRequest::Health => Ok(serde_json::json!({"status":"ok","mode":"local"})),
+        ControlRequest::Health => {
+            let metrics = raft.metrics().borrow().clone();
+            let state = storage.query_state().await;
+            Ok(health_view(
+                format!("{:?}", metrics.state),
+                metrics.last_applied.map(|id| id.index),
+                metrics.last_log_index,
+                metrics.membership_config.voter_ids().collect(),
+                &state,
+            ))
+        }
         ControlRequest::List => {
             let state = storage.query_state().await;
             let runs: Vec<_> = state
@@ -722,7 +1048,7 @@ async fn dispatch_control(
                 )
                 .await
                 .map(|_| {
-                    notify.notify_one();
+                    wake(notify);
                     serde_json::json!({"status":"ok"})
                 }),
                 Err(err) => Err(err),
@@ -739,7 +1065,7 @@ async fn dispatch_control(
             )
             .await
             .map(|_| {
-                notify.notify_one();
+                wake(notify);
                 serde_json::json!({"status":"ok"})
             }),
             Err(err) => Err(Error::invalid(err)),
@@ -770,6 +1096,105 @@ async fn dispatch_control(
             .snapshot()
             .await
             .map(|_| serde_json::json!({"status":"ok"}))
+            .map_err(|err| Error::invalid(err.to_string())),
+        ControlRequest::Acknowledge { reason } => write_raft(
+            raft,
+            Command {
+                id: CommandId::generate(),
+                time: now(),
+                body: CommandBody::AcknowledgeRecovery { reason },
+            },
+        )
+        .await
+        .map(|_| {
+            wake(notify);
+            serde_json::json!({"status":"ok"})
+        }),
+        ControlRequest::ResolveBlocked {
+            run,
+            forward,
+            input,
+        } => match (
+            RunId::from_hex(&run),
+            crate::ids::ActivationId::from_hex(&forward),
+        ) {
+            (Ok(run), Ok(forward)) => write_raft(
+                raft,
+                Command {
+                    id: CommandId::generate(),
+                    time: now(),
+                    body: CommandBody::ResolveBlocked {
+                        run,
+                        forward,
+                        input,
+                    },
+                },
+            )
+            .await
+            .map(|_| {
+                wake(notify);
+                serde_json::json!({"status":"ok"})
+            }),
+            (Err(err), _) | (_, Err(err)) => Err(Error::invalid(err)),
+        },
+        ControlRequest::Abandon { run, reason } => match RunId::from_hex(&run) {
+            Ok(run) => write_raft(
+                raft,
+                Command {
+                    id: CommandId::generate(),
+                    time: now(),
+                    body: CommandBody::AbandonCompensation { run, reason },
+                },
+            )
+            .await
+            .map(|_| {
+                wake(notify);
+                serde_json::json!({"status":"ok"})
+            }),
+            Err(err) => Err(Error::invalid(err)),
+        },
+        ControlRequest::Join {
+            node_id,
+            addr,
+            ca_pem,
+            cert_pem,
+            key_pem,
+            server_name,
+        } => match (cluster_net, addr.parse::<std::net::SocketAddr>()) {
+            (None, _) => Err(Error::invalid("join requires a clustered member")),
+            (_, Err(err)) => Err(Error::invalid(err.to_string())),
+            (Some(net), Ok(parsed)) => {
+                net.insert_peer(
+                    node_id,
+                    parsed,
+                    crate::tls::TlsMaterial {
+                        ca_pem,
+                        cert_pem,
+                        key_pem,
+                        server_name,
+                    },
+                );
+                raft.add_learner(node_id, BasicNode::new(parsed.to_string()), true)
+                    .await
+                    .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
+                    .map_err(|err| Error::invalid(err.to_string()))
+            }
+        },
+        ControlRequest::Promote { node_id } => raft
+            .change_membership(
+                ChangeMembers::AddVoterIds(std::iter::once(node_id).collect()),
+                true,
+            )
+            .await
+            .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
+            .map_err(|err| Error::invalid(err.to_string())),
+        ControlRequest::Remove { node_id } => raft
+            .change_membership(
+                ChangeMembers::RemoveVoters(std::iter::once(node_id).collect()),
+                false,
+            )
+            .await
+            .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
             .map_err(|err| Error::invalid(err.to_string())),
     };
     match result {
@@ -815,7 +1240,7 @@ async fn start_via_raft(
         },
     )
     .await?;
-    notify.notify_one();
+    wake(notify);
     Ok(run)
 }
 
@@ -855,7 +1280,7 @@ async fn wait_via_raft(
             },
         )
         .await;
-        notify.notify_one();
+        wake(notify);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -888,8 +1313,30 @@ async fn snapshot_controller(raft: Raft<TypeConfig>, _storage: StorageHandle) {
     }
 }
 
+async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc<Notify>) {
+    loop {
+        tokio::select! {
+            _ = notify.notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        let state = storage.query_state().await;
+        for run in active_runs(&state) {
+            let _ = write_raft(
+                &raft,
+                Command {
+                    id: CommandId::generate(),
+                    time: now(),
+                    body: CommandBody::Progress { run },
+                },
+            )
+            .await;
+        }
+    }
+}
+
 async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc<Notify>) {
     let session = crate::ids::WorkerSessionId::generate();
+    let blocking_slots = Arc::new(Semaphore::new(limits::BLOCKING_POOL_DEFAULT as usize));
     let _ = write_raft(
         &raft,
         Command {
@@ -904,18 +1351,9 @@ async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc
     )
     .await;
     loop {
-        notify.notified().await;
-        let state = storage.query_state().await;
-        for run in active_runs(&state) {
-            let _ = write_raft(
-                &raft,
-                Command {
-                    id: CommandId::generate(),
-                    time: now(),
-                    body: CommandBody::Progress { run },
-                },
-            )
-            .await;
+        tokio::select! {
+            _ = notify.notified() => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
         let claim = Command {
             id: CommandId::generate(),
@@ -946,7 +1384,11 @@ async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc
                 })
                 .is_some_and(|contract| contract.execution == ExecutionKind::Blocking);
             if assignment.role == crate::ids::ExecutionRole::Reconciliation {
-                let outcome = builtin_reconcile(&assignment.activity_name, &assignment.input);
+                let outcome = builtin_reconcile(
+                    &assignment.activity_name,
+                    &assignment.input,
+                    Some(&assignment.effect_key.to_hex()),
+                );
                 let _ = write_raft(
                     &raft,
                     Command {
@@ -968,13 +1410,24 @@ async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc
                 let output = if blocking {
                     let name = assignment.activity_name.clone();
                     let input = assignment.input.clone();
-                    match tokio::task::spawn_blocking(move || builtin_handler(&name, &input)).await
+                    let Ok(permit) = blocking_slots.clone().acquire_owned().await else {
+                        continue;
+                    };
+                    match tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        builtin_handler(&name, &input)
+                    })
+                    .await
                     {
                         Ok(Ok(output)) => output,
                         _ => continue,
                     }
                 } else {
-                    match builtin_handler(&assignment.activity_name, &assignment.input) {
+                    match dispatch_handler(
+                        &assignment.activity_name,
+                        &assignment.input,
+                        Some(&assignment.effect_key.to_hex()),
+                    ) {
                         Ok(output) => output,
                         Err(_) => continue,
                     }
@@ -999,12 +1452,20 @@ async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc
             did_work = true;
         }
         if did_work {
-            notify.notify_one();
+            wake(&notify);
         }
     }
 }
 
 pub fn builtin_handler(name: &str, input: &Value) -> Result<Value> {
+    dispatch_handler(name, input, None)
+}
+
+pub(crate) fn dispatch_handler(
+    name: &str,
+    input: &Value,
+    effect_key: Option<&str>,
+) -> Result<Value> {
     match name {
         "counter.increment" => {
             let Value::Object(fields) = input else {
@@ -1024,31 +1485,38 @@ pub fn builtin_handler(name: &str, input: &Value) -> Result<Value> {
             let Value::Object(fields) = input else {
                 return Err(Error::invalid("order input"));
             };
-            let mut out = fields.clone();
-            out.insert(
-                "reservation_id".to_owned(),
-                Value::String("res-1".to_owned()),
-            );
-            Ok(Value::Object(out))
+            let order_id = fields
+                .get("order_id")
+                .cloned()
+                .unwrap_or(Value::String(String::new()));
+            let amount = fields.get("amount").cloned().unwrap_or(Value::Int(0));
+            keyed_output(effect_key, "forward", || {
+                Value::Object(BTreeMap::from([
+                    ("order_id".to_owned(), order_id.clone()),
+                    ("amount".to_owned(), amount.clone()),
+                    (
+                        "reservation_id".to_owned(),
+                        Value::String("res-1".to_owned()),
+                    ),
+                ]))
+            })
         }
         "payment.charge" => {
             let Value::Object(fields) = input else {
                 return Err(Error::invalid("reserved input"));
             };
-            Ok(Value::Object(BTreeMap::from([
-                (
-                    "order_id".to_owned(),
-                    fields
-                        .get("order_id")
-                        .cloned()
-                        .unwrap_or(Value::String(String::new())),
-                ),
-                (
-                    "amount".to_owned(),
-                    fields.get("amount").cloned().unwrap_or(Value::Int(0)),
-                ),
-                ("payment_id".to_owned(), Value::String("pay-1".to_owned())),
-            ])))
+            let order_id = fields
+                .get("order_id")
+                .cloned()
+                .unwrap_or(Value::String(String::new()));
+            let amount = fields.get("amount").cloned().unwrap_or(Value::Int(0));
+            keyed_output(effect_key, "forward", || {
+                Value::Object(BTreeMap::from([
+                    ("order_id".to_owned(), order_id.clone()),
+                    ("amount".to_owned(), amount.clone()),
+                    ("payment_id".to_owned(), Value::String("pay-1".to_owned())),
+                ]))
+            })
         }
         "tax.quote" => {
             let Value::Object(fields) = input else {
@@ -1064,8 +1532,23 @@ pub fn builtin_handler(name: &str, input: &Value) -> Result<Value> {
             "cents".to_owned(),
             Value::Int(500),
         )]))),
+        "test.block" => {
+            BLOCKING_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(400));
+            BLOCKING_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+            Ok(input.clone())
+        }
         "remote.echo" | "test.gate" => Ok(input.clone()),
-        "inventory.release" | "payment.refund" => Ok(Value::Null),
+        "inventory.release" | "payment.refund" => {
+            if name == "inventory.release" && SLOW_RELEASE.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(800));
+            }
+            if let Some(key) = effect_key {
+                let undo = format!("{key}:undo");
+                apply_keyed(&undo, "compensate", Value::Null)?;
+            }
+            Ok(Value::Null)
+        }
         "test.manual" => Ok(input.clone()),
         _ => Ok(input.clone()),
     }
@@ -1074,7 +1557,28 @@ pub fn builtin_handler(name: &str, input: &Value) -> Result<Value> {
 pub fn builtin_reconcile(
     name: &str,
     input: &Value,
+    effect_key: Option<&str>,
 ) -> (crate::domain::ReconcileOutcome, Option<Value>) {
+    if let (Some(url), Some(key)) = (crate::provider::provider_url(), effect_key) {
+        match crate::provider::probe_effect(&url, key) {
+            Ok(resp) => {
+                return match resp.status {
+                    crate::provider::EffectStatus::Applied => (
+                        crate::domain::ReconcileOutcome::Applied,
+                        resp.output.or_else(|| Some(input.clone())),
+                    ),
+                    crate::provider::EffectStatus::NotApplied => {
+                        (crate::domain::ReconcileOutcome::NotApplied, None)
+                    }
+                    crate::provider::EffectStatus::Pending
+                    | crate::provider::EffectStatus::Unknown => {
+                        (crate::domain::ReconcileOutcome::Unknown, None)
+                    }
+                };
+            }
+            Err(_) => return (crate::domain::ReconcileOutcome::Unknown, None),
+        }
+    }
     match name {
         "test.lookup" | "inventory.lookup" | "payment.lookup" => (
             crate::domain::ReconcileOutcome::Applied,
@@ -1087,6 +1591,8 @@ pub fn builtin_reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static COMPENSATION_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn catalog() -> Catalog {
         Catalog::from_json(include_bytes!(
@@ -1130,6 +1636,16 @@ mod tests {
         engine.shutdown().await.unwrap();
         let replayed = replay(dir.path()).unwrap();
         assert!(run_output(&replayed, run).is_some());
+        let before = std::fs::metadata(dir.path().join("member.redb"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let _ = replay(dir.path()).unwrap();
+        let after = std::fs::metadata(dir.path().join("member.redb"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after, "readonly replay must not write the store");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1207,6 +1723,8 @@ mod tests {
             .map(|entries| entries.filter_map(|e| e.ok()).count())
             .unwrap_or(0);
         assert!(found > 0, "expected snapshot file in {}", snaps.display());
+        let replayed = replay(dir.path()).unwrap();
+        assert!(run_output(&replayed, run).is_some());
     }
 
     #[test]
@@ -1222,7 +1740,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "applies 20_000 raft entries"]
+    #[ignore = "applies 20_000 raft entries (~4 min)"]
     async fn snapshot_controller_fires_at_20000_entries() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::local(dir.path()).await.unwrap();
@@ -1287,5 +1805,511 @@ mod tests {
             "controller did not write a snapshot after {applied} applied entries in {}",
             snaps.display()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_saga_failure_compensates() {
+        let _guard = COMPENSATION_TEST.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/saga.yaml"),
+                &catalog(),
+                Value::Object(BTreeMap::from([
+                    ("order_id".to_owned(), Value::String("o1".to_owned())),
+                    ("amount".to_owned(), Value::Int(1000)),
+                    ("fail_after_payment".to_owned(), Value::Bool(true)),
+                ])),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = engine.inspect(run).await.unwrap();
+            let failed = matches!(
+                state.runs.get(&run).unwrap().status,
+                RunStatus::Failed { .. }
+            );
+            let compensated =
+                state.obligations.iter().all(|item| {
+                    matches!(item.status, crate::domain::ObligationStatus::Compensated)
+                }) && !state.obligations.is_empty();
+            if failed && compensated {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "saga did not compensate; failed={failed} obligations={}",
+                    state.obligations.len()
+                );
+            }
+            let _ = engine.progress(run).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let events = engine.history(run).await.unwrap();
+        let handlers: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::domain::DomainEvent::CompensationStarted { handler, .. } => {
+                    Some(handler.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(handlers, ["payment.refund", "inventory.release"]);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_nested_saga_transfers() {
+        let _guard = COMPENSATION_TEST.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/nested-saga.yaml"),
+                &catalog(),
+                order(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = engine.inspect(run).await.unwrap();
+            let failed = matches!(
+                state.runs.get(&run).unwrap().status,
+                RunStatus::Failed { .. }
+            );
+            let compensated = state.obligations.iter().all(|item| {
+                matches!(
+                    item.status,
+                    crate::domain::ObligationStatus::Compensated
+                        | crate::domain::ObligationStatus::Released
+                )
+            }) && !state.obligations.is_empty();
+            if failed && compensated {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("nested saga did not settle");
+            }
+            let _ = engine.progress(run).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let events = engine.history(run).await.unwrap();
+        let handlers: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::domain::DomainEvent::CompensationStarted { handler, .. } => {
+                    Some(handler.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(handlers, ["payment.refund", "inventory.release"]);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_cancel_does_not_prove_termination() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let yaml = r#"
+dsl: graphrun/v1
+id: block_once
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: block
+nodes:
+  block:
+    kind: activity
+    activity: {name: test.block, version: 1}
+    input: {from: workflow.input}
+    next: done
+  done:
+    kind: complete
+    output: {from: nodes.block.output}
+"#;
+        let run = engine
+            .start_yaml(
+                yaml,
+                &catalog(),
+                Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(1))])),
+            )
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        loop {
+            if BLOCKING_IN_FLIGHT.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(5) {
+                panic!("blocking handler never entered");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        engine.cancel(run, "stop").await.unwrap();
+        assert_eq!(
+            BLOCKING_IN_FLIGHT.load(Ordering::SeqCst),
+            1,
+            "cancel must not terminate the blocking thread"
+        );
+        let _ = engine.inspect(run).await.unwrap();
+        let _ = engine.progress(run).await;
+        let inflight_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while BLOCKING_IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+            if tokio::time::Instant::now() >= inflight_deadline {
+                panic!("blocking handler never returned");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let state = engine.inspect(run).await.unwrap();
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Failed { .. }
+        ));
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_unfinished_parallel_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+dsl: graphrun/v1
+id: unfinished_parallel
+version: 1
+input_schema: unit/v1
+output_schema: {tuple: [approval/v1, approval/v1]}
+signals:
+  approval: {schema: approval/v1}
+start: both
+nodes:
+  both:
+    kind: parallel
+    branches:
+      - name: left
+        input: {literal: null}
+        body:
+          input_schema: unit/v1
+          output_schema: approval/v1
+          start: wait
+          nodes:
+            wait:
+              kind: wait_signal
+              signal: approval
+              key: {literal: "k1"}
+              consume_from: buffered
+              timeout: null
+              next: done
+            done:
+              kind: complete
+              output: {from: nodes.wait.output}
+      - name: right
+        input: {literal: null}
+        body:
+          input_schema: unit/v1
+          output_schema: approval/v1
+          start: wait
+          nodes:
+            wait:
+              kind: wait_signal
+              signal: approval
+              key: {literal: "k2"}
+              consume_from: buffered
+              timeout: null
+              next: done
+            done:
+              kind: complete
+              output: {from: nodes.wait.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.both.output}
+"#;
+        let run = {
+            let engine = Engine::local(dir.path()).await.unwrap();
+            let run = engine
+                .start_yaml(yaml, &catalog(), Value::Null)
+                .await
+                .unwrap();
+            let mut opened = false;
+            for _ in 0..50 {
+                engine.progress(run).await.unwrap();
+                let state = engine.inspect(run).await.unwrap();
+                let pending = state.waits.values().filter(|wait| wait.pending).count();
+                let branches: Vec<_> = state
+                    .scopes
+                    .values()
+                    .filter_map(|scope| match &scope.role {
+                        crate::domain::ScopeRole::ParallelBranch { name, .. } => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if pending == 2 && branches.len() == 2 {
+                    assert!(branches.contains(&"left".to_owned()));
+                    assert!(branches.contains(&"right".to_owned()));
+                    engine.snapshot().await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    opened = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(opened, "parallel waits did not open");
+            engine.shutdown().await.unwrap();
+            run
+        };
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let state = engine.inspect(run).await.unwrap();
+        let branches: Vec<_> = state
+            .scopes
+            .values()
+            .filter_map(|scope| match &scope.role {
+                crate::domain::ScopeRole::ParallelBranch { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(branches.len(), 2);
+        assert!(state.waits.values().filter(|wait| wait.pending).count() >= 1);
+        engine
+            .signal(
+                run,
+                EventId::generate(),
+                "approval",
+                "k1",
+                Value::Object(BTreeMap::from([("approved".to_owned(), Value::Bool(true))])),
+            )
+            .await
+            .unwrap();
+        engine
+            .signal(
+                run,
+                EventId::generate(),
+                "approval",
+                "k2",
+                Value::Object(BTreeMap::from([("approved".to_owned(), Value::Bool(true))])),
+            )
+            .await
+            .unwrap();
+        let output = engine
+            .wait_terminal(run, Duration::from_secs(10))
+            .await
+            .unwrap();
+        let Value::Array(items) = output else {
+            panic!("tuple");
+        };
+        assert_eq!(items.len(), 2);
+        let state = engine.inspect(run).await.unwrap();
+        let branch_count = state
+            .scopes
+            .values()
+            .filter(|scope| matches!(scope.role, crate::domain::ScopeRole::ParallelBranch { .. }))
+            .count();
+        assert_eq!(
+            branch_count, 2,
+            "snapshot restore must not duplicate branches"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_during_saga_compensates() {
+        let _guard = COMPENSATION_TEST.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/saga.yaml"),
+                &catalog(),
+                order(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = engine.inspect(run).await.unwrap();
+            if state
+                .obligations
+                .iter()
+                .any(|item| item.handler == "inventory.release")
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("reserve obligation never registered");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        engine.cancel(run, "stop").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let state = engine.inspect(run).await.unwrap();
+            let cancelled = matches!(
+                &state.runs.get(&run).unwrap().status,
+                RunStatus::Failed { error } if error.code == "run.cancelled"
+            );
+            let compensated = !state.obligations.is_empty()
+                && state.obligations.iter().all(|item| {
+                    matches!(item.status, crate::domain::ObligationStatus::Compensated)
+                });
+            if cancelled && compensated {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("cancel did not compensate");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compensation_resumes_after_restart() {
+        let _guard = COMPENSATION_TEST.lock().await;
+        SLOW_RELEASE.store(true, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let run = {
+            let engine = Engine::local(dir.path()).await.unwrap();
+            let run = engine
+                .start_yaml(
+                    include_str!("../../docs/specs/v1/examples/saga.yaml"),
+                    &catalog(),
+                    Value::Object(BTreeMap::from([
+                        ("order_id".to_owned(), Value::String("o1".to_owned())),
+                        ("amount".to_owned(), Value::Int(1000)),
+                        ("fail_after_payment".to_owned(), Value::Bool(true)),
+                    ])),
+                )
+                .await
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                let state = engine.inspect(run).await.unwrap();
+                let refunded = state.obligations.iter().any(|item| {
+                    item.handler == "payment.refund"
+                        && matches!(item.status, crate::domain::ObligationStatus::Compensated)
+                });
+                let release_open = state.obligations.iter().any(|item| {
+                    item.handler == "inventory.release"
+                        && !matches!(item.status, crate::domain::ObligationStatus::Compensated)
+                });
+                if refunded && release_open {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    SLOW_RELEASE.store(false, Ordering::SeqCst);
+                    panic!("did not catch mid-compensation");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            engine.shutdown().await.unwrap();
+            run
+        };
+        SLOW_RELEASE.store(false, Ordering::SeqCst);
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let state = engine.inspect(run).await.unwrap();
+            let done = !state.obligations.is_empty()
+                && state.obligations.iter().all(|item| {
+                    matches!(item.status, crate::domain::ObligationStatus::Compensated)
+                });
+            if done {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("compensation did not resume");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let events = engine.history(run).await.unwrap();
+        let releases = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::domain::DomainEvent::CompensationStarted { handler, .. } if handler == "inventory.release"
+                )
+            })
+            .count();
+        assert_eq!(releases, 1);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn logical_restore_suspends_until_authorized() {
+        let src = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let run = {
+            let engine = Engine::local(src.path()).await.unwrap();
+            let run = engine
+                .start_yaml(
+                    include_str!("../../docs/specs/v1/examples/events.yaml"),
+                    &catalog(),
+                    Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                )
+                .await
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let state = engine.inspect(run).await.unwrap();
+                if state.waits.values().any(|wait| wait.pending) {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("wait never opened");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            engine.shutdown().await.unwrap();
+            Engine::backup(src.path(), backup.path()).unwrap();
+            run
+        };
+        Engine::restore(backup.path(), dest.path(), "disaster").unwrap();
+        let identity = std::fs::read_to_string(dest.path().join("identity.json")).unwrap();
+        assert!(identity.contains("graphrun-restored-"));
+        assert!(!dest.path().join("member.redb").exists());
+        let engine = Engine::local(dest.path()).await.unwrap();
+        let state = engine.inspect(run).await.unwrap();
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Active
+        ));
+        assert!(state.recovery.as_ref().is_some_and(|hold| !hold.authorized));
+        let err = engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                &catalog(),
+                order(),
+            )
+            .await
+            .expect_err("start must stay suspended");
+        assert!(err.to_string().contains("suspended"));
+        engine
+            .acknowledge_recovery("operator authorized restore")
+            .await
+            .unwrap();
+        engine
+            .signal(
+                run,
+                EventId::generate(),
+                "approval",
+                "k1",
+                Value::Object(BTreeMap::from([("approved".to_owned(), Value::Bool(true))])),
+            )
+            .await
+            .unwrap();
+        let output = engine
+            .wait_terminal(run, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(output.pointer("/approved").unwrap(), &Value::Bool(true));
+        engine.shutdown().await.unwrap();
     }
 }

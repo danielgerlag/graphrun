@@ -21,3 +21,4 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tonic.workspace = true

@@ -24,7 +24,7 @@ struct ConnectArgs {
     ca: Option<PathBuf>,
     #[arg(long)]
     cert: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long = "tls-key", id = "tls_key")]
     key: Option<PathBuf>,
     #[arg(long)]
     server_name: Option<String>,
@@ -67,7 +67,7 @@ enum Commands {
         run: String,
         #[arg(long)]
         name: String,
-        #[arg(long)]
+        #[arg(long, id = "wait_key")]
         key: String,
         #[arg(long)]
         event_id: String,
@@ -111,6 +111,18 @@ enum Commands {
         run: String,
         #[arg(long)]
         reason: String,
+        #[arg(long, default_value_t = false)]
+        confirm: bool,
+        #[arg(long, default_value_t = false)]
+        abandon: bool,
+        #[arg(long, default_value_t = false)]
+        ack: bool,
+        #[arg(long)]
+        blocked_input: Option<PathBuf>,
+        #[arg(long)]
+        forward: Option<String>,
+        #[command(flatten)]
+        connect: ConnectArgs,
     },
     Cluster {
         #[command(subcommand)]
@@ -132,6 +144,10 @@ enum Commands {
         #[arg(long)]
         reason: Option<String>,
     },
+    Serve {
+        #[arg(long)]
+        local_dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -140,9 +156,34 @@ enum ClusterCommands {
         #[command(flatten)]
         connect: ConnectArgs,
     },
-    Join,
-    Promote,
-    Remove,
+    Join {
+        #[arg(long)]
+        node_id: u64,
+        #[arg(long)]
+        addr: String,
+        #[arg(long = "peer-ca")]
+        peer_ca: PathBuf,
+        #[arg(long = "peer-cert")]
+        peer_cert: PathBuf,
+        #[arg(long = "peer-tls-key")]
+        peer_key: PathBuf,
+        #[arg(long = "peer-server-name")]
+        peer_server_name: String,
+        #[command(flatten)]
+        connect: ConnectArgs,
+    },
+    Promote {
+        #[arg(long)]
+        node_id: u64,
+        #[command(flatten)]
+        connect: ConnectArgs,
+    },
+    Remove {
+        #[arg(long)]
+        node_id: u64,
+        #[command(flatten)]
+        connect: ConnectArgs,
+    },
 }
 
 #[tokio::main]
@@ -342,14 +383,7 @@ async fn run() -> Result<(), String> {
             Ok(())
         }
         Commands::Backup { out, local_dir } => {
-            std::fs::create_dir_all(&out).map_err(|err| err.to_string())?;
-            let src = local_dir.join("member.redb");
-            std::fs::copy(&src, out.join("member.redb")).map_err(|err| err.to_string())?;
-            let identity = local_dir.join("identity.json");
-            if identity.exists() {
-                std::fs::copy(&identity, out.join("identity.json"))
-                    .map_err(|err| err.to_string())?;
-            }
+            Engine::backup(&local_dir, &out).map_err(|err| err.to_string())?;
             println!(
                 "{}",
                 serde_json::json!({"status":"ok","from": local_dir.display().to_string()})
@@ -365,21 +399,38 @@ async fn run() -> Result<(), String> {
             if !confirm {
                 return Err("restore requires --confirm and --reason".to_owned());
             }
-            if reason.as_deref().unwrap_or("").is_empty() {
+            let reason = reason.unwrap_or_default();
+            if reason.is_empty() {
                 return Err("restore requires --reason".to_owned());
             }
-            std::fs::create_dir_all(&local_dir).map_err(|err| err.to_string())?;
-            std::fs::copy(from.join("member.redb"), local_dir.join("member.redb"))
-                .map_err(|err| err.to_string())?;
-            let identity = from.join("identity.json");
-            if identity.exists() {
-                std::fs::copy(&identity, local_dir.join("identity.json"))
-                    .map_err(|err| err.to_string())?;
-            }
+            Engine::restore(&from, &local_dir, &reason).map_err(|err| err.to_string())?;
             println!(
                 "{}",
                 serde_json::json!({"status":"ok","restored": local_dir.display().to_string()})
             );
+            Ok(())
+        }
+        Commands::Serve { local_dir } => {
+            let engine = Engine::local(&local_dir)
+                .await
+                .map_err(|err| err.to_string())?;
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .map_err(|err| err.to_string())?;
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c()
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+            engine.shutdown().await.map_err(|err| err.to_string())?;
             Ok(())
         }
         Commands::Cluster {
@@ -395,8 +446,89 @@ async fn run() -> Result<(), String> {
             println!("{body}");
             Ok(())
         }
-        Commands::Resolve { .. } | Commands::Cluster { .. } => {
-            Err("cluster membership commands are not implemented in this build".to_owned())
+        Commands::Cluster {
+            command:
+                ClusterCommands::Join {
+                    node_id,
+                    addr,
+                    peer_ca,
+                    peer_cert,
+                    peer_key,
+                    peer_server_name,
+                    connect,
+                },
+        } => {
+            let local_dir = require_local(connect.local_dir)?;
+            let body = dispatch(
+                &local_dir,
+                ControlRequest::Join {
+                    node_id,
+                    addr,
+                    ca_pem: std::fs::read_to_string(peer_ca).map_err(|err| err.to_string())?,
+                    cert_pem: std::fs::read_to_string(peer_cert).map_err(|err| err.to_string())?,
+                    key_pem: std::fs::read_to_string(peer_key).map_err(|err| err.to_string())?,
+                    server_name: peer_server_name,
+                },
+                false,
+            )
+            .await?;
+            println!("{body}");
+            Ok(())
+        }
+        Commands::Cluster {
+            command: ClusterCommands::Promote { node_id, connect },
+        } => {
+            let local_dir = require_local(connect.local_dir)?;
+            let body = dispatch(&local_dir, ControlRequest::Promote { node_id }, false).await?;
+            println!("{body}");
+            Ok(())
+        }
+        Commands::Cluster {
+            command: ClusterCommands::Remove { node_id, connect },
+        } => {
+            let local_dir = require_local(connect.local_dir)?;
+            let body = dispatch(&local_dir, ControlRequest::Remove { node_id }, false).await?;
+            println!("{body}");
+            Ok(())
+        }
+        Commands::Resolve {
+            run,
+            reason,
+            confirm,
+            abandon,
+            ack,
+            blocked_input,
+            forward,
+            connect,
+        } => {
+            if reason.is_empty() {
+                return Err("resolve requires --reason".to_owned());
+            }
+            let local_dir = require_local(connect.local_dir)?;
+            let req = if ack {
+                ControlRequest::Acknowledge { reason }
+            } else if abandon {
+                if !confirm {
+                    return Err(
+                        "compensation abandonment requires --confirm and --reason".to_owned()
+                    );
+                }
+                ControlRequest::Abandon { run, reason }
+            } else if let (Some(path), Some(forward)) = (blocked_input, forward) {
+                ControlRequest::ResolveBlocked {
+                    run,
+                    forward,
+                    input: load_value(&path)?,
+                }
+            } else {
+                return Err(
+                    "resolve requires --ack, --abandon --confirm, or --blocked-input with --forward"
+                        .to_owned(),
+                );
+            };
+            let body = dispatch(&local_dir, req, false).await?;
+            println!("{body}");
+            Ok(())
         }
     }
 }
@@ -420,7 +552,7 @@ async fn grpc_client(connect: &ConnectArgs) -> Result<Option<GrpcClient>, String
     let key = connect
         .key
         .as_ref()
-        .ok_or_else(|| "--key is required with --endpoint".to_owned())?;
+        .ok_or_else(|| "--tls-key is required with --endpoint".to_owned())?;
     let server_name = connect
         .server_name
         .clone()
@@ -506,7 +638,7 @@ async fn dispatch(
                 let events = engine.history(id).await.map_err(|err| err.to_string())?;
                 serde_json::to_value(events).map_err(|err| err.to_string())?
             }
-            ControlRequest::Health => serde_json::json!({"status":"ok","mode":"local"}),
+            ControlRequest::Health => engine.health().await,
             _ => unreachable!(),
         };
         engine.shutdown().await.map_err(|err| err.to_string())?;
@@ -571,6 +703,46 @@ async fn dispatch(
             let run = RunId::from_hex(&run)?;
             engine
                 .cancel(run, &reason)
+                .await
+                .map_err(|err| err.to_string())?;
+            engine.shutdown().await.map_err(|err| err.to_string())?;
+            Ok(serde_json::json!({"status":"ok"}))
+        }
+        ControlRequest::Acknowledge { reason } => {
+            let engine = Engine::local(local_dir)
+                .await
+                .map_err(|err| err.to_string())?;
+            engine
+                .acknowledge_recovery(&reason)
+                .await
+                .map_err(|err| err.to_string())?;
+            engine.shutdown().await.map_err(|err| err.to_string())?;
+            Ok(serde_json::json!({"status":"ok"}))
+        }
+        ControlRequest::Abandon { run, reason } => {
+            let engine = Engine::local(local_dir)
+                .await
+                .map_err(|err| err.to_string())?;
+            let run = RunId::from_hex(&run)?;
+            engine
+                .abandon_compensation(run, &reason)
+                .await
+                .map_err(|err| err.to_string())?;
+            engine.shutdown().await.map_err(|err| err.to_string())?;
+            Ok(serde_json::json!({"status":"ok"}))
+        }
+        ControlRequest::ResolveBlocked {
+            run,
+            forward,
+            input,
+        } => {
+            let engine = Engine::local(local_dir)
+                .await
+                .map_err(|err| err.to_string())?;
+            let run = RunId::from_hex(&run)?;
+            let forward = graphrun::ids::ActivationId::from_hex(&forward)?;
+            engine
+                .resolve_blocked(run, forward, input)
                 .await
                 .map_err(|err| err.to_string())?;
             engine.shutdown().await.map_err(|err| err.to_string())?;

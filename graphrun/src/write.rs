@@ -1,20 +1,62 @@
 use crate::domain::{Command, ObligationStatus, State, run_events};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::ids::RunId;
 use crate::storage::{RaftRequest, TypeConfig};
 use crate::time::EngineTime;
 use openraft::Raft;
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+static WALL_WATERMARK_MS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static LOCAL_CLOCK_WATERMARK: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
 pub(crate) fn now() -> EngineTime {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    let ms = wall_ms();
+    WALL_WATERMARK_MS.fetch_max(ms, Ordering::SeqCst);
     EngineTime::from_millis(ms)
 }
 
+fn wall_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+pub(crate) fn clock_is_safe() -> bool {
+    let ms = wall_ms();
+    let watermark = LOCAL_CLOCK_WATERMARK
+        .with(Cell::get)
+        .unwrap_or_else(|| WALL_WATERMARK_MS.load(Ordering::SeqCst));
+    ms.saturating_add(2_000) >= watermark
+}
+
+#[cfg(test)]
+pub fn inject_clock_watermark(ms: u64) {
+    LOCAL_CLOCK_WATERMARK.with(|cell| cell.set(Some(ms)));
+}
+
+#[cfg(test)]
+pub fn clear_clock_watermark() {
+    LOCAL_CLOCK_WATERMARK.with(|cell| cell.set(None));
+}
+
 pub(crate) async fn write_raft(raft: &Raft<TypeConfig>, command: Command) -> Result<()> {
+    if !clock_is_safe() {
+        return Err(Error::new(ErrorKind::FailedPrecondition, "clock rollback"));
+    }
+    let metrics = raft.metrics().borrow().clone();
+    let last_log = metrics.last_log_index.unwrap_or(0);
+    let applied = metrics.last_applied.map(|id| id.index).unwrap_or(0);
+    let pending = last_log.saturating_sub(applied);
+    let encoded = serde_json::to_vec(&command)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0);
+    admit_unapplied(pending, pending.saturating_add(1).saturating_mul(encoded))?;
     let resp = raft
         .client_write(RaftRequest { command })
         .await
@@ -55,6 +97,9 @@ pub(crate) fn inspect_view(state: &State, run: RunId) -> serde_json::Value {
                     ObligationStatus::Compensating { .. } => "compensating",
                     ObligationStatus::Compensated => "compensated",
                     ObligationStatus::Released => "released",
+                    ObligationStatus::Blocked { .. } => "blocked",
+                    ObligationStatus::Irreversible { .. } => "irreversible",
+                    ObligationStatus::Abandoned => "abandoned",
                 },
             })
         })
@@ -82,5 +127,165 @@ pub(crate) fn inspect_view(state: &State, run: RunId) -> serde_json::Value {
         "pending_waits": waits,
         "obligations": obligations,
         "event_count": run_events(state, run).len(),
+        "recovery": state.recovery.as_ref().map(|hold| {
+            serde_json::json!({
+                "reason": hold.reason,
+                "authorized": hold.authorized,
+                "suspended": !hold.authorized,
+            })
+        }),
+        "blocked_reason": stall_reason(state, run),
+        "ready_leaves": state
+            .activations
+            .values()
+            .filter(|act| act.run == run && act.status == crate::domain::ActivationStatus::Ready)
+            .count(),
+        "open_scopes": state
+            .scopes
+            .values()
+            .filter(|scope| {
+                scope.run == run && matches!(scope.status, crate::domain::ScopeStatus::Open)
+            })
+            .count(),
+        "inbox_depth": state
+            .inbox
+            .iter()
+            .filter(|entry| entry.run == Some(run) && !entry.consumed)
+            .count(),
+        "interventions": state
+            .interventions
+            .iter()
+            .filter(|(id, _)| state.activations.get(id).is_some_and(|act| act.run == run))
+            .map(|(id, reason)| {
+                serde_json::json!({"activation": id.to_hex(), "reason": reason})
+            })
+            .collect::<Vec<_>>(),
     })
+}
+
+fn stall_reason(state: &State, run: RunId) -> Option<String> {
+    let run_state = state.runs.get(&run)?;
+    if !matches!(run_state.status, crate::domain::RunStatus::Active) {
+        return None;
+    }
+    if state.recovery.as_ref().is_some_and(|hold| !hold.authorized) {
+        return Some("execution suspended until recovery is acknowledged".to_owned());
+    }
+    if let Some((_, reason)) = state
+        .interventions
+        .iter()
+        .find(|(id, _)| state.activations.get(id).is_some_and(|act| act.run == run))
+    {
+        return Some(format!("intervention required: {reason}"));
+    }
+    if let Some(wait) = state
+        .waits
+        .values()
+        .find(|wait| wait.run == run && wait.pending)
+    {
+        return Some(format!(
+            "waiting for signal {} key {}",
+            wait.signal, wait.key
+        ));
+    }
+    if let Some(item) = state.obligations.iter().find(|item| item.run == run) {
+        match &item.status {
+            ObligationStatus::Blocked { reason } => {
+                return Some(format!("compensation input blocked: {reason}"));
+            }
+            ObligationStatus::Irreversible { reason } => {
+                return Some(format!("irreversible effect: {reason}"));
+            }
+            ObligationStatus::Compensating { .. } => {
+                return Some(format!("compensation in flight: {}", item.handler));
+            }
+            _ => {}
+        }
+    }
+    if state.activations.values().any(|act| {
+        act.run == run
+            && act.status == crate::domain::ActivationStatus::Ready
+            && act.claim.is_some()
+    }) {
+        return Some("activity claimed; waiting for worker result".to_owned());
+    }
+    if state
+        .activations
+        .values()
+        .any(|act| act.run == run && act.status == crate::domain::ActivationStatus::Ready)
+    {
+        return Some("ready work waiting for a worker claim".to_owned());
+    }
+    Some("active with no pending wait, obligation, or ready leaf".to_owned())
+}
+
+pub(crate) fn health_view(
+    raft_state: String,
+    last_applied: Option<u64>,
+    last_log: Option<u64>,
+    voters: Vec<u64>,
+    state: &State,
+) -> serde_json::Value {
+    let applied = last_applied.unwrap_or(0);
+    let log = last_log.unwrap_or(0);
+    serde_json::json!({
+        "status": "ok",
+        "clock_safe": clock_is_safe(),
+        "state": raft_state,
+        "last_applied": last_applied,
+        "last_log": last_log,
+        "apply_lag": log.saturating_sub(applied),
+        "unapplied_entries": log.saturating_sub(applied),
+        "voters": voters,
+        "active_runs": state.runs.values().filter(|run| matches!(run.status, crate::domain::RunStatus::Active)).count(),
+        "ready_leaves": state.activations.values().filter(|act| act.status == crate::domain::ActivationStatus::Ready).count(),
+        "inbox_depth": state.inbox.iter().filter(|entry| !entry.consumed).count(),
+        "open_scopes": state.scopes.values().filter(|scope| matches!(scope.status, crate::domain::ScopeStatus::Open)).count(),
+        "recovery": state.recovery.as_ref().map(|hold| {
+            serde_json::json!({
+                "reason": hold.reason,
+                "authorized": hold.authorized,
+                "suspended": !hold.authorized,
+            })
+        }),
+    })
+}
+
+pub(crate) fn admit_unapplied(unapplied_entries: u64, unapplied_bytes: u64) -> Result<()> {
+    if unapplied_entries >= crate::limits::UNAPPLIED_ENTRIES as u64 {
+        return Err(Error::new(
+            ErrorKind::ResourceExhausted,
+            "unapplied entry credit exhausted",
+        ));
+    }
+    if unapplied_bytes >= crate::limits::UNAPPLIED_BYTES {
+        return Err(Error::new(
+            ErrorKind::ResourceExhausted,
+            "unapplied byte credit exhausted",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unapplied_credits_reject_at_limit() {
+        assert!(admit_unapplied(0, 0).is_ok());
+        assert!(
+            admit_unapplied(
+                u64::from(crate::limits::UNAPPLIED_ENTRIES) - 1,
+                crate::limits::UNAPPLIED_BYTES - 1
+            )
+            .is_ok()
+        );
+        let entries = admit_unapplied(u64::from(crate::limits::UNAPPLIED_ENTRIES), 0).unwrap_err();
+        assert_eq!(entries.kind, ErrorKind::ResourceExhausted);
+        assert!(entries.to_string().contains("unapplied entry credit"));
+        let bytes = admit_unapplied(0, crate::limits::UNAPPLIED_BYTES).unwrap_err();
+        assert_eq!(bytes.kind, ErrorKind::ResourceExhausted);
+        assert!(bytes.to_string().contains("unapplied byte credit"));
+    }
 }

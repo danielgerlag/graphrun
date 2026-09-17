@@ -124,6 +124,69 @@ pub fn compile_spanned(root: &Spanned, catalog: &Catalog) -> Result<Definition> 
     Ok(definition)
 }
 
+pub fn validate_definition(definition: &Definition, catalog: &Catalog) -> Result<()> {
+    let ctx = RegionCtx {
+        input_schema: definition.input_schema.clone(),
+        output_schema: definition.output_schema.clone(),
+        in_loop: false,
+        in_foreach: false,
+        in_saga: false,
+        in_compensation: false,
+    };
+    analyze_tree(&definition.root, &ctx, catalog)
+}
+
+fn analyze_tree(region: &Region, ctx: &RegionCtx, catalog: &Catalog) -> Result<()> {
+    analyze_region(region, ctx, catalog)?;
+    for node in region.nodes.values() {
+        match node {
+            Node::While { body, .. } | Node::DoWhile { body, .. } | Node::Repeat { body, .. } => {
+                let mut child = ctx.clone();
+                child.in_loop = true;
+                child.input_schema = body.input_schema.clone();
+                child.output_schema = body.output_schema.clone();
+                analyze_tree(body, &child, catalog)?;
+            }
+            Node::Foreach { body, .. } => {
+                let mut child = ctx.clone();
+                child.in_foreach = true;
+                child.input_schema = body.input_schema.clone();
+                child.output_schema = body.output_schema.clone();
+                analyze_tree(body, &child, catalog)?;
+            }
+            Node::Saga { body, .. } => {
+                let mut child = ctx.clone();
+                child.in_saga = true;
+                child.input_schema = body.input_schema.clone();
+                child.output_schema = body.output_schema.clone();
+                analyze_tree(body, &child, catalog)?;
+            }
+            Node::Parallel { branches, .. } => {
+                for branch in branches {
+                    let mut child = ctx.clone();
+                    child.input_schema = branch.body.input_schema.clone();
+                    child.output_schema = branch.body.output_schema.clone();
+                    analyze_tree(&branch.body, &child, catalog)?;
+                }
+            }
+            Node::Choose { cases, default, .. } => {
+                for case in cases {
+                    let mut child = ctx.clone();
+                    child.input_schema = case.body.input_schema.clone();
+                    child.output_schema = case.body.output_schema.clone();
+                    analyze_tree(&case.body, &child, catalog)?;
+                }
+                let mut child = ctx.clone();
+                child.input_schema = default.input_schema.clone();
+                child.output_schema = default.output_schema.clone();
+                analyze_tree(default, &child, catalog)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Counts {
     nodes: usize,
@@ -1240,5 +1303,129 @@ mod tests {
         let a = compile_yaml(text, &catalog).unwrap();
         let b = compile_yaml(text, &catalog).unwrap();
         assert_eq!(a.digest, b.digest);
+    }
+
+    #[test]
+    fn digest_changes_when_semantics_change() {
+        let catalog = catalog();
+        let original = include_str!("../../docs/specs/v1/examples/sequence.yaml");
+        let changed = original.replace("max_attempts: 5", "max_attempts: 4");
+        let a = compile_yaml(original, &catalog).unwrap();
+        let b = compile_yaml(&changed, &catalog).unwrap();
+        assert_ne!(a.digest, b.digest);
+    }
+
+    #[test]
+    fn bindings_and_conditions_match_spec() {
+        let catalog = catalog();
+        let missing_path = r#"
+dsl: graphrun/v1
+id: missing_path
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {from: workflow.input, path: /missing}
+"#;
+        compile_yaml(missing_path, &catalog).expect("missing path compiles; evaluation rejects it");
+
+        let empty_all = r#"
+dsl: graphrun/v1
+id: empty_all
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: count
+nodes:
+  count:
+    kind: while
+    state_schema: counter/v1
+    state: {from: workflow.input}
+    condition:
+      all: []
+    max_iterations: 1
+    body:
+      input_schema: counter/v1
+      output_schema: counter/v1
+      start: done
+      nodes:
+        done:
+          kind: complete
+          output: {from: scope.input}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.count.output}
+"#;
+        let err = compile_yaml(empty_all, &catalog).unwrap_err();
+        assert!(
+            err.message
+                .contains("all/any requires at least one condition"),
+            "{}",
+            err.message
+        );
+
+        let unknown_ref = r#"
+dsl: graphrun/v1
+id: bad_ref
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {from: not.a.reference}
+"#;
+        let err = compile_yaml(unknown_ref, &catalog).unwrap_err();
+        assert!(err.message.contains("unknown reference"), "{}", err.message);
+
+        let tuple_array = r#"
+dsl: graphrun/v1
+id: schemas
+version: 1
+input_schema:
+  tuple:
+    - counter/v1
+    - counter/v1
+output_schema:
+  array: counter/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output:
+      array:
+        - {from: workflow.input, path: /0}
+        - {from: workflow.input, path: /1}
+"#;
+        compile_yaml(tuple_array, &catalog).expect("tuple and array constructors compile");
+
+        let null_literal = r#"
+dsl: graphrun/v1
+id: null_out
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {literal: null}
+"#;
+        compile_yaml(null_literal, &catalog).expect("explicit null is a value");
+    }
+
+    #[test]
+    fn rejects_yaml_tags_and_anchors() {
+        let err = crate::yaml::parse_yaml("a: &id 1\nb: *id\n").unwrap_err();
+        assert!(
+            err.message.contains("anchor") || err.message.contains("alias"),
+            "{}",
+            err.message
+        );
     }
 }

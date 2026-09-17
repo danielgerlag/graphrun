@@ -183,6 +183,44 @@ impl Catalog {
         }
     }
 
+    pub fn validate_value(&self, schema: &SchemaRef, value: &crate::value::Value) -> Result<()> {
+        let json_schema = self.schema_json(schema)?;
+        let instance = value.to_json();
+        if jsonschema::is_valid(&json_schema, &instance) {
+            Ok(())
+        } else {
+            Err(Error::invalid("output does not match activity schema"))
+        }
+    }
+
+    fn schema_json(&self, schema: &SchemaRef) -> Result<serde_json::Value> {
+        match schema {
+            SchemaRef::Named { key } => self
+                .schemas
+                .get(key)
+                .cloned()
+                .ok_or_else(|| Error::invalid(format!("unknown schema {key}"))),
+            SchemaRef::Array { element } => Ok(serde_json::json!({
+                "type": "array",
+                "items": self.schema_json(element)?,
+            })),
+            SchemaRef::Tuple { elements } => {
+                let items: Result<Vec<_>> = elements
+                    .iter()
+                    .map(|element| self.schema_json(element))
+                    .collect();
+                Ok(serde_json::json!({
+                    "type": "array",
+                    "items": items?,
+                }))
+            }
+            SchemaRef::Integer => Ok(serde_json::json!({"type": "integer"})),
+            SchemaRef::String => Ok(serde_json::json!({"type": "string"})),
+            SchemaRef::Boolean => Ok(serde_json::json!({"type": "boolean"})),
+            SchemaRef::Null => Ok(serde_json::json!({"type": "null"})),
+        }
+    }
+
     pub fn activity(&self, key: &ActivityKey) -> Result<&ActivityContract> {
         self.activities.get(key).ok_or_else(|| {
             Error::invalid(format!("unknown activity {}/v{}", key.name, key.version))

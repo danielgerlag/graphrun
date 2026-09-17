@@ -154,6 +154,139 @@ fn yaml_and_builder_sequence_have_digests() {
     assert!(!yaml.digest.0.is_empty());
 }
 
+fn execution_ir(definition: &graphrun::Definition) -> serde_json::Value {
+    let mut value = serde_json::to_value(definition).unwrap();
+    fn strip(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.remove("digest");
+                if map
+                    .get("path")
+                    .is_some_and(|value| value.is_array() || value.is_object())
+                {
+                    map.remove("path");
+                }
+                for child in map.values_mut() {
+                    strip(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    strip(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    strip(&mut value);
+    value
+}
+
+#[test]
+fn yaml_and_builder_while_match() {
+    let catalog = catalog();
+    let yaml = compile_yaml(
+        include_str!("../../docs/specs/v1/examples/while.yaml"),
+        &catalog,
+    )
+    .unwrap();
+    let increment = catalog
+        .activity_ref::<Counter, Counter>("counter.increment", 1)
+        .unwrap();
+    let mut body = RegionBuilder::<Counter>::new();
+    let bumped = body
+        .activity("increment", &increment, body.input())
+        .unwrap();
+    let body = body.complete("done", bumped.output()).unwrap();
+    let mut root = RegionBuilder::<Counter>::new();
+    let condition = Condition::Lt {
+        left: Binding::from_path(Reference::LoopState, "/value"),
+        right: Binding::literal(graphrun::value::Value::Int(3)),
+    };
+    let looped = root
+        .while_loop("count", root.workflow_input(), condition, body, 10)
+        .unwrap();
+    let root = root.complete("finish", looped.output()).unwrap();
+    let built = WorkflowBuilder::new("while_counter", 1, root)
+        .build(&catalog)
+        .unwrap();
+    assert_eq!(execution_ir(&yaml), execution_ir(&built));
+}
+
+#[test]
+fn field_path_and_cross_scope_errors() {
+    let graph = RegionGraphBuilder::<Counter>::new();
+    let err =
+        match graph.map_input::<Counter>(Binding::from_path(Reference::WorkflowInput, "value")) {
+            Ok(_) => panic!("expected JSON Pointer error"),
+            Err(err) => err,
+        };
+    assert!(err.to_string().contains("JSON Pointer"), "{}", err);
+    let outer = graph.input();
+    let mut other = RegionGraphBuilder::<Counter>::new();
+    let err = match other.declare_complete("finish", outer) {
+        Ok(_) => panic!("expected cross-region error"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("cross-region"), "{}", err);
+}
+
+#[test]
+fn timed_wait_yaml_and_builder_and_invalid_edge() {
+    let catalog = catalog();
+    let yaml = compile_yaml(
+        include_str!("../../docs/specs/v1/examples/timeout-recovery.yaml"),
+        &catalog,
+    )
+    .unwrap();
+    let increment = catalog
+        .activity_ref::<Counter, Counter>("counter.increment", 1)
+        .unwrap();
+    let approval = SignalRef::<Approval>::new("approval").unwrap();
+    let mut graph = RegionGraphBuilder::<Counter>::new();
+    let input = graph.workflow_input();
+    let key = graph.literal("approval".to_owned()).unwrap();
+    let wait = graph
+        .declare_timed_wait("approval", &approval, key, Duration::from_secs(1))
+        .unwrap();
+    let recovery = graph
+        .declare_activity("recover", &increment, input.clone())
+        .unwrap();
+    let finish = graph.declare_complete("finish", input).unwrap();
+    graph.start_at(wait.entry()).unwrap();
+    graph.connect(wait.success_port(), finish.entry()).unwrap();
+    graph
+        .connect(wait.timeout_port(), recovery.entry())
+        .unwrap();
+    graph.connect(recovery.exit(), finish.entry()).unwrap();
+    let region = graph.finish::<Counter>().unwrap();
+    let built = WorkflowBuilder::new("timeout_recovery", 1, region)
+        .build(&catalog)
+        .unwrap();
+    assert_eq!(execution_ir(&yaml), execution_ir(&built));
+
+    let mut bad = RegionGraphBuilder::<Counter>::new();
+    let approval = SignalRef::<Approval>::new("approval").unwrap();
+    let key = bad.literal("approval".to_owned()).unwrap();
+    let wait = bad
+        .declare_timed_wait("approval", &approval, key, Duration::from_secs(1))
+        .unwrap();
+    let finish = bad.declare_complete("finish", wait.output()).unwrap();
+    bad.start_at(wait.entry()).unwrap();
+    bad.connect(wait.success_port(), finish.entry()).unwrap();
+    bad.connect(wait.timeout_port(), finish.entry()).unwrap();
+    let region = bad.finish::<Approval>().unwrap();
+    let err = WorkflowBuilder::new("bad_timeout_payload", 1, region)
+        .build(&catalog)
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not available on every incoming path"),
+        "{}",
+        err
+    );
+}
+
 #[test]
 fn while_condition_builder_compiles() {
     let catalog = catalog();

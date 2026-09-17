@@ -1,6 +1,6 @@
 # Executable fixture requirements
 
-These are normative input fixtures for the implementation and verification driver. They are not currently executable because no engine exists yet.
+These are normative input fixtures for the implementation and verification driver. Run them with `graphrun validate` and `graphrun start` as in [the local YAML quickstart](../../../quickstarts/local-yaml.md).
 
 The [catalog](activity-catalog.json) declares their payload and activity contracts. The implementation must provide deterministic fixture handlers and equivalent Rust-built definitions.
 

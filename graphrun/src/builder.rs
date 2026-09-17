@@ -1,6 +1,6 @@
 use crate::binding::Binding;
 use crate::catalog::Catalog;
-use crate::compiler::digest_of;
+use crate::compiler::{digest_of, validate_definition};
 use crate::error::{Error, Result};
 use crate::ids::{ActivityKey, NodeKey, valid_ascii_name};
 use crate::ir::{
@@ -14,7 +14,31 @@ use crate::value::Value;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+fn next_builder_scope() -> ScopeId {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    ScopeId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+fn check_binding_paths(binding: &Binding) -> Result<()> {
+    match binding {
+        Binding::From {
+            path: Some(path), ..
+        } => {
+            if !path.starts_with('/') {
+                return Err(Error::invalid(format!(
+                    "JSON Pointer {path} must start with /"
+                )));
+            }
+            Ok(())
+        }
+        Binding::Object { fields } => fields.values().try_for_each(check_binding_paths),
+        Binding::Array { items } => items.iter().try_for_each(check_binding_paths),
+        _ => Ok(()),
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ScopeId(u64);
@@ -258,6 +282,10 @@ impl<I: DurablePayload> RegionBuilder<I> {
         self.graph.input()
     }
 
+    pub fn workflow_input(&self) -> ValueRef<I> {
+        self.graph.workflow_input()
+    }
+
     pub fn literal<T: DurablePayload + Serialize>(&self, value: T) -> Result<ValueRef<T>> {
         self.graph.literal(value)
     }
@@ -459,7 +487,7 @@ impl<I: DurablePayload> RegionGraphBuilder<I> {
     pub fn new() -> Self {
         Self {
             draft: Draft {
-                scope: ScopeId(1),
+                scope: next_builder_scope(),
                 _input_schema: I::schema_ref(),
                 nodes: BTreeMap::new(),
                 start: None,
@@ -473,6 +501,14 @@ impl<I: DurablePayload> RegionGraphBuilder<I> {
     pub fn input(&self) -> ValueRef<I> {
         ValueRef {
             binding: Binding::from_ref(crate::binding::Reference::ScopeInput),
+            scope: self.draft.scope,
+            _t: PhantomData,
+        }
+    }
+
+    pub fn workflow_input(&self) -> ValueRef<I> {
+        ValueRef {
+            binding: Binding::from_ref(crate::binding::Reference::WorkflowInput),
             scope: self.draft.scope,
             _t: PhantomData,
         }
@@ -492,6 +528,7 @@ impl<I: DurablePayload> RegionGraphBuilder<I> {
         if binding.depth() > crate::limits::MAX_DATA_DEPTH {
             return Err(Error::invalid("binding exceeds maximum depth"));
         }
+        check_binding_paths(&binding)?;
         Ok(InputMapping {
             binding,
             _t: PhantomData,
@@ -1019,6 +1056,7 @@ impl<I: DurablePayload, O: DurablePayload> WorkflowBuilder<I, O> {
             digest: Digest(String::new()),
         };
         definition.signals = self.root.signals;
+        validate_definition(&definition, catalog)?;
         definition.digest = digest_of(&definition)?;
         Ok(definition)
     }

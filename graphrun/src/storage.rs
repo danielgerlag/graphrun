@@ -19,6 +19,7 @@ use redb::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::{self, Cursor, Seek, SeekFrom};
 use std::ops::Bound;
@@ -64,15 +65,42 @@ fn sto_err(verb: ErrorVerb, err: impl std::fmt::Display) -> StoErr {
     StorageIOError::new(ErrorSubject::Store, verb, AnyError::error(err.to_string())).into()
 }
 
-static CUT: Mutex<Option<&'static str>> = Mutex::new(None);
+struct Cut {
+    point: &'static str,
+}
+
+static CUT: Mutex<Option<Cut>> = Mutex::new(None);
+
+thread_local! {
+    static LOCAL_CUT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
 
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn inject_cut(point: &'static str) {
-    *CUT.lock().unwrap() = Some(point);
+    LOCAL_CUT.with(|cell| cell.set(Some(point)));
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn inject_cut_any_thread(point: &'static str) {
+    *CUT.lock().unwrap() = Some(Cut { point });
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn clear_cut() {
+    LOCAL_CUT.with(|cell| cell.set(None));
+    *CUT.lock().unwrap() = None;
 }
 
 fn after_persist(point: &'static str) -> std::result::Result<(), StoErr> {
-    let cut = CUT.lock().unwrap().as_deref() == Some(point);
+    let cut = {
+        let local = LOCAL_CUT.with(|cell| cell.get() == Some(point));
+        if local {
+            true
+        } else {
+            let guard = CUT.lock().unwrap();
+            matches!(guard.as_ref(), Some(cut) if cut.point == point)
+        }
+    };
     let env_hit = {
         #[cfg(feature = "fault-injection")]
         {
@@ -84,6 +112,7 @@ fn after_persist(point: &'static str) -> std::result::Result<(), StoErr> {
         }
     };
     if cut || env_hit {
+        LOCAL_CUT.with(|cell| cell.set(None));
         *CUT.lock().unwrap() = None;
         return Err(sto_err(ErrorVerb::Write, format!("fault cut {point}")));
     }
@@ -118,6 +147,7 @@ enum Req {
     ),
     CurrentSnapshot(oneshot::Sender<std::result::Result<Option<Snapshot<TypeConfig>>, StoErr>>),
     QueryState(oneshot::Sender<State>),
+    InstallDomain(Box<State>, oneshot::Sender<std::result::Result<(), StoErr>>),
     Shutdown,
 }
 
@@ -161,6 +191,16 @@ impl StorageHandle {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(Req::QueryState(tx));
         rx.await.unwrap_or_default()
+    }
+
+    pub async fn install_domain(&self, state: State) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Req::InstallDomain(Box::new(state), tx))
+            .map_err(|_| Error::invalid("storage thread stopped"))?;
+        rx.await
+            .map_err(|_| Error::invalid("storage thread dropped"))?
+            .map_err(|err| Error::invalid(err.to_string()))
     }
 
     pub async fn last_applied_index(&self) -> u64 {
@@ -227,7 +267,7 @@ fn storage_thread(
                 let _ = tx.send(Ok(load_json(&db, "vote")));
             }
             Req::Append(entries, tx) => {
-                let _ = tx.send(append_logs(&db, &entries));
+                let _ = tx.send(admit_and_append(&db, last_applied, &entries));
             }
             Req::Truncate(log_id, tx) => {
                 let _ = tx.send(truncate_logs(&db, log_id.index));
@@ -258,12 +298,31 @@ fn storage_thread(
             }
             Req::BuildSnapshot(tx) => {
                 let res = build_snapshot(last_applied, last_membership.clone(), &domain);
-                if let Ok(ref snap) = res {
-                    let _ = write_snapshot_file(&snapshot_dir, &snap.meta, snap.snapshot.get_ref());
-                    snapshot = Some((snap.meta.clone(), snap.snapshot.get_ref().clone()));
-                    let _ = put_json(&db, "snapshot_meta", &snap.meta);
-                    let _ = put_bytes(&db, "snapshot_data", snap.snapshot.get_ref());
-                }
+                let res = match res {
+                    Ok(snap) => {
+                        if let Err(err) =
+                            write_snapshot_file(&snapshot_dir, &snap.meta, snap.snapshot.get_ref())
+                        {
+                            Err(sto_err(ErrorVerb::Write, err))
+                        } else if let Err(err) = after_persist("after-snapshot-file") {
+                            Err(err)
+                        } else {
+                            snapshot = Some((snap.meta.clone(), snap.snapshot.get_ref().clone()));
+                            if let Err(err) = put_json(&db, "snapshot_meta", &snap.meta) {
+                                Err(err)
+                            } else if let Err(err) =
+                                put_bytes(&db, "snapshot_data", snap.snapshot.get_ref())
+                            {
+                                Err(err)
+                            } else if let Err(err) = after_persist("after-snapshot-activate") {
+                                Err(err)
+                            } else {
+                                Ok(snap)
+                            }
+                        }
+                    }
+                    Err(err) => Err(err),
+                };
                 let _ = tx.send(res);
             }
             Req::InstallSnapshot(meta, data, tx) => {
@@ -287,6 +346,11 @@ fn storage_thread(
             }
             Req::QueryState(tx) => {
                 let _ = tx.send(domain.clone());
+            }
+            Req::InstallDomain(next, tx) => {
+                domain = *next;
+                let res = put_json(&db, "domain", &domain);
+                let _ = tx.send(res);
             }
         }
     }
@@ -331,6 +395,36 @@ fn put_bytes(db: &Database, key: &str, bytes: &[u8]) -> std::result::Result<(), 
     }
     txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))?;
     Ok(())
+}
+
+fn encoded_entry_len(entry: &EntryT) -> u64 {
+    serde_json::to_vec(entry)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0)
+}
+
+fn admit_and_append(
+    db: &Database,
+    last_applied: Option<LogIdT>,
+    entries: &[EntryT],
+) -> std::result::Result<(), StoErr> {
+    let applied = last_applied.map(|id| id.index).unwrap_or(0);
+    let pending = get_logs(db, applied.saturating_add(1), u64::MAX)?;
+    let mut sizes = BTreeMap::new();
+    for entry in pending.iter().chain(entries.iter()) {
+        sizes.insert(entry.get_log_id().index, encoded_entry_len(entry));
+    }
+    if sizes.len() > crate::limits::UNAPPLIED_ENTRIES as usize {
+        return Err(sto_err(
+            ErrorVerb::Write,
+            "unapplied entry credit exhausted",
+        ));
+    }
+    let bytes: u64 = sizes.values().copied().sum();
+    if bytes > crate::limits::UNAPPLIED_BYTES {
+        return Err(sto_err(ErrorVerb::Write, "unapplied byte credit exhausted"));
+    }
+    append_logs(db, entries)
 }
 
 fn append_logs(db: &Database, entries: &[EntryT]) -> std::result::Result<(), StoErr> {
@@ -478,15 +572,25 @@ fn apply_entries(
     entries: Vec<EntryT>,
 ) -> std::result::Result<Vec<RaftResponse>, StoErr> {
     let mut replies = Vec::new();
+    let mut next_applied = *last_applied;
+    let mut next_membership = last_membership.clone();
+    let mut next_domain = domain.clone();
+    let mut domain_changed = false;
+    let mut membership_changed = false;
     for entry in entries {
-        *last_applied = Some(*entry.get_log_id());
+        next_applied = Some(*entry.get_log_id());
         if let Some(membership) = openraft::entry::RaftPayload::get_membership(&entry.payload) {
-            *last_membership = StoredMembership::new(Some(*entry.get_log_id()), membership.clone());
+            next_membership = StoredMembership::new(Some(*entry.get_log_id()), membership.clone());
+            membership_changed = true;
         }
         let mut reply = RaftResponse::default();
         if let EntryPayload::Normal(req) = &entry.payload {
-            match domain::commit_command(domain, req.command.clone()) {
-                Ok(_) => {}
+            match domain::commit_command(&mut next_domain, req.command.clone()) {
+                Ok(events) => {
+                    if !events.is_empty() {
+                        domain_changed = true;
+                    }
+                }
                 Err(err) => reply.error = Some(err.to_string()),
             }
         }
@@ -502,19 +606,27 @@ fn apply_entries(
             .open_table(META)
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         let applied =
-            serde_json::to_vec(last_applied).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            serde_json::to_vec(&next_applied).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         meta.insert("last_applied", applied.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        let membership =
-            serde_json::to_vec(last_membership).map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        meta.insert("membership", membership.as_slice())
-            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        let domain_bytes =
-            serde_json::to_vec(domain).map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        meta.insert("domain", domain_bytes.as_slice())
-            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        if membership_changed {
+            let membership = serde_json::to_vec(&next_membership)
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            meta.insert("membership", membership.as_slice())
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        }
+        if domain_changed {
+            let domain_bytes =
+                serde_json::to_vec(&next_domain).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            meta.insert("domain", domain_bytes.as_slice())
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        }
     }
     txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    *last_applied = next_applied;
+    *last_membership = next_membership;
+    *domain = next_domain;
+    after_persist("after-apply")?;
     Ok(replies)
 }
 
@@ -547,10 +659,6 @@ fn install_snapshot(
 ) -> std::result::Result<(), StoErr> {
     let (applied, membership, restored): (Option<LogIdT>, MembershipT, State) =
         serde_json::from_slice(&data).map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    *last_applied = applied;
-    *last_membership = membership;
-    *domain = restored;
-    *snapshot = Some((meta.clone(), data.clone()));
     let mut txn = db
         .begin_write()
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
@@ -561,17 +669,17 @@ fn install_snapshot(
             .open_table(META)
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         let applied_bytes =
-            serde_json::to_vec(last_applied).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            serde_json::to_vec(&applied).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         table
             .insert("last_applied", applied_bytes.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         let membership_bytes =
-            serde_json::to_vec(last_membership).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            serde_json::to_vec(&membership).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         table
             .insert("membership", membership_bytes.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         let domain_bytes =
-            serde_json::to_vec(domain).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            serde_json::to_vec(&restored).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         table
             .insert("domain", domain_bytes.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
@@ -584,6 +692,11 @@ fn install_snapshot(
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     }
     txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    *last_applied = applied;
+    *last_membership = membership;
+    *domain = restored;
+    *snapshot = Some((meta, data));
+    after_persist("after-snapshot")?;
     Ok(())
 }
 
@@ -831,7 +944,6 @@ mod tests {
 
     #[test]
     fn log_cut_after_persist_keeps_entries() {
-        inject_cut("after-log");
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("member.redb");
         let db = redb::Database::create(&path).unwrap();
@@ -845,9 +957,187 @@ mod tests {
             log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
             payload: EntryPayload::Blank,
         };
+        inject_cut("after-log");
         let err = append_logs(&db, &[entry]).unwrap_err();
+        clear_cut();
         assert!(err.to_string().contains("fault cut"));
         let loaded = get_logs(&db, 1, 2).unwrap();
         assert_eq!(loaded.len(), 1);
+    }
+
+    #[test]
+    fn apply_cut_does_not_mix_transactions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = redb::Database::create(&path).unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            let _ = txn.open_table(LOG);
+            let _ = txn.open_table(META);
+            txn.commit().unwrap();
+        }
+        let mut last_applied = None;
+        let mut last_membership = StoredMembership::new(None, Membership::new(vec![], None));
+        let mut domain = State::default();
+        inject_cut("after-apply");
+        let entry = Entry::<TypeConfig> {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Blank,
+        };
+        let err = apply_entries(
+            &db,
+            &mut last_applied,
+            &mut last_membership,
+            &mut domain,
+            vec![entry],
+        )
+        .unwrap_err();
+        clear_cut();
+        assert!(err.to_string().contains("fault cut"));
+        assert!(last_applied.is_some());
+        let loaded: Option<LogIdT> = load_json(&db, "last_applied");
+        assert_eq!(loaded, last_applied);
+    }
+
+    #[test]
+    fn snapshot_install_cut_keeps_generation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = redb::Database::create(&path).unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            let _ = txn.open_table(LOG);
+            let _ = txn.open_table(META);
+            txn.commit().unwrap();
+        }
+        let old_applied = Some(LogId::new(openraft::CommittedLeaderId::new(1, 1), 1));
+        let old_membership = StoredMembership::new(None, Membership::new(vec![], None));
+        let old_domain = State::default();
+        put_json(&db, "last_applied", &old_applied).unwrap();
+        put_json(&db, "membership", &old_membership).unwrap();
+        put_json(&db, "domain", &old_domain).unwrap();
+        let new_applied = Some(LogId::new(openraft::CommittedLeaderId::new(1, 1), 9));
+        let new_membership = old_membership.clone();
+        let new_domain = State::default();
+        let data = serde_json::to_vec(&(new_applied, new_membership.clone(), &new_domain)).unwrap();
+        let meta = SnapshotMeta {
+            last_log_id: new_applied,
+            last_membership: new_membership.clone(),
+            snapshot_id: "snap-9".to_owned(),
+        };
+        let mut last_applied = old_applied;
+        let mut last_membership = old_membership.clone();
+        let mut domain = old_domain.clone();
+        let mut snapshot = None;
+        inject_cut("after-snapshot");
+        let err = install_snapshot(
+            &db,
+            &mut last_applied,
+            &mut last_membership,
+            &mut domain,
+            &mut snapshot,
+            meta,
+            data,
+        )
+        .unwrap_err();
+        clear_cut();
+        assert!(err.to_string().contains("fault cut"));
+        let disk_applied: Option<LogIdT> = load_json(&db, "last_applied");
+        let disk_domain: State = load_json(&db, "domain").unwrap();
+        let disk_meta: Option<SnapMeta> = load_json(&db, "snapshot_meta");
+        let disk_data: Option<Vec<u8>> = load_bytes(&db, "snapshot_data");
+        assert_eq!(disk_applied, new_applied);
+        assert_eq!(last_applied, new_applied);
+        assert_eq!(disk_applied, last_applied);
+        assert!(disk_meta.is_some());
+        assert!(disk_data.is_some());
+        let _ = (old_domain, disk_domain);
+    }
+
+    #[test]
+    fn purge_does_not_drop_domain_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = redb::Database::create(&path).unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            let _ = txn.open_table(LOG);
+            let _ = txn.open_table(META);
+            txn.commit().unwrap();
+        }
+        let entries: Vec<EntryT> = (1..=3)
+            .map(|index| Entry::<TypeConfig> {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+        append_logs(&db, &entries).unwrap();
+        let mut history = std::collections::HashMap::new();
+        history.insert(
+            crate::ids::RunId::from_bytes([1; 16]),
+            vec![crate::domain::DomainEvent::RunAdmitted {
+                run: crate::ids::RunId::from_bytes([1; 16]),
+                definition_id: "seq".to_owned(),
+                definition_version: 1,
+                input: crate::value::Value::Null,
+                root: crate::ids::ScopeId::from_bytes([2; 16]),
+                policy: crate::policy::CapturedRunPolicy::defaults(None),
+                admitted_ms: 0,
+            }],
+        );
+        let domain = State {
+            history,
+            ..State::default()
+        };
+        put_json(&db, "domain", &domain).unwrap();
+        let through = LogId::new(openraft::CommittedLeaderId::new(1, 1), 2);
+        purge_logs(&db, 2, &through).unwrap();
+        let remaining = get_logs(&db, 0, u64::MAX).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].get_log_id().index, 3);
+        let loaded: State = load_json(&db, "domain").unwrap();
+        assert_eq!(loaded.history, domain.history);
+        truncate_logs(&db, 3).unwrap();
+        let after_truncate = get_logs(&db, 0, u64::MAX).unwrap();
+        assert!(after_truncate.is_empty());
+        let loaded_again: State = load_json(&db, "domain").unwrap();
+        assert_eq!(loaded_again.history, domain.history);
+        let resurrected = get_logs(&db, 1, 3).unwrap();
+        assert!(resurrected.is_empty());
+    }
+
+    #[test]
+    fn unapplied_credits_bound_append_without_truncating_reads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = redb::Database::create(&path).unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            let _ = txn.open_table(LOG);
+            let _ = txn.open_table(META);
+            txn.commit().unwrap();
+        }
+        let batch: Vec<EntryT> = (1..=crate::limits::UNAPPLIED_ENTRIES)
+            .map(|index| Entry::<TypeConfig> {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), u64::from(index)),
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+        append_logs(&db, &batch).unwrap();
+        let extra = [Entry::<TypeConfig> {
+            log_id: LogId::new(
+                openraft::CommittedLeaderId::new(1, 1),
+                u64::from(crate::limits::UNAPPLIED_ENTRIES) + 1,
+            ),
+            payload: EntryPayload::Blank,
+        }];
+        let err = admit_and_append(&db, None, &extra).unwrap_err();
+        assert!(err.to_string().contains("unapplied entry credit"));
+        let loaded = get_logs(&db, 1, u64::MAX).unwrap();
+        assert_eq!(loaded.len(), crate::limits::UNAPPLIED_ENTRIES as usize);
+        assert_eq!(
+            loaded.last().unwrap().get_log_id().index,
+            u64::from(crate::limits::UNAPPLIED_ENTRIES)
+        );
     }
 }

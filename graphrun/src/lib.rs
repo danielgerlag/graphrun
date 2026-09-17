@@ -17,6 +17,7 @@ pub mod ids;
 pub mod ir;
 pub mod limits;
 pub mod policy;
+pub mod provider;
 pub mod rpc;
 pub mod schema;
 pub mod storage;
@@ -35,7 +36,9 @@ pub use client::GrpcClient;
 pub use cluster::MemberConfig;
 pub use compiler::compile_yaml;
 pub use domain::{State, reconstruct, run_events, run_output};
-pub use engine::{ControlRequest, ControlResponse, Engine, connect_control, replay};
+pub use engine::{
+    ControlRequest, ControlResponse, Engine, LedgerEntry, connect_control, ledger_get, replay,
+};
 pub use error::{Error, ErrorKind, Result};
 pub use ids::{EventId, RunId};
 pub use ir::Definition;

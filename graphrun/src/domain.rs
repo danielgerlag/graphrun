@@ -12,6 +12,9 @@ use crate::value::Value;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub static READY_SCANS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -23,6 +26,8 @@ pub enum DomainEvent {
         input: Value,
         root: ScopeId,
         policy: CapturedRunPolicy,
+        #[serde(default)]
+        admitted_ms: u64,
     },
     ScopeOpened {
         run: RunId,
@@ -67,6 +72,14 @@ pub enum DomainEvent {
         output: Value,
         role: ExecutionRole,
     },
+    LeafFailed {
+        run: RunId,
+        activation: ActivationId,
+        attempt: AttemptNo,
+        code: String,
+        message: String,
+        retry: bool,
+    },
     WaitOpened {
         run: RunId,
         wait: WaitId,
@@ -93,6 +106,18 @@ pub enum DomainEvent {
         key: String,
         payload: Value,
         sequence: u64,
+        #[serde(default)]
+        accepted_ms: u64,
+        #[serde(default)]
+        expires_ms: u64,
+    },
+    EventReserved {
+        wait: WaitId,
+        event_id: EventId,
+    },
+    ReservationReleased {
+        wait: WaitId,
+        event_id: EventId,
     },
     ObligationRegistered {
         run: RunId,
@@ -100,6 +125,13 @@ pub enum DomainEvent {
         handler: String,
         handler_version: u32,
         input: Value,
+    },
+    ObligationBlocked {
+        run: RunId,
+        forward: ActivationId,
+        handler: String,
+        handler_version: u32,
+        reason: String,
     },
     CompensationStarted {
         run: RunId,
@@ -167,6 +199,19 @@ pub enum DomainEvent {
         run: RunId,
         error: FailError,
     },
+    RecoveryAuthorized {
+        reason: String,
+    },
+    AbortIntent {
+        run: RunId,
+        saga: ActivationId,
+        error: FailError,
+    },
+    CompensationAbandoned {
+        run: RunId,
+        reason: String,
+        unresolved: Vec<ActivationId>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +251,17 @@ pub enum CommandBody {
         run: RunId,
         activation: ActivationId,
         output: Value,
+    },
+    ReportError {
+        run: RunId,
+        activation: ActivationId,
+        code: String,
+        message: String,
+    },
+    ResolveBlocked {
+        run: RunId,
+        forward: ActivationId,
+        input: Value,
     },
     Signal {
         run: RunId,
@@ -256,6 +312,13 @@ pub enum CommandBody {
         revision: LeaseRevision,
         outcome: ReconcileOutcome,
         output: Option<Value>,
+    },
+    AcknowledgeRecovery {
+        reason: String,
+    },
+    AbandonCompensation {
+        run: RunId,
+        reason: String,
     },
 }
 
@@ -325,6 +388,10 @@ pub struct RunState {
     pub status: RunStatus,
     pub root: ScopeId,
     pub next_sequence: RunSequence,
+    #[serde(default)]
+    pub admitted_ms: u64,
+    #[serde(default)]
+    pub terminal_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -365,6 +432,8 @@ pub struct ActivationState {
     pub role: ExecutionRole,
     #[serde(default)]
     pub claim: Option<ClaimState>,
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -396,6 +465,9 @@ pub enum ObligationStatus {
     Compensating { activation: ActivationId },
     Compensated,
     Released,
+    Blocked { reason: String },
+    Irreversible { reason: String },
+    Abandoned,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -431,6 +503,12 @@ pub struct InboxEntry {
     pub sequence: u64,
     pub reserved_wait: Option<WaitId>,
     pub consumed: bool,
+    #[serde(default)]
+    pub accepted_ms: u64,
+    #[serde(default)]
+    pub expires_ms: u64,
+    #[serde(default)]
+    pub run: Option<RunId>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -457,6 +535,14 @@ pub struct State {
     pub next_generation: u64,
     #[serde(default)]
     pub interventions: HashMap<ActivationId, String>,
+    #[serde(default)]
+    pub recovery: Option<RecoveryHold>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryHold {
+    pub reason: String,
+    pub authorized: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -477,7 +563,15 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             definition,
             input,
             catalog: _,
-        } => decide_start(*run, definition, input.clone(), &mut ids),
+        } => {
+            if execution_suspended(state) {
+                return Err(Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "execution suspended until recovery is acknowledged",
+                ));
+            }
+            decide_start(*run, definition, input.clone(), command.time, &mut ids)
+        }
         CommandBody::ReportLeaf {
             run,
             activation,
@@ -490,6 +584,25 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             command.time,
             &mut ids,
         ),
+        CommandBody::ReportError {
+            run,
+            activation,
+            code,
+            message,
+        } => decide_report_error(
+            state,
+            *run,
+            *activation,
+            code,
+            message,
+            command.time,
+            &mut ids,
+        ),
+        CommandBody::ResolveBlocked {
+            run,
+            forward,
+            input,
+        } => decide_resolve_blocked(state, *run, *forward, input.clone()),
         CommandBody::Signal {
             run,
             event_id,
@@ -517,6 +630,9 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             capacity,
         } => decide_register(state, *session, activities, *capacity, command.time),
         CommandBody::Claim { session, capacity } => {
+            if execution_suspended(state) {
+                return Ok(Decision { events: Vec::new() });
+            }
             decide_claim(state, *session, *capacity, command.time, &mut ids)
         }
         CommandBody::Renew {
@@ -550,6 +666,10 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             command.time,
             &mut ids,
         ),
+        CommandBody::AcknowledgeRecovery { reason } => decide_acknowledge_recovery(state, reason),
+        CommandBody::AbandonCompensation { run, reason } => {
+            decide_abandon_compensation(state, *run, reason)
+        }
         CommandBody::Reconcile {
             run,
             activation,
@@ -573,10 +693,32 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
     }
 }
 
+fn execution_suspended(state: &State) -> bool {
+    state.recovery.as_ref().is_some_and(|hold| !hold.authorized)
+}
+
+fn decide_acknowledge_recovery(state: &State, reason: &str) -> Result<Decision> {
+    let Some(hold) = &state.recovery else {
+        return Err(Error::invalid("no recovery hold"));
+    };
+    if hold.authorized {
+        return Ok(Decision { events: Vec::new() });
+    }
+    if reason.is_empty() {
+        return Err(Error::invalid("recovery acknowledgement requires a reason"));
+    }
+    Ok(Decision {
+        events: vec![DomainEvent::RecoveryAuthorized {
+            reason: reason.to_owned(),
+        }],
+    })
+}
+
 fn decide_start(
     run: RunId,
     definition: &Definition,
     input: Value,
+    time: EngineTime,
     ids: &mut IdGen,
 ) -> Result<Decision> {
     let root = ids.scope();
@@ -591,6 +733,7 @@ fn decide_start(
                 input: input.clone(),
                 root,
                 policy: CapturedRunPolicy::defaults(definition.run_timeout_ms),
+                admitted_ms: time.as_millis(),
             },
             DomainEvent::ScopeOpened {
                 run,
@@ -652,6 +795,24 @@ fn report_success(
     if act.role == ExecutionRole::Compensation {
         return decide_compensation_result(state, run, activation, output);
     }
+    validate_leaf_output(state, act, &output)?;
+    if run_is_aborting(state, run) {
+        let mut events = vec![DomainEvent::LeafSucceeded {
+            run,
+            activation,
+            attempt: AttemptNo::new(1),
+            output: output.clone(),
+            role: ExecutionRole::Forward,
+        }];
+        events.push(DomainEvent::NodeOutputRecorded {
+            run,
+            scope: act.scope,
+            node: act.node.as_str().to_owned(),
+            output: output.clone(),
+        });
+        events.extend(compensation_events(state, act, &output));
+        return Ok(Decision { events });
+    }
     let mut events = vec![DomainEvent::LeafSucceeded {
         run,
         activation,
@@ -665,11 +826,262 @@ fn report_success(
         node: act.node.as_str().to_owned(),
         output: output.clone(),
     });
-    if let Some(comp) = compensation_for(state, act, &output) {
-        events.push(comp);
-    }
+    events.extend(compensation_events(state, act, &output));
     events.extend(follow_next(state, act.scope, &act.node, &output, ids)?);
     Ok(Decision { events })
+}
+
+fn decide_report_error(
+    state: &State,
+    run: RunId,
+    activation: ActivationId,
+    code: &str,
+    message: &str,
+    _time: EngineTime,
+    ids: &mut IdGen,
+) -> Result<Decision> {
+    let act = state
+        .activations
+        .get(&activation)
+        .ok_or_else(|| Error::invalid("unknown activation"))?;
+    if act.run != run {
+        return Err(Error::invalid("activation does not belong to run"));
+    }
+    if act.status != ActivationStatus::Ready {
+        return Err(Error::invalid("activation is not awaiting a result"));
+    }
+    let attempt = AttemptNo::new(u64::from(act.attempts.max(1)));
+    if act.role == ExecutionRole::Compensation {
+        let retryable = compensation_error_retryable(state, activation, code);
+        let mut events = vec![DomainEvent::LeafFailed {
+            run,
+            activation,
+            attempt,
+            code: code.to_owned(),
+            message: message.to_owned(),
+            retry: retryable,
+        }];
+        if retryable {
+            events.push(DomainEvent::ClaimCleared { activation });
+            return Ok(Decision { events });
+        }
+        if let Some(obligation) = state.obligations.iter().find(|item| {
+            matches!(
+                item.status,
+                ObligationStatus::Compensating { activation: current } if current == activation
+            )
+        }) {
+            events.push(DomainEvent::ObligationBlocked {
+                run,
+                forward: obligation.forward,
+                handler: obligation.handler.clone(),
+                handler_version: obligation.handler_version,
+                reason: format!("{code}: {message}"),
+            });
+        }
+        return Ok(Decision { events });
+    }
+    let retryable = forward_error_retryable(state, act, code);
+    let mut events = vec![DomainEvent::LeafFailed {
+        run,
+        activation,
+        attempt,
+        code: code.to_owned(),
+        message: message.to_owned(),
+        retry: retryable,
+    }];
+    if retryable {
+        events.push(DomainEvent::ClaimCleared { activation });
+        return Ok(Decision { events });
+    }
+    events.extend(fail_scope(
+        state,
+        act.scope,
+        FailError {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        },
+    )?);
+    let _ = ids;
+    Ok(Decision { events })
+}
+
+fn forward_error_retryable(state: &State, act: &ActivationState, code: &str) -> bool {
+    let Some(run) = state.runs.get(&act.run) else {
+        return false;
+    };
+    let Some(region) = region_for_scope(state, act.scope) else {
+        return false;
+    };
+    let Some(Node::Activity {
+        activity, retry, ..
+    }) = region.nodes.get(act.node.as_str())
+    else {
+        return false;
+    };
+    let Ok(contract) = run.catalog.activity(activity) else {
+        return false;
+    };
+    let Some(spec) = contract.known_code(code) else {
+        return false;
+    };
+    if !spec.retryable {
+        return false;
+    }
+    if !retry.errors.contains(&code.to_owned()) {
+        return false;
+    }
+    let attempts = act.attempts.max(1);
+    attempts < retry.max_attempts
+}
+
+fn compensation_error_retryable(state: &State, activation: ActivationId, code: &str) -> bool {
+    let Some(act) = state.activations.get(&activation) else {
+        return false;
+    };
+    let Some(run) = state.runs.get(&act.run) else {
+        return false;
+    };
+    let Some(obligation) = state.obligations.iter().find(|item| {
+        matches!(
+            item.status,
+            ObligationStatus::Compensating { activation: current } if current == activation
+        )
+    }) else {
+        return false;
+    };
+    let Some(forward) = state.activations.get(&obligation.forward) else {
+        return obligation_handler_retryable(run, obligation, code);
+    };
+    let Some(region) = region_for_scope(state, forward.scope) else {
+        return obligation_handler_retryable(run, obligation, code);
+    };
+    let Some(Node::Activity {
+        compensation:
+            Some(crate::ir::Compensation::Activity {
+                retry, activity, ..
+            }),
+        ..
+    }) = region.nodes.get(forward.node.as_str())
+    else {
+        return obligation_handler_retryable(run, obligation, code);
+    };
+    let Ok(contract) = run.catalog.activity(activity) else {
+        return false;
+    };
+    let Some(spec) = contract.known_code(code) else {
+        return false;
+    };
+    if !spec.retryable {
+        return false;
+    }
+    let policy = retry.clone().unwrap_or_else(|| {
+        crate::policy::RetryPolicy::compensation_default(contract.retryable_codes())
+    });
+    if policy.errors.is_empty() {
+        return false;
+    }
+    policy.errors.contains(&code.to_owned()) && act.attempts.max(1) < policy.max_attempts
+}
+
+fn obligation_handler_retryable(run: &RunState, obligation: &Obligation, code: &str) -> bool {
+    let key = crate::ids::ActivityKey::new(&obligation.handler, obligation.handler_version);
+    let Ok(contract) = run.catalog.activity(&key) else {
+        return false;
+    };
+    contract.known_code(code).is_some_and(|spec| spec.retryable)
+}
+
+fn decide_abandon_compensation(state: &State, run: RunId, reason: &str) -> Result<Decision> {
+    if reason.is_empty() {
+        return Err(Error::invalid("abandon requires a reason"));
+    }
+    let run_state = state
+        .runs
+        .get(&run)
+        .ok_or_else(|| Error::invalid("unknown run"))?;
+    if matches!(
+        &run_state.status,
+        RunStatus::Failed { error } if error.code == "saga.abandoned"
+    ) {
+        return Ok(Decision { events: Vec::new() });
+    }
+    let unresolved: Vec<ActivationId> = state
+        .obligations
+        .iter()
+        .filter(|item| {
+            item.run == run
+                && !matches!(
+                    item.status,
+                    ObligationStatus::Compensated
+                        | ObligationStatus::Released
+                        | ObligationStatus::Abandoned
+                )
+        })
+        .map(|item| item.forward)
+        .collect();
+    if unresolved.is_empty() {
+        return Err(Error::invalid("no unresolved obligations to abandon"));
+    }
+    let mut events = vec![DomainEvent::CompensationAbandoned {
+        run,
+        reason: reason.to_owned(),
+        unresolved: unresolved.clone(),
+    }];
+    if matches!(run_state.status, RunStatus::Active) {
+        if let Some(root) = state
+            .scopes
+            .values()
+            .find(|scope| scope.run == run && matches!(scope.role, ScopeRole::Root))
+        {
+            events.extend(fail_scope(
+                state,
+                root.id,
+                FailError {
+                    code: "saga.abandoned".to_owned(),
+                    message: format!(
+                        "unresolved obligations remain after operator abandonment: {}",
+                        unresolved
+                            .iter()
+                            .map(ActivationId::to_hex)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                },
+            )?);
+        }
+    }
+    Ok(Decision { events })
+}
+
+fn decide_resolve_blocked(
+    state: &State,
+    run: RunId,
+    forward: ActivationId,
+    input: Value,
+) -> Result<Decision> {
+    let Some(obligation) = state
+        .obligations
+        .iter()
+        .find(|item| item.forward == forward)
+    else {
+        return Err(Error::invalid("unknown obligation"));
+    };
+    if obligation.run != run {
+        return Err(Error::invalid("obligation does not belong to run"));
+    }
+    if !matches!(obligation.status, ObligationStatus::Blocked { .. }) {
+        return Err(Error::invalid("obligation is not blocked"));
+    }
+    Ok(Decision {
+        events: vec![DomainEvent::ObligationRegistered {
+            run,
+            forward,
+            handler: obligation.handler.clone(),
+            handler_version: obligation.handler_version,
+            input,
+        }],
+    })
 }
 
 fn decide_register(
@@ -723,24 +1135,41 @@ fn decide_claim(
     let mut events = Vec::new();
     let mut granted = 0u32;
     let mut runs = active_runs(state);
+    if runs.is_empty() {
+        return Ok(Decision { events });
+    }
     runs.sort();
-    for run in runs {
-        if granted >= cap {
-            break;
-        }
-        let mut ready = unclaimed_ready(state, run, time);
-        ready.sort();
-        for activation in ready {
+    let mut granted_ids = Vec::new();
+    while granted < cap {
+        let mut progressed = false;
+        for run in &runs {
             if granted >= cap {
                 break;
             }
+            let mut ready = unclaimed_ready(state, *run, time);
+            ready.sort();
+            let Some(activation) = ready.into_iter().find(|id| {
+                if granted_ids.contains(id) {
+                    return false;
+                }
+                let Some(act) = state.activations.get(id) else {
+                    return false;
+                };
+                let role = grant_role(state, act, time);
+                if role == ExecutionRole::Forward && run_past_deadline(state, *run, time) {
+                    return false;
+                }
+                !(role == ExecutionRole::Forward && run_is_aborting(state, *run))
+            }) else {
+                continue;
+            };
             let Some(act) = state.activations.get(&activation) else {
                 continue;
             };
+            let role = grant_role(state, act, time);
             let lease_expiry_ms = time
                 .as_millis()
                 .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64);
-            let role = grant_role(state, act, time);
             let timeout = match role {
                 ExecutionRole::Reconciliation => crate::policy::RECONCILIATION_ATTEMPT_TIMEOUT,
                 ExecutionRole::Compensation => crate::policy::COMPENSATION_ATTEMPT_TIMEOUT,
@@ -753,7 +1182,7 @@ fn decide_claim(
                 .map(|claim| claim.effect_key)
                 .unwrap_or_else(|| EffectKey::from_bytes(ids.next_bytes()));
             events.push(DomainEvent::ClaimGranted {
-                run,
+                run: *run,
                 activation,
                 session,
                 generation: OwnerGeneration::new(
@@ -765,10 +1194,46 @@ fn decide_claim(
                 effect_key,
                 role,
             });
+            granted_ids.push(activation);
             granted += 1;
+            progressed = true;
+        }
+        if !progressed {
+            break;
         }
     }
     Ok(Decision { events })
+}
+
+fn uncertain_forwards(state: &State, run: RunId) -> bool {
+    state.activations.values().any(|act| {
+        act.run == run
+            && act.role == ExecutionRole::Forward
+            && act.status == ActivationStatus::Ready
+            && (act.claim.is_some() || state.interventions.contains_key(&act.id))
+    })
+}
+
+fn run_is_aborting(state: &State, run: RunId) -> bool {
+    state.saga_errors.keys().any(|saga| {
+        state
+            .activations
+            .get(saga)
+            .is_some_and(|act| act.run == run)
+    })
+}
+
+fn run_past_deadline(state: &State, run: RunId, time: EngineTime) -> bool {
+    let Some(run_state) = state.runs.get(&run) else {
+        return false;
+    };
+    let Some(ms) = run_state.policy.run_timeout_ms else {
+        return false;
+    };
+    if run_state.admitted_ms == 0 {
+        return false;
+    }
+    time.as_millis() >= run_state.admitted_ms.saturating_add(ms)
 }
 
 fn decide_renew(
@@ -898,7 +1363,10 @@ fn grant_role(state: &State, act: &ActivationState, time: EngineTime) -> Executi
     let Ok(contract) = run.catalog.activity(activity) else {
         return ExecutionRole::Forward;
     };
-    if contract.recovery == crate::catalog::Recovery::Manual && contract.reconciler.is_some() {
+    if contract.reconciler.is_none() {
+        return ExecutionRole::Forward;
+    }
+    if contract.recovery == crate::catalog::Recovery::Manual || run_is_aborting(state, act.run) {
         ExecutionRole::Reconciliation
     } else {
         ExecutionRole::Forward
@@ -966,6 +1434,16 @@ fn decide_reconcile(
         }
         ReconcileOutcome::NotApplied => {
             events.push(DomainEvent::ClaimCleared { activation });
+            if run_is_aborting(state, run) {
+                events.push(DomainEvent::LeafFailed {
+                    run,
+                    activation,
+                    attempt: AttemptNo::new(u64::from(act.attempts.max(1))),
+                    code: "not_applied".to_owned(),
+                    message: "forward effect conclusively did not apply".to_owned(),
+                    retry: false,
+                });
+            }
         }
         ReconcileOutcome::Unknown => {
             if probes >= crate::policy::RECONCILIATION_PROBES {
@@ -982,6 +1460,7 @@ fn decide_reconcile(
 }
 
 fn unclaimed_ready(state: &State, run: RunId, time: EngineTime) -> Vec<ActivationId> {
+    READY_SCANS.fetch_add(1, Ordering::Relaxed);
     ready_activations(state, run)
         .into_iter()
         .filter(|id| {
@@ -1040,6 +1519,22 @@ fn decide_cancel(state: &State, run: RunId, reason: &str, ids: &mut IdGen) -> Re
         message: reason.to_owned(),
     };
     let mut events = Vec::new();
+    for wait in state
+        .waits
+        .values()
+        .filter(|wait| wait.run == run && wait.pending)
+    {
+        if let Some(entry) = state
+            .inbox
+            .iter()
+            .find(|entry| entry.reserved_wait == Some(wait.id) && !entry.consumed)
+        {
+            events.push(DomainEvent::ReservationReleased {
+                wait: wait.id,
+                event_id: entry.event_id,
+            });
+        }
+    }
     let sagas: Vec<ActivationId> = state
         .activations
         .values()
@@ -1070,30 +1565,57 @@ fn decide_cancel(state: &State, run: RunId, reason: &str, ids: &mut IdGen) -> Re
     Ok(Decision { events })
 }
 
-fn compensation_for(state: &State, act: &ActivationState, output: &Value) -> Option<DomainEvent> {
-    let region = region_for_scope(state, act.scope)?;
-    let Node::Activity {
-        compensation:
-            Some(crate::ir::Compensation::Activity {
-                activity, input, ..
-            }),
-        ..
-    } = region.nodes.get(act.node.as_str())?
-    else {
-        return None;
+fn compensation_events(state: &State, act: &ActivationState, output: &Value) -> Vec<DomainEvent> {
+    let Some(region) = region_for_scope(state, act.scope) else {
+        return Vec::new();
     };
-    let scope = state.scopes.get(&act.scope)?;
-    let mut ctx = eval_ctx(state, scope);
-    ctx.forward_input = Some(eval_binding(act_input_binding(region, &act.node)?, &ctx).ok()?);
-    ctx.forward_output = Some(output.clone());
-    let bound = eval_binding(input, &ctx).ok()?;
-    Some(DomainEvent::ObligationRegistered {
-        run: act.run,
-        forward: act.id,
-        handler: activity.name.clone(),
-        handler_version: activity.version,
-        input: bound,
-    })
+    let Some(node) = region.nodes.get(act.node.as_str()) else {
+        return Vec::new();
+    };
+    match node {
+        Node::Activity {
+            compensation:
+                Some(crate::ir::Compensation::Activity {
+                    activity, input, ..
+                }),
+            ..
+        } => {
+            let Some(scope) = state.scopes.get(&act.scope) else {
+                return Vec::new();
+            };
+            let mut ctx = eval_ctx(state, scope);
+            ctx.forward_input = act_input_binding(region, &act.node)
+                .and_then(|binding| eval_binding(binding, &ctx).ok());
+            ctx.forward_output = Some(output.clone());
+            match eval_binding(input, &ctx) {
+                Ok(bound) => vec![DomainEvent::ObligationRegistered {
+                    run: act.run,
+                    forward: act.id,
+                    handler: activity.name.clone(),
+                    handler_version: activity.version,
+                    input: bound,
+                }],
+                Err(err) => vec![DomainEvent::ObligationBlocked {
+                    run: act.run,
+                    forward: act.id,
+                    handler: activity.name.clone(),
+                    handler_version: activity.version,
+                    reason: err.message,
+                }],
+            }
+        }
+        Node::Activity {
+            compensation: Some(crate::ir::Compensation::Irreversible { reason }),
+            ..
+        } => vec![DomainEvent::ObligationBlocked {
+            run: act.run,
+            forward: act.id,
+            handler: "irreversible".to_owned(),
+            handler_version: 1,
+            reason: reason.clone(),
+        }],
+        _ => Vec::new(),
+    }
 }
 
 fn act_input_binding<'a>(region: &'a Region, node: &NodeKey) -> Option<&'a Binding> {
@@ -1110,7 +1632,7 @@ fn decide_signal(
     signal: &str,
     key: &str,
     payload: Value,
-    _time: EngineTime,
+    time: EngineTime,
     ids: &mut IdGen,
 ) -> Result<Decision> {
     let run_state = state
@@ -1135,7 +1657,32 @@ fn decide_signal(
             "event id payload conflict",
         ));
     }
+    let buffered = state
+        .inbox
+        .iter()
+        .filter(|entry| entry.run == Some(run) && !entry.consumed)
+        .count();
+    if buffered >= crate::limits::MAX_BUFFERED_EVENTS_PER_RUN as usize {
+        return Err(Error::new(
+            crate::error::ErrorKind::ResourceExhausted,
+            "inbox quota exceeded",
+        ));
+    }
+    let same_addr = state
+        .inbox
+        .iter()
+        .filter(|entry| !entry.consumed && entry.signal == signal && entry.key == key)
+        .count();
+    if same_addr >= crate::limits::MAX_EVENTS_PER_ADDRESS as usize {
+        return Err(Error::new(
+            crate::error::ErrorKind::ResourceExhausted,
+            "inbox address quota exceeded",
+        ));
+    }
     let sequence = run_state.next_sequence.get();
+    let accepted_ms = time.as_millis();
+    let expires_ms = accepted_ms
+        .saturating_add(crate::policy::UNRESERVED_EVENT_DAYS.saturating_mul(24 * 60 * 60 * 1000));
     let mut events = vec![DomainEvent::EventAccepted {
         run,
         event_id,
@@ -1143,29 +1690,16 @@ fn decide_signal(
         key: key.to_owned(),
         payload: payload.clone(),
         sequence,
+        accepted_ms,
+        expires_ms,
     }];
     if let Some(wait) = pending_wait(state, run, signal, key) {
-        events.push(DomainEvent::WaitSatisfied {
-            run,
+        events.push(DomainEvent::EventReserved {
             wait: wait.id,
             event_id,
-            payload: payload.clone(),
         });
-        events.push(DomainEvent::NodeOutputRecorded {
-            run,
-            scope: state.activations.get(&wait.activation).unwrap().scope,
-            node: state
-                .activations
-                .get(&wait.activation)
-                .unwrap()
-                .node
-                .as_str()
-                .to_owned(),
-            output: payload.clone(),
-        });
-        let act = state.activations.get(&wait.activation).unwrap();
-        events.extend(follow_next(state, act.scope, &act.node, &payload, ids)?);
     }
+    let _ = ids;
     Ok(Decision { events })
 }
 
@@ -1201,7 +1735,7 @@ fn decide_timer(
     if time.as_millis() < deadline {
         return Err(Error::invalid("wait deadline has not been reached"));
     }
-    if let Some(entry) = reserved_or_eligible(state, wait_state) {
+    if let Some(entry) = reserved_or_eligible(state, wait_state, time.as_millis()) {
         let act = state.activations.get(&wait_state.activation).unwrap();
         return Ok(Decision {
             events: vec![
@@ -1235,15 +1769,33 @@ fn decide_timer(
     Ok(Decision { events })
 }
 
-fn reserved_or_eligible<'a>(state: &'a State, wait: &WaitState) -> Option<&'a InboxEntry> {
+fn reserved_or_eligible<'a>(
+    state: &'a State,
+    wait: &WaitState,
+    now_ms: u64,
+) -> Option<&'a InboxEntry> {
+    if let Some(entry) = state
+        .inbox
+        .iter()
+        .find(|entry| !entry.consumed && entry.reserved_wait == Some(wait.id))
+    {
+        return Some(entry);
+    }
     state.inbox.iter().find(|entry| {
         !entry.consumed
+            && entry.reserved_wait.is_none()
             && entry.signal == wait.signal
             && entry.key == wait.key
             && match wait.consume_from {
                 ConsumeFrom::Buffered => true,
                 ConsumeFrom::AfterActivation => entry.sequence >= wait.opened_sequence,
             }
+            && (wait.deadline_ms.is_none()
+                || entry.accepted_ms == 0
+                || wait
+                    .deadline_ms
+                    .is_some_and(|deadline| entry.accepted_ms <= deadline))
+            && (entry.expires_ms == 0 || now_ms < entry.expires_ms)
     })
 }
 
@@ -1360,6 +1912,13 @@ fn next_progress(
                 }
             }
             Node::WaitSignal { .. } => {
+                if state
+                    .waits
+                    .values()
+                    .any(|wait| wait.activation == act.id && wait.pending)
+                {
+                    continue;
+                }
                 return Ok(Some(open_wait(state, act, time, ids)?));
             }
             Node::While {
@@ -1485,22 +2044,22 @@ fn due_wait(
     time: EngineTime,
     ids: &mut IdGen,
 ) -> Result<Option<Vec<DomainEvent>>> {
+    let now = time.as_millis();
     let mut due: Vec<&WaitState> = state
         .waits
         .values()
         .filter(|wait| {
             wait.run == run
                 && wait.pending
-                && wait
-                    .deadline_ms
-                    .is_some_and(|deadline| time.as_millis() >= deadline)
+                && (wait.deadline_ms.is_some_and(|deadline| now >= deadline)
+                    || reserved_or_eligible(state, wait, now).is_some())
         })
         .collect();
     due.sort_by_key(|wait| wait.deadline_ms.unwrap_or(0));
     let Some(wait) = due.first().copied() else {
         return Ok(None);
     };
-    if let Some(entry) = reserved_or_eligible(state, wait) {
+    if let Some(entry) = reserved_or_eligible(state, wait, now) {
         let act = state.activations.get(&wait.activation).unwrap();
         let mut events = vec![
             DomainEvent::WaitSatisfied {
@@ -1561,6 +2120,21 @@ fn open_wait(
         .as_str()
         .ok_or_else(|| Error::invalid("wait key must be a string"))?
         .to_owned();
+    if state.waits.values().any(|existing| {
+        existing.run == act.run
+            && existing.pending
+            && existing.signal == *signal
+            && existing.key == key_str
+    }) {
+        return fail_scope(
+            state,
+            act.scope,
+            FailError {
+                code: "WaitKeyConflict".to_owned(),
+                message: format!("conflicting active wait address {signal}/{key_str}"),
+            },
+        );
+    }
     let wait = ids.wait();
     let deadline = timeout_ms.map(|ms| time.as_millis().saturating_add(ms));
     let mut events = vec![DomainEvent::WaitOpened {
@@ -1583,7 +2157,7 @@ fn open_wait(
         opened_sequence: state.runs.get(&act.run).unwrap().next_sequence.get(),
         pending: true,
     };
-    if let Some(entry) = reserved_or_eligible(state, &fake) {
+    if let Some(entry) = reserved_or_eligible(state, &fake, time.as_millis()) {
         events.push(DomainEvent::WaitSatisfied {
             run: act.run,
             wait,
@@ -1834,6 +2408,29 @@ fn progress_foreach(
         events.extend(follow_next(state, act.scope, &act.node, &output, ids)?);
         return Ok(events);
     }
+    if let Some(failed) = children_of(state, act.id)
+        .into_iter()
+        .find(|child| matches!(child.status, ScopeStatus::Failed { .. }))
+    {
+        if let ScopeStatus::Failed { error } = failed.status.clone() {
+            let mut events = Vec::new();
+            for sibling in children_of(state, act.id) {
+                if sibling.id == failed.id || sibling.status != ScopeStatus::Open {
+                    continue;
+                }
+                events.extend(fail_scope(
+                    state,
+                    sibling.id,
+                    FailError {
+                        code: "item.cancelled".to_owned(),
+                        message: "sibling foreach item failed".to_owned(),
+                    },
+                )?);
+            }
+            events.extend(fail_scope(state, act.scope, error)?);
+            return Ok(events);
+        }
+    }
     let open_children = children_of(state, act.id)
         .into_iter()
         .filter(|child| child.status == ScopeStatus::Open)
@@ -1947,7 +2544,40 @@ fn progress_parallel(
         .find(|child| matches!(child.status, ScopeStatus::Failed { .. }))
     {
         if let ScopeStatus::Failed { error } = failed.status.clone() {
-            return fail_scope(state, act.scope, error);
+            let mut events = Vec::new();
+            let mut uncertain = false;
+            for sibling in children_of(state, act.id) {
+                if sibling.id == failed.id {
+                    continue;
+                }
+                if sibling.status != ScopeStatus::Open {
+                    continue;
+                }
+                let claimed = state.activations.values().any(|item| {
+                    item.scope == sibling.id
+                        && item.claim.as_ref().is_some_and(|claim| {
+                            // live claim means the effect may still apply
+                            claim.lease_expiry_ms > 0
+                        })
+                });
+                if claimed {
+                    uncertain = true;
+                    continue;
+                }
+                events.extend(fail_scope(
+                    state,
+                    sibling.id,
+                    FailError {
+                        code: "branch.cancelled".to_owned(),
+                        message: "sibling branch failed".to_owned(),
+                    },
+                )?);
+            }
+            if uncertain {
+                return Ok(events);
+            }
+            events.extend(fail_scope(state, act.scope, error)?);
+            return Ok(events);
         }
     }
     let _ = next;
@@ -2025,6 +2655,10 @@ fn progress_saga(
     if compensating_in_flight(state, act.id) {
         return Ok(Vec::new());
     }
+    if state.saga_errors.contains_key(&act.id) {
+        let error = state.saga_errors.get(&act.id).unwrap().clone();
+        return compensate_or_fail(state, act.id, error, ids);
+    }
     if let Some(child) = child_of(state, act.id) {
         return match &child.status {
             ScopeStatus::Open => Ok(Vec::new()),
@@ -2041,10 +2675,6 @@ fn progress_saga(
                 Ok(events)
             }
         };
-    }
-    if state.saga_errors.contains_key(&act.id) {
-        let error = state.saga_errors.get(&act.id).unwrap().clone();
-        return compensate_or_fail(state, act.id, error, ids);
     }
     let scope = state.scopes.get(&act.scope).unwrap();
     let captured = eval_binding(input, &eval_ctx(state, scope))?;
@@ -2083,12 +2713,45 @@ fn compensate_or_fail(
     let Some(act) = state.activations.get(&saga) else {
         return Err(Error::invalid("unknown saga"));
     };
+    if state
+        .obligations
+        .iter()
+        .any(|item| item.owner == saga && matches!(item.status, ObligationStatus::Blocked { .. }))
+    {
+        return Ok(vec![DomainEvent::InterventionRequired {
+            run: act.run,
+            activation: saga,
+            reason: "compensation input is blocked".to_owned(),
+        }]);
+    }
     let pending: Vec<&Obligation> = state
         .obligations
         .iter()
         .filter(|item| item.owner == saga && matches!(item.status, ObligationStatus::Open))
         .collect();
     if pending.is_empty() {
+        if uncertain_forwards(state, act.run) {
+            if state.saga_errors.contains_key(&saga) {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![DomainEvent::AbortIntent {
+                run: act.run,
+                saga,
+                error,
+            }]);
+        }
+        if state.obligations.iter().any(|item| {
+            item.owner == saga && matches!(item.status, ObligationStatus::Irreversible { .. })
+        }) {
+            return fail_scope(
+                state,
+                act.scope,
+                FailError {
+                    code: "saga.irreversible".to_owned(),
+                    message: error.message,
+                },
+            );
+        }
         return fail_scope(state, act.scope, error);
     }
     let obligation = pending[pending.len() - 1];
@@ -2461,22 +3124,29 @@ fn event_run(event: &DomainEvent) -> Option<RunId> {
         | DomainEvent::NodeOutputRecorded { run, .. }
         | DomainEvent::GuardRecorded { run, .. }
         | DomainEvent::LeafSucceeded { run, .. }
+        | DomainEvent::LeafFailed { run, .. }
         | DomainEvent::WaitOpened { run, .. }
         | DomainEvent::WaitSatisfied { run, .. }
         | DomainEvent::WaitTimedOut { run, .. }
         | DomainEvent::EventAccepted { run, .. }
         | DomainEvent::ObligationRegistered { run, .. }
+        | DomainEvent::ObligationBlocked { run, .. }
         | DomainEvent::CompensationStarted { run, .. }
         | DomainEvent::RunSucceeded { run, .. }
         | DomainEvent::RunFailed { run, .. }
         | DomainEvent::ObligationReleased { run, .. }
         | DomainEvent::ClaimGranted { run, .. }
         | DomainEvent::ReconciliationRecorded { run, .. }
-        | DomainEvent::InterventionRequired { run, .. } => *run,
+        | DomainEvent::InterventionRequired { run, .. }
+        | DomainEvent::AbortIntent { run, .. }
+        | DomainEvent::CompensationAbandoned { run, .. } => *run,
         DomainEvent::ObligationTransferred { .. }
         | DomainEvent::SessionRegistered { .. }
         | DomainEvent::ClaimRenewed { .. }
-        | DomainEvent::ClaimCleared { .. } => {
+        | DomainEvent::ClaimCleared { .. }
+        | DomainEvent::EventReserved { .. }
+        | DomainEvent::ReservationReleased { .. }
+        | DomainEvent::RecoveryAuthorized { .. } => {
             return None;
         }
     })
@@ -2489,14 +3159,15 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             input,
             root,
             policy,
+            admitted_ms,
             ..
         } => {
-            // definition is filled by the caller via start_with
             if let Some(run_state) = state.runs.get_mut(run) {
                 run_state.input = input.clone();
                 run_state.root = *root;
                 run_state.policy = policy.clone();
                 run_state.status = RunStatus::Active;
+                run_state.admitted_ms = *admitted_ms;
             }
         }
         DomainEvent::ScopeOpened {
@@ -2548,7 +3219,8 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                         .parallel_done
                         .entry(*activation)
                         .or_default()
-                        .insert(name.clone(), output.clone());
+                        .entry(name.clone())
+                        .or_insert(output.clone());
                 }
                 if let ScopeRole::LoopBody { activation, index } = scope_state.role {
                     state
@@ -2607,6 +3279,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     },
                     role: ExecutionRole::Forward,
                     claim: None,
+                    attempts: 0,
                 },
             );
             if let Some(scope_state) = state.scopes.get_mut(scope) {
@@ -2640,6 +3313,18 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             state
                 .loop_carry
                 .insert(*activation, (carry.clone(), *index));
+        }
+        DomainEvent::LeafFailed {
+            activation, retry, ..
+        } => {
+            if let Some(act) = state.activations.get_mut(activation) {
+                if *retry {
+                    act.status = ActivationStatus::Ready;
+                    act.claim = None;
+                } else {
+                    act.status = ActivationStatus::Failed;
+                }
+            }
         }
         DomainEvent::LeafSucceeded {
             activation, role, ..
@@ -2719,6 +3404,9 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             key,
             payload,
             sequence,
+            accepted_ms,
+            expires_ms,
+            run,
             ..
         } => {
             state.inbox.push(InboxEntry {
@@ -2729,9 +3417,12 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 sequence: *sequence,
                 reserved_wait: None,
                 consumed: false,
+                accepted_ms: *accepted_ms,
+                expires_ms: *expires_ms,
+                run: Some(*run),
             });
-            if let Some(run) = state.runs.values_mut().next() {
-                run.next_sequence = RunSequence::new(sequence + 1);
+            if let Some(run_state) = state.runs.get_mut(run) {
+                run_state.next_sequence = RunSequence::new(sequence + 1);
             }
         }
         DomainEvent::ObligationRegistered {
@@ -2741,16 +3432,25 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             handler_version,
             input,
         } => {
-            let owner = saga_owner(state, *forward).unwrap_or(*forward);
-            state.obligations.push(Obligation {
-                forward: *forward,
-                run: *run,
-                owner,
-                handler: handler.clone(),
-                handler_version: *handler_version,
-                input: input.clone(),
-                status: ObligationStatus::Open,
-            });
+            if let Some(obligation) = state
+                .obligations
+                .iter_mut()
+                .find(|item| item.forward == *forward)
+            {
+                obligation.input = input.clone();
+                obligation.status = ObligationStatus::Open;
+            } else {
+                let owner = saga_owner(state, *forward).unwrap_or(*forward);
+                state.obligations.push(Obligation {
+                    forward: *forward,
+                    run: *run,
+                    owner,
+                    handler: handler.clone(),
+                    handler_version: *handler_version,
+                    input: input.clone(),
+                    status: ObligationStatus::Open,
+                });
+            }
         }
         DomainEvent::CompensationStarted {
             run,
@@ -2788,6 +3488,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                         status: ActivationStatus::Ready,
                         role: ExecutionRole::Compensation,
                         claim: None,
+                        attempts: 0,
                     },
                 );
             }
@@ -2811,6 +3512,67 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 .find(|item| item.forward == *forward)
             {
                 obligation.status = ObligationStatus::Released;
+            }
+        }
+        DomainEvent::ObligationBlocked {
+            run,
+            forward,
+            handler,
+            handler_version,
+            reason,
+        } => {
+            if let Some(obligation) = state
+                .obligations
+                .iter_mut()
+                .find(|item| item.forward == *forward)
+            {
+                obligation.status = if handler == "irreversible" {
+                    ObligationStatus::Irreversible {
+                        reason: reason.clone(),
+                    }
+                } else {
+                    ObligationStatus::Blocked {
+                        reason: reason.clone(),
+                    }
+                };
+            } else {
+                let owner = saga_owner(state, *forward).unwrap_or(*forward);
+                let status = if handler == "irreversible" {
+                    ObligationStatus::Irreversible {
+                        reason: reason.clone(),
+                    }
+                } else {
+                    ObligationStatus::Blocked {
+                        reason: reason.clone(),
+                    }
+                };
+                state.obligations.push(Obligation {
+                    forward: *forward,
+                    run: *run,
+                    owner,
+                    handler: handler.clone(),
+                    handler_version: *handler_version,
+                    input: Value::Null,
+                    status,
+                });
+            }
+        }
+        DomainEvent::EventReserved { wait, event_id } => {
+            if let Some(entry) = state
+                .inbox
+                .iter_mut()
+                .find(|entry| entry.event_id == *event_id)
+            {
+                entry.reserved_wait = Some(*wait);
+            }
+        }
+        DomainEvent::ReservationReleased { event_id, .. } => {
+            if let Some(entry) = state
+                .inbox
+                .iter_mut()
+                .find(|entry| entry.event_id == *event_id)
+            {
+                entry.reserved_wait = None;
             }
         }
         DomainEvent::SessionRegistered {
@@ -2852,6 +3614,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     role: *role,
                     probes: 0,
                 });
+                act.attempts = act.attempts.saturating_add(1);
             }
         }
         DomainEvent::ClaimRenewed {
@@ -2900,6 +3663,28 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 };
             }
         }
+        DomainEvent::RecoveryAuthorized { .. } => {
+            if let Some(hold) = &mut state.recovery {
+                hold.authorized = true;
+            }
+        }
+        DomainEvent::AbortIntent { saga, error, .. } => {
+            state.saga_errors.insert(*saga, error.clone());
+        }
+        DomainEvent::CompensationAbandoned {
+            run, unresolved, ..
+        } => {
+            for obligation in &mut state.obligations {
+                if obligation.run == *run && unresolved.contains(&obligation.forward) {
+                    obligation.status = ObligationStatus::Abandoned;
+                }
+            }
+            for act in state.activations.values_mut() {
+                if act.run == *run {
+                    act.claim = None;
+                }
+            }
+        }
     }
 }
 
@@ -2930,6 +3715,8 @@ pub fn start_run(
             status: RunStatus::Active,
             root: ScopeId::from_bytes([0; 16]),
             next_sequence: RunSequence::new(1),
+            admitted_ms: 0,
+            terminal_ms: 0,
         },
     );
     let decision = decide(state, &command)?;
@@ -2944,6 +3731,18 @@ pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEv
     }
     let decision = decide(state, &command)?;
     apply_events(state, &decision.events);
+    for event in &decision.events {
+        if matches!(
+            event,
+            DomainEvent::RunSucceeded { .. } | DomainEvent::RunFailed { .. }
+        ) {
+            if let Some(run) = event_run(event) {
+                if let Some(run_state) = state.runs.get_mut(&run) {
+                    run_state.terminal_ms = command.time.as_millis();
+                }
+            }
+        }
+    }
     state.commands.insert(command.id, decision.events.clone());
     Ok(decision.events)
 }
@@ -2968,6 +3767,8 @@ pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainE
                     status: RunStatus::Active,
                     root: ScopeId::from_bytes([0; 16]),
                     next_sequence: RunSequence::new(1),
+                    admitted_ms: 0,
+                    terminal_ms: 0,
                 },
             );
         }
@@ -3101,6 +3902,49 @@ pub fn run_events(state: &State, run: RunId) -> &[DomainEvent] {
     state.history.get(&run).map(Vec::as_slice).unwrap_or(&[])
 }
 
+pub fn history_or_unavailable(
+    state: &State,
+    run: RunId,
+    now: EngineTime,
+) -> Result<&[DomainEvent]> {
+    let Some(run_state) = state.runs.get(&run) else {
+        return Err(Error::new(crate::error::ErrorKind::NotFound, "unknown run"));
+    };
+    if matches!(run_state.status, RunStatus::Active) {
+        return Ok(run_events(state, run));
+    }
+    if run_state.terminal_ms == 0 {
+        return Ok(run_events(state, run));
+    }
+    let retain_ms = run_state
+        .policy
+        .terminal_history_days
+        .saturating_mul(24 * 60 * 60 * 1000);
+    if now.as_millis() > run_state.terminal_ms.saturating_add(retain_ms) {
+        return Err(Error::new(
+            crate::error::ErrorKind::Unavailable,
+            "history range is unavailable",
+        ));
+    }
+    Ok(run_events(state, run))
+}
+
+fn validate_leaf_output(state: &State, act: &ActivationState, output: &Value) -> Result<()> {
+    let Some(run) = state.runs.get(&act.run) else {
+        return Ok(());
+    };
+    let Some(region) = lookup_region(state, act.scope) else {
+        return Ok(());
+    };
+    let Some(Node::Activity { activity, .. }) = region.nodes.get(act.node.as_str()) else {
+        return Ok(());
+    };
+    let Ok(contract) = run.catalog.activity(activity) else {
+        return Ok(());
+    };
+    run.catalog.validate_value(&contract.output_schema, output)
+}
+
 pub fn reconstruct(
     definition: Definition,
     catalog: Catalog,
@@ -3128,6 +3972,8 @@ pub fn reconstruct(
             status: RunStatus::Active,
             root: *root,
             next_sequence: RunSequence::new(1),
+            admitted_ms: 0,
+            terminal_ms: 0,
         },
     );
     apply_events(&mut state, events);
@@ -3200,6 +4046,45 @@ mod tests {
         .unwrap()
     }
 
+    fn apply(
+        state: &mut State,
+        time: u64,
+        body: CommandBody,
+    ) -> crate::error::Result<Vec<DomainEvent>> {
+        apply_command(
+            state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(time),
+                body,
+            },
+        )
+    }
+
+    fn start_yaml(yaml: &str, input: Value) -> (State, RunId) {
+        let catalog = catalog();
+        let definition = compile_yaml(yaml, &catalog).unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input,
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        (state, run)
+    }
+
     fn handler(name: &str, input: &Value) -> Value {
         match name {
             "counter.increment" => {
@@ -3213,12 +4098,23 @@ mod tests {
                 let Value::Object(fields) = input else {
                     panic!("order");
                 };
-                let mut out = fields.clone();
-                out.insert(
-                    "reservation_id".to_owned(),
-                    Value::String("res-1".to_owned()),
-                );
-                Value::Object(out)
+                Value::Object(BTreeMap::from([
+                    (
+                        "order_id".to_owned(),
+                        fields
+                            .get("order_id")
+                            .cloned()
+                            .unwrap_or(Value::String(String::new())),
+                    ),
+                    (
+                        "amount".to_owned(),
+                        fields.get("amount").cloned().unwrap_or(Value::Int(0)),
+                    ),
+                    (
+                        "reservation_id".to_owned(),
+                        Value::String("res-1".to_owned()),
+                    ),
+                ]))
             }
             "payment.charge" => {
                 let Value::Object(fields) = input else {
@@ -3569,9 +4465,21 @@ mod tests {
             live.history.get(&run).unwrap(),
         )
         .unwrap();
+        let live_out = run_output(&live, run).unwrap();
+        let rebuilt_out = run_output(&rebuilt, run).unwrap();
+        assert_eq!(live_out, rebuilt_out);
         assert_eq!(
-            run_output(&live, run).unwrap(),
-            run_output(&rebuilt, run).unwrap()
+            live_out.pointer("/payment_id").unwrap().as_str(),
+            Some("pay-1")
+        );
+        assert_eq!(
+            live.runs.get(&run).unwrap().status,
+            rebuilt.runs.get(&run).unwrap().status
+        );
+        assert_eq!(live.scopes.len(), rebuilt.scopes.len());
+        assert_eq!(
+            live.history.get(&run).map(Vec::len),
+            rebuilt.history.get(&run).map(Vec::len)
         );
     }
 
@@ -4115,5 +5023,3139 @@ nodes:
                 .as_i64(),
             Some(2)
         );
+    }
+
+    fn loop_yaml(max_iterations: u32) -> String {
+        format!(
+            r#"
+dsl: graphrun/v1
+id: loop_limit
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: count
+nodes:
+  count:
+    kind: while
+    state_schema: counter/v1
+    state: {{from: workflow.input}}
+    condition:
+      lt:
+        - {{from: loop.state, path: /value}}
+        - {{literal: 3}}
+    max_iterations: {max_iterations}
+    body:
+      input_schema: counter/v1
+      output_schema: counter/v1
+      start: increment
+      nodes:
+        increment:
+          kind: activity
+          activity: {{name: counter.increment, version: 1}}
+          input: {{from: scope.input}}
+          next: done
+        done:
+          kind: complete
+          output: {{from: nodes.increment.output}}
+    next: finish
+  finish:
+    kind: complete
+    output: {{from: nodes.count.output}}
+"#
+        )
+    }
+
+    #[test]
+    fn loop_limit_boundary() {
+        let ok = drive_state(
+            &loop_yaml(1),
+            Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(2))])),
+        );
+        let run = *ok.runs.keys().next().unwrap();
+        match &ok.runs.get(&run).unwrap().status {
+            RunStatus::Succeeded { output } => {
+                assert_eq!(output.pointer("/value").unwrap().as_i64(), Some(3));
+            }
+            other => panic!("false at the limit must succeed, got {other:?}"),
+        }
+        let failed = drive_state(
+            &loop_yaml(1),
+            Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(0))])),
+        );
+        let run = *failed.runs.keys().next().unwrap();
+        match &failed.runs.get(&run).unwrap().status {
+            RunStatus::Failed { error } => assert_eq!(error.code, "LoopLimitExceeded"),
+            other => panic!("expected LoopLimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_child_complete_does_not_complete_root() {
+        let state = drive_state(
+            include_str!("../../docs/specs/v1/examples/nested-controls.yaml"),
+            Value::Array(vec![
+                Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(1))])),
+                Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(4))])),
+            ]),
+        );
+        let run = *state.runs.keys().next().unwrap();
+        let events = state.history.get(&run).unwrap();
+        let mut root = None;
+        let mut root_completed_at = None;
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                DomainEvent::ScopeOpened {
+                    scope,
+                    role: ScopeRole::Root,
+                    ..
+                } => root = Some(*scope),
+                DomainEvent::ScopeCompleted { scope, .. } if Some(*scope) == root => {
+                    root_completed_at = Some(i);
+                }
+                DomainEvent::ScopeCompleted { .. } => {
+                    if let Some(at) = root_completed_at {
+                        panic!("child completed after root at {at}");
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(root_completed_at.is_some());
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Succeeded { .. }
+        ));
+    }
+
+    #[test]
+    fn generated_nested_controls_match_oracle() {
+        fn expected(values: &[i64]) -> Value {
+            Value::Array(
+                values
+                    .iter()
+                    .map(|value| {
+                        let after_repeat = *value + 2;
+                        Value::Array(vec![
+                            Value::Object(BTreeMap::from([(
+                                "value".to_owned(),
+                                Value::Int(after_repeat + 1),
+                            )])),
+                            Value::Object(BTreeMap::from([(
+                                "value".to_owned(),
+                                Value::Int(after_repeat),
+                            )])),
+                        ])
+                    })
+                    .collect(),
+            )
+        }
+        for values in [vec![], vec![1], vec![1, 4], vec![0, 2, 5]] {
+            let input = Value::Array(
+                values
+                    .iter()
+                    .map(|value| {
+                        Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(*value))]))
+                    })
+                    .collect(),
+            );
+            if values.is_empty() {
+                let output = drive(
+                    include_str!("../../docs/specs/v1/examples/foreach.yaml"),
+                    Value::Array(Vec::new()),
+                );
+                assert_eq!(output, Value::Array(Vec::new()));
+                continue;
+            }
+            let output = drive(
+                include_str!("../../docs/specs/v1/examples/nested-controls.yaml"),
+                input,
+            );
+            assert_eq!(output, expected(&values), "values={values:?}");
+        }
+    }
+
+    #[test]
+    fn foreach_respects_concurrency_window() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: foreach_window
+version: 1
+input_schema: {array: counter/v1}
+output_schema: {array: counter/v1}
+start: increment_all
+nodes:
+  increment_all:
+    kind: foreach
+    items: {from: workflow.input}
+    item_schema: counter/v1
+    max_items: 10
+    max_concurrency: 1
+    body:
+      input_schema: counter/v1
+      output_schema: counter/v1
+      start: increment
+      nodes:
+        increment:
+          kind: activity
+          activity: {name: counter.increment, version: 1}
+          input: {from: item.value}
+          next: done
+        done:
+          kind: complete
+          output: {from: nodes.increment.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.increment_all.output}
+"#;
+        let catalog = catalog();
+        let definition = compile_yaml(yaml, &catalog).unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        let input = Value::Array(vec![
+            Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(1))])),
+            Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(2))])),
+            Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(3))])),
+        ]);
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input,
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        for _ in 0..8 {
+            apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Progress { run },
+                },
+            )
+            .unwrap();
+        }
+        let open_items = state
+            .scopes
+            .values()
+            .filter(|scope| {
+                scope.run == run
+                    && matches!(scope.role, ScopeRole::ForeachItem { .. })
+                    && scope.status == ScopeStatus::Open
+            })
+            .count();
+        assert!(
+            open_items <= 1,
+            "foreach opened {open_items} item scopes with max_concurrency 1"
+        );
+        assert_eq!(ready_activations(&state, run).len(), 1);
+    }
+
+    #[test]
+    fn obligation_registers_with_forward_success() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/saga.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([
+                        ("order_id".to_owned(), Value::String("o1".to_owned())),
+                        ("amount".to_owned(), Value::Int(1000)),
+                    ])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        let events = apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::ReportLeaf {
+                    run,
+                    activation,
+                    output: Value::Object(BTreeMap::from([
+                        ("order_id".to_owned(), Value::String("o1".to_owned())),
+                        ("amount".to_owned(), Value::Int(1000)),
+                        (
+                            "reservation_id".to_owned(),
+                            Value::String("res-1".to_owned()),
+                        ),
+                    ])),
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, DomainEvent::LeafSucceeded { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DomainEvent::ObligationRegistered {
+                handler,
+                ..
+            } if handler == "inventory.release"
+        )));
+    }
+
+    #[test]
+    fn nested_saga_does_not_double_compensate() {
+        let state = drive_state(
+            include_str!("../../docs/specs/v1/examples/nested-saga.yaml"),
+            Value::Object(BTreeMap::from([
+                ("order_id".to_owned(), Value::String("o1".to_owned())),
+                ("amount".to_owned(), Value::Int(1000)),
+            ])),
+        );
+        let run = *state.runs.keys().next().unwrap();
+        let mut counts = BTreeMap::<String, usize>::new();
+        for event in state.history.get(&run).unwrap() {
+            if let DomainEvent::CompensationStarted { handler, .. } = event {
+                *counts.entry(handler.clone()).or_default() += 1;
+            }
+        }
+        assert_eq!(counts.get("payment.refund").copied(), Some(1));
+        assert_eq!(counts.get("inventory.release").copied(), Some(1));
+    }
+
+    #[test]
+    fn captured_policy_defaults_are_stable() {
+        let state = drive_state(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            Value::Object(BTreeMap::from([
+                ("order_id".to_owned(), Value::String("o1".to_owned())),
+                ("amount".to_owned(), Value::Int(1000)),
+            ])),
+        );
+        let run = *state.runs.keys().next().unwrap();
+        let policy = &state.runs.get(&run).unwrap().policy;
+        assert_eq!(
+            policy.forward_attempt_timeout_ms,
+            crate::policy::FORWARD_ATTEMPT_TIMEOUT.as_millis() as u64
+        );
+        assert_eq!(
+            policy.compensation_attempt_timeout_ms,
+            crate::policy::COMPENSATION_ATTEMPT_TIMEOUT.as_millis() as u64
+        );
+        assert_eq!(
+            policy.reconciliation_attempt_timeout_ms,
+            crate::policy::RECONCILIATION_ATTEMPT_TIMEOUT.as_millis() as u64
+        );
+        assert_eq!(
+            policy.terminal_history_days,
+            crate::policy::TERMINAL_HISTORY_DAYS
+        );
+        assert_eq!(
+            policy.terminal_summary_days,
+            crate::policy::TERMINAL_SUMMARY_DAYS
+        );
+        assert_eq!(
+            policy.command_result_hours,
+            crate::policy::COMMAND_RESULT_HOURS
+        );
+        assert_eq!(
+            policy.unreserved_event_days,
+            crate::policy::UNRESERVED_EVENT_DAYS
+        );
+        assert_eq!(
+            policy.checkpoint_event_cadence,
+            crate::policy::CHECKPOINT_EVENT_CADENCE
+        );
+        let admitted = state
+            .history
+            .get(&run)
+            .unwrap()
+            .iter()
+            .find_map(|event| match event {
+                DomainEvent::RunAdmitted { policy, .. } => Some(policy.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(admitted, *policy);
+        let rebuilt = reconstruct(
+            state.runs.get(&run).unwrap().definition.clone(),
+            state.runs.get(&run).unwrap().catalog.clone(),
+            state.history.get(&run).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt.runs.get(&run).unwrap().policy, *policy);
+    }
+
+    #[test]
+    fn binding_eval_missing_null_and_no_coercion() {
+        let missing = r#"
+dsl: graphrun/v1
+id: missing_field
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {from: workflow.input, path: /missing}
+"#;
+        let catalog = catalog();
+        let definition = compile_yaml(missing, &catalog).unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(1))])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        let err = apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("missing object field"),
+            "{}",
+            err.message
+        );
+
+        let null_out = drive(
+            r#"
+dsl: graphrun/v1
+id: null_ok
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {literal: null}
+"#,
+            Value::Null,
+        );
+        assert_eq!(null_out, Value::Null);
+
+        let coerced = r#"
+dsl: graphrun/v1
+id: no_coerce
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: count
+nodes:
+  count:
+    kind: while
+    state_schema: counter/v1
+    state: {from: workflow.input}
+    condition:
+      eq:
+        - {from: loop.state, path: /value}
+        - {literal: "3"}
+    max_iterations: 1
+    body:
+      input_schema: counter/v1
+      output_schema: counter/v1
+      start: increment
+      nodes:
+        increment:
+          kind: activity
+          activity: {name: counter.increment, version: 1}
+          input: {from: scope.input}
+          next: done
+        done:
+          kind: complete
+          output: {from: nodes.increment.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.count.output}
+"#;
+        let output = drive(
+            coerced,
+            Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(3))])),
+        );
+        assert_eq!(
+            output.pointer("/value").unwrap().as_i64(),
+            Some(3),
+            "string 3 must not coerce to integer 3"
+        );
+    }
+
+    #[test]
+    fn event_before_wait_is_consumed() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/events.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let event_id = EventId::from_bytes([7; 16]);
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::Signal {
+                    run,
+                    event_id,
+                    signal: "approval".to_owned(),
+                    key: "k1".to_owned(),
+                    payload: Value::Object(BTreeMap::from([(
+                        "approved".to_owned(),
+                        Value::Bool(true),
+                    )])),
+                },
+            },
+        )
+        .unwrap();
+        assert!(state.inbox.iter().any(|entry| entry.event_id == event_id));
+        let activation = ready_activations(&state, run)[0];
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(3),
+                body: CommandBody::ReportLeaf {
+                    run,
+                    activation,
+                    output: Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(4),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            run_output(&state, run)
+                .unwrap()
+                .pointer("/approved")
+                .unwrap(),
+            &Value::Bool(true)
+        );
+        assert!(
+            state
+                .inbox
+                .iter()
+                .any(|entry| entry.event_id == event_id && entry.consumed)
+        );
+    }
+
+    #[test]
+    fn event_identity_and_fifo() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/events.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        let first = EventId::from_bytes([1; 16]);
+        let payload = Value::Object(BTreeMap::from([("approved".to_owned(), Value::Bool(true))]));
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Signal {
+                    run,
+                    event_id: first,
+                    signal: "approval".to_owned(),
+                    key: "k1".to_owned(),
+                    payload: payload.clone(),
+                },
+            },
+        )
+        .unwrap();
+        let dup = apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::Signal {
+                    run,
+                    event_id: first,
+                    signal: "approval".to_owned(),
+                    key: "k1".to_owned(),
+                    payload: payload.clone(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(dup.is_empty());
+        let conflict = apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(3),
+                body: CommandBody::Signal {
+                    run,
+                    event_id: first,
+                    signal: "approval".to_owned(),
+                    key: "k1".to_owned(),
+                    payload: Value::Object(BTreeMap::from([(
+                        "approved".to_owned(),
+                        Value::Bool(false),
+                    )])),
+                },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(conflict.kind, crate::error::ErrorKind::AlreadyExists);
+        let second = EventId::from_bytes([2; 16]);
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(4),
+                body: CommandBody::Signal {
+                    run,
+                    event_id: second,
+                    signal: "approval".to_owned(),
+                    key: "k1".to_owned(),
+                    payload,
+                },
+            },
+        )
+        .unwrap();
+        let inbox_ids: Vec<_> = state.inbox.iter().map(|entry| entry.event_id).collect();
+        assert_eq!(inbox_ids, vec![first, second]);
+    }
+
+    #[test]
+    fn renewal_does_not_extend_attempt_deadline() {
+        let (mut state, _run, activation, session) = {
+            let catalog = catalog();
+            let definition = compile_yaml(manual_yaml(), &catalog).unwrap();
+            let mut state = State::default();
+            let run = RunId::generate();
+            start_run(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(0),
+                    body: CommandBody::Start {
+                        run,
+                        definition: Box::new(definition.clone()),
+                        input: Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(2))])),
+                        catalog: Box::new(catalog.clone()),
+                    },
+                },
+                definition,
+                catalog,
+            )
+            .unwrap();
+            apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Progress { run },
+                },
+            )
+            .unwrap();
+            let session = WorkerSessionId::generate();
+            apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::RegisterSession {
+                        session,
+                        activities: vec!["*".to_owned()],
+                        capacity: 8,
+                    },
+                },
+            )
+            .unwrap();
+            apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Claim {
+                        session,
+                        capacity: 8,
+                    },
+                },
+            )
+            .unwrap();
+            let activation = ready_activations(&state, run)[0];
+            (state, run, activation, session)
+        };
+        let claim = state.activations[&activation].claim.clone().unwrap();
+        let deadline = claim.attempt_deadline_ms;
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(5_000),
+                body: CommandBody::Renew {
+                    session,
+                    activation,
+                    generation: claim.generation,
+                    revision: claim.revision,
+                },
+            },
+        )
+        .unwrap();
+        let renewed = state.activations[&activation].claim.clone().unwrap();
+        assert_eq!(renewed.attempt_deadline_ms, deadline);
+        assert!(renewed.lease_expiry_ms > claim.lease_expiry_ms);
+    }
+
+    #[test]
+    fn expired_claim_rejects_renewal() {
+        let catalog = catalog();
+        let definition = compile_yaml(manual_yaml(), &catalog).unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(2))])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let session = WorkerSessionId::generate();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Claim {
+                    session,
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        let claim = state.activations[&activation].claim.clone().unwrap();
+        let err = apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(claim.lease_expiry_ms),
+                body: CommandBody::Renew {
+                    session,
+                    activation,
+                    generation: claim.generation,
+                    revision: claim.revision,
+                },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+    }
+
+    fn flaky_yaml() -> &'static str {
+        r#"
+dsl: graphrun/v1
+id: flaky_loop
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: count
+nodes:
+  count:
+    kind: while
+    state_schema: counter/v1
+    state: {from: workflow.input}
+    condition:
+      lt:
+        - {from: loop.state, path: /value}
+        - {literal: 2}
+    max_iterations: 10
+    body:
+      input_schema: counter/v1
+      output_schema: counter/v1
+      start: step
+      nodes:
+        step:
+          kind: activity
+          activity: {name: test.flaky, version: 1}
+          input: {from: scope.input}
+          retry:
+            errors: [test.flaky]
+            max_attempts: 3
+          next: done
+        done:
+          kind: complete
+          output: {from: nodes.step.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.count.output}
+"#
+    }
+
+    #[test]
+    fn loop_retry_is_not_another_iteration() {
+        let catalog = catalog();
+        let definition = compile_yaml(flaky_yaml(), &catalog).unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(0))])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::ReportError {
+                    run,
+                    activation,
+                    code: "test.flaky".to_owned(),
+                    message: "transient".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            state.activations[&activation].status,
+            ActivationStatus::Ready
+        );
+        let extra_bodies = state
+            .scopes
+            .values()
+            .filter(|scope| matches!(scope.role, ScopeRole::LoopBody { index, .. } if index > 0))
+            .count();
+        assert_eq!(extra_bodies, 0, "retry must not open another iteration");
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(3),
+                body: CommandBody::ReportLeaf {
+                    run,
+                    activation,
+                    output: Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(1))])),
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(4),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        assert_eq!(state.activations[&activation].id, activation);
+    }
+
+    #[test]
+    fn terminal_error_does_not_retry() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([
+                        ("order_id".to_owned(), Value::String("o1".to_owned())),
+                        ("amount".to_owned(), Value::Int(1)),
+                    ])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::ReportError {
+                    run,
+                    activation,
+                    code: "payment.declined".to_owned(),
+                    message: "no".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn parallel_sibling_cancels_on_branch_failure() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: parallel_fail
+version: 1
+input_schema: order/v1
+output_schema: {tuple: [tax/v1, shipping/v1]}
+start: quotes
+nodes:
+  quotes:
+    kind: parallel
+    branches:
+      - name: tax
+        input: {from: workflow.input}
+        body:
+          input_schema: order/v1
+          output_schema: tax/v1
+          start: boom
+          nodes:
+            boom:
+              kind: fail
+              error: {code: tax.failed, message: tax failed}
+      - name: shipping
+        input: {from: workflow.input}
+        body:
+          input_schema: order/v1
+          output_schema: shipping/v1
+          start: quote
+          nodes:
+            quote:
+              kind: activity
+              activity: {name: shipping.quote, version: 1}
+              input: {from: scope.input}
+              next: done
+            done:
+              kind: complete
+              output: {from: nodes.quote.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.quotes.output}
+"#;
+        let state = drive_state(
+            yaml,
+            Value::Object(BTreeMap::from([
+                ("order_id".to_owned(), Value::String("o1".to_owned())),
+                ("amount".to_owned(), Value::Int(1000)),
+            ])),
+        );
+        let run = *state.runs.keys().next().unwrap();
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Failed { .. }
+        ));
+        let cancelled = state.scopes.values().any(|scope| {
+            matches!(
+                &scope.status,
+                ScopeStatus::Failed { error } if error.code == "branch.cancelled"
+            )
+        });
+        assert!(cancelled, "sibling should be cancelled");
+    }
+
+    #[test]
+    fn parallel_join_is_idempotent() {
+        let live = drive_state(
+            include_str!("../../docs/specs/v1/examples/parallel.yaml"),
+            Value::Object(BTreeMap::from([
+                ("order_id".to_owned(), Value::String("o1".to_owned())),
+                ("amount".to_owned(), Value::Int(1000)),
+            ])),
+        );
+        let run = *live.runs.keys().next().unwrap();
+        let joins = live
+            .history
+            .get(&run)
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    DomainEvent::NodeOutputRecorded { node, .. } if node == "quotes"
+                )
+            })
+            .count();
+        assert_eq!(joins, 1);
+        apply_command(
+            &mut drive_state(
+                include_str!("../../docs/specs/v1/examples/parallel.yaml"),
+                Value::Object(BTreeMap::from([
+                    ("order_id".to_owned(), Value::String("o1".to_owned())),
+                    ("amount".to_owned(), Value::Int(1000)),
+                ])),
+            ),
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(9_000_000),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .ok();
+        let again = live
+            .history
+            .get(&run)
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    DomainEvent::NodeOutputRecorded { node, .. } if node == "quotes"
+                )
+            })
+            .count();
+        assert_eq!(again, 1);
+    }
+
+    #[test]
+    fn inbox_quota_is_explicit() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/events.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        for i in 0..crate::limits::MAX_EVENTS_PER_ADDRESS {
+            apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1 + u64::from(i)),
+                    body: CommandBody::Signal {
+                        run,
+                        event_id: EventId::from_bytes({
+                            let mut bytes = [0u8; 16];
+                            bytes[0] = (i % 256) as u8;
+                            bytes[1] = (i / 256) as u8;
+                            bytes
+                        }),
+                        signal: "approval".to_owned(),
+                        key: "k1".to_owned(),
+                        payload: Value::Object(BTreeMap::from([(
+                            "approved".to_owned(),
+                            Value::Bool(true),
+                        )])),
+                    },
+                },
+            )
+            .unwrap();
+        }
+        let err = apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(10_000),
+                body: CommandBody::Signal {
+                    run,
+                    event_id: EventId::from_bytes([9; 16]),
+                    signal: "approval".to_owned(),
+                    key: "k1".to_owned(),
+                    payload: Value::Object(BTreeMap::from([(
+                        "approved".to_owned(),
+                        Value::Bool(true),
+                    )])),
+                },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, crate::error::ErrorKind::ResourceExhausted);
+        assert_eq!(
+            state.inbox.len(),
+            crate::limits::MAX_EVENTS_PER_ADDRESS as usize
+        );
+    }
+
+    #[test]
+    fn unreserved_expired_event_does_not_satisfy_wait() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/events.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Signal {
+                    run,
+                    event_id: EventId::from_bytes([1; 16]),
+                    signal: "approval".to_owned(),
+                    key: "k1".to_owned(),
+                    payload: Value::Object(BTreeMap::from([(
+                        "approved".to_owned(),
+                        Value::Bool(true),
+                    )])),
+                },
+            },
+        )
+        .unwrap();
+        state.inbox[0].expires_ms = 10;
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::ReportLeaf {
+                    run,
+                    activation,
+                    output: Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(50),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        assert!(state.waits.values().any(|wait| wait.pending));
+        assert!(!state.inbox[0].consumed);
+    }
+
+    #[test]
+    fn reserved_event_survives_ttl() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/events.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::ReportLeaf {
+                    run,
+                    activation,
+                    output: Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(3),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        assert!(state.waits.values().any(|wait| wait.pending));
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(4),
+                body: CommandBody::Signal {
+                    run,
+                    event_id: EventId::from_bytes([3; 16]),
+                    signal: "approval".to_owned(),
+                    key: "k1".to_owned(),
+                    payload: Value::Object(BTreeMap::from([(
+                        "approved".to_owned(),
+                        Value::Bool(true),
+                    )])),
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            state
+                .inbox
+                .iter()
+                .any(|entry| entry.reserved_wait.is_some())
+        );
+        state.inbox[0].expires_ms = 5;
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(50),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            run_output(&state, run)
+                .unwrap()
+                .pointer("/approved")
+                .unwrap(),
+            &Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn cancel_releases_reservation() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/events.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::ReportLeaf {
+                    run,
+                    activation,
+                    output: Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(3),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(4),
+                body: CommandBody::Signal {
+                    run,
+                    event_id: EventId::from_bytes([4; 16]),
+                    signal: "approval".to_owned(),
+                    key: "k1".to_owned(),
+                    payload: Value::Object(BTreeMap::from([(
+                        "approved".to_owned(),
+                        Value::Bool(true),
+                    )])),
+                },
+            },
+        )
+        .unwrap();
+        let expiry = state.inbox[0].expires_ms;
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(5),
+                body: CommandBody::Cancel {
+                    run,
+                    reason: "stop".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(state.inbox[0].reserved_wait.is_none());
+        assert_eq!(state.inbox[0].expires_ms, expiry);
+        assert!(!state.inbox[0].consumed);
+    }
+
+    #[test]
+    fn compensation_binding_failure_keeps_forward_success() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: blocked_comp
+version: 1
+input_schema: order/v1
+output_schema: reserved_order/v1
+start: fulfill
+nodes:
+  fulfill:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: reserved_order/v1
+      start: reserve
+      nodes:
+        reserve:
+          kind: activity
+          activity: {name: inventory.reserve, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: inventory.release, version: 1}
+            input: {from: forward.output, path: /missing}
+          next: done
+        done:
+          kind: complete
+          output: {from: nodes.reserve.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.fulfill.output}
+"#;
+        let catalog = catalog();
+        let definition = compile_yaml(yaml, &catalog).unwrap();
+        let mut state = State::default();
+        let run = RunId::generate();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(0),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Object(BTreeMap::from([
+                        ("order_id".to_owned(), Value::String("o1".to_owned())),
+                        ("amount".to_owned(), Value::Int(1)),
+                    ])),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        let events = apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::ReportLeaf {
+                    run,
+                    activation,
+                    output: Value::Object(BTreeMap::from([
+                        ("order_id".to_owned(), Value::String("o1".to_owned())),
+                        ("amount".to_owned(), Value::Int(1)),
+                        (
+                            "reservation_id".to_owned(),
+                            Value::String("res-1".to_owned()),
+                        ),
+                    ])),
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, DomainEvent::LeafSucceeded { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, DomainEvent::ObligationBlocked { .. }))
+        );
+        assert!(matches!(
+            state.obligations[0].status,
+            ObligationStatus::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn claim_fairness_shares_capacity() {
+        let catalog = catalog();
+        let yaml = include_str!("../../docs/specs/v1/examples/sequence.yaml");
+        let mut state = State::default();
+        let mut runs = Vec::new();
+        for i in 0..2u8 {
+            let definition = compile_yaml(yaml, &catalog).unwrap();
+            let run = RunId::from_bytes({
+                let mut bytes = [0u8; 16];
+                bytes[0] = i + 1;
+                bytes
+            });
+            start_run(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(0),
+                    body: CommandBody::Start {
+                        run,
+                        definition: Box::new(definition.clone()),
+                        input: Value::Object(BTreeMap::from([
+                            ("order_id".to_owned(), Value::String("o1".to_owned())),
+                            ("amount".to_owned(), Value::Int(1)),
+                        ])),
+                        catalog: Box::new(catalog.clone()),
+                    },
+                },
+                definition,
+                catalog.clone(),
+            )
+            .unwrap();
+            apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Progress { run },
+                },
+            )
+            .unwrap();
+            runs.push(run);
+        }
+        let session = WorkerSessionId::generate();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::Claim {
+                    session,
+                    capacity: 2,
+                },
+            },
+        )
+        .unwrap();
+        let claimed_runs: Vec<_> = state
+            .activations
+            .values()
+            .filter(|act| act.claim.is_some())
+            .map(|act| act.run)
+            .collect();
+        assert_eq!(claimed_runs.len(), 2);
+        assert!(claimed_runs.contains(&runs[0]));
+        assert!(claimed_runs.contains(&runs[1]));
+    }
+
+    fn order_input() -> Value {
+        Value::Object(BTreeMap::from([
+            ("order_id".to_owned(), Value::String("o1".to_owned())),
+            ("amount".to_owned(), Value::Int(1000)),
+        ]))
+    }
+
+    fn approval_payload() -> Value {
+        Value::Object(BTreeMap::from([("approved".to_owned(), Value::Bool(true))]))
+    }
+
+    fn pump(state: &mut State, run: RunId, time: u64) {
+        apply(state, time, CommandBody::Progress { run }).unwrap();
+        for activation in ready_activations(state, run) {
+            let Some((name, _, input)) = activity_key(state, activation) else {
+                continue;
+            };
+            let output = handler(&name, &input);
+            apply(
+                state,
+                time,
+                CommandBody::ReportLeaf {
+                    run,
+                    activation,
+                    output,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn repeated_waits_and_concurrent_keys() {
+        let (mut state, run) = start_yaml(
+            include_str!("../../docs/specs/v1/examples/events-in-foreach.yaml"),
+            Value::Array(vec![
+                Value::Object(BTreeMap::from([(
+                    "key".to_owned(),
+                    Value::String("k1".to_owned()),
+                )])),
+                Value::Object(BTreeMap::from([(
+                    "key".to_owned(),
+                    Value::String("k2".to_owned()),
+                )])),
+            ]),
+        );
+        for i in 0..8 {
+            apply(&mut state, 1 + i, CommandBody::Progress { run }).unwrap();
+        }
+        let pending: Vec<_> = state
+            .waits
+            .values()
+            .filter(|wait| wait.pending)
+            .map(|wait| wait.key.clone())
+            .collect();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains(&"k1".to_owned()));
+        assert!(pending.contains(&"k2".to_owned()));
+        apply(
+            &mut state,
+            20,
+            CommandBody::Signal {
+                run,
+                event_id: EventId::from_bytes([1; 16]),
+                signal: "approval".to_owned(),
+                key: "k1".to_owned(),
+                payload: approval_payload(),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            21,
+            CommandBody::Signal {
+                run,
+                event_id: EventId::from_bytes([2; 16]),
+                signal: "approval".to_owned(),
+                key: "k2".to_owned(),
+                payload: approval_payload(),
+            },
+        )
+        .unwrap();
+        for i in 0..8 {
+            apply(&mut state, 30 + i, CommandBody::Progress { run }).unwrap();
+        }
+        let Value::Array(items) = run_output(&state, run).unwrap() else {
+            panic!("foreach output");
+        };
+        assert_eq!(items.len(), 2);
+
+        let yaml = r#"
+dsl: graphrun/v1
+id: wait_reuse
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+signals:
+  approval: {schema: approval/v1}
+start: loop
+nodes:
+  loop:
+    kind: while
+    state_schema: counter/v1
+    state: {from: workflow.input}
+    condition:
+      lt:
+        - {from: loop.state, path: /value}
+        - {literal: 2}
+    max_iterations: 4
+    body:
+      input_schema: counter/v1
+      output_schema: counter/v1
+      start: wait
+      nodes:
+        wait:
+          kind: wait_signal
+          signal: approval
+          key: {literal: "k1"}
+          consume_from: buffered
+          timeout: null
+          next: increment
+        increment:
+          kind: activity
+          activity: {name: counter.increment, version: 1}
+          input: {from: scope.input}
+          next: done
+        done:
+          kind: complete
+          output: {from: nodes.increment.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.loop.output}
+"#;
+        let (mut state, run) = start_yaml(
+            yaml,
+            Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(0))])),
+        );
+        for round in 0..2u8 {
+            for i in 0..6 {
+                apply(
+                    &mut state,
+                    100 + u64::from(round) * 20 + i,
+                    CommandBody::Progress { run },
+                )
+                .unwrap();
+            }
+            assert!(
+                state
+                    .waits
+                    .values()
+                    .any(|wait| wait.pending && wait.key == "k1"),
+                "iteration {round} should reopen the wait"
+            );
+            apply(
+                &mut state,
+                110 + u64::from(round) * 20,
+                CommandBody::Signal {
+                    run,
+                    event_id: EventId::from_bytes([10 + round; 16]),
+                    signal: "approval".to_owned(),
+                    key: "k1".to_owned(),
+                    payload: approval_payload(),
+                },
+            )
+            .unwrap();
+            for i in 0..6 {
+                pump(&mut state, run, 112 + u64::from(round) * 20 + i);
+            }
+        }
+        assert_eq!(
+            run_output(&state, run)
+                .unwrap()
+                .pointer("/value")
+                .unwrap()
+                .as_i64(),
+            Some(2)
+        );
+
+        let (mut state, run) = start_yaml(
+            include_str!("../../docs/specs/v1/examples/events-in-foreach.yaml"),
+            Value::Array(vec![
+                Value::Object(BTreeMap::from([(
+                    "key".to_owned(),
+                    Value::String("same".to_owned()),
+                )])),
+                Value::Object(BTreeMap::from([(
+                    "key".to_owned(),
+                    Value::String("same".to_owned()),
+                )])),
+            ]),
+        );
+        for i in 0..12 {
+            apply(&mut state, 1 + i, CommandBody::Progress { run }).unwrap();
+        }
+        let conflict = state.history.get(&run).unwrap().iter().any(|event| {
+            matches!(
+                event,
+                DomainEvent::ScopeFailed { error, .. } if error.code == "WaitKeyConflict"
+            )
+        });
+        assert!(conflict, "duplicate foreach keys must fail WaitKeyConflict");
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn parallel_saga_compensates_after_join() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: parallel_saga
+version: 1
+input_schema: order/v1
+output_schema: reserved_order/v1
+start: fulfill
+nodes:
+  fulfill:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: reserved_order/v1
+      start: both
+      nodes:
+        both:
+          kind: parallel
+          branches:
+            - name: left
+              input: {from: scope.input}
+              body:
+                input_schema: order/v1
+                output_schema: reserved_order/v1
+                start: reserve
+                nodes:
+                  reserve:
+                    kind: activity
+                    activity: {name: inventory.reserve, version: 1}
+                    input: {from: scope.input}
+                    compensation:
+                      kind: activity
+                      activity: {name: inventory.release, version: 1}
+                      input: {from: forward.output}
+                    next: done
+                  done:
+                    kind: complete
+                    output: {from: nodes.reserve.output}
+            - name: right
+              input: {from: scope.input}
+              body:
+                input_schema: order/v1
+                output_schema: reserved_order/v1
+                start: reserve
+                nodes:
+                  reserve:
+                    kind: activity
+                    activity: {name: inventory.reserve, version: 1}
+                    input: {from: scope.input}
+                    compensation:
+                      kind: activity
+                      activity: {name: inventory.release, version: 1}
+                      input: {from: forward.output}
+                    next: done
+                  done:
+                    kind: complete
+                    output: {from: nodes.reserve.output}
+          next: abort
+        abort:
+          kind: fail
+          error: {code: fixture.failed, message: fail after parallel}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.fulfill.output}
+"#;
+        let (mut state, run) = start_yaml(yaml, order_input());
+        let mut first_success = None;
+        for i in 0..16 {
+            apply(&mut state, 1 + i, CommandBody::Progress { run }).unwrap();
+            let ready = ready_activations(&state, run);
+            if ready.len() == 2 && first_success.is_none() {
+                let left = ready[0];
+                let right = ready[1];
+                apply(
+                    &mut state,
+                    50,
+                    CommandBody::ReportLeaf {
+                        run,
+                        activation: left,
+                        output: handler("inventory.reserve", &order_input()),
+                    },
+                )
+                .unwrap();
+                first_success = Some(left);
+                apply(&mut state, 51, CommandBody::Progress { run }).unwrap();
+                assert!(
+                    state
+                        .history
+                        .get(&run)
+                        .unwrap()
+                        .iter()
+                        .all(|event| !matches!(event, DomainEvent::CompensationStarted { .. })),
+                    "one finished branch must not start compensation"
+                );
+                apply(
+                    &mut state,
+                    52,
+                    CommandBody::ReportLeaf {
+                        run,
+                        activation: right,
+                        output: handler("inventory.reserve", &order_input()),
+                    },
+                )
+                .unwrap();
+            } else {
+                for activation in ready {
+                    if Some(activation) == first_success {
+                        continue;
+                    }
+                    let Some((name, _, input)) = activity_key(&state, activation) else {
+                        continue;
+                    };
+                    apply(
+                        &mut state,
+                        60 + i,
+                        CommandBody::ReportLeaf {
+                            run,
+                            activation,
+                            output: handler(&name, &input),
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let handlers: Vec<_> = state
+            .history
+            .get(&run)
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                DomainEvent::CompensationStarted { handler, .. } => Some(handler.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(handlers, ["inventory.release", "inventory.release"]);
+        let succeeded: Vec<_> = state
+            .history
+            .get(&run)
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                DomainEvent::LeafSucceeded {
+                    activation,
+                    role: ExecutionRole::Forward,
+                    ..
+                } => Some(*activation),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(succeeded.len(), 2);
+        let first_comp = state
+            .history
+            .get(&run)
+            .unwrap()
+            .iter()
+            .position(|event| matches!(event, DomainEvent::CompensationStarted { .. }))
+            .unwrap();
+        let last_success = state
+            .history
+            .get(&run)
+            .unwrap()
+            .iter()
+            .rposition(|event| {
+                matches!(
+                    event,
+                    DomainEvent::LeafSucceeded {
+                        role: ExecutionRole::Forward,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(
+            first_comp > last_success,
+            "compensation starts only after both forward successes"
+        );
+        assert!(
+            state
+                .obligations
+                .iter()
+                .all(|item| matches!(item.status, ObligationStatus::Compensated))
+        );
+    }
+
+    #[test]
+    fn compensation_reported_error_policy() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: refund_policy
+version: 1
+input_schema: order/v1
+output_schema: receipt/v1
+start: fulfill
+nodes:
+  fulfill:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: receipt/v1
+      start: reserve
+      nodes:
+        reserve:
+          kind: activity
+          activity: {name: inventory.reserve, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: inventory.release, version: 1}
+            input: {from: forward.output}
+          next: charge
+        charge:
+          kind: activity
+          activity: {name: payment.charge, version: 1}
+          input: {from: nodes.reserve.output}
+          compensation:
+            kind: activity
+            activity: {name: payment.refund, version: 1}
+            input: {from: forward.output}
+            retry:
+              errors: [payment.refund_unavailable]
+              max_attempts: 2
+              backoff: {initial: "1s", multiplier: 2, max: "30s"}
+          next: abort
+        abort:
+          kind: fail
+          error: {code: fixture.failed, message: force compensate}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.fulfill.output}
+"#;
+        let (mut state, run) = start_yaml(yaml, order_input());
+        for i in 0..16 {
+            apply(&mut state, 1 + i, CommandBody::Progress { run }).unwrap();
+            for activation in ready_activations(&state, run) {
+                if state.activations[&activation].role == ExecutionRole::Compensation {
+                    continue;
+                }
+                let Some((name, _, input)) = activity_key(&state, activation) else {
+                    continue;
+                };
+                apply(
+                    &mut state,
+                    1 + i,
+                    CommandBody::ReportLeaf {
+                        run,
+                        activation,
+                        output: handler(&name, &input),
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let refund = state
+            .activations
+            .values()
+            .find(|act| act.role == ExecutionRole::Compensation)
+            .map(|act| act.id)
+            .expect("compensation activation");
+        apply(
+            &mut state,
+            20,
+            CommandBody::ReportError {
+                run,
+                activation: refund,
+                code: "payment.refund_unavailable".to_owned(),
+                message: "busy".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.activations[&refund].status, ActivationStatus::Ready);
+        apply(
+            &mut state,
+            21,
+            CommandBody::ReportError {
+                run,
+                activation: refund,
+                code: "payment.refund_rejected".to_owned(),
+                message: "no".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            state
+                .obligations
+                .iter()
+                .find(|item| item.handler == "payment.refund")
+                .unwrap()
+                .status,
+            ObligationStatus::Blocked { .. }
+        ));
+        assert!(!matches!(
+            state
+                .obligations
+                .iter()
+                .find(|item| item.handler == "payment.refund")
+                .unwrap()
+                .status,
+            ObligationStatus::Compensated
+        ));
+
+        let empty = r#"
+dsl: graphrun/v1
+id: empty_retry
+version: 1
+input_schema: order/v1
+output_schema: reserved_order/v1
+start: fulfill
+nodes:
+  fulfill:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: reserved_order/v1
+      start: reserve
+      nodes:
+        reserve:
+          kind: activity
+          activity: {name: inventory.reserve, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: inventory.release, version: 1}
+            input: {from: forward.output}
+            retry:
+              errors: []
+              max_attempts: 3
+              backoff: {initial: "1s", multiplier: 2, max: "30s"}
+          next: abort
+        abort:
+          kind: fail
+          error: {code: fixture.failed, message: force}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.fulfill.output}
+"#;
+        let (mut state, run) = start_yaml(empty, order_input());
+        for i in 0..16 {
+            apply(&mut state, 1 + i, CommandBody::Progress { run }).unwrap();
+            for activation in ready_activations(&state, run) {
+                if state.activations[&activation].role == ExecutionRole::Compensation {
+                    continue;
+                }
+                let Some((name, _, input)) = activity_key(&state, activation) else {
+                    continue;
+                };
+                apply(
+                    &mut state,
+                    1 + i,
+                    CommandBody::ReportLeaf {
+                        run,
+                        activation,
+                        output: handler(&name, &input),
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let release = state
+            .activations
+            .values()
+            .find(|act| act.role == ExecutionRole::Compensation)
+            .map(|act| act.id)
+            .unwrap();
+        apply(
+            &mut state,
+            20,
+            CommandBody::ReportError {
+                run,
+                activation: release,
+                code: "inventory.release_unavailable".to_owned(),
+                message: "busy".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            state.obligations[0].status,
+            ObligationStatus::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn irreversible_effect_fails_closed() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: irreversible_saga
+version: 1
+input_schema: order/v1
+output_schema: reserved_order/v1
+start: fulfill
+nodes:
+  fulfill:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: reserved_order/v1
+      start: reserve
+      nodes:
+        reserve:
+          kind: activity
+          activity: {name: inventory.reserve, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: irreversible
+            reason: inventory cannot be unreserved
+          next: abort
+        abort:
+          kind: fail
+          error: {code: fixture.failed, message: cannot undo}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.fulfill.output}
+"#;
+        let state = drive_state(yaml, order_input());
+        let run = *state.runs.keys().next().unwrap();
+        assert!(matches!(
+            state.obligations[0].status,
+            ObligationStatus::Irreversible { .. }
+        ));
+        match &state.runs.get(&run).unwrap().status {
+            RunStatus::Failed { error } => {
+                assert_eq!(error.code, "saga.irreversible");
+            }
+            other => panic!("expected irreversible failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operator_resolves_blocked_compensation() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: resolve_blocked
+version: 1
+input_schema: order/v1
+output_schema: reserved_order/v1
+start: fulfill
+nodes:
+  fulfill:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: reserved_order/v1
+      start: reserve
+      nodes:
+        reserve:
+          kind: activity
+          activity: {name: inventory.reserve, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: inventory.release, version: 1}
+            input: {from: forward.output, path: /missing}
+          next: abort
+        abort:
+          kind: fail
+          error: {code: fixture.failed, message: need undo}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.fulfill.output}
+"#;
+        let (mut state, run) = start_yaml(yaml, order_input());
+        for i in 0..8 {
+            pump(&mut state, run, 1 + i);
+        }
+        assert!(matches!(
+            state.obligations[0].status,
+            ObligationStatus::Blocked { .. }
+        ));
+        let forward = state.obligations[0].forward;
+        let pinned_handler = state.obligations[0].handler.clone();
+        apply(&mut state, 20, CommandBody::Progress { run }).unwrap();
+        assert!(
+            state
+                .history
+                .get(&run)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, DomainEvent::InterventionRequired { .. }))
+        );
+        let supplied = handler("inventory.reserve", &order_input());
+        apply(
+            &mut state,
+            21,
+            CommandBody::ResolveBlocked {
+                run,
+                forward,
+                input: supplied.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.obligations[0].handler, pinned_handler);
+        assert_eq!(state.obligations[0].input, supplied);
+        assert!(matches!(
+            state.obligations[0].status,
+            ObligationStatus::Open
+        ));
+        for i in 0..8 {
+            pump(&mut state, run, 30 + i);
+        }
+        assert!(matches!(
+            state.obligations[0].status,
+            ObligationStatus::Compensated
+        ));
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Failed { .. }
+        ));
+        let err = apply(
+            &mut state,
+            40,
+            CommandBody::ResolveBlocked {
+                run,
+                forward,
+                input: supplied,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, crate::error::ErrorKind::InvalidArgument);
+    }
+
+    #[test]
+    fn operator_abandons_blocked_compensation() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: abandon_blocked
+version: 1
+input_schema: order/v1
+output_schema: reserved_order/v1
+start: fulfill
+nodes:
+  fulfill:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: reserved_order/v1
+      start: reserve
+      nodes:
+        reserve:
+          kind: activity
+          activity: {name: inventory.reserve, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: inventory.release, version: 1}
+            input: {from: forward.output, path: /missing}
+          next: abort
+        abort:
+          kind: fail
+          error: {code: fixture.failed, message: need undo}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.fulfill.output}
+"#;
+        let (mut state, run) = start_yaml(yaml, order_input());
+        for i in 0..8 {
+            pump(&mut state, run, 1 + i);
+        }
+        assert!(matches!(
+            state.obligations[0].status,
+            ObligationStatus::Blocked { .. }
+        ));
+        apply(
+            &mut state,
+            20,
+            CommandBody::AbandonCompensation {
+                run,
+                reason: "operator gives up".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            state.obligations[0].status,
+            ObligationStatus::Abandoned
+        ));
+        match &state.runs.get(&run).unwrap().status {
+            RunStatus::Failed { error } => {
+                assert_eq!(error.code, "saga.abandoned");
+                assert!(!error.message.contains("rollback"));
+            }
+            other => panic!("expected abandoned failure, got {other:?}"),
+        }
+        apply(
+            &mut state,
+            21,
+            CommandBody::AbandonCompensation {
+                run,
+                reason: "operator gives up".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .history
+                .get(&run)
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event, DomainEvent::CompensationAbandoned { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn successful_saga_does_not_reopen_on_later_failure() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: later_failure
+version: 1
+input_schema: order/v1
+output_schema: reserved_order/v1
+start: fulfill
+nodes:
+  fulfill:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: reserved_order/v1
+      start: reserve
+      nodes:
+        reserve:
+          kind: activity
+          activity: {name: inventory.reserve, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: inventory.release, version: 1}
+            input: {from: forward.output}
+          next: done
+        done:
+          kind: complete
+          output: {from: nodes.reserve.output}
+    next: boom
+  boom:
+    kind: fail
+    error: {code: later.failed, message: after saga success}
+"#;
+        let state = drive_state(yaml, order_input());
+        let run = *state.runs.keys().next().unwrap();
+        assert!(
+            state
+                .obligations
+                .iter()
+                .all(|item| matches!(item.status, ObligationStatus::Released))
+        );
+        assert!(
+            state
+                .history
+                .get(&run)
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(event, DomainEvent::CompensationStarted { .. }))
+        );
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn cancel_during_saga_stops_forward_and_compensates() {
+        let (mut state, run) = start_yaml(
+            include_str!("../../docs/specs/v1/examples/saga.yaml"),
+            order_input(),
+        );
+        apply(&mut state, 1, CommandBody::Progress { run }).unwrap();
+        let activation = ready_activations(&state, run)[0];
+        apply(
+            &mut state,
+            2,
+            CommandBody::ReportLeaf {
+                run,
+                activation,
+                output: handler("inventory.reserve", &order_input()),
+            },
+        )
+        .unwrap();
+        assert!(
+            state
+                .obligations
+                .iter()
+                .any(|item| item.handler == "inventory.release"
+                    && matches!(item.status, ObligationStatus::Open))
+        );
+        apply(
+            &mut state,
+            3,
+            CommandBody::Cancel {
+                run,
+                reason: "operator stop".to_owned(),
+            },
+        )
+        .unwrap();
+        for i in 0..16 {
+            apply(&mut state, 10 + i, CommandBody::Progress { run }).unwrap();
+            for activation in ready_activations(&state, run) {
+                if state.activations[&activation].role != ExecutionRole::Compensation {
+                    continue;
+                }
+                let Some((name, _, input)) = activity_key(&state, activation) else {
+                    continue;
+                };
+                apply(
+                    &mut state,
+                    10 + i,
+                    CommandBody::ReportLeaf {
+                        run,
+                        activation,
+                        output: handler(&name, &input),
+                    },
+                )
+                .unwrap();
+            }
+        }
+        assert!(
+            state
+                .obligations
+                .iter()
+                .all(|item| matches!(item.status, ObligationStatus::Compensated))
+        );
+        match &state.runs.get(&run).unwrap().status {
+            RunStatus::Failed { error } => assert_eq!(error.code, "run.cancelled"),
+            other => panic!("expected cancel, got {other:?}"),
+        }
+        assert!(
+            state
+                .history
+                .get(&run)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    DomainEvent::CompensationStarted { handler, .. } if handler == "inventory.release"
+                ))
+        );
+    }
+
+    #[test]
+    fn run_deadline_blocks_forward_claims_not_settlement() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: deadline_saga
+version: 1
+input_schema: order/v1
+output_schema: reserved_order/v1
+run_timeout: "10ms"
+start: fulfill
+nodes:
+  fulfill:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: reserved_order/v1
+      start: reserve
+      nodes:
+        reserve:
+          kind: activity
+          activity: {name: inventory.reserve, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: inventory.release, version: 1}
+            input: {from: forward.output}
+          next: abort
+        abort:
+          kind: fail
+          error: {code: fixture.failed, message: compensate after deadline}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.fulfill.output}
+"#;
+        let (mut state, run) = start_yaml(yaml, order_input());
+        apply(&mut state, 1, CommandBody::Progress { run }).unwrap();
+        let session = WorkerSessionId::generate();
+        apply(
+            &mut state,
+            1,
+            CommandBody::RegisterSession {
+                session,
+                activities: vec!["*".to_owned()],
+                capacity: 8,
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            1,
+            CommandBody::Claim {
+                session,
+                capacity: 8,
+            },
+        )
+        .unwrap();
+        let forward = ready_activations(&state, run)[0];
+        assert_eq!(
+            state.activations[&forward].claim.as_ref().unwrap().role,
+            ExecutionRole::Forward
+        );
+        let output = handler("inventory.reserve", &order_input());
+        let (generation, revision) = {
+            let claim = state.activations[&forward].claim.as_ref().unwrap();
+            (claim.generation, claim.revision)
+        };
+        apply(
+            &mut state,
+            1,
+            CommandBody::ReportAssigned {
+                run,
+                activation: forward,
+                output,
+                session,
+                generation,
+                revision,
+            },
+        )
+        .unwrap();
+        for i in 0..8 {
+            apply(&mut state, 2 + i, CommandBody::Progress { run }).unwrap();
+        }
+        let later = 10_000u64;
+        apply(
+            &mut state,
+            later,
+            CommandBody::RegisterSession {
+                session,
+                activities: vec!["*".to_owned()],
+                capacity: 8,
+            },
+        )
+        .unwrap();
+        let before = state
+            .activations
+            .values()
+            .filter(|act| {
+                act.role == ExecutionRole::Forward
+                    && act.claim.as_ref().is_some_and(|claim| {
+                        later < claim.lease_expiry_ms && claim.role == ExecutionRole::Forward
+                    })
+            })
+            .count();
+        apply(
+            &mut state,
+            later,
+            CommandBody::Claim {
+                session,
+                capacity: 8,
+            },
+        )
+        .unwrap();
+        let forward_after = state
+            .activations
+            .values()
+            .filter(|act| {
+                act.role == ExecutionRole::Forward
+                    && act
+                        .claim
+                        .as_ref()
+                        .is_some_and(|claim| claim.role == ExecutionRole::Forward)
+            })
+            .count();
+        assert_eq!(forward_after, before);
+        let compensation = state
+            .activations
+            .values()
+            .find(|act| act.role == ExecutionRole::Compensation)
+            .map(|act| act.id)
+            .expect("compensation ready after fail");
+        assert_eq!(
+            state.activations[&compensation]
+                .claim
+                .as_ref()
+                .unwrap()
+                .role,
+            ExecutionRole::Compensation
+        );
+        let (generation, revision, attempt_deadline_ms) = {
+            let claim = state.activations[&compensation].claim.as_ref().unwrap();
+            (claim.generation, claim.revision, claim.attempt_deadline_ms)
+        };
+        assert!(attempt_deadline_ms > later);
+        apply(
+            &mut state,
+            later,
+            CommandBody::ReportAssigned {
+                run,
+                activation: compensation,
+                output: Value::Null,
+                session,
+                generation,
+                revision,
+            },
+        )
+        .unwrap();
+        for i in 0..6 {
+            apply(&mut state, later + 1 + i, CommandBody::Progress { run }).unwrap();
+        }
+        assert!(
+            state
+                .obligations
+                .iter()
+                .all(|item| matches!(item.status, ObligationStatus::Compensated))
+        );
+    }
+
+    #[test]
+    fn schema_invalid_result_does_not_advance() {
+        let (mut state, run) = start_yaml(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            order_input(),
+        );
+        apply(&mut state, 1, CommandBody::Progress { run }).unwrap();
+        let activation = ready_activations(&state, run)[0];
+        let err = apply(
+            &mut state,
+            2,
+            CommandBody::ReportLeaf {
+                run,
+                activation,
+                output: Value::Null,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, crate::error::ErrorKind::InvalidArgument);
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Active
+        ));
+    }
+
+    #[test]
+    fn stale_assigned_result_does_not_advance() {
+        let (mut state, run) = start_yaml(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            order_input(),
+        );
+        apply(&mut state, 1, CommandBody::Progress { run }).unwrap();
+        let session = WorkerSessionId::generate();
+        apply(
+            &mut state,
+            1,
+            CommandBody::RegisterSession {
+                session,
+                activities: vec!["*".to_owned()],
+                capacity: 8,
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            1,
+            CommandBody::Claim {
+                session,
+                capacity: 8,
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        let claim = state.activations[&activation].claim.clone().unwrap();
+        let err = apply(
+            &mut state,
+            2,
+            CommandBody::ReportAssigned {
+                run,
+                activation,
+                output: handler("inventory.reserve", &order_input()),
+                session,
+                generation: crate::ids::OwnerGeneration::new(claim.generation.get() + 1),
+                revision: claim.revision,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Active
+        ));
+    }
+
+    #[test]
+    fn expired_history_range_is_unavailable() {
+        let state = drive_state(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            order_input(),
+        );
+        let run = *state.runs.keys().next().unwrap();
+        let terminal = state.runs.get(&run).unwrap().terminal_ms;
+        assert!(terminal > 0);
+        let events =
+            history_or_unavailable(&state, run, EngineTime::from_millis(terminal)).unwrap();
+        assert!(!events.is_empty());
+        let rebuilt = reconstruct(
+            state.runs.get(&run).unwrap().definition.clone(),
+            state.runs.get(&run).unwrap().catalog.clone(),
+            events,
+        )
+        .unwrap();
+        assert_eq!(run_output(&state, run), run_output(&rebuilt, run));
+        let expired = EngineTime::from_millis(terminal.saturating_add(31 * 24 * 60 * 60 * 1000));
+        let err = history_or_unavailable(&state, run, expired).unwrap_err();
+        assert_eq!(err.kind, crate::error::ErrorKind::Unavailable);
+        assert!(run_output(&state, run).is_some());
+    }
+
+    #[test]
+    fn unknown_blocks_undo_until_applied() {
+        let (mut state, run) = start_yaml(
+            include_str!("../../docs/specs/v1/examples/saga.yaml"),
+            order_input(),
+        );
+        apply(&mut state, 1, CommandBody::Progress { run }).unwrap();
+        let session = WorkerSessionId::generate();
+        apply(
+            &mut state,
+            1,
+            CommandBody::RegisterSession {
+                session,
+                activities: vec!["*".to_owned()],
+                capacity: 8,
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            1,
+            CommandBody::Claim {
+                session,
+                capacity: 8,
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            2,
+            CommandBody::Cancel {
+                run,
+                reason: "stop with in-flight reserve".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(
+            state
+                .history
+                .get(&run)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, DomainEvent::AbortIntent { .. }))
+        );
+        assert!(
+            !state
+                .history
+                .get(&run)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, DomainEvent::CompensationStarted { .. }))
+        );
+        let later = crate::policy::SESSION_LEASE.as_millis() as u64 + 3;
+        apply(
+            &mut state,
+            later,
+            CommandBody::RegisterSession {
+                session,
+                activities: vec!["*".to_owned()],
+                capacity: 8,
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            later,
+            CommandBody::Claim {
+                session,
+                capacity: 8,
+            },
+        )
+        .unwrap();
+        let activation = ready_activations(&state, run)[0];
+        let claim = state.activations[&activation].claim.clone().unwrap();
+        assert_eq!(claim.role, ExecutionRole::Reconciliation);
+        apply(
+            &mut state,
+            later,
+            CommandBody::Reconcile {
+                run,
+                activation,
+                session,
+                generation: claim.generation,
+                revision: claim.revision,
+                outcome: ReconcileOutcome::Unknown,
+                output: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            !state
+                .history
+                .get(&run)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, DomainEvent::CompensationStarted { .. }))
+        );
+        apply(
+            &mut state,
+            later + 1,
+            CommandBody::Reconcile {
+                run,
+                activation,
+                session,
+                generation: claim.generation,
+                revision: claim.revision,
+                outcome: ReconcileOutcome::Applied,
+                output: Some(handler("inventory.reserve", &order_input())),
+            },
+        )
+        .unwrap();
+        assert!(
+            state
+                .obligations
+                .iter()
+                .any(|item| item.handler == "inventory.release")
+        );
+        for i in 0..12 {
+            apply(&mut state, later + 2 + i, CommandBody::Progress { run }).unwrap();
+            for ready in ready_activations(&state, run) {
+                if state.activations[&ready].role != ExecutionRole::Compensation {
+                    continue;
+                }
+                let Some((name, _, input)) = activity_key(&state, ready) else {
+                    continue;
+                };
+                apply(
+                    &mut state,
+                    later + 2 + i,
+                    CommandBody::ReportLeaf {
+                        run,
+                        activation: ready,
+                        output: handler(&name, &input),
+                    },
+                )
+                .unwrap();
+            }
+        }
+        assert!(
+            state
+                .history
+                .get(&run)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    DomainEvent::CompensationStarted { handler, .. } if handler == "inventory.release"
+                ))
+        );
+    }
+
+    #[test]
+    fn restore_hold_blocks_start_until_ack() {
+        let (mut state, run) = start_yaml(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            order_input(),
+        );
+        state.recovery = Some(RecoveryHold {
+            reason: "disaster restore".to_owned(),
+            authorized: false,
+        });
+        let err = apply(
+            &mut state,
+            1,
+            CommandBody::Start {
+                run: RunId::generate(),
+                definition: Box::new(
+                    compile_yaml(
+                        include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                        &catalog(),
+                    )
+                    .unwrap(),
+                ),
+                input: order_input(),
+                catalog: Box::new(catalog()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+        apply(
+            &mut state,
+            2,
+            CommandBody::AcknowledgeRecovery {
+                reason: "operator ack".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(state.recovery.as_ref().unwrap().authorized);
+        let _ = run;
     }
 }

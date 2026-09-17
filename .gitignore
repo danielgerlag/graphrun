@@ -2,4 +2,6 @@
 **/*.rs.bk
 .DS_Store
 /target-e2e-artifacts
+target/e2e-artifacts
+target/e2e-artifacts-release
 graphrun/wip

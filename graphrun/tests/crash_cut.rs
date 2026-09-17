@@ -6,7 +6,7 @@ use std::time::Duration;
 
 async fn child_main(dir: PathBuf) {
     let engine = Engine::local(&dir).await.expect("child engine");
-    graphrun::storage::inject_cut("after-log");
+    graphrun::storage::inject_cut_any_thread("after-log");
     let catalog = Catalog::from_json(include_bytes!(
         "../../docs/specs/v1/examples/activity-catalog.json"
     ))

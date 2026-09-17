@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test
+        run: cargo test --workspace --locked -- --skip snapshot_controller_fires
+      - name: doc tests
+        run: cargo test --workspace --doc --locked
+      - name: crash cuts
+        run: cargo test -p graphrun --test crash_cut --features fault-injection --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: test 1.90.0
+        run: cargo test --workspace --locked -- --skip snapshot_controller_fires
+
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: release CLI
+        run: cargo build --release --locked -p graphrun-cli
+      - name: e2e matrix
+        run: >
+          cargo run --locked -p graphrun-e2e -- verify
+          --cli target/release/graphrun
+          --matrix docs/specs/v1/verification-matrix.tsv
+          --artifacts target/e2e-artifacts
+      - name: upload e2e artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: |
+            target/e2e-artifacts/report.json
+            target/e2e-artifacts/PERF-001-measure.txt
+            target/e2e-artifacts/PERF-002-measure.txt
+            target/e2e-artifacts/cargo-lib.log
+            target/e2e-artifacts/cargo-snapshot.log
+          if-no-files-found: warn
