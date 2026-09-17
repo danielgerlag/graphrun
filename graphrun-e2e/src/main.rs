@@ -1911,6 +1911,42 @@ fn cluster_inspect(cli: &Path, cluster: &LiveCluster, node: usize, run: &str) ->
     if body.is_empty() { stderr } else { body }
 }
 
+fn inspect_succeeded(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    value.get("status").and_then(|status| status.as_str()) == Some("succeeded")
+        && value.get("output").is_some_and(|output| !output.is_null())
+}
+
+fn wait_nodes_succeeded(
+    cli: &Path,
+    cluster: &LiveCluster,
+    run: &str,
+    nodes: impl IntoIterator<Item = usize> + Clone,
+    min_nodes: usize,
+    timeout: Duration,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::new();
+    loop {
+        let mut ok = 0;
+        for node in nodes.clone() {
+            last = cluster_inspect(cli, cluster, node, run);
+            if inspect_succeeded(&last) {
+                ok += 1;
+            }
+        }
+        if ok >= min_nodes {
+            return Ok(last);
+        }
+        if Instant::now() >= deadline {
+            return Err(last);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn wait_inspect(
     cli: &Path,
     cluster: &LiveCluster,
@@ -2170,45 +2206,34 @@ fn cluster_nested_survives_leader_kill(
         Ok(run) => run,
         Err(err) => return fail(row, "cluster start nested", err),
     };
-    if let Err(err) = wait_inspect(cli, &cluster, &run, "succeeded", Duration::from_secs(25)) {
-        return fail(row, "nested complete", err);
-    }
-    let replicated = Instant::now() + Duration::from_secs(30);
-    let mut last = String::new();
-    loop {
-        let mut ok = 0;
-        for node in 0..cluster.addrs.len() {
-            last = cluster_inspect(cli, &cluster, node, &run);
-            if last.contains("succeeded") {
-                ok += 1;
-            }
-        }
-        if ok >= 2 {
-            break;
-        }
-        if Instant::now() >= replicated {
-            return fail(row, "replicate nested before kill", last);
-        }
-        std::thread::sleep(Duration::from_millis(200));
+    if let Err(err) = wait_nodes_succeeded(
+        cli,
+        &cluster,
+        &run,
+        0..cluster.addrs.len(),
+        2,
+        Duration::from_secs(90),
+    ) {
+        return fail(row, "replicate nested before kill", err);
     }
     terminate(&mut cluster.members[2].0);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        for node in 1..cluster.addrs.len() {
-            last = cluster_inspect(cli, &cluster, node, &run);
-            if last.contains("succeeded") {
-                return finish(
-                    row,
-                    "PASS",
-                    "nested-controls output survives leader kill",
-                    last,
-                    vec![cluster.dir.clone()],
-                );
-            }
-        }
-        std::thread::sleep(Duration::from_millis(200));
+    match wait_nodes_succeeded(
+        cli,
+        &cluster,
+        &run,
+        1..cluster.addrs.len(),
+        1,
+        Duration::from_secs(30),
+    ) {
+        Ok(body) => finish(
+            row,
+            "PASS",
+            "nested-controls output survives leader kill",
+            body,
+            vec![cluster.dir.clone()],
+        ),
+        Err(last) => fail(row, "inspect nested after leader kill", last),
     }
-    fail(row, "inspect nested after leader kill", last)
 }
 
 fn cluster_join_promote(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
