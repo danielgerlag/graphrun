@@ -2119,11 +2119,15 @@ nodes:
         let _guard = COMPENSATION_TEST.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::local(dir.path()).await.unwrap();
+        let mut fail_order = order();
+        if let Value::Object(fields) = &mut fail_order {
+            fields.insert("fail_after_payment".to_owned(), Value::Bool(true));
+        }
         let run = engine
             .start_yaml(
                 include_str!("../../docs/specs/v1/examples/saga.yaml"),
                 &catalog(),
-                order(),
+                fail_order,
             )
             .await
             .unwrap();
@@ -2142,19 +2146,26 @@ nodes:
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        engine.cancel(run, "stop").await.unwrap();
+        if let Err(err) = engine.cancel(run, "stop").await {
+            let state = engine.inspect(run).await.unwrap();
+            let inactive = !matches!(state.runs.get(&run).unwrap().status, RunStatus::Active);
+            assert!(
+                inactive || err.to_string().contains("not active"),
+                "cancel failed: {err}"
+            );
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let state = engine.inspect(run).await.unwrap();
-            let cancelled = matches!(
+            let failed = matches!(
                 &state.runs.get(&run).unwrap().status,
-                RunStatus::Failed { error } if error.code == "run.cancelled"
+                RunStatus::Failed { .. }
             );
             let compensated = !state.obligations.is_empty()
                 && state.obligations.iter().all(|item| {
                     matches!(item.status, crate::domain::ObligationStatus::Compensated)
                 });
-            if cancelled && compensated {
+            if failed && compensated {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {

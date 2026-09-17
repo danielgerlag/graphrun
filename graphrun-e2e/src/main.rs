@@ -218,13 +218,19 @@ struct Evidence {
 
 fn collect_evidence(artifacts: &Path) -> Evidence {
     let lib = Command::new("cargo")
-        .args(["test", "-p", "graphrun", "--lib", "--offline"])
+        .args([
+            "test", "-p", "graphrun", "--lib", "--locked", "--color", "never",
+        ])
         .output();
     let api = Command::new("cargo")
-        .args(["test", "-p", "graphrun", "--test", "api", "--offline"])
+        .args([
+            "test", "-p", "graphrun", "--test", "api", "--locked", "--color", "never",
+        ])
         .output();
     let ui = Command::new("cargo")
-        .args(["test", "-p", "graphrun", "--test", "ui", "--offline"])
+        .args([
+            "test", "-p", "graphrun", "--test", "ui", "--locked", "--color", "never",
+        ])
         .output();
     let crash = Command::new("cargo")
         .args([
@@ -235,7 +241,9 @@ fn collect_evidence(artifacts: &Path) -> Evidence {
             "crash_cut",
             "--features",
             "fault-injection",
-            "--offline",
+            "--locked",
+            "--color",
+            "never",
         ])
         .output();
     let api_ok = api.as_ref().is_ok_and(|o| o.status.success());
@@ -248,7 +256,9 @@ fn collect_evidence(artifacts: &Path) -> Evidence {
             "graphrun",
             "--lib",
             "snapshot_controller_fires_at_20000_entries",
-            "--offline",
+            "--locked",
+            "--color",
+            "never",
             "--",
             "--ignored",
             "--nocapture",
