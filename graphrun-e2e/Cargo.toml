@@ -16,7 +16,7 @@ fault-injection = ["graphrun/fault-injection"]
 
 [dependencies]
 clap.workspace = true
-graphrun = { path = "../graphrun" }
+graphrun.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

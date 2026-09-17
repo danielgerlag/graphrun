@@ -2,6 +2,32 @@
 
 Durable workflow engine. Specification lives in `docs/specs/v1/`.
 
+## Install
+
+Library:
+
+```toml
+[dependencies]
+graphrun = "0.1"
+```
+
+CLI (`graphrun` binary):
+
+```sh
+cargo install graphrun-cli --locked
+```
+
+## crates.io
+
+The `publish` workflow uploads `graphrun` and `graphrun-cli` when you push a `vX.Y.Z` tag that matches the workspace version. `graphrun-e2e` is not published.
+
+Before the first tag, add a `CARGO_REGISTRY_TOKEN` secret (repo or the `crates-io` environment), or configure [trusted publishing](https://crates.io/docs/trusted-publishing) for this repository, workflow `publish.yml`, and environment `crates-io`. Then:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Commands
 
 ```sh
@@ -18,7 +44,7 @@ cargo run --locked -p graphrun-e2e -- verify \
 
 Minimum toolchain is Rust 1.90.0. Current development uses stable.
 
-CI on GitHub Actions runs fmt, clippy, tests on Linux and macOS, the 1.90.0 toolchain, and the e2e matrix against a release `graphrun` binary. PERF-001 and PERF-002 stay BLOCKED unless the job runs on the spec's three 4-vCPU members.
+CI on GitHub Actions runs fmt, clippy, tests on Linux and macOS, the 1.90.0 toolchain, a crates.io package dry-run, and the e2e matrix against a release `graphrun` binary. PERF-001 and PERF-002 stay BLOCKED unless the job runs on the spec's three 4-vCPU members.
 
 ```sh
 rustup run 1.90.0 cargo test --workspace --locked

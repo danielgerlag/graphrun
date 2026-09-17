@@ -43,6 +43,15 @@ jobs:
       - name: crash cuts
         run: cargo test -p graphrun --test crash_cut --features fault-injection --locked
 
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: crates.io dry-run
+        run: bash scripts/publish.sh --dry-run
+
   msrv:
     runs-on: ubuntu-latest
     steps:

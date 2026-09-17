@@ -3,8 +3,14 @@ name = "graphrun-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-publish.workspace = true
-description = "Production Graphrun CLI"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Production CLI for the Graphrun durable workflow engine"
+readme = "README.md"
+keywords = ["workflow", "cli"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "graphrun"
@@ -12,6 +18,6 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-graphrun = { path = "../graphrun" }
+graphrun.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

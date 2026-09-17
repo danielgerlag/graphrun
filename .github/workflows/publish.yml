@@ -1,0 +1,65 @@
+name: publish
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Package without uploading to crates.io"
+        type: boolean
+        default: true
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    outputs:
+      upload: ${{ steps.flags.outputs.upload }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Decide whether to upload
+        id: flags
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "upload=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "upload=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "upload=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Dry-run package
+        run: bash scripts/publish.sh --dry-run
+
+  publish:
+    needs: package
+    if: needs.package.outputs.upload == 'true'
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+        continue-on-error: true
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outcome == 'success' && steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "Set repository or crates-io environment secret CARGO_REGISTRY_TOKEN, or configure crates.io trusted publishing for workflow publish.yml and environment crates-io." >&2
+            exit 1
+          fi
+          bash scripts/publish.sh
