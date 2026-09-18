@@ -1,8 +1,44 @@
 use graphrun::Catalog;
 use graphrun::builder::{Branch, RegionBuilder, RegionGraphBuilder, WorkflowBuilder};
-use graphrun_samples::{Order, Shipping, Tax, catalog, pretty, run_pair, to_value};
+use graphrun::schema::{DurablePayload, SchemaRef};
+use graphrun_samples::{pretty, run_pair, to_value};
+use serde::{Deserialize, Serialize};
 
 const YAML: &str = include_str!("workflow.yaml");
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Order {
+    order_id: String,
+    amount: i64,
+}
+
+impl DurablePayload for Order {
+    fn schema_ref() -> SchemaRef {
+        SchemaRef::named("order", 1).expect("order/v1")
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Tax {
+    cents: i64,
+}
+
+impl DurablePayload for Tax {
+    fn schema_ref() -> SchemaRef {
+        SchemaRef::named("tax", 1).expect("tax/v1")
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Shipping {
+    cents: i64,
+}
+
+impl DurablePayload for Shipping {
+    fn schema_ref() -> SchemaRef {
+        SchemaRef::named("shipping", 1).expect("shipping/v1")
+    }
+}
 
 fn build(catalog: &Catalog) -> graphrun::Result<graphrun::Definition> {
     let tax = catalog.activity_ref::<Order, Tax>("tax.quote", 1)?;
@@ -37,12 +73,11 @@ fn build(catalog: &Catalog) -> graphrun::Result<graphrun::Definition> {
 
 #[tokio::main]
 async fn main() -> graphrun::Result<()> {
-    let catalog = catalog()?;
+    let catalog = Catalog::from_json(include_bytes!("catalog.json"))?;
     let built = build(&catalog)?;
     let input = to_value(&Order {
         order_id: "o1".to_owned(),
         amount: 1000,
-        fail_after_payment: None,
     })?;
     let output = run_pair(YAML, built, &catalog, input).await?;
     println!("parallel {}", pretty(&output));

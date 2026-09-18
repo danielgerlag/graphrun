@@ -1,17 +1,9 @@
-//! Shared catalog, payloads, and `Engine::local` helpers for the sample bins.
-//!
-//! Each sample bin still shows the graph: YAML in `workflow.yaml` and the
-//! typed builder in `builder.rs`. Activities are catalog contracts. Local
-//! mode runs the built-in handlers in the library.
+//! Shared `Engine::local` harness. Sample graphs, catalogs, and payload types
+//! live next to each bin.
 
-use graphrun::schema::{DurablePayload, SchemaRef};
 use graphrun::{Catalog, Definition, Engine, Error, Result, Value};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::time::Duration;
-
-pub fn catalog() -> Result<Catalog> {
-    Catalog::from_json(include_bytes!("../catalog.json"))
-}
 
 pub fn execution_ir(definition: &Definition) -> serde_json::Value {
     let mut value = serde_json::to_value(definition).expect("definition JSON");
@@ -130,99 +122,4 @@ pub async fn run_pair(
         )));
     }
     Ok(yaml_out)
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Counter {
-    pub value: i64,
-}
-
-impl DurablePayload for Counter {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("counter", 1).expect("counter/v1")
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Order {
-    pub order_id: String,
-    pub amount: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fail_after_payment: Option<bool>,
-}
-
-impl DurablePayload for Order {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("order", 1).expect("order/v1")
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ReservedOrder {
-    pub order_id: String,
-    pub amount: i64,
-    pub reservation_id: String,
-}
-
-impl DurablePayload for ReservedOrder {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("reserved_order", 1).expect("reserved_order/v1")
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Receipt {
-    pub order_id: String,
-    pub amount: i64,
-    pub payment_id: String,
-}
-
-impl DurablePayload for Receipt {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("receipt", 1).expect("receipt/v1")
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct EventRequest {
-    pub key: String,
-}
-
-impl DurablePayload for EventRequest {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("event_request", 1).expect("event_request/v1")
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Approval {
-    pub approved: bool,
-}
-
-impl DurablePayload for Approval {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("approval", 1).expect("approval/v1")
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Tax {
-    pub cents: i64,
-}
-
-impl DurablePayload for Tax {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("tax", 1).expect("tax/v1")
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Shipping {
-    pub cents: i64,
-}
-
-impl DurablePayload for Shipping {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("shipping", 1).expect("shipping/v1")
-    }
 }

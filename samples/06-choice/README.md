@@ -10,4 +10,4 @@ This is the Graphrun equivalent of WorkflowCore Sample11. Case bodies share an i
 cargo run -p graphrun-samples --bin 06-choice
 ```
 
-The bin compiles this YAML, builds the same graph with `RegionBuilder::choose`, checks IR parity, and runs both the matching case and the default on `Engine::local`.
+The bin compiles this YAML against `catalog.json` in this directory, builds the same graph with `RegionBuilder::choose`, checks IR parity, and runs both the matching case and the default on `Engine::local`.

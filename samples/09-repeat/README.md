@@ -10,4 +10,4 @@ YAML can also bind `count` from a request object; the builder sample uses a type
 cargo run -p graphrun-samples --bin 09-repeat
 ```
 
-The bin compiles this YAML, builds the same graph with `RegionBuilder`, checks IR parity, and runs both on `Engine::local`.
+The bin compiles this YAML against `catalog.json` in this directory, builds the same graph with `RegionBuilder`, checks IR parity, and runs both on `Engine::local`.

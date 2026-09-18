@@ -1,12 +1,34 @@
 use graphrun::builder::{RegionGraphBuilder, SignalRef, WorkflowBuilder};
+use graphrun::schema::{DurablePayload, SchemaRef};
 use graphrun::{Catalog, EventId, Value};
-use graphrun_samples::{
-    Approval, Counter, LocalEngine, assert_same_ir, catalog, expect_value, pretty, to_value,
-};
+use graphrun_samples::{LocalEngine, assert_same_ir, expect_value, pretty, to_value};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 const YAML: &str = include_str!("workflow.yaml");
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Counter {
+    value: i64,
+}
+
+impl DurablePayload for Counter {
+    fn schema_ref() -> SchemaRef {
+        SchemaRef::named("counter", 1).expect("counter/v1")
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Approval {
+    approved: bool,
+}
+
+impl DurablePayload for Approval {
+    fn schema_ref() -> SchemaRef {
+        SchemaRef::named("approval", 1).expect("approval/v1")
+    }
+}
 
 fn build(catalog: &Catalog) -> graphrun::Result<graphrun::Definition> {
     let increment = catalog.activity_ref::<Counter, Counter>("counter.increment", 1)?;
@@ -69,7 +91,7 @@ async fn run_timeout(
 
 #[tokio::main]
 async fn main() -> graphrun::Result<()> {
-    let catalog = catalog()?;
+    let catalog = Catalog::from_json(include_bytes!("catalog.json"))?;
     let yaml = graphrun::compile_yaml(YAML, &catalog)?;
     let built = build(&catalog)?;
     assert_same_ir(&yaml, &built)?;

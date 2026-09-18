@@ -21,4 +21,4 @@ cargo run -p graphrun-samples --bin 01-hello-world
 
 These follow the WorkflowCore `src/samples` set that Graphrun v1 actually has. Human/user workflows, a REST host, DI containers, recurring `IHostedService`, and Mongo persistence providers are out of scope.
 
-The catalog is [`catalog.json`](catalog.json). Payload types used by several bins live in `src/lib.rs`.
+Each sample directory has its own `workflow.yaml`, `catalog.json`, payload types, and builder. `src/lib.rs` is only the `Engine::local` run harness.

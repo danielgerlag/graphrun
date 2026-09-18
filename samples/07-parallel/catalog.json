@@ -1,0 +1,48 @@
+{
+  "format": "graphrun.catalog/v1",
+  "schemas": {
+    "order/v1": {
+      "type": "object",
+      "required": ["order_id", "amount"],
+      "additionalProperties": false,
+      "properties": {
+        "order_id": {"type": "string"},
+        "amount": {"type": "integer", "minimum": 0}
+      }
+    },
+    "tax/v1": {
+      "type": "object",
+      "required": ["cents"],
+      "additionalProperties": false,
+      "properties": {"cents": {"type": "integer"}}
+    },
+    "shipping/v1": {
+      "type": "object",
+      "required": ["cents"],
+      "additionalProperties": false,
+      "properties": {"cents": {"type": "integer"}}
+    }
+  },
+  "activities": [
+    {
+      "name": "tax.quote",
+      "version": 1,
+      "input_schema": "order/v1",
+      "output_schema": "tax/v1",
+      "execution": "async",
+      "effects": "pure",
+      "recovery": "RetrySafe",
+      "error_codes": []
+    },
+    {
+      "name": "shipping.quote",
+      "version": 1,
+      "input_schema": "order/v1",
+      "output_schema": "shipping/v1",
+      "execution": "blocking",
+      "effects": "pure",
+      "recovery": "RetrySafe",
+      "error_codes": []
+    }
+  ]
+}

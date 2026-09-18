@@ -11,3 +11,5 @@ YAML and the typed builder compile the same control flow. Compensation retry def
 ```sh
 cargo run -p graphrun-samples --bin 08-saga
 ```
+
+Contracts live in `catalog.json` in this directory.

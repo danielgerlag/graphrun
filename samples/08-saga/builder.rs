@@ -1,10 +1,52 @@
 use graphrun::binding::{Binding, Condition, Reference};
 use graphrun::builder::{Case, RegionBuilder, RegionGraphBuilder, WorkflowBuilder};
+use graphrun::schema::{DurablePayload, SchemaRef};
 use graphrun::{Catalog, Error, Value};
-use graphrun_samples::{LocalEngine, Order, Receipt, ReservedOrder, catalog, pretty, to_value};
+use graphrun_samples::{LocalEngine, pretty, to_value};
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const YAML: &str = include_str!("workflow.yaml");
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Order {
+    order_id: String,
+    amount: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fail_after_payment: Option<bool>,
+}
+
+impl DurablePayload for Order {
+    fn schema_ref() -> SchemaRef {
+        SchemaRef::named("order", 1).expect("order/v1")
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ReservedOrder {
+    order_id: String,
+    amount: i64,
+    reservation_id: String,
+}
+
+impl DurablePayload for ReservedOrder {
+    fn schema_ref() -> SchemaRef {
+        SchemaRef::named("reserved_order", 1).expect("reserved_order/v1")
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Receipt {
+    order_id: String,
+    amount: i64,
+    payment_id: String,
+}
+
+impl DurablePayload for Receipt {
+    fn schema_ref() -> SchemaRef {
+        SchemaRef::named("receipt", 1).expect("receipt/v1")
+    }
+}
 
 fn build(catalog: &Catalog) -> graphrun::Result<graphrun::Definition> {
     let reserve = catalog.activity_ref::<Order, ReservedOrder>("inventory.reserve", 1)?;
@@ -107,7 +149,7 @@ async fn run_failed(
 
 #[tokio::main]
 async fn main() -> graphrun::Result<()> {
-    let catalog = catalog()?;
+    let catalog = Catalog::from_json(include_bytes!("catalog.json"))?;
     let yaml = graphrun::compile_yaml(YAML, &catalog)?;
     let built = build(&catalog)?;
     let input = to_value(&Order {

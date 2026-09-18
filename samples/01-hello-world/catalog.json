@@ -1,0 +1,23 @@
+{
+  "format": "graphrun.catalog/v1",
+  "schemas": {
+    "counter/v1": {
+      "type": "object",
+      "required": ["value"],
+      "additionalProperties": false,
+      "properties": {"value": {"type": "integer"}}
+    }
+  },
+  "activities": [
+    {
+      "name": "counter.increment",
+      "version": 1,
+      "input_schema": "counter/v1",
+      "output_schema": "counter/v1",
+      "execution": "async",
+      "effects": "pure",
+      "recovery": "RetrySafe",
+      "error_codes": []
+    }
+  ]
+}

@@ -10,4 +10,4 @@ This is the Graphrun equivalent of WorkflowCore Sample13. The typed builder uses
 cargo run -p graphrun-samples --bin 07-parallel
 ```
 
-The bin compiles this YAML, builds the same graph with `RegionGraphBuilder`, checks IR parity, and runs both on `Engine::local`.
+The bin compiles this YAML against `catalog.json` in this directory, builds the same graph with `RegionGraphBuilder`, checks IR parity, and runs both on `Engine::local`.

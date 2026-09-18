@@ -10,4 +10,4 @@ This is the Graphrun equivalent of WorkflowCore Sample03. Data is immutable bind
 cargo run -p graphrun-samples --bin 02-passing-data
 ```
 
-The bin compiles this YAML, builds the same graph with `RegionBuilder`, checks IR parity, and runs both on `Engine::local`.
+The bin compiles this YAML against `catalog.json` in this directory, builds the same graph with `RegionBuilder`, checks IR parity, and runs both on `Engine::local`.

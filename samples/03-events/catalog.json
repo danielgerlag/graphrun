@@ -1,0 +1,18 @@
+{
+  "format": "graphrun.catalog/v1",
+  "schemas": {
+    "event_request/v1": {
+      "type": "object",
+      "required": ["key"],
+      "additionalProperties": false,
+      "properties": {"key": {"type": "string"}}
+    },
+    "approval/v1": {
+      "type": "object",
+      "required": ["approved"],
+      "additionalProperties": false,
+      "properties": {"approved": {"type": "boolean"}}
+    }
+  },
+  "activities": []
+}

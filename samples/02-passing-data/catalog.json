@@ -1,0 +1,62 @@
+{
+  "format": "graphrun.catalog/v1",
+  "schemas": {
+    "order/v1": {
+      "type": "object",
+      "required": ["order_id", "amount"],
+      "additionalProperties": false,
+      "properties": {
+        "order_id": {"type": "string"},
+        "amount": {"type": "integer", "minimum": 0}
+      }
+    },
+    "reserved_order/v1": {
+      "type": "object",
+      "required": ["order_id", "amount", "reservation_id"],
+      "additionalProperties": false,
+      "properties": {
+        "order_id": {"type": "string"},
+        "amount": {"type": "integer"},
+        "reservation_id": {"type": "string"}
+      }
+    },
+    "receipt/v1": {
+      "type": "object",
+      "required": ["order_id", "amount", "payment_id"],
+      "additionalProperties": false,
+      "properties": {
+        "order_id": {"type": "string"},
+        "amount": {"type": "integer"},
+        "payment_id": {"type": "string"}
+      }
+    }
+  },
+  "activities": [
+    {
+      "name": "inventory.reserve",
+      "version": 1,
+      "input_schema": "order/v1",
+      "output_schema": "reserved_order/v1",
+      "execution": "async",
+      "effects": "external",
+      "recovery": "RetrySafe",
+      "error_codes": [{"code": "inventory.unavailable", "retryable": true}],
+      "reconciler": {"name": "inventory.lookup", "version": 1}
+    },
+    {
+      "name": "payment.charge",
+      "version": 1,
+      "input_schema": "reserved_order/v1",
+      "output_schema": "receipt/v1",
+      "execution": "async",
+      "effects": "external",
+      "recovery": "RetrySafe",
+      "error_codes": [{"code": "payment.declined", "retryable": false}],
+      "reconciler": {"name": "payment.lookup", "version": 1}
+    }
+  ],
+  "reconcilers": [
+    {"name": "inventory.lookup", "version": 1, "forward_activity": {"name": "inventory.reserve", "version": 1}},
+    {"name": "payment.lookup", "version": 1, "forward_activity": {"name": "payment.charge", "version": 1}}
+  ]
+}

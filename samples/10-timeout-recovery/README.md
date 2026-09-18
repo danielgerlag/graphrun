@@ -10,4 +10,4 @@ This is the Graphrun equivalent of WorkflowCore `WaitFor` with a timeout. The sh
 cargo run -p graphrun-samples --bin 10-timeout-recovery
 ```
 
-The bin compiles this YAML, builds the same graph with `RegionGraphBuilder`, checks IR parity, then runs the success path (signal) and the timeout path (wait) on `Engine::local`.
+The bin compiles this YAML against `catalog.json` in this directory, builds the same graph with `RegionGraphBuilder`, checks IR parity, then runs the success path (signal) and the timeout path (wait) on `Engine::local`.
