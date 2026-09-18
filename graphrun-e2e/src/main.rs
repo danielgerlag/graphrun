@@ -1825,13 +1825,57 @@ fn spawn_fixture_member(
 }
 
 fn spawn_fixture_worker(cluster: &LiveCluster, i: usize) -> Result<ChildProc, String> {
-    let cert = &cluster.certs[i % cluster.certs.len()];
+    spawn_worker_on(cluster, i, 0)
+}
+
+fn spawn_workers_on_survivors(
+    cluster: &mut LiveCluster,
+    count: usize,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut last = "no worker stayed up on survivors".to_owned();
+    let mut next = cluster.workers.len();
+    while cluster.workers.len() < count {
+        if Instant::now() >= deadline {
+            return Err(last);
+        }
+        for endpoint in 1..cluster.addrs.len() {
+            if cluster.workers.len() >= count {
+                break;
+            }
+            match spawn_worker_on(cluster, next, endpoint) {
+                Ok(mut worker) => {
+                    std::thread::sleep(Duration::from_millis(250));
+                    match worker.0.try_wait() {
+                        Ok(None) => {
+                            cluster.workers.push(worker);
+                            next += 1;
+                        }
+                        Ok(Some(status)) => last = format!("worker exited {status}"),
+                        Err(err) => last = err.to_string(),
+                    }
+                }
+                Err(err) => last = err,
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+fn spawn_worker_on(
+    cluster: &LiveCluster,
+    i: usize,
+    endpoint_node: usize,
+) -> Result<ChildProc, String> {
+    let cert = &cluster.certs[endpoint_node];
     let log = cluster.dir.join(format!("worker-{}.log", i + 1));
     let mut cmd = Command::new(&cluster.e2e);
     cmd.args([
         "fixture-worker",
         "--endpoint",
-        &format!("https://{}", cluster.addrs[0]),
+        &format!("https://{}", cluster.addrs[endpoint_node]),
         "--ca",
         cluster.ca_path.to_str().unwrap(),
         "--cert",
@@ -1839,7 +1883,7 @@ fn spawn_fixture_worker(cluster: &LiveCluster, i: usize) -> Result<ChildProc, St
         "--key",
         cert.1.to_str().unwrap(),
         "--server-name",
-        &cluster.certs[0].2,
+        &cert.2,
     ]);
     cmd.stdout(Stdio::null());
     if let Ok(file) = fs::File::create(log) {
@@ -1917,6 +1961,14 @@ fn inspect_succeeded(body: &str) -> bool {
     };
     value.get("status").and_then(|status| status.as_str()) == Some("succeeded")
         && value.get("output").is_some_and(|output| !output.is_null())
+}
+
+fn inspect_known_run(body: &str, run: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    value.get("run").and_then(|id| id.as_str()) == Some(run)
+        && value.get("error").is_none_or(|error| error.is_null())
 }
 
 fn wait_nodes_succeeded(
@@ -2192,7 +2244,7 @@ fn cluster_nested_survives_leader_kill(
     artifacts: &Path,
     row: &MatrixRow,
 ) -> CaseResult {
-    let mut cluster = match boot_three(artifacts, row, 2) {
+    let mut cluster = match boot_three(artifacts, row, 0) {
         Ok(cluster) => cluster,
         Err(err) => return fail(row, "boot cluster", err),
     };
@@ -2201,29 +2253,40 @@ fn cluster_nested_survives_leader_kill(
         &cluster,
         "nested-controls.yaml",
         r#"[{"value":1},{"value":4}]"#,
-        true,
+        false,
     ) {
         Ok(run) => run,
         Err(err) => return fail(row, "cluster start nested", err),
     };
-    if let Err(err) = wait_nodes_succeeded(
-        cli,
-        &cluster,
-        &run,
-        0..cluster.addrs.len(),
-        2,
-        Duration::from_secs(90),
-    ) {
-        return fail(row, "replicate nested before kill", err);
+    let replicated = Instant::now() + Duration::from_secs(20);
+    let mut last = String::new();
+    loop {
+        let mut seen = 0;
+        for node in 0..cluster.addrs.len() {
+            last = cluster_inspect(cli, &cluster, node, &run);
+            if inspect_known_run(&last, &run) {
+                seen += 1;
+            }
+        }
+        if seen >= 2 {
+            break;
+        }
+        if Instant::now() >= replicated {
+            return fail(row, "replicate nested start before kill", last);
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
     terminate(&mut cluster.members[2].0);
+    if let Err(err) = spawn_workers_on_survivors(&mut cluster, 2, Duration::from_secs(15)) {
+        return fail(row, "workers on survivors", err);
+    }
     match wait_nodes_succeeded(
         cli,
         &cluster,
         &run,
         1..cluster.addrs.len(),
         1,
-        Duration::from_secs(30),
+        Duration::from_secs(40),
     ) {
         Ok(body) => finish(
             row,
