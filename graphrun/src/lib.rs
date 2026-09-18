@@ -1,4 +1,25 @@
-//! Graphrun durable workflow engine.
+//! Durable workflow engine.
+//!
+//! YAML and a typed Rust builder compile to one IR. [`Engine::local`] is one
+//! Raft member on a redb file. A cluster uses the same write path.
+//!
+//! ```no_run
+//! use graphrun::{Catalog, Engine, Value};
+//! use std::time::Duration;
+//!
+//! # async fn run() -> graphrun::Result<()> {
+//! let catalog = Catalog::from_json(br#"{"format":"graphrun.catalog/v1"}"#)?;
+//! let engine = Engine::local("/tmp/graphrun-demo").await?;
+//! let run = engine
+//!     .start_yaml("dsl: graphrun/v1\nid: empty\nversion: 1\ninput_schema: unit/v1\noutput_schema: unit/v1\nstart: finish\nnodes:\n  finish:\n    kind: complete\n    output: {from: workflow.input}\n", &catalog, Value::Null)
+//!     .await?;
+//! let _output = engine.wait_terminal(run, Duration::from_secs(10)).await?;
+//! engine.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! See the crate README for a reserve-then-charge example and the CLI.
 
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::collapsible_if)]
