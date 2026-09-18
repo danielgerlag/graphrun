@@ -1,13 +1,11 @@
 # 01 Hello World
 
-A linear sequence of two catalog activities, then `complete`. `counter.increment` adds one each time, so input `{value: 0}` finishes at `{value: 2}`.
+Two `counter.increment` steps. Input `{value: 0}` finishes at `{value: 2}`.
 
-This is the Graphrun equivalent of WorkflowCore Sample01: the smallest graph that actually runs. There is no custom handler registration; local mode executes the built-in increment handler.
-
-## Run
+`counter.increment` is a built-in fixture. This directory is the whole sample: `workflow.yaml`, `catalog.json`, and `builder.rs`.
 
 ```sh
 cargo run -p graphrun-samples --bin 01-hello-world
 ```
 
-The bin compiles this YAML against `catalog.json` in this directory, builds the same graph with `RegionBuilder`, checks IR parity, and runs both on `Engine::local`.
+Next: [02 Passing Data](../02-passing-data).

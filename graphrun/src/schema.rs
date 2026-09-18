@@ -103,6 +103,9 @@ impl SchemaRef {
     }
 }
 
+/// Ties a Rust payload type to a catalog schema name such as `order/v1`.
+///
+/// The schema name is data in the catalog, not the Rust type name.
 pub trait DurablePayload:
     serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static
 {

@@ -1,30 +1,93 @@
 # Build a workflow in Rust
 
-This how-to compiles a typed graph that matches `sequence.yaml` and runs it on a local engine.
+Same graph as the YAML below: reserve inventory, then charge. Typed builder lives in [`samples/02-passing-data/builder.rs`](../../samples/02-passing-data/builder.rs). YAML: [`workflow.yaml`](../../samples/02-passing-data/workflow.yaml). Catalog: [`catalog.json`](../../samples/02-passing-data/catalog.json).
 
-## Open a catalog
+`DurablePayload` on a struct is a catalog schema name (`order/v1`), not the Rust type name. `activity_ref` checks the struct against that contract. Use `workflow_input()` for the run input (YAML `from: workflow.input`). `input()` is the current region’s input (`scope.input`).
 
-```rust
-use graphrun::{Catalog, Engine, Value};
+## Definition
 
-let catalog = Catalog::from_json(include_bytes!(
-    "docs/specs/v1/examples/activity-catalog.json"
-))?;
+```yaml
+dsl: graphrun/v1
+id: passing_data
+version: 1
+input_schema: order/v1
+output_schema: receipt/v1
+start: reserve
+nodes:
+  reserve:
+    kind: activity
+    activity: {name: inventory.reserve, version: 1}
+    input: {from: workflow.input}
+    next: charge
+  charge:
+    kind: activity
+    activity: {name: payment.charge, version: 1}
+    input: {from: nodes.reserve.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.charge.output}
 ```
 
-`activity_ref` binds input and output types. A mismatch fails at compile time. See `graphrun/tests/api.rs` and `graphrun/tests/ui/` for the pass and fail cases.
+`inventory.reserve` and `payment.charge` are built-in fixtures. Input `{"order_id":"o1","amount":1000}` finishes with `payment_id: pay-1`.
 
-## Construct the graph
-
-Follow `graphrun/tests/api.rs`. The builder and YAML compiler produce one IR. `cargo test --test api yaml_and_builder_while_match` checks that parity.
-
-## Run it
+## Builder
 
 ```rust
-let engine = Engine::local("/tmp/graphrun-builder").await?;
+use graphrun::builder::{RegionBuilder, WorkflowBuilder};
+use graphrun::schema::{DurablePayload, SchemaRef};
+use graphrun::{Catalog, Engine};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Order {
+	order_id: String,
+	amount: i64,
+}
+impl DurablePayload for Order {
+	fn schema_ref() -> SchemaRef {
+		SchemaRef::named("order", 1).unwrap()
+	}
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ReservedOrder {
+	order_id: String,
+	amount: i64,
+	reservation_id: String,
+}
+impl DurablePayload for ReservedOrder {
+	fn schema_ref() -> SchemaRef {
+		SchemaRef::named("reserved_order", 1).unwrap()
+	}
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Receipt {
+	order_id: String,
+	amount: i64,
+	payment_id: String,
+}
+impl DurablePayload for Receipt {
+	fn schema_ref() -> SchemaRef {
+		SchemaRef::named("receipt", 1).unwrap()
+	}
+}
+
+let catalog = Catalog::from_json(include_bytes!("catalog.json"))?;
+let reserve = catalog.activity_ref::<Order, ReservedOrder>("inventory.reserve", 1)?;
+let charge = catalog.activity_ref::<ReservedOrder, Receipt>("payment.charge", 1)?;
+let mut root = RegionBuilder::<Order>::new();
+let reserved = root.activity("reserve", &reserve, root.workflow_input())?;
+let charged = root.activity("charge", &charge, reserved.output())?;
+let root = root.complete("finish", charged.output())?;
+let definition = WorkflowBuilder::new("passing_data", 1, root).build(&catalog)?;
+
+let engine = Engine::local("./graphrun-data").await?;
 let run = engine.start(definition, catalog, input).await?;
 let output = engine.wait_terminal(run, std::time::Duration::from_secs(10)).await?;
-engine.shutdown().await?;
 ```
 
-Local mode still commits through one-member Raft. There is no in-memory shortcut.
+```sh
+cargo run -p graphrun-samples --bin 02-passing-data
+```

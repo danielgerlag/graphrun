@@ -1,52 +1,50 @@
-# Run a local YAML workflow
+# Run YAML from your process
 
-This how-to starts a one-member engine on disk and runs `sequence.yaml`. You do not install a database, broker, or container.
+Open `Engine::local` and call `start_yaml`. You do not install a database or run `graphrun serve`.
 
-## Prerequisites
+## Definition
 
-- Rust 1.90 or newer
-- This repository as the working directory
+[`samples/01-hello-world/workflow.yaml`](../../samples/01-hello-world/workflow.yaml)
 
-## Build the CLI
-
-```sh
-cargo build -p graphrun-cli
+```yaml
+dsl: graphrun/v1
+id: hello_world
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: hello
+nodes:
+  hello:
+    kind: activity
+    activity: {name: counter.increment, version: 1}
+    input: {from: workflow.input}
+    next: goodbye
+  goodbye:
+    kind: activity
+    activity: {name: counter.increment, version: 1}
+    input: {from: nodes.hello.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.goodbye.output}
 ```
 
-The binary is `target/debug/graphrun`.
+Contracts: [`samples/01-hello-world/catalog.json`](../../samples/01-hello-world/catalog.json). `counter.increment` is a built-in fixture (`{value: n}` → `{value: n+1}`). Input `{value: 0}` finishes at `{value: 2}`.
 
-## Validate the definition
+## Run it
 
-```sh
-./target/debug/graphrun validate \
-	--definition docs/specs/v1/examples/sequence.yaml \
-	--catalog docs/specs/v1/examples/activity-catalog.json
+```rust
+let catalog = Catalog::from_json(include_bytes!("catalog.json"))?;
+let engine = Engine::local("./graphrun-data").await?;
+let input = Value::Object(BTreeMap::from([("value".into(), Value::Int(0))]));
+let run = engine.start_yaml(include_str!("workflow.yaml"), &catalog, input).await?;
+let output = engine.wait_terminal(run, Duration::from_secs(10)).await?;
 ```
 
-You should see JSON with `"status":"ok"` and a digest.
-
-## Start the engine and the run
+Put `workflow.yaml` and `catalog.json` next to the source, as the sample does. From this repository:
 
 ```sh
-mkdir -p /tmp/graphrun-local
-echo '{"order_id":"o1","amount":1000}' > /tmp/order.json
-
-./target/debug/graphrun serve --local-dir /tmp/graphrun-local &
-sleep 1
-
-./target/debug/graphrun start \
-	--definition docs/specs/v1/examples/sequence.yaml \
-	--catalog docs/specs/v1/examples/activity-catalog.json \
-	--input /tmp/order.json \
-	--local-dir /tmp/graphrun-local
+cargo run -p graphrun-samples --bin 01-hello-world
 ```
 
-The start command prints a 32-character run id. Inspect it:
-
-```sh
-./target/debug/graphrun inspect --run <run-id> --local-dir /tmp/graphrun-local
-```
-
-The run status is `succeeded` and the output includes `"payment_id":"pay-1"`.
-
-Stop the engine with SIGTERM. The same `--local-dir` reopens the store on the next `serve`.
+A longer graph (reserve, then charge) is [`samples/02-passing-data/workflow.yaml`](../../samples/02-passing-data/workflow.yaml). Restart the process on the same data directory; the run is still there.

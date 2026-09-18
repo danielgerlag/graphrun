@@ -1,6 +1,6 @@
 # graphrun-cli
 
-Optional operator CLI for the [graphrun](https://crates.io/crates/graphrun) library. Your application depends on `graphrun` and opens `Engine::local` itself. This binary inspects, signals, and administers an engine that is already running, or opens a data directory for ops.
+Optional operator CLI for the [graphrun](https://crates.io/crates/graphrun) library. Your application depends on `graphrun` and opens `Engine::local` itself. This binary inspects, signals, and administers a data directory that engine already uses.
 
 ```sh
 cargo install graphrun-cli --locked
@@ -8,23 +8,24 @@ cargo install graphrun-cli --locked
 
 Rust 1.90 or newer. Linux and macOS.
 
-## Talk to a local data directory
+## Inspect a local data directory
 
 ```sh
-graphrun serve --local-dir /tmp/graphrun-demo &
-
+graphrun inspect --run <run-id> --local-dir ./graphrun-data
 graphrun validate --definition sequence.yaml --catalog catalog.json
+```
 
+`start` waits for a terminal status. Pass `--no-wait` to return the run id immediately.
+
+```sh
 graphrun start \
 	--definition sequence.yaml \
 	--catalog catalog.json \
 	--input order.json \
-	--local-dir /tmp/graphrun-demo
-
-graphrun inspect --run <run-id> --local-dir /tmp/graphrun-demo
+	--local-dir ./graphrun-data
 ```
 
-`start` waits for a terminal status. Pass `--no-wait` to return the run id immediately.
+`graphrun serve --local-dir ./graphrun-data` opens a local engine for ops when your app is not running. Prefer embedding `Engine::local` in the application.
 
 ## Cluster member
 
@@ -48,7 +49,7 @@ graphrun start \
 
 | Command | Purpose |
 |---|---|
-| `validate` | Compile YAML against a catalog. Prints a digest. |
+| `validate` | Compile YAML against a catalog. |
 | `start` | Start a run. |
 | `signal` | Deliver an event to a wait. |
 | `cancel` | Cancel an active run. |
@@ -57,8 +58,8 @@ graphrun start \
 | `history` | Recorded events. |
 | `replay` | Reconstruct state from history (read-only). |
 | `resolve` | Supply blocked compensation input, or `--abandon --confirm`. |
-| `serve` | Local engine on `--local-dir`. |
+| `serve` | Open a local engine on `--local-dir` (ops only). |
 | `backup` / `restore` | Logical backup. Restore assigns a new identity. |
-| `cluster join\|promote\|remove` | Membership through the leader's control socket. |
+| `cluster join\|promote\|remove` | Membership through the leader. |
 
-Graphs, catalogs, and how-tos: <https://github.com/danielgerlag/graphrun>
+Samples and how-tos: <https://github.com/danielgerlag/graphrun>

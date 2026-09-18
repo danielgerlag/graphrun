@@ -8,7 +8,11 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "graphrun", version, about = "Graphrun production CLI")]
+#[command(
+    name = "graphrun",
+    version,
+    about = "Optional operator CLI for the graphrun library"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

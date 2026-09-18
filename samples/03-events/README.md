@@ -1,13 +1,9 @@
 # 03 Events
 
-The run parks on `wait_signal` until the host delivers an `approval` event with matching correlation key `order-1`. The bin starts the run, calls `Engine::signal`, then `wait_terminal` — it does not sit forever.
-
-This is the Graphrun equivalent of WorkflowCore Sample04 `WaitFor`. Events are addressed by run, signal name, and key. `EventId` is 32 hex characters.
-
-## Run
+The run parks on `wait_signal` until the host calls `Engine::signal` with name `approval` and key `order-1`. Output is `{"approved":true}`.
 
 ```sh
 cargo run -p graphrun-samples --bin 03-events
 ```
 
-The bin compiles this YAML against `catalog.json` in this directory, builds the same graph with `RegionBuilder`, checks IR parity, and runs both on `Engine::local`.
+Then pick from [04–10](../README.md).

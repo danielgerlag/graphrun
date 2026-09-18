@@ -1,8 +1,8 @@
 # Graphrun v1 implementation specification
 
-This directory is the normative implementation contract. It supersedes `docs/brainstorming/`, especially the earlier exclusions of loops, parallel branches, compensation, and a Rust graph builder.
+This directory is the implementation contract for contributors. It is not a getting-started guide. New users should start at the repository README and `samples/`.
 
-The engine has not been implemented. Specification/example checks are not evidence that the runtime works.
+This contract supersedes `docs/brainstorming/`, especially the earlier exclusions of loops, parallel branches, compensation, and a Rust graph builder.
 
 ## Mandatory delivery
 

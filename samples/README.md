@@ -1,24 +1,27 @@
 # Graphrun samples
 
-Each sample is a small in-process program. It compiles a sibling `workflow.yaml`, builds the same graph with the typed Rust builder, and runs both through [`Engine::local`](https://docs.rs/graphrun/latest/graphrun/engine/struct.Engine.html). There is no `graphrun serve` step and no custom activity plugin API. Local mode executes the catalog names that the library already handles (`counter.increment`, `inventory.reserve`, `payment.charge`, and the rest).
+Each folder is one graph: `workflow.yaml`, `catalog.json`, payload types, and a typed builder. Run it with `Engine::local`. There is no `graphrun serve` step.
+
+**You cannot register custom activity handlers.** Local mode runs built-in fixtures for names such as `counter.increment` and `inventory.reserve`. Unknown names echo their input.
+
+Start here, in order:
+
+1. [01 Hello World](01-hello-world) — two increments
+2. [02 Passing Data](02-passing-data) — order → reserve → charge
+3. [03 Events](03-events) — `wait_signal` + `Engine::signal`
+
+Then pick one:
+
+| Sample | Shows |
+|---|---|
+| [04 While](04-while) | Loop until a condition fails |
+| [05 Foreach](05-foreach) | Map a body over an array |
+| [06 Choice](06-choice) | `choose` with `when` / `eq` |
+| [07 Parallel](07-parallel) | Two branches, all-join |
+| [08 Saga](08-saga) | Compensation after payment fails |
+| [09 Repeat](09-repeat) | Fixed iteration count |
+| [10 Timeout recovery](10-timeout-recovery) | Timed wait success vs timeout |
 
 ```sh
 cargo run -p graphrun-samples --bin 01-hello-world
 ```
-
-| Sample | Shows | Run |
-|---|---|---|
-| [01 Hello World](01-hello-world) | Sequence of activities, then complete | `cargo run -p graphrun-samples --bin 01-hello-world` |
-| [02 Passing Data](02-passing-data) | Typed payloads: order → reserve → charge | `cargo run -p graphrun-samples --bin 02-passing-data` |
-| [03 Events](03-events) | `wait_signal` + `Engine::signal` | `cargo run -p graphrun-samples --bin 03-events` |
-| [04 While](04-while) | `while_loop` until a condition fails | `cargo run -p graphrun-samples --bin 04-while` |
-| [05 Foreach](05-foreach) | Map a body over an array | `cargo run -p graphrun-samples --bin 05-foreach` |
-| [06 Choice / If](06-choice) | `choose` with `when` / `eq` | `cargo run -p graphrun-samples --bin 06-choice` |
-| [07 Parallel](07-parallel) | Two branches, all-join tuple | `cargo run -p graphrun-samples --bin 07-parallel` |
-| [08 Saga](08-saga) | Compensation after `fail_after_payment` | `cargo run -p graphrun-samples --bin 08-saga` |
-| [09 Repeat](09-repeat) | Fixed iteration count | `cargo run -p graphrun-samples --bin 09-repeat` |
-| [10 Timeout Recovery](10-timeout-recovery) | Timed wait success vs timeout ports | `cargo run -p graphrun-samples --bin 10-timeout-recovery` |
-
-These follow the WorkflowCore `src/samples` set that Graphrun v1 actually has. Human/user workflows, a REST host, DI containers, recurring `IHostedService`, and Mongo persistence providers are out of scope.
-
-Each sample directory has its own `workflow.yaml`, `catalog.json`, payload types, and builder. `src/lib.rs` is only the `Engine::local` run harness.

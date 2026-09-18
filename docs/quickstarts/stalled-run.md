@@ -1,34 +1,51 @@
-# Diagnose a stalled run
+# Inspect a stalled run
 
-Inspect the run. Do not guess from logs.
+A wait that never gets a signal stays `active` with a pending wait. This is that graph:
+
+## Definition
+
+[`samples/03-events/workflow.yaml`](../../samples/03-events/workflow.yaml)
+
+```yaml
+dsl: graphrun/v1
+id: external_approval
+version: 1
+input_schema: event_request/v1
+output_schema: approval/v1
+signals:
+  approval: {schema: approval/v1}
+start: approval
+nodes:
+  approval:
+    kind: wait_signal
+    signal: approval
+    key: {literal: order-1}
+    consume_from: buffered
+    timeout: null
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.approval.output}
+```
+
+Until `Engine::signal` / `graphrun signal` delivers `approval` with key `order-1`, inspect shows `status: active` and `pending_waits` with `"signal":"approval"`.
 
 ```sh
-./target/debug/graphrun inspect --run <run-id> --local-dir /tmp/graphrun-local
+graphrun inspect --run <run-id> --local-dir ./graphrun-data
 ```
 
 Read these fields in order:
 
 1. `blocked_reason`. Why the run is not advancing, if it is still active.
 2. `status`. `active` means the run is not terminal.
-3. `pending_waits`. A row with `signal` and `key` means the run is waiting for `graphrun signal`. `deadline_ms` is the wait deadline.
-4. `obligations`. `blocked` needs `resolve --blocked-input`. `irreversible` cannot undo. `compensating` is in-flight undo. `abandoned` was closed by an operator.
+3. `pending_waits`. A row with `signal` and `key` is a wait.
+4. `obligations`. `blocked` needs `resolve --blocked-input`. `compensating` is in-flight undo.
 5. `recovery`. If `suspended` is true, the store was restored and needs `resolve --ack`.
-6. `interventions`. Operator action still required.
-7. `error`. Domain failure, not a transport timeout.
-
-History is a separate command:
+6. `error`. Domain failure, not a transport timeout.
 
 ```sh
-./target/debug/graphrun history --run <run-id> --local-dir /tmp/graphrun-local
-./target/debug/graphrun replay --run <run-id> --local-dir /tmp/graphrun-local
+graphrun history --run <run-id> --local-dir ./graphrun-data
+graphrun replay --run <run-id> --local-dir ./graphrun-data
 ```
 
 `replay` is read-only. It does not start activities or write the store.
-
-Cluster health:
-
-```sh
-./target/debug/graphrun cluster health --local-dir /tmp/graphrun-local
-```
-
-The JSON includes `clock_safe`, Raft `state`, `last_applied`, `last_log`, `apply_lag`, `unapplied_entries`, `voters`, `active_runs`, `ready_leaves`, and `inbox_depth`. A large `apply_lag` is apply lag. New commands fail when unapplied entries reach 4096 or unapplied encoded bytes reach 64 MiB. If `clock_safe` is false, writes fail closed.

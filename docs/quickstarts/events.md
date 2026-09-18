@@ -1,35 +1,61 @@
-# Deliver an external event
+# Wait for an external event
 
-This how-to starts `events.yaml`, waits for the approval wait, then signals it.
+The run parks on `wait_signal` until the host calls `Engine::signal` with the same signal name and correlation key.
 
-```sh
-mkdir -p /tmp/graphrun-events
-echo '{"key":"k1"}' > /tmp/event-input.json
-echo '{"approved":true}' > /tmp/approval.json
+## Definition
 
-./target/debug/graphrun serve --local-dir /tmp/graphrun-events &
-sleep 1
+[`samples/03-events/workflow.yaml`](../../samples/03-events/workflow.yaml)
 
-./target/debug/graphrun start \
-	--definition docs/specs/v1/examples/events.yaml \
-	--catalog docs/specs/v1/examples/activity-catalog.json \
-	--input /tmp/event-input.json \
-	--local-dir /tmp/graphrun-events \
-	--no-wait
+```yaml
+dsl: graphrun/v1
+id: external_approval
+version: 1
+input_schema: event_request/v1
+output_schema: approval/v1
+signals:
+  approval: {schema: approval/v1}
+start: approval
+nodes:
+  approval:
+    kind: wait_signal
+    signal: approval
+    key: {literal: order-1}
+    consume_from: buffered
+    timeout: null
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.approval.output}
 ```
 
-Inspect until `pending_waits` includes `"signal":"approval"`. Then:
+Catalog: [`samples/03-events/catalog.json`](../../samples/03-events/catalog.json). Builder: [`builder.rs`](../../samples/03-events/builder.rs).
+
+## Drive it
+
+```rust
+let run = engine.start_yaml(include_str!("workflow.yaml"), &catalog, input).await?;
+engine
+	.signal(run, event_id, "approval", "order-1", payload)
+	.await?;
+let output = engine.wait_terminal(run, Duration::from_secs(15)).await?;
+```
+
+`EventId` is 32 hex characters. Duplicate ids are idempotent. Output is `{"approved":true}`.
 
 ```sh
-./target/debug/graphrun signal \
+cargo run -p graphrun-samples --bin 03-events
+```
+
+Optional CLI, against a directory your app already uses:
+
+```sh
+graphrun signal \
 	--run <run-id> \
 	--name approval \
-	--key k1 \
+	--key order-1 \
 	--event-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-	--payload /tmp/approval.json \
-	--local-dir /tmp/graphrun-events
+	--payload approval.json \
+	--local-dir ./graphrun-data
 ```
 
-`--key` is the wait correlation key. TLS material uses `--tls-key`.
-
-The inspect output then shows `"status":"succeeded"` and `"approved":true`.
+`--key` is the wait correlation key. Certificate private keys use `--tls-key`.

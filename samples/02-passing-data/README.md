@@ -1,13 +1,9 @@
 # 02 Passing Data
 
-An order flows through typed activity outputs: `inventory.reserve` adds `reservation_id`, then `payment.charge` adds `payment_id`. The builder checks those payload types against the catalog at compile time.
-
-This is the Graphrun equivalent of WorkflowCore Sample03. Data is immutable bindings, not a mutable workflow data bag.
-
-## Run
+An order goes through `inventory.reserve` (adds `reservation_id`) then `payment.charge` (adds `payment_id`). Those names are built-in fixtures. `activity_ref` checks the Rust payload types against this folder’s `catalog.json`.
 
 ```sh
 cargo run -p graphrun-samples --bin 02-passing-data
 ```
 
-The bin compiles this YAML against `catalog.json` in this directory, builds the same graph with `RegionBuilder`, checks IR parity, and runs both on `Engine::local`.
+Next: [03 Events](../03-events).

@@ -1,26 +1,13 @@
-//! Durable workflow engine library.
+//! Embedded workflow engine.
 //!
-//! Embed [`Engine::local`] in your process. YAML and a typed Rust builder
-//! compile to one IR. Local mode is one Raft member on a redb file. A cluster
-//! uses the same write path. The library does not start a server.
+//! Open [`Engine::local`] on a directory in your process. YAML and a typed
+//! builder compile to one IR. This crate does not start a server.
 //!
-//! ```no_run
-//! use graphrun::{Catalog, Engine, Value};
-//! use std::time::Duration;
+//! This release runs built-in fixture handlers for catalog names such as
+//! `counter.increment`. You cannot register your own activity bodies yet.
+//! Unknown names echo their input.
 //!
-//! # async fn run() -> graphrun::Result<()> {
-//! let catalog = Catalog::from_json(br#"{"format":"graphrun.catalog/v1"}"#)?;
-//! let engine = Engine::local("/tmp/graphrun-demo").await?;
-//! let run = engine
-//!     .start_yaml("dsl: graphrun/v1\nid: empty\nversion: 1\ninput_schema: unit/v1\noutput_schema: unit/v1\nstart: finish\nnodes:\n  finish:\n    kind: complete\n    output: {from: workflow.input}\n", &catalog, Value::Null)
-//!     .await?;
-//! let _output = engine.wait_terminal(run, Duration::from_secs(10)).await?;
-//! engine.shutdown().await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! See the crate README for a reserve-then-charge example.
+//! See the crate README for a complete paste-and-run example.
 
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::collapsible_if)]
@@ -34,18 +21,22 @@ pub mod compiler;
 pub mod domain;
 pub mod engine;
 pub mod error;
+#[doc(hidden)]
 pub mod generated;
 pub mod ids;
 pub mod ir;
 pub mod limits;
 pub mod policy;
 pub mod provider;
+#[doc(hidden)]
 pub mod rpc;
 pub mod schema;
+#[doc(hidden)]
 pub mod storage;
 pub mod time;
 pub mod tls;
 pub mod value;
+#[doc(hidden)]
 pub mod write;
 pub mod yaml;
 

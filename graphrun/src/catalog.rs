@@ -62,6 +62,9 @@ pub struct ReconcilerContract {
     pub forward: ActivityKey,
 }
 
+/// Registry of payload schemas and activity contracts a workflow may name.
+///
+/// Not the graph and not handler code.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
     pub schemas: BTreeMap<SchemaKey, serde_json::Value>,

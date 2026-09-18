@@ -1,13 +1,7 @@
-# 10 Timeout Recovery
+# 10 Timeout recovery
 
-A timed wait has two ports. If `approval` arrives within one second, the success port goes straight to `finish`. If it does not, the timeout port runs `counter.increment` and then the same `finish`. Both paths return the original counter; only timeout executes recovery.
-
-This is the Graphrun equivalent of WorkflowCore `WaitFor` with a timeout. The shared tail is required: you cannot feed the wait payload into `finish` from both ports.
-
-## Run
+A timed wait: if the approval event arrives in time, finish with the original input. If it times out, run `counter.increment` on the recovery path, then still finish with the original input (the complete node binds `workflow.input`).
 
 ```sh
 cargo run -p graphrun-samples --bin 10-timeout-recovery
 ```
-
-The bin compiles this YAML against `catalog.json` in this directory, builds the same graph with `RegionGraphBuilder`, checks IR parity, then runs the success path (signal) and the timeout path (wait) on `Engine::local`.

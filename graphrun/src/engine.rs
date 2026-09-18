@@ -97,6 +97,11 @@ fn apply_keyed(key: &str, kind: &str, output: Value) -> Result<Value> {
     }
 }
 
+/// In-process workflow runtime.
+///
+/// Open with [`Engine::local`] on a data directory in your Tokio process.
+/// There is no in-memory shortcut: commands still go through one-member Raft
+/// onto a redb file in that directory.
 pub struct Engine {
     raft: Raft<TypeConfig>,
     storage: StorageHandle,
@@ -176,6 +181,11 @@ pub struct ControlResponse {
 }
 
 impl Engine {
+    /// Open a one-member engine on `data_dir`.
+    ///
+    /// Creates the directory if needed. Restarting on the same path continues
+    /// from durable state. Local mode runs built-in fixture handlers for
+    /// catalog activity names; unknown names echo their input.
     pub async fn local(data_dir: impl AsRef<Path>) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir).map_err(|err| Error::invalid(err.to_string()))?;
@@ -372,6 +382,7 @@ impl Engine {
         self.data_dir.join("control.sock")
     }
 
+    /// Start a run from a compiled definition and return its id immediately.
     pub async fn start(
         &self,
         definition: Definition,
@@ -394,11 +405,16 @@ impl Engine {
         Ok(run)
     }
 
+    /// Compile `yaml` against `catalog` and [`start`](Self::start) it.
     pub async fn start_yaml(&self, yaml: &str, catalog: &Catalog, input: Value) -> Result<RunId> {
         let definition = compile_yaml(yaml, catalog)?;
         self.start(definition, catalog.clone(), input).await
     }
 
+    /// Deliver an event to a `wait_signal` on `run`.
+    ///
+    /// `name` and `key` must match the wait. `event_id` is 32 hex characters;
+    /// a duplicate id is idempotent.
     pub async fn signal(
         &self,
         run: RunId,
@@ -759,6 +775,10 @@ impl Engine {
             .unwrap_or(0)
     }
 
+    /// Block until `run` succeeds or fails, or `timeout` elapses.
+    ///
+    /// On success, returns the run output. On domain failure, returns an error
+    /// with the failure code and message.
     pub async fn wait_terminal(&self, run: RunId, timeout: Duration) -> Result<Value> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -800,6 +820,7 @@ impl Engine {
         self.write(command).await
     }
 
+    /// Stop workers, Raft, and the control socket. Does not delete `data_dir`.
     pub async fn shutdown(&self) -> Result<()> {
         if let Some(worker) = &self.worker {
             worker.abort();

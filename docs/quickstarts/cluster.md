@@ -1,27 +1,41 @@
 # Run a three-member cluster
 
-This how-to starts three voters and two workers on loopback with generated certificates.
+Do this after a local `Engine::local` run works. A cluster is the same write path with more Raft voters.
 
-## Generate certificates
+Start the same graph you already ran locally, for example [`samples/02-passing-data/workflow.yaml`](../../samples/02-passing-data/workflow.yaml):
 
-The e2e driver already does this. For a manual run, use `graphrun::generate_ca` and `graphrun::issue_node` from a small helper, or run:
-
-```sh
-cargo build -p graphrun-e2e -p graphrun-cli
-./target/debug/graphrun-e2e verify \
-	--cli ./target/debug/graphrun \
-	--matrix docs/specs/v1/verification-matrix.tsv \
-	--artifacts target/e2e-artifacts
+```yaml
+dsl: graphrun/v1
+id: passing_data
+version: 1
+input_schema: order/v1
+output_schema: receipt/v1
+start: reserve
+nodes:
+  reserve:
+    kind: activity
+    activity: {name: inventory.reserve, version: 1}
+    input: {from: workflow.input}
+    next: charge
+  charge:
+    kind: activity
+    activity: {name: payment.charge, version: 1}
+    input: {from: nodes.reserve.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.charge.output}
 ```
 
-`CLUSTER-001` in that report starts three `fixture-member` processes and two `fixture-worker` processes, then starts `sequence.yaml` through the production CLI over mTLS.
+- `Engine::member` — storage replica. Activity execution is opt-in.
+- `Engine::run_worker` — claims ready activities over gRPC/mTLS. Does not open a data directory.
+- Certificates: `graphrun::generate_ca` and `graphrun::issue_node`.
+- Membership changes go through the leader (`cluster join` / `promote` / `remove`).
 
-## Join, promote, and remove
-
-Membership changes go through the leader's Unix control socket.
+Join a new id as a learner first. Wait until it has caught up. Then promote it. Remove one voter at a time so two healthy voters remain.
 
 ```sh
-./target/debug/graphrun cluster join \
+graphrun cluster join \
 	--local-dir /path/to/leader \
 	--node-id 4 \
 	--addr 127.0.0.1:PORT \
@@ -30,24 +44,19 @@ Membership changes go through the leader's Unix control socket.
 	--peer-tls-key n4.key.pem \
 	--peer-server-name <issued-name>
 
-./target/debug/graphrun cluster promote \
+graphrun cluster promote \
 	--local-dir /path/to/leader \
 	--node-id 4
 
-./target/debug/graphrun cluster remove \
-	--local-dir /path/to/leader \
-	--node-id 1
-```
-
-Join the new id as a learner first. Wait until it has caught up. Then promote it. Remove one voter at a time so two healthy voters remain.
-
-Workers register over gRPC. They do not change the voter set.
-
-```sh
-./target/debug/graphrun-e2e fixture-worker \
+graphrun start \
+	--definition samples/02-passing-data/workflow.yaml \
+	--catalog samples/02-passing-data/catalog.json \
+	--input order.json \
 	--endpoint https://127.0.0.1:PORT \
 	--ca ca.pem \
-	--cert worker.cert.pem \
-	--key worker.key.pem \
-	--server-name <member-name>
+	--cert client.cert.pem \
+	--tls-key client.key.pem \
+	--server-name <issued-name>
 ```
+
+Workers register over gRPC. They do not change the voter set. `--key` on `signal` is the wait correlation key; certificate keys are `--tls-key` / `--peer-tls-key`.
