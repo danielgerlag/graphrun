@@ -1,0 +1,45 @@
+name: yank
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Crate version to yank, for example 0.1.1"
+        required: true
+        type: string
+      undo:
+        description: "Un-yank instead"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  yank:
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+        continue-on-error: true
+      - name: Yank
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outcome == 'success' && steps.auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          UNDO: ${{ inputs.undo }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is missing" >&2
+            exit 1
+          fi
+          extra=()
+          if [ "$UNDO" = "true" ]; then
+            extra+=(--undo)
+          fi
+          cargo yank --version "$VERSION" "${extra[@]}" graphrun
+          cargo yank --version "$VERSION" "${extra[@]}" graphrun-cli
