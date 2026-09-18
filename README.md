@@ -1,6 +1,6 @@
 # Graphrun
 
-Graphrun is a Rust library. You depend on `graphrun`, open [`Engine::local`](https://docs.rs/graphrun/latest/graphrun/engine/struct.Engine.html) on a directory in your process, and drive runs through that API. The library uses your Tokio runtime. It does not start a server, install signal handlers, or require a database daemon.
+Graphrun is an embedded workflow engine for Rust. You depend on `graphrun`, open [`Engine::local`](https://docs.rs/graphrun/latest/graphrun/engine/struct.Engine.html) on a directory in your process, and drive runs through that API. The library uses your Tokio runtime. It does not start a server, install signal handlers, or require a database daemon.
 
 The graph is data. Write it with the typed builder or with YAML. Both compile to the same IR. Each command is committed through Raft, then applied to a redb file in that directory. Restart the process on the same path and the run is still there.
 
