@@ -1,0 +1,25 @@
+dsl: graphrun/v1
+id: timeout_recovery
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+signals:
+  approval: {schema: approval/v1}
+start: approval
+nodes:
+  approval:
+    kind: wait_signal
+    signal: approval
+    key: {literal: approval}
+    consume_from: buffered
+    timeout: "1s"
+    next: finish
+    on_timeout: recover
+  recover:
+    kind: activity
+    activity: {name: counter.increment, version: 1}
+    input: {from: workflow.input}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: workflow.input}

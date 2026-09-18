@@ -50,7 +50,7 @@ pub mod write;
 pub mod yaml;
 
 pub use builder::{
-    ActivityRef, Branch, EntryPort, ExitPort, InputMapping, NodeRef, Region, RegionBuilder,
+    ActivityRef, Branch, Case, EntryPort, ExitPort, InputMapping, NodeRef, Region, RegionBuilder,
     RegionGraphBuilder, SignalRef, TerminalRef, TimedWaitRef, ValueRef, WorkflowBuilder,
 };
 pub use catalog::Catalog;

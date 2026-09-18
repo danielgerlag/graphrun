@@ -1,0 +1,19 @@
+dsl: graphrun/v1
+id: external_approval
+version: 1
+input_schema: event_request/v1
+output_schema: approval/v1
+signals:
+  approval: {schema: approval/v1}
+start: approval
+nodes:
+  approval:
+    kind: wait_signal
+    signal: approval
+    key: {literal: order-1}
+    consume_from: buffered
+    timeout: null
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.approval.output}

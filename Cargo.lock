@@ -817,6 +817,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphrun-samples"
+version = "0.1.1"
+dependencies = [
+ "graphrun",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["graphrun", "graphrun-cli", "graphrun-e2e"]
-default-members = ["graphrun", "graphrun-cli", "graphrun-e2e"]
+members = ["graphrun", "graphrun-cli", "graphrun-e2e", "samples"]
+default-members = ["graphrun", "graphrun-cli", "graphrun-e2e", "samples"]
 
 [workspace.package]
 version = "0.1.1"

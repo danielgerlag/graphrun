@@ -52,6 +52,14 @@ cargo run -p graphrun --example order
 
 That prints `payment_id: pay-1`. The example activity names (`inventory.reserve`, `payment.charge`, and the other fixture names) have handlers inside the library. That is how the example finishes without a worker process of your own.
 
+## Samples
+
+YAML and typed-builder pairs that run on `Engine::local` live in [`samples/`](samples/README.md).
+
+```sh
+cargo run -p graphrun-samples --bin 01-hello-world
+```
+
 ## Typed builder
 
 `activity_ref` checks input and output types against the catalog. A mismatch is a compile error.

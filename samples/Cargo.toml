@@ -1,0 +1,55 @@
+[package]
+name = "graphrun-samples"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Consumer samples for the Graphrun workflow engine"
+
+[[bin]]
+name = "01-hello-world"
+path = "01-hello-world/builder.rs"
+
+[[bin]]
+name = "02-passing-data"
+path = "02-passing-data/builder.rs"
+
+[[bin]]
+name = "03-events"
+path = "03-events/builder.rs"
+
+[[bin]]
+name = "04-while"
+path = "04-while/builder.rs"
+
+[[bin]]
+name = "05-foreach"
+path = "05-foreach/builder.rs"
+
+[[bin]]
+name = "06-choice"
+path = "06-choice/builder.rs"
+
+[[bin]]
+name = "07-parallel"
+path = "07-parallel/builder.rs"
+
+[[bin]]
+name = "08-saga"
+path = "08-saga/builder.rs"
+
+[[bin]]
+name = "09-repeat"
+path = "09-repeat/builder.rs"
+
+[[bin]]
+name = "10-timeout-recovery"
+path = "10-timeout-recovery/builder.rs"
+
+[dependencies]
+graphrun.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

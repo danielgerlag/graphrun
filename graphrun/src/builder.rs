@@ -4,15 +4,15 @@ use crate::compiler::{digest_of, validate_definition};
 use crate::error::{Error, Result};
 use crate::ids::{ActivityKey, NodeKey, valid_ascii_name};
 use crate::ir::{
-    Compensation, ConsumeFrom, DSL, Definition, Digest, FORMAT_VERSION, FailError, Node,
-    ParallelBranch, Region as IrRegion, RegionPath, SignalDecl,
+    ChooseCase, Compensation, ConsumeFrom, DSL, Definition, Digest, FORMAT_VERSION, FailError,
+    Node, ParallelBranch, Region as IrRegion, RegionPath, SignalDecl,
 };
 use crate::policy::{COMPENSATION_ATTEMPT_TIMEOUT, FORWARD_ATTEMPT_TIMEOUT, RetryPolicy};
 use crate::schema::{DurablePayload, SchemaRef};
 use crate::time::duration_to_millis;
 use crate::value::Value;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -240,6 +240,12 @@ pub struct Branch<I, O> {
     pub body: Region<I, O>,
 }
 
+pub struct Case<I, O> {
+    pub name: String,
+    pub when: crate::binding::Condition,
+    pub body: Region<I, O>,
+}
+
 pub struct Region<I, O> {
     ir: IrRegion,
     signals: BTreeMap<String, SignalDecl>,
@@ -369,6 +375,23 @@ impl<I: DurablePayload> RegionBuilder<I> {
         let node = self
             .graph
             .declare_foreach(key, items, body, max_items, max_concurrency)?;
+        self.link_tail(node.entry())?;
+        self.graph.draft.tail = Some(node.key.clone());
+        Ok(node)
+    }
+
+    pub fn choose<A, B>(
+        &mut self,
+        key: &str,
+        input: impl IntoInput<A>,
+        cases: Vec<Case<A, B>>,
+        default: Region<A, B>,
+    ) -> Result<NodeRef<B>>
+    where
+        A: DurablePayload,
+        B: DurablePayload,
+    {
+        let node = self.graph.declare_choose(key, input, cases, default)?;
         self.link_tail(node.entry())?;
         self.graph.draft.tail = Some(node.key.clone());
         Ok(node)
@@ -758,6 +781,54 @@ impl<I: DurablePayload> RegionGraphBuilder<I> {
             },
         );
         self.draft.signals.extend(body.signals);
+        Ok(NodeRef {
+            key: node_key,
+            scope: self.draft.scope,
+            _o: PhantomData,
+        })
+    }
+
+    pub fn declare_choose<A, B>(
+        &mut self,
+        key: &str,
+        input: impl IntoInput<A>,
+        cases: Vec<Case<A, B>>,
+        default: Region<A, B>,
+    ) -> Result<NodeRef<B>>
+    where
+        A: DurablePayload,
+        B: DurablePayload,
+    {
+        if cases.is_empty() {
+            return Err(Error::invalid("choose requires a nonempty cases list"));
+        }
+        let mut names = BTreeSet::new();
+        let mut ir_cases = Vec::new();
+        for case in cases {
+            if !valid_ascii_name(&case.name) || !names.insert(case.name.clone()) {
+                return Err(Error::invalid(format!(
+                    "invalid or duplicate case name {}",
+                    case.name
+                )));
+            }
+            self.draft.signals.extend(case.body.signals);
+            ir_cases.push(ChooseCase {
+                name: case.name,
+                when: case.when,
+                body: case.body.ir,
+            });
+        }
+        self.draft.signals.extend(default.signals);
+        let node_key = self.insert_key(key)?;
+        self.draft.nodes.insert(
+            node_key.as_str().to_owned(),
+            Node::Choose {
+                input: input.into_binding(),
+                cases: ir_cases,
+                default: default.ir,
+                next: node_key.clone(),
+            },
+        );
         Ok(NodeRef {
             key: node_key,
             scope: self.draft.scope,

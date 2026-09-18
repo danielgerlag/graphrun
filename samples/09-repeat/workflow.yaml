@@ -1,0 +1,30 @@
+dsl: graphrun/v1
+id: repeat_counter
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: count
+nodes:
+  count:
+    kind: repeat
+    count: {literal: 3}
+    state_schema: counter/v1
+    state: {from: workflow.input}
+    max_iterations: 10
+    body:
+      input_schema: counter/v1
+      output_schema: counter/v1
+      start: increment
+      nodes:
+        increment:
+          kind: activity
+          activity: {name: counter.increment, version: 1}
+          input: {from: scope.input}
+          next: done
+        done:
+          kind: complete
+          output: {from: nodes.increment.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.count.output}

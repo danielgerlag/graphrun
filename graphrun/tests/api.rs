@@ -1,5 +1,5 @@
 use graphrun::binding::{Binding, Condition, Reference};
-use graphrun::builder::{RegionBuilder, RegionGraphBuilder, SignalRef, WorkflowBuilder};
+use graphrun::builder::{Case, RegionBuilder, RegionGraphBuilder, SignalRef, WorkflowBuilder};
 use graphrun::catalog::Catalog;
 use graphrun::compile_yaml;
 use graphrun::schema::{DurablePayload, SchemaRef};
@@ -310,4 +310,49 @@ fn while_condition_builder_compiles() {
     WorkflowBuilder::new("while_counter", 1, root)
         .build(&catalog)
         .unwrap();
+}
+
+#[test]
+fn yaml_and_builder_choose_match() {
+    let catalog = catalog();
+    let yaml = compile_yaml(
+        include_str!("../../samples/06-choice/workflow.yaml"),
+        &catalog,
+    )
+    .unwrap();
+    let increment = catalog
+        .activity_ref::<Counter, Counter>("counter.increment", 1)
+        .unwrap();
+    let echo = catalog
+        .activity_ref::<Counter, Counter>("remote.echo", 1)
+        .unwrap();
+    let mut bump = RegionBuilder::<Counter>::new();
+    let bumped = bump
+        .activity("increment", &increment, bump.input())
+        .unwrap();
+    let bump = bump.complete("done", bumped.output()).unwrap();
+    let mut keep = RegionBuilder::<Counter>::new();
+    let echoed = keep.activity("echo", &echo, keep.input()).unwrap();
+    let keep = keep.complete("done", echoed.output()).unwrap();
+    let mut root = RegionBuilder::<Counter>::new();
+    let decided = root
+        .choose(
+            "decide",
+            root.workflow_input(),
+            vec![Case {
+                name: "bump".to_owned(),
+                when: Condition::Eq {
+                    left: Binding::from_path(Reference::WorkflowInput, "/value"),
+                    right: Binding::literal(graphrun::value::Value::Int(1)),
+                },
+                body: bump,
+            }],
+            keep,
+        )
+        .unwrap();
+    let root = root.complete("finish", decided.output()).unwrap();
+    let built = WorkflowBuilder::new("choice", 1, root)
+        .build(&catalog)
+        .unwrap();
+    assert_eq!(execution_ir(&yaml), execution_ir(&built));
 }

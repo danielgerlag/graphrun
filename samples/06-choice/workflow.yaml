@@ -1,0 +1,46 @@
+dsl: graphrun/v1
+id: choice
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: decide
+nodes:
+  decide:
+    kind: choose
+    input: {from: workflow.input}
+    cases:
+      - name: bump
+        when:
+          eq:
+            - {from: workflow.input, path: /value}
+            - {literal: 1}
+        body:
+          input_schema: counter/v1
+          output_schema: counter/v1
+          start: increment
+          nodes:
+            increment:
+              kind: activity
+              activity: {name: counter.increment, version: 1}
+              input: {from: scope.input}
+              next: done
+            done:
+              kind: complete
+              output: {from: nodes.increment.output}
+    default:
+      input_schema: counter/v1
+      output_schema: counter/v1
+      start: echo
+      nodes:
+        echo:
+          kind: activity
+          activity: {name: remote.echo, version: 1}
+          input: {from: scope.input}
+          next: done
+        done:
+          kind: complete
+          output: {from: nodes.echo.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.decide.output}
