@@ -1,7 +1,8 @@
-//! Durable workflow engine.
+//! Durable workflow engine library.
 //!
-//! YAML and a typed Rust builder compile to one IR. [`Engine::local`] is one
-//! Raft member on a redb file. A cluster uses the same write path.
+//! Embed [`Engine::local`] in your process. YAML and a typed Rust builder
+//! compile to one IR. Local mode is one Raft member on a redb file. A cluster
+//! uses the same write path. The library does not start a server.
 //!
 //! ```no_run
 //! use graphrun::{Catalog, Engine, Value};
@@ -19,7 +20,7 @@
 //! # }
 //! ```
 //!
-//! See the crate README for a reserve-then-charge example and the CLI.
+//! See the crate README for a reserve-then-charge example.
 
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::collapsible_if)]

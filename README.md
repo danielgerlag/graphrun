@@ -1,56 +1,23 @@
 # Graphrun
 
-Graphrun is a durable workflow engine. You write a graph in YAML or with a typed Rust builder. Both compile to the same IR. Every command goes through Raft, then a redb apply. Kill the process. Open the same data directory again. The run is still there.
+Graphrun is a Rust library. You depend on `graphrun`, open [`Engine::local`](https://docs.rs/graphrun/latest/graphrun/engine/struct.Engine.html) on a directory in your process, and drive runs through that API. The library uses your Tokio runtime. It does not start a server, install signal handlers, or require a database daemon.
 
-Local mode is one Raft voter in-process. A cluster uses the same write path with more voters and optional remote workers. There is no in-memory shortcut.
+The graph is data. Write it with the typed builder or with YAML. Both compile to the same IR. Each command is committed through Raft, then applied to a redb file in that directory. Restart the process on the same path and the run is still there.
 
 ## Install
 
-Library:
-
 ```toml
 [dependencies]
-graphrun = "0.1"
+graphrun = "0.1.1"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-```
-
-CLI (installs the `graphrun` binary):
-
-```sh
-cargo install graphrun-cli --locked
 ```
 
 Rust 1.90 or newer. Linux and macOS.
 
-## Run a workflow
+## Embed the engine
 
-`Engine::local` owns a data directory. This graph reserves inventory, then charges payment. Built-in handlers in the library implement those two activity names.
-
-```yaml
-dsl: graphrun/v1
-id: sequence
-version: 1
-input_schema: order/v1
-output_schema: receipt/v1
-start: reserve
-nodes:
-  reserve:
-    kind: activity
-    activity: {name: inventory.reserve, version: 1}
-    input: {from: workflow.input}
-    retry:
-      errors: [inventory.unavailable]
-      max_attempts: 5
-    next: charge
-  charge:
-    kind: activity
-    activity: {name: payment.charge, version: 1}
-    input: {from: nodes.reserve.output}
-    next: finish
-  finish:
-    kind: complete
-    output: {from: nodes.charge.output}
-```
+This is the whole local runtime: one Raft voter, in-process worker, Unix control socket under the data directory.
 
 ```rust
 use graphrun::{Catalog, Engine, Value};
@@ -60,32 +27,34 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> graphrun::Result<()> {
 	let catalog = Catalog::from_json(include_bytes!("catalog.json"))?;
-	let engine = Engine::local("/tmp/graphrun-demo").await?;
+	let engine = Engine::local("./graphrun-data").await?;
 	let input = Value::Object(BTreeMap::from([
 		("order_id".into(), Value::String("o1".into())),
 		("amount".into(), Value::Int(1000)),
 	]));
-	let run = engine.start_yaml(include_str!("sequence.yaml"), &catalog, input).await?;
+	let run = engine
+		.start_yaml(include_str!("sequence.yaml"), &catalog, input)
+		.await?;
 	let output = engine.wait_terminal(run, Duration::from_secs(10)).await?;
-	println!("{output:?}");
 	engine.shutdown().await?;
+	println!("{output:?}");
 	Ok(())
 }
 ```
 
-The output is `payment_id: pay-1`.
+`start` takes a compiled [`Definition`](https://docs.rs/graphrun/latest/graphrun/ir/struct.Definition.html) from the builder. `start_yaml` compiles YAML against the same catalog. `inspect`, `signal`, `cancel`, and `history` are methods on `Engine`.
 
-A complete, runnable copy (catalog JSON included) is `graphrun/examples/order.rs`:
+A complete listing, including catalog JSON, is `graphrun/examples/order.rs`. From this repo:
 
 ```sh
 cargo run -p graphrun --example order
 ```
 
-The catalog is contracts: schema, activity name/version, execution kind, effect kind, recovery, and error codes. YAML and the builder both require it. The example catalog and more graphs live in [`docs/specs/v1/examples`](docs/specs/v1/examples).
+That prints `payment_id: pay-1`. The example activity names (`inventory.reserve`, `payment.charge`, and the other fixture names) have handlers inside the library. That is how the example finishes without a worker process of your own.
 
-## Build the same graph in Rust
+## Typed builder
 
-`activity_ref` binds input and output types. A mismatch fails at compile time.
+`activity_ref` checks input and output types against the catalog. A mismatch is a compile error.
 
 ```rust
 use graphrun::builder::{RegionBuilder, WorkflowBuilder};
@@ -119,77 +88,39 @@ let reserved = root.activity("reserve", &reserve, root.input())?;
 let charged = root.activity("charge", &charge, reserved.output())?;
 let root = root.complete("finish", charged.output())?;
 let definition = WorkflowBuilder::new("sequence", 1, root).build(&catalog)?;
+let run = engine.start(definition, catalog, input).await?;
 ```
 
-Then `engine.start(definition, catalog, input).await`. YAML and builder produce one IR. `cargo test --test api yaml_and_builder_while_match` checks that parity.
-
-Add `serde = { version = "1", features = ["derive"] }` for the payload types.
-
-## CLI
-
-```sh
-graphrun serve --local-dir /tmp/graphrun-demo &
-
-graphrun validate \
-	--definition sequence.yaml \
-	--catalog catalog.json
-
-graphrun start \
-	--definition sequence.yaml \
-	--catalog catalog.json \
-	--input order.json \
-	--local-dir /tmp/graphrun-demo
-
-graphrun inspect --run <run-id> --local-dir /tmp/graphrun-demo
-```
-
-`start` waits for a terminal status unless you pass `--no-wait`. Inspect prints `status`, `output`, `blocked_reason`, pending waits, and open scopes.
-
-To deliver an external event:
-
-```sh
-graphrun signal \
-	--run <run-id> \
-	--name approval \
-	--key k1 \
-	--event-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-	--payload approval.json \
-	--local-dir /tmp/graphrun-demo
-```
-
-`--key` is the wait correlation key. Certificate private keys use `--tls-key`.
-
-Other commands: `cancel`, `list`, `history`, `replay`, `resolve` (blocked compensation, abandon), `backup`, `restore`, `cluster join|promote|remove`.
-
-A cluster member is reached with `--endpoint`, `--ca`, `--cert`, `--tls-key`, and `--server-name` instead of `--local-dir`.
-
-## What the engine does
-
-- **One write path.** Command, Raft quorum, decide, events, evolve, redb apply. Local and clustered runs share that path.
-- **Activities.** Catalog contracts are data. `Engine::local` runs the library handlers for the names in the example catalog (`inventory.reserve`, `payment.charge`, `counter.increment`, and the other fixture names). Those handlers are how the examples complete without a separate worker process.
-- **Waits and signals.** A run can block on a named signal and a correlation key. `EventId` is a 32-character hex identity. Duplicate ids are idempotent.
-- **Sagas.** A failed run compensates open obligations in reverse order. If compensation input cannot be built, the obligation is `blocked` until `resolve` supplies input or `--abandon --confirm`.
-- **History.** `inspect` and `history` are read-only. Replay reconstructs state from recorded events. Apply does not call activities, clocks, or RNG.
+The catalog is contracts: schema, activity key/version, execution kind, effect kind, recovery, error codes. It is not Rust type names. YAML for the same graph is [`docs/specs/v1/examples/sequence.yaml`](docs/specs/v1/examples/sequence.yaml).
 
 ## Cluster
 
-Three members plus workers is the production shape. Members speak Tonic gRPC over mTLS. Workers claim ready activities from a member. See [Run a three-member cluster](docs/quickstarts/cluster.md).
+`Engine::member` is a storage replica. Activity execution is opt-in. `Engine::run_worker` is a process that claims work over gRPC/mTLS and does not open a data directory. Local and clustered runs use the same write path. See [Run a three-member cluster](docs/quickstarts/cluster.md).
+
+## Optional CLI
+
+[`graphrun-cli`](https://crates.io/crates/graphrun-cli) is an operator binary. It talks to an engine you already opened (`--local-dir`) or to a member (`--endpoint` plus mTLS). Your application does not depend on it.
+
+```sh
+cargo install graphrun-cli --locked
+graphrun inspect --run <run-id> --local-dir ./graphrun-data
+```
 
 ## Limits
 
-A definition may have 512 nodes. YAML, payloads, and the normalized IR are each capped at 256 KiB. Unapplied log is capped at 4,096 entries or 64 MiB. The full table is [docs/limits.md](docs/limits.md).
+512 nodes per definition. YAML, payloads, and normalized IR are each 256 KiB. Unapplied log: 4,096 entries or 64 MiB. Full table: [docs/limits.md](docs/limits.md).
 
 ## How-tos
 
-- [Run a local YAML workflow](docs/quickstarts/local-yaml.md)
 - [Build a workflow in Rust](docs/quickstarts/rust-builder.md)
+- [Run a local YAML workflow](docs/quickstarts/local-yaml.md)
 - [Run a three-member cluster](docs/quickstarts/cluster.md)
 - [Deliver an external event](docs/quickstarts/events.md)
 - [Compensate, intervene, or abandon](docs/quickstarts/compensation.md)
 - [Back up and restore a member](docs/quickstarts/backup-restore.md)
 - [Diagnose a stalled run](docs/quickstarts/stalled-run.md)
 
-The v1 spec is [`docs/specs/v1`](docs/specs/v1).
+Spec: [`docs/specs/v1`](docs/specs/v1).
 
 ## Development
 

@@ -1,6 +1,6 @@
 # graphrun-cli
 
-The `graphrun` binary for the [graphrun](https://crates.io/crates/graphrun) engine.
+Optional operator CLI for the [graphrun](https://crates.io/crates/graphrun) library. Your application depends on `graphrun` and opens `Engine::local` itself. This binary inspects, signals, and administers an engine that is already running, or opens a data directory for ops.
 
 ```sh
 cargo install graphrun-cli --locked
@@ -8,7 +8,7 @@ cargo install graphrun-cli --locked
 
 Rust 1.90 or newer. Linux and macOS.
 
-## Local engine
+## Talk to a local data directory
 
 ```sh
 graphrun serve --local-dir /tmp/graphrun-demo &
