@@ -186,6 +186,14 @@ impl Engine {
     /// Creates the directory if needed. Restarting on the same path continues
     /// from durable state. Local mode runs built-in fixture handlers for
     /// catalog activity names; unknown names echo their input.
+    ///
+    /// ```
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let engine = graphrun::Engine::local(dir.path()).await.unwrap();
+    /// engine.shutdown().await.unwrap();
+    /// # });
+    /// ```
     pub async fn local(data_dir: impl AsRef<Path>) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir).map_err(|err| Error::invalid(err.to_string()))?;

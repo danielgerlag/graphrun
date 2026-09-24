@@ -9,7 +9,7 @@ homepage.workspace = true
 authors.workspace = true
 description = "Optional operator CLI for the graphrun library"
 readme = "README.md"
-keywords = ["workflow", "cli"]
+keywords = ["workflow", "cli", "durable", "saga"]
 categories = ["command-line-utilities"]
 
 [[bin]]

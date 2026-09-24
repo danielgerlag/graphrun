@@ -1,0 +1,31 @@
+# Graphrun
+
+> Embedded durable workflow engine for Rust. Graph is data (YAML or typed builder). Local mode is one Raft voter on a redb file in-process. No workflow server.
+
+From the author of Workflow Core (https://github.com/danielgerlag/workflow-core).
+
+## Install
+
+```toml
+[dependencies]
+graphrun = "0.1"
+```
+
+Docs: https://docs.rs/graphrun
+Repo: https://github.com/danielgerlag/graphrun
+Crate: https://crates.io/crates/graphrun
+
+## Start here
+
+- README: https://github.com/danielgerlag/graphrun/blob/main/README.md
+- Agent notes: https://github.com/danielgerlag/graphrun/blob/main/AGENTS.md
+- Example (hello world): https://github.com/danielgerlag/graphrun/blob/main/graphrun/examples/hello_world.rs
+- Example (order): https://github.com/danielgerlag/graphrun/blob/main/graphrun/examples/order.rs
+- Samples: https://github.com/danielgerlag/graphrun/tree/main/samples
+- How-tos: https://github.com/danielgerlag/graphrun/tree/main/docs/quickstarts
+
+## This release
+
+You cannot plug in your own activity handlers. Fixture names (`counter.increment`, `inventory.reserve`, …) run in `Engine::local`. Unknown names echo input.
+
+Do not use docs/specs/v1 as a getting-started guide.

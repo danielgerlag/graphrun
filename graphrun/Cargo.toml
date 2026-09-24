@@ -7,11 +7,11 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Durable workflow engine library"
+description = "Embedded durable workflow engine for Rust"
 readme = "../README.md"
 documentation = "https://docs.rs/graphrun"
-keywords = ["workflow", "durable-execution", "raft"]
-categories = ["asynchronous", "network-programming"]
+keywords = ["workflow", "durable", "saga", "compensation", "raft"]
+categories = ["asynchronous", "concurrency", "database"]
 
 [lib]
 name = "graphrun"

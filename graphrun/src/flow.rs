@@ -29,6 +29,41 @@ pub fn region<I: DurablePayload>() -> Sequence<I, I> {
 
 /// Root workflow named `id` at version 1. First activity uses `workflow.input`.
 /// Completes as node `finish`.
+///
+/// ```
+/// use graphrun::{payload, workflow, Catalog};
+/// #[derive(Clone, serde::Serialize, serde::Deserialize)]
+/// struct Counter { value: i64 }
+/// payload!(Counter, "counter");
+/// let catalog = Catalog::from_json(br#"{
+///   "format": "graphrun.catalog/v1",
+///   "schemas": {
+///     "counter/v1": {
+///       "type": "object",
+///       "required": ["value"],
+///       "additionalProperties": false,
+///       "properties": {"value": {"type": "integer"}}
+///     }
+///   },
+///   "activities": [{
+///     "name": "counter.increment",
+///     "version": 1,
+///     "input_schema": "counter/v1",
+///     "output_schema": "counter/v1",
+///     "execution": "async",
+///     "effects": "pure",
+///     "recovery": "RetrySafe",
+///     "error_codes": []
+///   }]
+/// }"#).unwrap();
+/// let inc = catalog.activity_v1::<Counter, Counter>("counter.increment").unwrap();
+/// let def = workflow::<Counter>("hello")
+///     .activity("inc", &inc)
+///     .unwrap()
+///     .finish(&catalog)
+///     .unwrap();
+/// assert_eq!(def.id, "hello");
+/// ```
 pub fn workflow<I: DurablePayload>(id: impl Into<String>) -> Workflow<I, I> {
     let inner = RegionBuilder::new();
     let last = inner.workflow_input();

@@ -73,6 +73,15 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Parse a `graphrun.catalog/v1` JSON document.
+    ///
+    /// ```
+    /// let catalog = graphrun::Catalog::from_json(
+    ///     br#"{"format":"graphrun.catalog/v1","schemas":{},"activities":[]}"#,
+    /// )
+    /// .unwrap();
+    /// assert!(catalog.activities.is_empty());
+    /// ```
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         let raw: RawCatalog = serde_json::from_slice(bytes)
             .map_err(|err| Error::invalid(format!("catalog JSON: {err}")))?;

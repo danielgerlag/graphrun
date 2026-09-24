@@ -1,13 +1,13 @@
-//! Embedded workflow engine.
+//! Embedded durable workflow engine for Rust.
 //!
-//! Open [`Engine::local`] on a directory in your process. YAML and a typed
-//! builder compile to one IR. This crate does not start a server.
+//! Open [`Engine::local`] on a directory in your process. YAML and
+//! [`workflow`] compile to one IR. This crate does not start a server.
 //!
 //! This release runs built-in fixture handlers for catalog names such as
 //! `counter.increment`. You cannot register your own activity bodies yet.
 //! Unknown names echo their input.
 //!
-//! Graphs are YAML or [`flow::workflow`]. See the crate README for a paste-and-run example.
+//! See the crate README, `examples/hello_world.rs`, and `examples/order.rs`.
 
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::collapsible_if)]

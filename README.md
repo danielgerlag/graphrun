@@ -1,6 +1,12 @@
 # Graphrun
 
-Graphrun is an embedded workflow engine for Rust. Depend on `graphrun`, open `Engine::local` on a directory in your process, and drive runs through that API. It uses your Tokio runtime. It does not start a server or need a database daemon.
+[![crates.io](https://img.shields.io/crates/v/graphrun.svg)](https://crates.io/crates/graphrun)
+[![docs.rs](https://img.shields.io/docsrs/graphrun)](https://docs.rs/graphrun)
+[![CI](https://github.com/danielgerlag/graphrun/actions/workflows/ci.yml/badge.svg)](https://github.com/danielgerlag/graphrun/actions/workflows/ci.yml)
+
+Graphrun is an embedded durable workflow engine for Rust. Depend on `graphrun`, open `Engine::local` on a directory in your process, and drive runs through that API. It uses your Tokio runtime. It does not start a server or need a database daemon.
+
+This is from the author of [Workflow Core](https://github.com/danielgerlag/workflow-core). Same job (long-running graphs, waits, sagas) as an embeddable library: the graph is data, local mode is one Raft voter on a redb file, no separate workflow server.
 
 The graph is data: YAML or a typed builder, both the same IR. Commands go through Raft onto a redb file in that directory. Restart the process on the same path and the run is still there.
 
@@ -88,13 +94,14 @@ async fn main() -> graphrun::Result<()> {
 
 A catalog is the registry of payload schemas and activity contracts the graph may name. It is not the workflow and not your handler code.
 
-From this repository, the same idea as a crate example:
+Crate examples (also on docs.rs source):
 
 ```sh
+cargo run -p graphrun --example hello_world
 cargo run -p graphrun --example order
 ```
 
-That prints `payment_id: pay-1` (`inventory.reserve` then `payment.charge`).
+`hello_world` prints `{value: 2}`. `order` prints `payment_id: pay-1`.
 
 ## What to read next
 
