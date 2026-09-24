@@ -47,6 +47,10 @@ path = "09-repeat/builder.rs"
 name = "10-timeout-recovery"
 path = "10-timeout-recovery/builder.rs"
 
+[[bin]]
+name = "battle"
+path = "battle/main.rs"
+
 [dependencies]
 graphrun.workspace = true
 serde.workspace = true
