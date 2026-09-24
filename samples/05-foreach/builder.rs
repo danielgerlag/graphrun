@@ -1,6 +1,4 @@
-use graphrun::Catalog;
-use graphrun::builder::{RegionBuilder, WorkflowBuilder};
-use graphrun::schema::{DurablePayload, SchemaRef};
+use graphrun::{Catalog, payload, region, workflow};
 use graphrun_samples::{pretty, run_pair, to_value};
 use serde::{Deserialize, Serialize};
 
@@ -10,22 +8,16 @@ const YAML: &str = include_str!("workflow.yaml");
 struct Counter {
     value: i64,
 }
-
-impl DurablePayload for Counter {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("counter", 1).expect("counter/v1")
-    }
-}
+payload!(Counter, "counter");
 
 fn build(catalog: &Catalog) -> graphrun::Result<graphrun::Definition> {
-    let increment = catalog.activity_ref::<Counter, Counter>("counter.increment", 1)?;
-    let mut body = RegionBuilder::<Counter>::new();
-    let bumped = body.activity("increment", &increment, body.input())?;
-    let body = body.complete("done", bumped.output())?;
-    let mut root = RegionBuilder::<Vec<Counter>>::new();
-    let each = root.foreach("increment_all", root.workflow_input(), body, 100, 4)?;
-    let root = root.complete("finish", each.output())?;
-    WorkflowBuilder::new("foreach_counter", 1, root).build(catalog)
+    let increment = catalog.activity_v1::<Counter, Counter>("counter.increment")?;
+    let body = region::<Counter>()
+        .activity("increment", &increment)?
+        .finish()?;
+    workflow::<Vec<Counter>>("foreach_counter")
+        .foreach("increment_all", body, 100, 4)?
+        .finish(catalog)
 }
 
 #[tokio::main]

@@ -1,6 +1,4 @@
-use graphrun::Catalog;
-use graphrun::builder::{RegionBuilder, WorkflowBuilder};
-use graphrun::schema::{DurablePayload, SchemaRef};
+use graphrun::{Catalog, payload, workflow};
 use graphrun_samples::{pretty, run_pair, to_value};
 use serde::{Deserialize, Serialize};
 
@@ -10,20 +8,14 @@ const YAML: &str = include_str!("workflow.yaml");
 struct Counter {
     value: i64,
 }
-
-impl DurablePayload for Counter {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("counter", 1).expect("counter/v1")
-    }
-}
+payload!(Counter, "counter");
 
 fn build(catalog: &Catalog) -> graphrun::Result<graphrun::Definition> {
-    let increment = catalog.activity_ref::<Counter, Counter>("counter.increment", 1)?;
-    let mut root = RegionBuilder::<Counter>::new();
-    let hello = root.activity("hello", &increment, root.workflow_input())?;
-    let goodbye = root.activity("goodbye", &increment, hello.output())?;
-    let root = root.complete("finish", goodbye.output())?;
-    WorkflowBuilder::new("hello_world", 1, root).build(catalog)
+    let increment = catalog.activity_v1::<Counter, Counter>("counter.increment")?;
+    workflow::<Counter>("hello_world")
+        .activity("hello", &increment)?
+        .activity("goodbye", &increment)?
+        .finish(catalog)
 }
 
 #[tokio::main]

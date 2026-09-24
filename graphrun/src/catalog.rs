@@ -242,6 +242,15 @@ impl Catalog {
         crate::builder::ActivityRef::from_catalog(self, name, version)
     }
 
+    /// Lookup `name` at version 1.
+    pub fn activity_v1<I, O>(&self, name: &str) -> Result<crate::builder::ActivityRef<I, O>>
+    where
+        I: crate::schema::DurablePayload,
+        O: crate::schema::DurablePayload,
+    {
+        self.activity_ref(name, 1)
+    }
+
     pub fn named_schema(&self, key: &SchemaKey) -> Result<&serde_json::Value> {
         self.schemas
             .get(key)

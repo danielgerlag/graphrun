@@ -1,7 +1,4 @@
-use graphrun::binding::{Binding, Condition, Reference};
-use graphrun::builder::{Case, RegionBuilder, RegionGraphBuilder, WorkflowBuilder};
-use graphrun::schema::{DurablePayload, SchemaRef};
-use graphrun::{Catalog, Error, Value};
+use graphrun::{Catalog, Error, Value, payload, region, workflow};
 use graphrun_samples::{LocalEngine, pretty, to_value};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -15,12 +12,7 @@ struct Order {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fail_after_payment: Option<bool>,
 }
-
-impl DurablePayload for Order {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("order", 1).expect("order/v1")
-    }
-}
+payload!(Order, "order");
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ReservedOrder {
@@ -28,12 +20,7 @@ struct ReservedOrder {
     amount: i64,
     reservation_id: String,
 }
-
-impl DurablePayload for ReservedOrder {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("reserved_order", 1).expect("reserved_order/v1")
-    }
-}
+payload!(ReservedOrder, "reserved_order");
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Receipt {
@@ -41,61 +28,28 @@ struct Receipt {
     amount: i64,
     payment_id: String,
 }
-
-impl DurablePayload for Receipt {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("receipt", 1).expect("receipt/v1")
-    }
-}
+payload!(Receipt, "receipt");
 
 fn build(catalog: &Catalog) -> graphrun::Result<graphrun::Definition> {
-    let reserve = catalog.activity_ref::<Order, ReservedOrder>("inventory.reserve", 1)?;
-    let release = catalog.activity_ref::<ReservedOrder, ()>("inventory.release", 1)?;
-    let charge = catalog.activity_ref::<ReservedOrder, Receipt>("payment.charge", 1)?;
-    let refund = catalog.activity_ref::<Receipt, ()>("payment.refund", 1)?;
-    let abort = RegionBuilder::<Receipt>::new();
-    let abort = abort.fail("abort", "fixture.failed", "Failure after recorded payment.")?;
-    let accept = RegionBuilder::<Receipt>::new();
-    let accepted = accept.input();
-    let accept = accept.complete("accept", accepted)?;
-    let mut body = RegionGraphBuilder::<Order>::new();
-    let reserved = body.declare_activity("reserve", &reserve, body.input())?;
-    body.attach_compensation(&reserved, &release)?;
-    let charged = body.declare_activity("charge", &charge, reserved.output())?;
-    body.attach_compensation(&charged, &refund)?;
-    let decided = body.declare_choose(
-        "decide",
-        charged.output(),
-        vec![Case {
-            name: "force_failure".to_owned(),
-            when: Condition::All {
-                items: vec![
-                    Condition::Exists {
-                        binding: Binding::from_path(
-                            Reference::WorkflowInput,
-                            "/fail_after_payment",
-                        ),
-                    },
-                    Condition::Eq {
-                        left: Binding::from_path(Reference::WorkflowInput, "/fail_after_payment"),
-                        right: Binding::literal(Value::Bool(true)),
-                    },
-                ],
-            },
-            body: abort,
-        }],
-        accept,
-    )?;
-    let done = body.declare_complete("done", decided.output())?;
-    body.start_at(reserved.entry())?;
-    body.connect(reserved.exit(), charged.entry())?;
-    body.connect(charged.exit(), decided.entry())?;
-    body.connect(decided.exit(), done.entry())?;
-    let body = body.finish::<Receipt>()?;
-    let mut root = RegionBuilder::<Order>::new();
-    let fulfilled = root.saga("fulfill", root.workflow_input(), body)?;
-    let root = root.complete("finish", fulfilled.output())?;
-    WorkflowBuilder::new("compensating_fulfillment", 1, root).build(catalog)
+    let reserve = catalog.activity_v1::<Order, ReservedOrder>("inventory.reserve")?;
+    let release = catalog.activity_v1::<ReservedOrder, ()>("inventory.release")?;
+    let charge = catalog.activity_v1::<ReservedOrder, Receipt>("payment.charge")?;
+    let refund = catalog.activity_v1::<Receipt, ()>("payment.refund")?;
+    let abort =
+        region::<Receipt>().fail("abort", "fixture.failed", "Failure after recorded payment.")?;
+    let accept = region::<Receipt>().complete("accept")?;
+    let body = region::<Order>()
+        .activity("reserve", &reserve)?
+        .compensate(&release)?
+        .activity("charge", &charge)?
+        .compensate(&refund)?
+        .choose("decide")
+        .when_true("force_failure", "/fail_after_payment", abort)
+        .otherwise(accept)?
+        .complete("done")?;
+    workflow::<Order>("compensating_fulfillment")
+        .saga("fulfill", body)?
+        .finish(catalog)
 }
 
 async fn run_failed(

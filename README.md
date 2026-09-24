@@ -122,18 +122,17 @@ How-tos:
 
 ## Typed builder
 
-`DurablePayload` ties a Rust struct to a catalog schema name (`order/v1`), not to the Rust type name. `activity_ref` checks that the struct’s schema matches the activity contract. Use `workflow_input()` for the run’s input so the builder matches YAML `from: workflow.input`.
+`payload!(Order, "order")` binds a struct to catalog schema `order/v1`. First `.activity` uses the run input; the next uses the previous output. Same IR as the YAML.
 
 The full listing is [samples/02-passing-data](https://github.com/danielgerlag/graphrun/tree/main/samples/02-passing-data).
 
 ```rust
-let reserve = catalog.activity_ref::<Order, ReservedOrder>("inventory.reserve", 1)?;
-let charge = catalog.activity_ref::<ReservedOrder, Receipt>("payment.charge", 1)?;
-let mut root = RegionBuilder::<Order>::new();
-let reserved = root.activity("reserve", &reserve, root.workflow_input())?;
-let charged = root.activity("charge", &charge, reserved.output())?;
-let root = root.complete("finish", charged.output())?;
-let definition = WorkflowBuilder::new("passing_data", 1, root).build(&catalog)?;
+let reserve = catalog.activity_v1::<Order, ReservedOrder>("inventory.reserve")?;
+let charge = catalog.activity_v1::<ReservedOrder, Receipt>("payment.charge")?;
+let definition = workflow::<Order>("passing_data")
+	.activity("reserve", &reserve)?
+	.activity("charge", &charge)?
+	.finish(&catalog)?;
 let run = engine.start(definition, catalog, input).await?;
 ```
 

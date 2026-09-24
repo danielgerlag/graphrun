@@ -1,6 +1,4 @@
-use graphrun::Catalog;
-use graphrun::builder::{RegionBuilder, WorkflowBuilder};
-use graphrun::schema::{DurablePayload, SchemaRef};
+use graphrun::{Catalog, payload, workflow};
 use graphrun_samples::{pretty, run_pair, to_value};
 use serde::{Deserialize, Serialize};
 
@@ -11,12 +9,7 @@ struct Order {
     order_id: String,
     amount: i64,
 }
-
-impl DurablePayload for Order {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("order", 1).expect("order/v1")
-    }
-}
+payload!(Order, "order");
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ReservedOrder {
@@ -24,12 +17,7 @@ struct ReservedOrder {
     amount: i64,
     reservation_id: String,
 }
-
-impl DurablePayload for ReservedOrder {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("reserved_order", 1).expect("reserved_order/v1")
-    }
-}
+payload!(ReservedOrder, "reserved_order");
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Receipt {
@@ -37,21 +25,15 @@ struct Receipt {
     amount: i64,
     payment_id: String,
 }
-
-impl DurablePayload for Receipt {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("receipt", 1).expect("receipt/v1")
-    }
-}
+payload!(Receipt, "receipt");
 
 fn build(catalog: &Catalog) -> graphrun::Result<graphrun::Definition> {
-    let reserve = catalog.activity_ref::<Order, ReservedOrder>("inventory.reserve", 1)?;
-    let charge = catalog.activity_ref::<ReservedOrder, Receipt>("payment.charge", 1)?;
-    let mut root = RegionBuilder::<Order>::new();
-    let reserved = root.activity("reserve", &reserve, root.workflow_input())?;
-    let charged = root.activity("charge", &charge, reserved.output())?;
-    let root = root.complete("finish", charged.output())?;
-    WorkflowBuilder::new("passing_data", 1, root).build(catalog)
+    let reserve = catalog.activity_v1::<Order, ReservedOrder>("inventory.reserve")?;
+    let charge = catalog.activity_v1::<ReservedOrder, Receipt>("payment.charge")?;
+    workflow::<Order>("passing_data")
+        .activity("reserve", &reserve)?
+        .activity("charge", &charge)?
+        .finish(catalog)
 }
 
 #[tokio::main]

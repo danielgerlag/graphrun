@@ -1,8 +1,8 @@
 # Build a workflow in Rust
 
-Same graph as the YAML below: reserve inventory, then charge. Typed builder lives in [`samples/02-passing-data/builder.rs`](../../samples/02-passing-data/builder.rs). YAML: [`workflow.yaml`](../../samples/02-passing-data/workflow.yaml). Catalog: [`catalog.json`](../../samples/02-passing-data/catalog.json).
+Same graph as the YAML below: reserve inventory, then charge. Typed builder: [`samples/02-passing-data/builder.rs`](../../samples/02-passing-data/builder.rs). YAML: [`workflow.yaml`](../../samples/02-passing-data/workflow.yaml). Catalog: [`catalog.json`](../../samples/02-passing-data/catalog.json).
 
-`DurablePayload` on a struct is a catalog schema name (`order/v1`), not the Rust type name. `activity_ref` checks the struct against that contract. Use `workflow_input()` for the run input (YAML `from: workflow.input`). `input()` is the current region’s input (`scope.input`).
+`payload!(Order, "order")` binds the struct to catalog schema `order/v1`. `activity_v1` checks that against the activity contract. First `.activity` uses the run input; the next uses the previous output.
 
 ## Definition
 
@@ -34,9 +34,7 @@ nodes:
 ## Builder
 
 ```rust
-use graphrun::builder::{RegionBuilder, WorkflowBuilder};
-use graphrun::schema::{DurablePayload, SchemaRef};
-use graphrun::{Catalog, Engine};
+use graphrun::{payload, workflow, Catalog};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -44,11 +42,7 @@ struct Order {
 	order_id: String,
 	amount: i64,
 }
-impl DurablePayload for Order {
-	fn schema_ref() -> SchemaRef {
-		SchemaRef::named("order", 1).unwrap()
-	}
-}
+payload!(Order, "order");
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ReservedOrder {
@@ -56,11 +50,7 @@ struct ReservedOrder {
 	amount: i64,
 	reservation_id: String,
 }
-impl DurablePayload for ReservedOrder {
-	fn schema_ref() -> SchemaRef {
-		SchemaRef::named("reserved_order", 1).unwrap()
-	}
-}
+payload!(ReservedOrder, "reserved_order");
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Receipt {
@@ -68,25 +58,33 @@ struct Receipt {
 	amount: i64,
 	payment_id: String,
 }
-impl DurablePayload for Receipt {
-	fn schema_ref() -> SchemaRef {
-		SchemaRef::named("receipt", 1).unwrap()
-	}
-}
+payload!(Receipt, "receipt");
 
 let catalog = Catalog::from_json(include_bytes!("catalog.json"))?;
-let reserve = catalog.activity_ref::<Order, ReservedOrder>("inventory.reserve", 1)?;
-let charge = catalog.activity_ref::<ReservedOrder, Receipt>("payment.charge", 1)?;
-let mut root = RegionBuilder::<Order>::new();
-let reserved = root.activity("reserve", &reserve, root.workflow_input())?;
-let charged = root.activity("charge", &charge, reserved.output())?;
-let root = root.complete("finish", charged.output())?;
-let definition = WorkflowBuilder::new("passing_data", 1, root).build(&catalog)?;
+let reserve = catalog.activity_v1::<Order, ReservedOrder>("inventory.reserve")?;
+let charge = catalog.activity_v1::<ReservedOrder, Receipt>("payment.charge")?;
+let definition = workflow::<Order>("passing_data")
+	.activity("reserve", &reserve)?
+	.activity("charge", &charge)?
+	.finish(&catalog)?;
 
 let engine = Engine::local("./graphrun-data").await?;
 let run = engine.start(definition, catalog, input).await?;
 let output = engine.wait_terminal(run, std::time::Duration::from_secs(10)).await?;
 ```
+
+Nested bodies use `region::<T>()` (scope input, complete as `done`):
+
+```rust
+let body = region::<Counter>()
+	.activity("increment", &increment)?
+	.finish()?;
+workflow::<Counter>("while_counter")
+	.while_lt("count", "/value", 3, body, 10)?
+	.finish(&catalog)?;
+```
+
+`RegionBuilder` / `RegionGraphBuilder` remain for graphs that are not a straight chain.
 
 ```sh
 cargo run -p graphrun-samples --bin 02-passing-data

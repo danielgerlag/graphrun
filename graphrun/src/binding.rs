@@ -148,6 +148,31 @@ pub enum Condition {
 }
 
 impl Condition {
+    pub fn eq_input(path: &str, value: Value) -> Self {
+        Self::Eq {
+            left: Binding::from_path(Reference::WorkflowInput, path),
+            right: Binding::literal(value),
+        }
+    }
+
+    pub fn lt_loop(path: &str, value: i64) -> Self {
+        Self::Lt {
+            left: Binding::from_path(Reference::LoopState, path),
+            right: Binding::literal(Value::Int(value)),
+        }
+    }
+
+    pub fn flag_true(path: &str) -> Self {
+        Self::All {
+            items: vec![
+                Self::Exists {
+                    binding: Binding::from_path(Reference::WorkflowInput, path),
+                },
+                Self::eq_input(path, Value::Bool(true)),
+            ],
+        }
+    }
+
     pub fn operator_count(&self) -> usize {
         match self {
             Self::All { items } | Self::Any { items } => {

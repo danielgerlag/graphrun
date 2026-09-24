@@ -1,7 +1,4 @@
-use graphrun::Catalog;
-use graphrun::binding::{Binding, Condition, Reference};
-use graphrun::builder::{Case, RegionBuilder, WorkflowBuilder};
-use graphrun::schema::{DurablePayload, SchemaRef};
+use graphrun::{Catalog, payload, region, workflow};
 use graphrun_samples::{expect_value, pretty, run_pair, to_value};
 use serde::{Deserialize, Serialize};
 
@@ -11,38 +8,20 @@ const YAML: &str = include_str!("workflow.yaml");
 struct Counter {
     value: i64,
 }
-
-impl DurablePayload for Counter {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("counter", 1).expect("counter/v1")
-    }
-}
+payload!(Counter, "counter");
 
 fn build(catalog: &Catalog) -> graphrun::Result<graphrun::Definition> {
-    let increment = catalog.activity_ref::<Counter, Counter>("counter.increment", 1)?;
-    let echo = catalog.activity_ref::<Counter, Counter>("remote.echo", 1)?;
-    let mut bump = RegionBuilder::<Counter>::new();
-    let bumped = bump.activity("increment", &increment, bump.input())?;
-    let bump = bump.complete("done", bumped.output())?;
-    let mut keep = RegionBuilder::<Counter>::new();
-    let echoed = keep.activity("echo", &echo, keep.input())?;
-    let keep = keep.complete("done", echoed.output())?;
-    let mut root = RegionBuilder::<Counter>::new();
-    let decided = root.choose(
-        "decide",
-        root.workflow_input(),
-        vec![Case {
-            name: "bump".to_owned(),
-            when: Condition::Eq {
-                left: Binding::from_path(Reference::WorkflowInput, "/value"),
-                right: Binding::literal(graphrun::value::Value::Int(1)),
-            },
-            body: bump,
-        }],
-        keep,
-    )?;
-    let root = root.complete("finish", decided.output())?;
-    WorkflowBuilder::new("choice", 1, root).build(catalog)
+    let increment = catalog.activity_v1::<Counter, Counter>("counter.increment")?;
+    let echo = catalog.activity_v1::<Counter, Counter>("remote.echo")?;
+    let bump = region::<Counter>()
+        .activity("increment", &increment)?
+        .finish()?;
+    let keep = region::<Counter>().activity("echo", &echo)?.finish()?;
+    workflow::<Counter>("choice")
+        .choose("decide")
+        .when_eq("bump", "/value", 1, bump)
+        .otherwise(keep)?
+        .finish(catalog)
 }
 
 #[tokio::main]

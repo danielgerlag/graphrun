@@ -14,6 +14,24 @@ pub enum Value {
     Object(BTreeMap<String, Value>),
 }
 
+impl From<i32> for Value {
+    fn from(value: i32) -> Self {
+        Self::Int(i64::from(value))
+    }
+}
+
+impl From<i64> for Value {
+    fn from(value: i64) -> Self {
+        Self::Int(value)
+    }
+}
+
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        Self::Bool(value)
+    }
+}
+
 impl Value {
     pub fn from_json(json: serde_json::Value) -> Result<Self> {
         from_json(json, 0)

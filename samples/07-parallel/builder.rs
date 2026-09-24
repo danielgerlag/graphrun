@@ -1,6 +1,4 @@
-use graphrun::Catalog;
-use graphrun::builder::{Branch, RegionBuilder, RegionGraphBuilder, WorkflowBuilder};
-use graphrun::schema::{DurablePayload, SchemaRef};
+use graphrun::{Catalog, payload, region, workflow};
 use graphrun_samples::{pretty, run_pair, to_value};
 use serde::{Deserialize, Serialize};
 
@@ -11,64 +9,30 @@ struct Order {
     order_id: String,
     amount: i64,
 }
-
-impl DurablePayload for Order {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("order", 1).expect("order/v1")
-    }
-}
+payload!(Order, "order");
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Tax {
     cents: i64,
 }
-
-impl DurablePayload for Tax {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("tax", 1).expect("tax/v1")
-    }
-}
+payload!(Tax, "tax");
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Shipping {
     cents: i64,
 }
-
-impl DurablePayload for Shipping {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("shipping", 1).expect("shipping/v1")
-    }
-}
+payload!(Shipping, "shipping");
 
 fn build(catalog: &Catalog) -> graphrun::Result<graphrun::Definition> {
-    let tax = catalog.activity_ref::<Order, Tax>("tax.quote", 1)?;
-    let shipping = catalog.activity_ref::<Order, Shipping>("shipping.quote", 1)?;
-    let mut tax_body = RegionBuilder::<Order>::new();
-    let tax_quote = tax_body.activity("quote", &tax, tax_body.input())?;
-    let tax_body = tax_body.complete("done", tax_quote.output())?;
-    let mut shipping_body = RegionBuilder::<Order>::new();
-    let shipping_quote = shipping_body.activity("quote", &shipping, shipping_body.input())?;
-    let shipping_body = shipping_body.complete("done", shipping_quote.output())?;
-    let mut graph = RegionGraphBuilder::<Order>::new();
-    let input = graph.workflow_input();
-    let quotes = graph.declare_parallel2(
-        "quotes",
-        Branch {
-            name: "tax".to_owned(),
-            input: input.binding().clone(),
-            body: tax_body,
-        },
-        Branch {
-            name: "shipping".to_owned(),
-            input: input.binding().clone(),
-            body: shipping_body,
-        },
-    )?;
-    let finish = graph.declare_complete("finish", quotes.output())?;
-    graph.start_at(quotes.entry())?;
-    graph.connect(quotes.exit(), finish.entry())?;
-    let region = graph.finish::<(Tax, Shipping)>()?;
-    WorkflowBuilder::new("parallel_quotes", 1, region).build(catalog)
+    let tax = catalog.activity_v1::<Order, Tax>("tax.quote")?;
+    let shipping = catalog.activity_v1::<Order, Shipping>("shipping.quote")?;
+    let tax_body = region::<Order>().activity("quote", &tax)?.finish()?;
+    let shipping_body = region::<Order>().activity("quote", &shipping)?.finish()?;
+    workflow::<Order>("parallel_quotes")
+        .parallel("quotes")
+        .branch("tax", tax_body)
+        .branch("shipping", shipping_body)?
+        .finish(catalog)
 }
 
 #[tokio::main]

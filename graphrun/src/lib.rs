@@ -7,7 +7,7 @@
 //! `counter.increment`. You cannot register your own activity bodies yet.
 //! Unknown names echo their input.
 //!
-//! See the crate README for a complete paste-and-run example.
+//! Graphs are YAML or [`flow::workflow`]. See the crate README for a paste-and-run example.
 
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::collapsible_if)]
@@ -21,6 +21,7 @@ pub mod compiler;
 pub mod domain;
 pub mod engine;
 pub mod error;
+pub mod flow;
 #[doc(hidden)]
 pub mod generated;
 pub mod ids;
@@ -53,6 +54,7 @@ pub use engine::{
     ControlRequest, ControlResponse, Engine, LedgerEntry, connect_control, ledger_get, replay,
 };
 pub use error::{Error, ErrorKind, Result};
+pub use flow::{region, workflow};
 pub use ids::{EventId, RunId};
 pub use ir::Definition;
 pub use schema::{DurablePayload, SchemaRef};

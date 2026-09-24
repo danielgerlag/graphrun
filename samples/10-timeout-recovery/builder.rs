@@ -1,6 +1,5 @@
-use graphrun::builder::{RegionGraphBuilder, SignalRef, WorkflowBuilder};
-use graphrun::schema::{DurablePayload, SchemaRef};
-use graphrun::{Catalog, EventId, Value};
+use graphrun::builder::SignalRef;
+use graphrun::{Catalog, EventId, Value, payload, workflow};
 use graphrun_samples::{LocalEngine, assert_same_ir, expect_value, pretty, to_value};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -12,39 +11,21 @@ const YAML: &str = include_str!("workflow.yaml");
 struct Counter {
     value: i64,
 }
-
-impl DurablePayload for Counter {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("counter", 1).expect("counter/v1")
-    }
-}
+payload!(Counter, "counter");
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Approval {
     approved: bool,
 }
-
-impl DurablePayload for Approval {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("approval", 1).expect("approval/v1")
-    }
-}
+payload!(Approval, "approval");
 
 fn build(catalog: &Catalog) -> graphrun::Result<graphrun::Definition> {
-    let increment = catalog.activity_ref::<Counter, Counter>("counter.increment", 1)?;
+    let increment = catalog.activity_v1::<Counter, Counter>("counter.increment")?;
     let approval = SignalRef::<Approval>::new("approval")?;
-    let mut graph = RegionGraphBuilder::<Counter>::new();
-    let input = graph.workflow_input();
-    let key = graph.literal("approval".to_owned())?;
-    let wait = graph.declare_timed_wait("approval", &approval, key, Duration::from_secs(1))?;
-    let recovery = graph.declare_activity("recover", &increment, input.clone())?;
-    let finish = graph.declare_complete("finish", input)?;
-    graph.start_at(wait.entry())?;
-    graph.connect(wait.success_port(), finish.entry())?;
-    graph.connect(wait.timeout_port(), recovery.entry())?;
-    graph.connect(recovery.exit(), finish.entry())?;
-    let region = graph.finish::<Counter>()?;
-    WorkflowBuilder::new("timeout_recovery", 1, region).build(catalog)
+    workflow::<Counter>("timeout_recovery")
+        .timed_wait("approval", &approval, "approval", Duration::from_secs(1))?
+        .on_timeout("recover", &increment)?
+        .finish(catalog)
 }
 
 fn recover_succeeded(engine_state: &graphrun::State, run: graphrun::RunId) -> bool {

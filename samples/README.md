@@ -1,6 +1,6 @@
 # Graphrun samples
 
-Each folder is one graph: `workflow.yaml`, `catalog.json`, payload types, and a typed builder. Run it with `Engine::local`. There is no `graphrun serve` step.
+Each folder is one graph: `workflow.yaml`, `catalog.json`, payload types, and a typed builder (`workflow` / `region`). Run it with `Engine::local`. There is no `graphrun serve` step.
 
 **You cannot register custom activity handlers.** Local mode runs built-in fixtures for names such as `counter.increment` and `inventory.reserve`. Unknown names echo their input.
 

@@ -1,6 +1,5 @@
-use graphrun::builder::{RegionBuilder, SignalRef, WorkflowBuilder};
-use graphrun::schema::{DurablePayload, SchemaRef};
-use graphrun::{Catalog, EventId, Value};
+use graphrun::builder::SignalRef;
+use graphrun::{Catalog, EventId, Value, payload, workflow};
 use graphrun_samples::{LocalEngine, assert_same_ir, expect_value, pretty, to_value};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -12,31 +11,19 @@ const YAML: &str = include_str!("workflow.yaml");
 struct EventRequest {
     key: String,
 }
-
-impl DurablePayload for EventRequest {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("event_request", 1).expect("event_request/v1")
-    }
-}
+payload!(EventRequest, "event_request");
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Approval {
     approved: bool,
 }
-
-impl DurablePayload for Approval {
-    fn schema_ref() -> SchemaRef {
-        SchemaRef::named("approval", 1).expect("approval/v1")
-    }
-}
+payload!(Approval, "approval");
 
 fn build(catalog: &Catalog) -> graphrun::Result<graphrun::Definition> {
     let approval = SignalRef::<Approval>::new("approval")?;
-    let mut root = RegionBuilder::<EventRequest>::new();
-    let key = root.literal("order-1".to_owned())?;
-    let waited = root.wait_signal("approval", &approval, key)?;
-    let root = root.complete("finish", waited.output())?;
-    WorkflowBuilder::new("external_approval", 1, root).build(catalog)
+    workflow::<EventRequest>("external_approval")
+        .wait_signal("approval", &approval, "order-1")?
+        .finish(catalog)
 }
 
 async fn run_signaled(

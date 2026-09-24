@@ -3,6 +3,7 @@ use graphrun::builder::{Case, RegionBuilder, RegionGraphBuilder, SignalRef, Work
 use graphrun::catalog::Catalog;
 use graphrun::compile_yaml;
 use graphrun::schema::{DurablePayload, SchemaRef};
+use graphrun::workflow;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -90,6 +91,25 @@ fn sequence_builder_compiles() {
         .build(&catalog)
         .unwrap();
     assert_eq!(definition.id, "sequence");
+}
+
+#[test]
+fn fluent_sequence_compiles() {
+    let catalog = catalog();
+    let reserve = catalog
+        .activity_v1::<Order, ReservedOrder>("inventory.reserve")
+        .unwrap();
+    let charge = catalog
+        .activity_v1::<ReservedOrder, Receipt>("payment.charge")
+        .unwrap();
+    let definition = workflow::<Order>("passing_data")
+        .activity("reserve", &reserve)
+        .unwrap()
+        .activity("charge", &charge)
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+    assert_eq!(definition.id, "passing_data");
 }
 
 #[test]

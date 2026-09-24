@@ -484,6 +484,36 @@ impl<I: DurablePayload> RegionBuilder<I> {
         graph.finish()
     }
 
+    pub fn compensate<O, U>(
+        &mut self,
+        node: &NodeRef<O>,
+        compensator: &ActivityRef<O, U>,
+    ) -> Result<()>
+    where
+        O: DurablePayload,
+        U: DurablePayload,
+    {
+        self.graph.attach_compensation(node, compensator)
+    }
+
+    pub fn parallel2<A, B, IA, IB>(
+        &mut self,
+        key: &str,
+        left: Branch<IA, A>,
+        right: Branch<IB, B>,
+    ) -> Result<NodeRef<(A, B)>>
+    where
+        A: DurablePayload,
+        B: DurablePayload,
+        IA: DurablePayload,
+        IB: DurablePayload,
+    {
+        let node = self.graph.declare_parallel2(key, left, right)?;
+        self.link_tail(node.entry())?;
+        self.graph.draft.tail = Some(node.key.clone());
+        Ok(node)
+    }
+
     fn link_tail(&mut self, entry: EntryPort) -> Result<()> {
         if let Some(tail) = self.graph.draft.tail.clone() {
             self.graph.connect(

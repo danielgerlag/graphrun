@@ -112,6 +112,24 @@ pub trait DurablePayload:
     fn schema_ref() -> SchemaRef;
 }
 
+/// Bind `$ty` to catalog schema `$name/v1`.
+///
+/// ```ignore
+/// #[derive(Clone, Serialize, Deserialize)]
+/// struct Order { order_id: String, amount: i64 }
+/// graphrun::payload!(Order, "order");
+/// ```
+#[macro_export]
+macro_rules! payload {
+    ($ty:ty, $name:literal) => {
+        impl $crate::DurablePayload for $ty {
+            fn schema_ref() -> $crate::SchemaRef {
+                $crate::SchemaRef::named($name, 1).expect(concat!($name, "/v1"))
+            }
+        }
+    };
+}
+
 impl DurablePayload for () {
     fn schema_ref() -> SchemaRef {
         SchemaRef::named("unit", 1).expect("unit/v1")
