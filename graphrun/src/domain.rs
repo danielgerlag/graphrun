@@ -1129,10 +1129,20 @@ fn decide_claim(
             "session expired",
         ));
     }
+    let activities = worker.activities.clone();
+    let worker_capacity = worker.capacity;
+    let expires_ms = time
+        .as_millis()
+        .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64);
+    let mut events = vec![DomainEvent::SessionRegistered {
+        session,
+        activities,
+        capacity: worker_capacity,
+        expires_ms,
+    }];
     let cap = capacity
-        .min(worker.capacity)
+        .min(worker_capacity)
         .min(crate::limits::CLAIM_BATCH);
-    let mut events = Vec::new();
     let mut granted = 0u32;
     let mut runs = active_runs(state);
     if runs.is_empty() {

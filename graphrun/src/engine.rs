@@ -1385,6 +1385,19 @@ async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc
             },
         };
         if write_raft(&raft, claim.clone()).await.is_err() {
+            let _ = write_raft(
+                &raft,
+                Command {
+                    id: CommandId::generate(),
+                    time: now(),
+                    body: CommandBody::RegisterSession {
+                        session,
+                        activities: vec!["*".to_owned()],
+                        capacity: crate::limits::CLAIM_BATCH,
+                    },
+                },
+            )
+            .await;
             continue;
         }
         let mut did_work = false;
@@ -1667,6 +1680,48 @@ mod tests {
             .modified()
             .unwrap();
         assert_eq!(before, after, "readonly replay must not write the store");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_engine_survives_past_session_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let yaml = r#"
+dsl: graphrun/v1
+id: bump
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: inc
+nodes:
+  inc:
+    kind: activity
+    activity: {name: counter.increment, version: 1}
+    input: {from: workflow.input}
+    next: done
+  done:
+    kind: complete
+    output: {from: nodes.inc.output}
+"#;
+        let input = Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(0))]));
+        for i in 0..80 {
+            if i == 10 {
+                tokio::time::sleep(crate::policy::SESSION_LEASE + Duration::from_millis(200)).await;
+            }
+            let run = engine
+                .start_yaml(yaml, &catalog(), input.clone())
+                .await
+                .unwrap();
+            let output = engine
+                .wait_terminal(run, Duration::from_secs(5))
+                .await
+                .unwrap_or_else(|err| panic!("run {i}: {err}"));
+            assert_eq!(
+                output,
+                Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(1))]))
+            );
+        }
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
