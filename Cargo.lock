@@ -764,7 +764,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "graphrun"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",
@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "graphrun-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "graphrun",
@@ -805,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "graphrun-e2e"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "graphrun",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "graphrun-samples"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "graphrun",
  "serde",
