@@ -1,4 +1,5 @@
 use crate::catalog::Catalog;
+use crate::cluster::ClusterNetwork;
 use crate::compiler::compile_yaml;
 use crate::domain::{Command, CommandBody, assignments_from};
 use crate::error::ErrorKind;
@@ -6,11 +7,12 @@ use crate::generated::client_server::{Client, ClientServer};
 use crate::generated::raft_server::{Raft as RaftSvc, RaftServer};
 use crate::generated::worker_server::{Worker as WorkerSvc, WorkerServer};
 use crate::generated::{
-    Ack, Blob, CancelRequest, ClaimRequest, ClaimResponse, CommandResultRequest,
-    CommandResultResponse, HistoryRequest, HistoryResponse, InspectRequest, InspectResponse,
-    ListRequest, ListResponse, PublishCatalogRequest, PublishDefinitionRequest, ReconcileRequest,
-    RegisterRequest, RenewRequest, RenewResponse, ReplayRequest, ReplayResponse, ReportRequest,
-    SignalRequest, StartRequest, StartResponse,
+    Ack, Blob, CancelRequest, ClaimRequest, ClaimResponse, ClockAcknowledgeRequest,
+    ClockHealthRequest, ClockHealthResponse, CommandResultRequest, CommandResultResponse,
+    HistoryRequest, HistoryResponse, InspectRequest, InspectResponse, ListRequest, ListResponse,
+    PublishCatalogRequest, PublishDefinitionRequest, ReconcileRequest, RegisterRequest,
+    RenewRequest, RenewResponse, ReplayRequest, ReplayResponse, ReportRequest, SignalRequest,
+    StartRequest, StartResponse,
 };
 use crate::ids::{
     ActivationId, CommandId, EventId, LeaseRevision, OwnerGeneration, RunId, WorkerSessionId,
@@ -18,9 +20,12 @@ use crate::ids::{
 use crate::storage::{StorageHandle, TypeConfig};
 use crate::tls::TlsMaterial;
 use crate::value::Value;
-use crate::write::{admit_unapplied, inspect_view, now, write_raft, write_raft_response};
-use openraft::Raft;
+use crate::write::{
+    admit_unapplied, inspect_view, linearizable_read, now, write_raft, write_raft_response,
+};
 use openraft::raft::AppendEntriesRequest;
+use openraft::{Raft, ServerState};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -34,6 +39,9 @@ pub struct GraphServices {
     notify: Arc<Notify>,
     publication_ca: Arc<String>,
     publication_cluster: crate::tls::ClusterId,
+    genesis_members: BTreeMap<u64, SocketAddr>,
+    network: ClusterNetwork,
+    node_id: u64,
 }
 
 impl GraphServices {
@@ -42,15 +50,20 @@ impl GraphServices {
         storage: StorageHandle,
         notify: Arc<Notify>,
         ca_pem: String,
+        node_id: u64,
+        genesis_members: BTreeMap<u64, SocketAddr>,
+        network: ClusterNetwork,
     ) -> Self {
-        use sha2::Digest;
-        let cluster = hex::encode(&sha2::Sha256::digest(ca_pem.as_bytes())[..16]);
+        let cluster = crate::tls::cluster_id_from_ca(&ca_pem).expect("hex cluster id");
         Self {
             raft,
             storage,
             notify,
             publication_ca: Arc::new(ca_pem),
-            publication_cluster: crate::tls::ClusterId::parse(cluster).expect("hex cluster id"),
+            publication_cluster: cluster,
+            genesis_members,
+            network,
+            node_id,
         }
     }
 
@@ -91,6 +104,67 @@ impl GraphServices {
         Ok(crate::publication::AuthContext::verified_peer(&peer))
     }
 
+    async fn member_context<T>(&self, request: &Request<T>, sender_id: u64) -> Result<(), Status> {
+        let peer = self.verified_peer(request)?;
+        let member_id =
+            crate::tls::PrincipalId::parse(sender_id.to_string()).map_err(status_error)?;
+        peer.require_member_identity(&self.publication_cluster, &member_id)
+            .map_err(status_error)?;
+        let roster = self.storage.applied_members().await.map_err(status_error)?;
+        let expected = if roster.is_empty() && self.storage.last_applied_index().await == 0 {
+            self.genesis_members.get(&sender_id).copied()
+        } else {
+            roster
+                .get(&sender_id)
+                .and_then(|endpoint| endpoint.parse::<SocketAddr>().ok())
+        }
+        .ok_or_else(|| Status::permission_denied("member is not in the committed roster"))?;
+        let source = request
+            .remote_addr()
+            .ok_or_else(|| Status::permission_denied("member endpoint unavailable"))?;
+        if source.ip() != expected.ip() {
+            return Err(Status::permission_denied(
+                "member endpoint does not match roster",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn read_barrier(&self) -> Result<(), Status> {
+        self.require_leader()?;
+        linearizable_read(&self.raft).await.map_err(status_error)
+    }
+
+    fn require_leader(&self) -> Result<(), Status> {
+        let metrics = self.raft.metrics().borrow().clone();
+        if metrics.state == ServerState::Leader {
+            return Ok(());
+        }
+        let mut status = Status::unavailable("not leader; retry with the elected leader");
+        if let Some(leader) = metrics.current_leader {
+            if let (Some(node), Some((configured_addr, server_name))) = (
+                metrics.membership_config.membership().get_node(&leader),
+                self.network.peer(leader),
+            ) {
+                if let Ok(endpoint) = node.addr.parse::<SocketAddr>() {
+                    if configured_addr == endpoint {
+                        status.metadata_mut().insert(
+                            "graphrun-leader-endpoint",
+                            format!("https://{endpoint}")
+                                .parse()
+                                .expect("socket address is ASCII"),
+                        );
+                        status.metadata_mut().insert(
+                            "graphrun-leader-server-name",
+                            server_name.parse().expect("configured DNS name is ASCII"),
+                        );
+                    }
+                }
+            }
+        }
+        Err(status)
+    }
+
     async fn publication_write(
         &self,
         auth: &crate::publication::AuthContext,
@@ -99,7 +173,7 @@ impl GraphServices {
     ) -> Result<crate::publication::CommandResult, Status> {
         let command =
             crate::publication::command(auth, id, now(), operation).map_err(status_error)?;
-        let reply = write_raft_response(&self.raft, command)
+        let reply = write_raft_response(&self.raft, &self.storage, command)
             .await
             .map_err(status_error)?;
         let receipt = reply.command_result.ok_or_else(|| {
@@ -139,9 +213,15 @@ fn receipt_response(
 #[tonic::async_trait]
 impl RaftSvc for GraphServices {
     async fn append_entries(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
-        let rpc: AppendEntriesRequest<TypeConfig> =
-            serde_json::from_slice(&request.into_inner().json)
-                .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        self.member_context(&request, request.get_ref().sender_id)
+            .await?;
+        let rpc: AppendEntriesRequest<TypeConfig> = serde_json::from_slice(&request.get_ref().json)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        if rpc.vote.leader_id.voted_for() != Some(request.get_ref().sender_id) {
+            return Err(Status::permission_denied(
+                "Raft leader differs from signed member",
+            ));
+        }
         if !rpc.entries.is_empty() {
             let metrics = self.raft.metrics().borrow().clone();
             let last_log = metrics.last_log_index.unwrap_or(0);
@@ -172,12 +252,20 @@ impl RaftSvc for GraphServices {
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(Blob {
             json: serde_json::to_vec(&resp).map_err(|err| Status::internal(err.to_string()))?,
+            sender_id: self.node_id,
         }))
     }
 
     async fn vote(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
-        let rpc = serde_json::from_slice(&request.into_inner().json)
+        self.member_context(&request, request.get_ref().sender_id)
+            .await?;
+        let rpc: openraft::raft::VoteRequest<u64> = serde_json::from_slice(&request.get_ref().json)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        if rpc.vote.leader_id.voted_for() != Some(request.get_ref().sender_id) {
+            return Err(Status::permission_denied(
+                "Raft candidate differs from signed member",
+            ));
+        }
         let resp = self
             .raft
             .vote(rpc)
@@ -185,12 +273,21 @@ impl RaftSvc for GraphServices {
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(Blob {
             json: serde_json::to_vec(&resp).map_err(|err| Status::internal(err.to_string()))?,
+            sender_id: self.node_id,
         }))
     }
 
     async fn install_snapshot(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
-        let rpc = serde_json::from_slice(&request.into_inner().json)
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        self.member_context(&request, request.get_ref().sender_id)
+            .await?;
+        let rpc: openraft::raft::InstallSnapshotRequest<TypeConfig> =
+            serde_json::from_slice(&request.get_ref().json)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        if rpc.vote.leader_id.voted_for() != Some(request.get_ref().sender_id) {
+            return Err(Status::permission_denied(
+                "snapshot leader differs from signed member",
+            ));
+        }
         let resp = self
             .raft
             .install_snapshot(rpc)
@@ -198,6 +295,24 @@ impl RaftSvc for GraphServices {
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(Blob {
             json: serde_json::to_vec(&resp).map_err(|err| Status::internal(err.to_string()))?,
+            sender_id: self.node_id,
+        }))
+    }
+
+    async fn clock_health(
+        &self,
+        request: Request<ClockHealthRequest>,
+    ) -> Result<Response<ClockHealthResponse>, Status> {
+        self.member_context(&request, request.get_ref().sender_id)
+            .await?;
+        self.storage
+            .clock()
+            .sample(&self.storage)
+            .await
+            .map_err(status_error)?;
+        Ok(Response::new(ClockHealthResponse {
+            member_id: self.node_id,
+            wall_ms: crate::write::now().as_millis(),
         }))
     }
 }
@@ -209,6 +324,7 @@ impl Client for GraphServices {
         request: Request<PublishCatalogRequest>,
     ) -> Result<Response<CommandResultResponse>, Status> {
         let auth = self.authenticated_context(&request, crate::tls::PeerRole::Admin)?;
+        self.require_leader()?;
         let req = request.into_inner();
         let catalog: Catalog = serde_json::from_slice(&req.catalog_json)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -230,6 +346,8 @@ impl Client for GraphServices {
         request: Request<PublishDefinitionRequest>,
     ) -> Result<Response<CommandResultResponse>, Status> {
         let auth = self.authenticated_context(&request, crate::tls::PeerRole::Admin)?;
+        self.require_leader()?;
+        self.read_barrier().await?;
         let req = request.into_inner();
         let state = self.storage.query_state().await;
         let catalog = state
@@ -258,10 +376,7 @@ impl Client for GraphServices {
     ) -> Result<Response<CommandResultResponse>, Status> {
         let auth = self.query_context(&request)?;
         let id = parse_publication_command_id(&request.into_inner().command_id)?;
-        self.raft
-            .ensure_linearizable()
-            .await
-            .map_err(|err| Status::unavailable(err.to_string()))?;
+        self.read_barrier().await?;
         let state = self.storage.query_state().await;
         let receipt = state
             .command_results
@@ -275,11 +390,8 @@ impl Client for GraphServices {
         &self,
         request: Request<StartRequest>,
     ) -> Result<Response<StartResponse>, Status> {
-        let auth = if !request.get_ref().workflow.is_empty() {
-            Some(self.authenticated_context(&request, crate::tls::PeerRole::Client)?)
-        } else {
-            None
-        };
+        let auth = self.authenticated_context(&request, crate::tls::PeerRole::Client)?;
+        self.require_leader()?;
         let req = request.into_inner();
         if !req.workflow.is_empty() {
             if !req.yaml.is_empty() || !req.catalog_json.is_empty() {
@@ -291,7 +403,7 @@ impl Client for GraphServices {
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
             let receipt = self
                 .publication_write(
-                    auth.as_ref().expect("checked"),
+                    &auth,
                     parse_publication_command_id(&req.command_id)?,
                     crate::publication::PublicationOperation::Start {
                         workflow: req.workflow,
@@ -319,6 +431,7 @@ impl Client for GraphServices {
         let command_id = parse_command_id(&req.command_id)?;
         let result = write_raft_response(
             &self.raft,
+            &self.storage,
             Command {
                 id: command_id,
                 time: now(),
@@ -354,6 +467,8 @@ impl Client for GraphServices {
     }
 
     async fn signal(&self, request: Request<SignalRequest>) -> Result<Response<Ack>, Status> {
+        self.query_context(&request)?;
+        self.require_leader()?;
         let req = request.into_inner();
         let run = parse_run(&req.run_id)?;
         let event_id = EventId::from_hex(&req.event_id).map_err(Status::invalid_argument)?;
@@ -361,6 +476,7 @@ impl Client for GraphServices {
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         ack(write_raft(
             &self.raft,
+            &self.storage,
             Command {
                 id: parse_command_id(&req.command_id)?,
                 time: now(),
@@ -378,9 +494,12 @@ impl Client for GraphServices {
     }
 
     async fn cancel(&self, request: Request<CancelRequest>) -> Result<Response<Ack>, Status> {
+        self.query_context(&request)?;
+        self.require_leader()?;
         let req = request.into_inner();
         ack(write_raft(
             &self.raft,
+            &self.storage,
             Command {
                 id: parse_command_id(&req.command_id)?,
                 time: now(),
@@ -398,6 +517,8 @@ impl Client for GraphServices {
         &self,
         request: Request<InspectRequest>,
     ) -> Result<Response<InspectResponse>, Status> {
+        self.query_context(&request)?;
+        self.read_barrier().await?;
         let run = parse_run(&request.into_inner().run_id)?;
         let state = self.storage.query_state().await;
         if let Some(summary) = state.terminal_summaries.get(&run) {
@@ -408,10 +529,7 @@ impl Client for GraphServices {
             }));
         }
         let Some(run_state) = state.runs.get(&run) else {
-            return Ok(Response::new(InspectResponse {
-                view_json: Vec::new(),
-                error: "unknown run".to_owned(),
-            }));
+            return Err(Status::not_found("unknown run"));
         };
         if let Some(pinned) = &run_state.published {
             pinned
@@ -420,12 +538,15 @@ impl Client for GraphServices {
         }
         let view = inspect_view(&state, run);
         Ok(Response::new(InspectResponse {
-            view_json: serde_json::to_vec(&view).unwrap_or_default(),
+            view_json: serde_json::to_vec(&view)
+                .map_err(|err| Status::internal(err.to_string()))?,
             error: String::new(),
         }))
     }
 
-    async fn list(&self, _request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
+    async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
+        self.query_context(&request)?;
+        self.read_barrier().await?;
         let state = self.storage.query_state().await;
         let runs: Vec<_> = state
             .runs
@@ -445,7 +566,8 @@ impl Client for GraphServices {
                 .map(crate::history::summary_view),
         );
         Ok(Response::new(ListResponse {
-            runs_json: serde_json::to_vec(&runs).unwrap_or_default(),
+            runs_json: serde_json::to_vec(&runs)
+                .map_err(|err| Status::internal(err.to_string()))?,
         }))
     }
 
@@ -456,10 +578,7 @@ impl Client for GraphServices {
         self.query_context(&request)?;
         let req = request.into_inner();
         let run = parse_run(&req.run_id)?;
-        self.raft
-            .ensure_linearizable()
-            .await
-            .map_err(|err| Status::unavailable(err.to_string()))?;
+        self.read_barrier().await?;
         let state = self.storage.query_state().await;
         let page = crate::history::page(&state, run, req.after_sequence, req.page_size, now())
             .map_err(status_error)?;
@@ -477,10 +596,7 @@ impl Client for GraphServices {
         self.query_context(&request)?;
         let req = request.into_inner();
         let run = parse_run(&req.run_id)?;
-        self.raft
-            .ensure_linearizable()
-            .await
-            .map_err(|err| Status::unavailable(err.to_string()))?;
+        self.read_barrier().await?;
         let state = self.storage.query_state().await;
         let projection = crate::history::reconstruct_at(&state, run, req.through_sequence, now())
             .map_err(status_error)?;
@@ -490,16 +606,34 @@ impl Client for GraphServices {
             error: String::new(),
         }))
     }
+
+    async fn acknowledge_clock(
+        &self,
+        request: Request<ClockAcknowledgeRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        self.authenticated_context(&request, crate::tls::PeerRole::Admin)?;
+        self.storage
+            .clock()
+            .acknowledge(&self.storage, &request.into_inner().reason)
+            .await
+            .map_err(status_error)?;
+        Ok(Response::new(Ack {
+            error: String::new(),
+        }))
+    }
 }
 
 #[tonic::async_trait]
 impl WorkerSvc for GraphServices {
     async fn register(&self, request: Request<RegisterRequest>) -> Result<Response<Ack>, Status> {
+        self.authenticated_context(&request, crate::tls::PeerRole::Worker)?;
+        self.require_leader()?;
         let req = request.into_inner();
         let session =
             WorkerSessionId::from_hex(&req.session_id).map_err(Status::invalid_argument)?;
         ack(write_raft(
             &self.raft,
+            &self.storage,
             Command {
                 id: CommandId::generate(),
                 time: now(),
@@ -517,6 +651,8 @@ impl WorkerSvc for GraphServices {
         &self,
         request: Request<ClaimRequest>,
     ) -> Result<Response<ClaimResponse>, Status> {
+        self.authenticated_context(&request, crate::tls::PeerRole::Worker)?;
+        self.require_leader()?;
         let req = request.into_inner();
         let session =
             WorkerSessionId::from_hex(&req.session_id).map_err(Status::invalid_argument)?;
@@ -528,7 +664,13 @@ impl WorkerSvc for GraphServices {
                 capacity: req.capacity,
             },
         };
-        if let Err(err) = write_raft(&self.raft, command.clone()).await {
+        if let Err(err) = write_raft(&self.raft, &self.storage, command.clone()).await {
+            if matches!(
+                err.kind,
+                ErrorKind::Unavailable | ErrorKind::DeadlineExceeded
+            ) {
+                return Err(status_error(err));
+            }
             return Ok(Response::new(ClaimResponse {
                 assignments: Vec::new(),
                 error: err.to_string(),
@@ -564,6 +706,8 @@ impl WorkerSvc for GraphServices {
         &self,
         request: Request<RenewRequest>,
     ) -> Result<Response<RenewResponse>, Status> {
+        self.authenticated_context(&request, crate::tls::PeerRole::Worker)?;
+        self.require_leader()?;
         let req = request.into_inner();
         let session =
             WorkerSessionId::from_hex(&req.session_id).map_err(Status::invalid_argument)?;
@@ -579,7 +723,7 @@ impl WorkerSvc for GraphServices {
                 revision: LeaseRevision::new(req.revision),
             },
         };
-        match write_raft(&self.raft, command.clone()).await {
+        match write_raft(&self.raft, &self.storage, command.clone()).await {
             Ok(()) => {
                 let state = self.storage.query_state().await;
                 let claim = state
@@ -595,6 +739,14 @@ impl WorkerSvc for GraphServices {
                     error: String::new(),
                 }))
             }
+            Err(err)
+                if matches!(
+                    err.kind,
+                    ErrorKind::Unavailable | ErrorKind::DeadlineExceeded
+                ) =>
+            {
+                Err(status_error(err))
+            }
             Err(err) => Ok(Response::new(RenewResponse {
                 revision: req.revision,
                 lease_expiry_ms: 0,
@@ -604,11 +756,14 @@ impl WorkerSvc for GraphServices {
     }
 
     async fn report(&self, request: Request<ReportRequest>) -> Result<Response<Ack>, Status> {
+        self.authenticated_context(&request, crate::tls::PeerRole::Worker)?;
+        self.require_leader()?;
         let req = request.into_inner();
         let output: Value = serde_json::from_slice(&req.output_json)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         ack(write_raft(
             &self.raft,
+            &self.storage,
             Command {
                 id: parse_command_id(&req.command_id)?,
                 time: now(),
@@ -629,16 +784,14 @@ impl WorkerSvc for GraphServices {
     }
 
     async fn reconcile(&self, request: Request<ReconcileRequest>) -> Result<Response<Ack>, Status> {
+        self.authenticated_context(&request, crate::tls::PeerRole::Worker)?;
+        self.require_leader()?;
         let req = request.into_inner();
         let outcome = match req.outcome.as_str() {
             "applied" => crate::domain::ReconcileOutcome::Applied,
             "not_applied" => crate::domain::ReconcileOutcome::NotApplied,
             "unknown" => crate::domain::ReconcileOutcome::Unknown,
-            other => {
-                return Ok(Response::new(Ack {
-                    error: format!("unknown outcome {other}"),
-                }));
-            }
+            other => return Err(Status::invalid_argument(format!("unknown outcome {other}"))),
         };
         let output = if req.output_json.is_empty() {
             None
@@ -650,6 +803,7 @@ impl WorkerSvc for GraphServices {
         };
         ack(write_raft(
             &self.raft,
+            &self.storage,
             Command {
                 id: parse_command_id(&req.command_id)?,
                 time: now(),
@@ -672,14 +826,25 @@ impl WorkerSvc for GraphServices {
 }
 
 pub async fn serve_grpc(
-    bind: SocketAddr,
+    listener: tokio::net::TcpListener,
     tls: TlsMaterial,
     raft: Raft<TypeConfig>,
     storage: StorageHandle,
     notify: Arc<Notify>,
+    node_id: u64,
+    genesis_members: BTreeMap<u64, SocketAddr>,
+    network: ClusterNetwork,
 ) -> crate::error::Result<()> {
     crate::tls::install_provider();
-    let svc = GraphServices::new(raft, storage, notify, tls.ca_pem.clone());
+    let svc = GraphServices::new(
+        raft,
+        storage,
+        notify,
+        tls.ca_pem.clone(),
+        node_id,
+        genesis_members,
+        network,
+    );
     let identity = Identity::from_pem(tls.cert_pem, tls.key_pem);
     let ca = Certificate::from_pem(tls.ca_pem);
     let tls_config = ServerTlsConfig::new().identity(identity).client_ca_root(ca);
@@ -689,7 +854,7 @@ pub async fn serve_grpc(
         .add_service(RaftServer::new(svc.clone()))
         .add_service(ClientServer::new(svc.clone()))
         .add_service(WorkerServer::new(svc))
-        .serve(bind)
+        .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener))
         .await
         .map_err(|err| crate::error::Error::invalid(err.to_string()))
 }
@@ -726,9 +891,14 @@ fn ack(result: Result<(), crate::error::Error>) -> Result<Response<Ack>, Status>
         Ok(()) => Ok(Response::new(Ack {
             error: String::new(),
         })),
-        Err(err) if err.kind == ErrorKind::FailedPrecondition => Ok(Response::new(Ack {
-            error: err.to_string(),
-        })),
+        Err(err)
+            if matches!(
+                err.kind,
+                ErrorKind::Unavailable | ErrorKind::DeadlineExceeded
+            ) =>
+        {
+            Err(status_error(err))
+        }
         Err(err) => Ok(Response::new(Ack {
             error: err.to_string(),
         })),

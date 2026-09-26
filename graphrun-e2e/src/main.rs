@@ -30,6 +30,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    SmokeCluster {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
     Verify {
         #[arg(long)]
         cli: PathBuf,
@@ -117,6 +123,7 @@ struct PerformanceEvidence {
 
 fn main() -> ExitCode {
     match Cli::parse().command {
+        Commands::SmokeCluster { cli, artifacts } => smoke_cluster(&cli, &artifacts),
         Commands::Verify {
             cli,
             matrix,
@@ -154,6 +161,40 @@ fn main() -> ExitCode {
             server_name,
         } => fixture_worker(endpoint, ca, cert, key, server_name),
         Commands::FixtureProvider { bind, data_dir } => fixture_provider(bind, data_dir),
+    }
+}
+
+fn smoke_cluster(cli: &Path, artifacts: &Path) -> ExitCode {
+    if let Err(error) = fs::create_dir_all(artifacts) {
+        eprintln!("cannot create cluster smoke artifacts: {error}");
+        return ExitCode::from(2);
+    }
+    let matrix = match parse_matrix(include_str!("../../docs/specs/v1/verification-matrix.tsv")) {
+        Ok(matrix) => matrix,
+        Err(error) => {
+            eprintln!("cannot load cluster smoke case: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(row) = matrix.into_iter().find(|row| row.id == "CLUSTER-001") else {
+        eprintln!("CLUSTER-001 case missing from verification matrix");
+        return ExitCode::from(2);
+    };
+    let result = cluster_three_and_workers(cli, artifacts, &row);
+    println!(
+        "{}",
+        serde_json::json!({
+            "kind": "smoke-not-certification",
+            "case_id": result.id,
+            "status": result.status,
+            "actual": result.actual,
+            "artifacts": result.artifacts,
+        })
+    );
+    if result.status == "PASS" {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
 
@@ -2687,6 +2728,7 @@ fn cluster_start(
     fs::write(&input_path, input).map_err(|err| err.to_string())?;
     let definition = examples().join(yaml);
     let mut last = String::new();
+    let command_id = graphrun::ids::CommandId::generate().to_hex();
     let deadline = Instant::now() + Duration::from_secs(25);
     while Instant::now() < deadline {
         for node in 0..cluster.addrs.len() {
@@ -2698,6 +2740,8 @@ fn cluster_start(
                 catalog().display().to_string(),
                 "--input".to_owned(),
                 input_path.display().to_string(),
+                "--command-id".to_owned(),
+                command_id.clone(),
             ];
             if !wait {
                 args.push("--no-wait".to_owned());
@@ -2706,8 +2750,17 @@ fn cluster_start(
             let strs: Vec<&str> = args.iter().map(String::as_str).collect();
             let (ok, stdout, stderr) = run_cli(cli, &strs);
             last = format!("{stdout}\n{stderr}");
-            if ok && let Some(id) = stdout.split('"').find(|part| part.len() == 32) {
-                return Ok(id.to_owned());
+            if ok {
+                match serde_json::from_str::<serde_json::Value>(&stdout) {
+                    Ok(response) => match response.get("run").and_then(|run| run.as_str()) {
+                        Some(run) => match graphrun::RunId::from_hex(run) {
+                            Ok(_) => return Ok(run.to_owned()),
+                            Err(error) => last = format!("invalid start run identity: {error}"),
+                        },
+                        None => last = format!("start response has no run: {stdout}"),
+                    },
+                    Err(error) => last = format!("invalid start response: {error}: {stdout}"),
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(200));

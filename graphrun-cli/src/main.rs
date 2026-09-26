@@ -186,6 +186,12 @@ enum ClusterCommands {
         #[command(flatten)]
         connect: ConnectArgs,
     },
+    AcknowledgeClock {
+        #[arg(long)]
+        reason: String,
+        #[command(flatten)]
+        connect: ConnectArgs,
+    },
     Join {
         #[arg(long)]
         node_id: u64,
@@ -689,6 +695,29 @@ async fn run() -> Result<(), String> {
             Ok(())
         }
         Commands::Cluster {
+            command: ClusterCommands::AcknowledgeClock { reason, connect },
+        } => {
+            if reason.trim().is_empty() {
+                return Err("clock acknowledgement requires --reason".to_owned());
+            }
+            if let Some(mut client) = grpc_client(&connect).await? {
+                client
+                    .acknowledge_clock(&reason)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            } else {
+                let local_dir = require_local(connect.local_dir)?;
+                dispatch(
+                    &local_dir,
+                    ControlRequest::AcknowledgeClock { reason },
+                    false,
+                )
+                .await?;
+            }
+            println!("{}", serde_json::json!({"status":"ok"}));
+            Ok(())
+        }
+        Commands::Cluster {
             command:
                 ClusterCommands::Join {
                     node_id,
@@ -964,7 +993,7 @@ async fn dispatch(
                     .await
                     .map_err(|err| err.to_string())?
             }
-            ControlRequest::List => engine.list().await,
+            ControlRequest::List => engine.list().await.map_err(|err| err.to_string())?,
             ControlRequest::Health => engine.health().await,
             _ => unreachable!(),
         };
@@ -1121,6 +1150,17 @@ async fn dispatch(
                 .map_err(|err| err.to_string())?;
             engine
                 .acknowledge_recovery(&reason)
+                .await
+                .map_err(|err| err.to_string())?;
+            engine.shutdown().await.map_err(|err| err.to_string())?;
+            Ok(serde_json::json!({"status":"ok"}))
+        }
+        ControlRequest::AcknowledgeClock { reason } => {
+            let engine = Engine::local(local_dir)
+                .await
+                .map_err(|err| err.to_string())?;
+            engine
+                .acknowledge_clock(&reason)
                 .await
                 .map_err(|err| err.to_string())?;
             engine.shutdown().await.map_err(|err| err.to_string())?;

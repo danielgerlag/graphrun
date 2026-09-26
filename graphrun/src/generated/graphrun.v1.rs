@@ -3,6 +3,20 @@
 pub struct Blob {
     #[prost(bytes = "vec", tag = "1")]
     pub json: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub sender_id: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClockHealthRequest {
+    #[prost(uint64, tag = "1")]
+    pub sender_id: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClockHealthResponse {
+    #[prost(uint64, tag = "1")]
+    pub member_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub wall_ms: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Ack {
@@ -140,6 +154,11 @@ pub struct ReplayResponse {
     pub view_json: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, tag = "2")]
     pub error: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClockAcknowledgeRequest {
+    #[prost(string, tag = "1")]
+    pub reason: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RegisterRequest {
@@ -402,6 +421,30 @@ pub mod raft_client {
                 .insert(GrpcMethod::new("graphrun.v1.Raft", "InstallSnapshot"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn clock_health(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ClockHealthRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ClockHealthResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/graphrun.v1.Raft/ClockHealth",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("graphrun.v1.Raft", "ClockHealth"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -429,6 +472,13 @@ pub mod raft_server {
             &self,
             request: tonic::Request<super::Blob>,
         ) -> std::result::Result<tonic::Response<super::Blob>, tonic::Status>;
+        async fn clock_health(
+            &self,
+            request: tonic::Request<super::ClockHealthRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ClockHealthResponse>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct RaftServer<T> {
@@ -620,6 +670,49 @@ pub mod raft_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = InstallSnapshotSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/graphrun.v1.Raft/ClockHealth" => {
+                    #[allow(non_camel_case_types)]
+                    struct ClockHealthSvc<T: Raft>(pub Arc<T>);
+                    impl<T: Raft> tonic::server::UnaryService<super::ClockHealthRequest>
+                    for ClockHealthSvc<T> {
+                        type Response = super::ClockHealthResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ClockHealthRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Raft>::clock_health(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ClockHealthSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -982,6 +1075,27 @@ pub mod client_client {
             req.extensions_mut().insert(GrpcMethod::new("graphrun.v1.Client", "Replay"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn acknowledge_clock(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ClockAcknowledgeRequest>,
+        ) -> std::result::Result<tonic::Response<super::Ack>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/graphrun.v1.Client/AcknowledgeClock",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("graphrun.v1.Client", "AcknowledgeClock"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1046,6 +1160,10 @@ pub mod client_server {
             &self,
             request: tonic::Request<super::ReplayRequest>,
         ) -> std::result::Result<tonic::Response<super::ReplayResponse>, tonic::Status>;
+        async fn acknowledge_clock(
+            &self,
+            request: tonic::Request<super::ClockAcknowledgeRequest>,
+        ) -> std::result::Result<tonic::Response<super::Ack>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct ClientServer<T> {
@@ -1544,6 +1662,51 @@ pub mod client_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ReplaySvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/graphrun.v1.Client/AcknowledgeClock" => {
+                    #[allow(non_camel_case_types)]
+                    struct AcknowledgeClockSvc<T: Client>(pub Arc<T>);
+                    impl<
+                        T: Client,
+                    > tonic::server::UnaryService<super::ClockAcknowledgeRequest>
+                    for AcknowledgeClockSvc<T> {
+                        type Response = super::Ack;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ClockAcknowledgeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Client>::acknowledge_clock(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AcknowledgeClockSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

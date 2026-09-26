@@ -29,7 +29,7 @@ nodes:
 
 - `Engine::member` — storage replica. Activity execution is opt-in.
 - `Engine::run_worker` — claims ready activities over gRPC/mTLS. Does not open a data directory.
-- Certificates: `graphrun::generate_ca` and `graphrun::issue_node`.
+- Certificates: `graphrun::generate_ca` and `graphrun::tls::issue_principal`.
 - Membership changes go through the leader (`cluster join` / `promote` / `remove`).
 
 Join a new id as a learner first. Wait until it has caught up. Then promote it. Remove one voter at a time so two healthy voters remain.
@@ -61,11 +61,45 @@ graphrun start \
 
 Workers register over gRPC. They do not change the voter set. `--key` on `signal` is the wait correlation key; certificate keys are `--tls-key` / `--peer-tls-key`.
 
-For immutable catalog/definition publication and keyed starts, use the
-owner-only `--local-dir` control interface shown in the README, or present a
-CA-signed URI SAN principal on `--endpoint`: `admin` for publishing and
-`client` for starting. Use the cluster ID from the member's `identity.json`
-when issuing the principal certificate. `issue_node` certificates are
-roleless and do not authorize these operations; `--cert` is the client's
-principal certificate. The legacy inline `--definition` start above remains
-available.
+Each certificate must have a CA-signed URI SAN
+`spiffe://graphrun/<cluster-id>/<role>/<principal-id>`. Assign `member` to
+voters and learners, `worker` to workers, `client` to starts and queries, and
+`admin` to publication and clock acknowledgement. Members must also have the
+same numeric principal ID and endpoint as their committed roster entry. Use
+the cluster ID from `identity.json`. `issue_node` grants all four roles for
+fixtures; use `issue_principal` with only the needed roles in production.
+
+The owner-only `--local-dir` control interface does not use mTLS. A remote
+client presenting `--cert` uses that certificate's signed roles for every RPC,
+including inline `--definition` starts. `GrpcClient` follows a leader redirect
+without changing its command ID. Reads require a live leader and voting quorum;
+a disconnected follower returns `Unavailable` instead of a stale view.
+
+If wall/boot divergence, a watchdog gap, or a future committed watermark
+stops dispatch, correct the clock and wait for ten seconds of healthy samples.
+Then acknowledge the fault with an admin certificate or the owner-only socket:
+
+```sh
+graphrun cluster acknowledge-clock \
+  --local-dir /path/to/member \
+  --reason "host clock repaired"
+```
+
+Acknowledgement never lowers the committed engine-time watermark. A cluster
+also needs fresh bounded clock-health samples from a voting quorum before
+scheduling work.
+
+# Check live mTLS processes
+
+Build the CLI and verification driver, then run a focused process smoke test
+that starts three separate members and two separate workers:
+
+```sh
+cargo build -p graphrun-cli -p graphrun-e2e
+cargo run -p graphrun-e2e -- smoke-cluster \
+  --cli target/debug/graphrun \
+  --artifacts /tmp/graphrun-cluster-smoke
+```
+
+This checks the real gRPC path but does not certify the full verification
+matrix. Use `graphrun-e2e verify` for that gate.

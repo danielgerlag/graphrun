@@ -1,7 +1,9 @@
-use crate::generated::{Blob, raft_client::RaftClient};
+use crate::generated::{Blob, ClockHealthRequest, raft_client::RaftClient};
+#[cfg(test)]
 use crate::rpc::client_tls;
 use crate::storage::TypeConfig;
 use crate::tls::TlsMaterial;
+use hyper_util::rt::TokioIo;
 use openraft::BasicNode;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -10,11 +12,16 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tonic::transport::Channel;
+use std::task::{Context, Poll};
+use tonic::codegen::Service;
+use tonic::codegen::http::Uri;
+use tonic::transport::{Channel, Endpoint};
 
 #[derive(Clone)]
 pub struct MemberConfig {
@@ -30,32 +37,157 @@ pub struct MemberConfig {
 #[derive(Clone)]
 pub struct ClusterNetwork {
     peers: Arc<Mutex<BTreeMap<u64, (SocketAddr, TlsMaterial)>>>,
+    local_id: u64,
+    local_tls: TlsMaterial,
 }
 
 impl ClusterNetwork {
-    pub fn new(peers: BTreeMap<u64, (SocketAddr, TlsMaterial)>) -> Self {
+    pub fn new(
+        local_id: u64,
+        local_tls: TlsMaterial,
+        peers: BTreeMap<u64, (SocketAddr, TlsMaterial)>,
+    ) -> Self {
         Self {
             peers: Arc::new(Mutex::new(peers)),
+            local_id,
+            local_tls,
         }
     }
 
     pub fn insert_peer(&self, id: u64, addr: SocketAddr, tls: TlsMaterial) {
         self.peers.lock().unwrap().insert(id, (addr, tls));
     }
+
+    pub fn local_id(&self) -> u64 {
+        self.local_id
+    }
+
+    pub fn peer(&self, id: u64) -> Option<(SocketAddr, String)> {
+        self.peers
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|(addr, tls)| (*addr, tls.server_name.clone()))
+    }
+
+    pub async fn probe_clock(&self, target: u64, committed_endpoint: &str) -> io::Result<()> {
+        let peer = self.peers.lock().unwrap().get(&target).cloned();
+        let Some((addr, _)) = &peer else {
+            return Err(io::Error::other("clock member is not configured"));
+        };
+        if addr.to_string() != committed_endpoint {
+            return Err(io::Error::other(
+                "clock member endpoint differs from committed roster",
+            ));
+        }
+        let peer = PeerClient {
+            target,
+            peer,
+            expected_endpoint: committed_endpoint.to_owned(),
+            local_id: self.local_id,
+            local_tls: self.local_tls.clone(),
+        };
+        let started = crate::time::boot_millis().map_err(io::Error::other)?;
+        let (before_wall, result) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                let mut client = peer.client().await?;
+                let before_wall = crate::time::wall_millis().map_err(io::Error::other)?;
+                let response = client
+                    .clock_health(ClockHealthRequest {
+                        sender_id: self.local_id,
+                    })
+                    .await
+                    .map_err(io::Error::other)?
+                    .into_inner();
+                Ok::<_, io::Error>((before_wall, response))
+            })
+            .await
+            .map_err(io::Error::other)??;
+        let finished = crate::time::boot_millis().map_err(io::Error::other)?;
+        let after_wall = crate::time::wall_millis().map_err(io::Error::other)?;
+        if result.member_id != target
+            || finished.saturating_sub(started) > 500
+            || result.wall_ms < before_wall.saturating_sub(2_000)
+            || result.wall_ms > after_wall.saturating_add(2_000)
+        {
+            return Err(io::Error::other(
+                "clock member returned stale or skewed sample",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl RaftNetworkFactory<TypeConfig> for ClusterNetwork {
     type Network = PeerClient;
 
-    async fn new_client(&mut self, target: u64, _node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
         let peer = self.peers.lock().unwrap().get(&target).cloned();
-        PeerClient { target, peer }
+        PeerClient {
+            target,
+            peer,
+            expected_endpoint: node.addr.clone(),
+            local_id: self.local_id,
+            local_tls: self.local_tls.clone(),
+        }
     }
 }
 
 pub struct PeerClient {
     target: u64,
     peer: Option<(SocketAddr, TlsMaterial)>,
+    expected_endpoint: String,
+    local_id: u64,
+    local_tls: TlsMaterial,
+}
+
+struct VerifiedMemberConnector {
+    addr: SocketAddr,
+    tls: tokio_rustls::TlsConnector,
+    server_name: rustls::pki_types::ServerName<'static>,
+    ca_pem: Arc<String>,
+    member_id: u64,
+}
+
+impl Service<Uri> for VerifiedMemberConnector {
+    type Response = TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: Uri) -> Self::Future {
+        let addr = self.addr;
+        let connector = self.tls.clone();
+        let server_name = self.server_name.clone();
+        let ca_pem = self.ca_pem.clone();
+        let member_id = self.member_id;
+        Box::pin(async move {
+            let socket = tokio::net::TcpStream::connect(addr).await?;
+            let stream = connector
+                .connect(server_name, socket)
+                .await
+                .map_err(io::Error::other)?;
+            let chain = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .ok_or_else(|| io::Error::other("member server certificate missing"))?;
+            let cluster = crate::tls::cluster_id_from_ca(&ca_pem).map_err(io::Error::other)?;
+            let identity = crate::tls::verify_peer_identity(&ca_pem, &cluster, chain)
+                .map_err(io::Error::other)?;
+            identity
+                .require_member_identity(
+                    &cluster,
+                    &crate::tls::PrincipalId::parse(member_id.to_string())
+                        .map_err(io::Error::other)?,
+                )
+                .map_err(io::Error::other)?;
+            Ok(TokioIo::new(stream))
+        })
+    }
 }
 
 impl PeerClient {
@@ -63,12 +195,46 @@ impl PeerClient {
         let Some((addr, tls)) = &self.peer else {
             return Err(io::Error::other(format!("unknown peer {}", self.target)));
         };
-        let endpoint = format!("https://{addr}");
-        let channel = Channel::from_shared(endpoint)
+        if addr.to_string() != self.expected_endpoint {
+            return Err(io::Error::other(
+                "peer endpoint differs from committed roster",
+            ));
+        }
+        if tls.ca_pem != self.local_tls.ca_pem {
+            return Err(io::Error::other("peer belongs to another CA"));
+        }
+        let expected_cluster =
+            crate::tls::cluster_id_from_ca(&self.local_tls.ca_pem).map_err(io::Error::other)?;
+        let identity = crate::tls::verify_peer_identity(
+            &self.local_tls.ca_pem,
+            &expected_cluster,
+            &crate::tls::load_certs(&tls.cert_pem).map_err(io::Error::other)?,
+        )
+        .map_err(io::Error::other)?;
+        identity
+            .require_member_identity(
+                &expected_cluster,
+                &crate::tls::PrincipalId::parse(self.target.to_string())
+                    .map_err(io::Error::other)?,
+            )
+            .map_err(io::Error::other)?;
+        let mut rustls =
+            (*crate::tls::client_config(&self.local_tls).map_err(io::Error::other)?).clone();
+        rustls.alpn_protocols = vec![b"h2".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(rustls));
+        let server_name = rustls::pki_types::ServerName::try_from(tls.server_name.clone())
+            .map_err(io::Error::other)?;
+        let channel = Endpoint::from_shared(format!("http://{addr}"))
             .map_err(io::Error::other)?
-            .tls_config(client_tls(tls).map_err(io::Error::other)?)
-            .map_err(io::Error::other)?
-            .connect()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(5))
+            .connect_with_connector(VerifiedMemberConnector {
+                addr: *addr,
+                tls: connector,
+                server_name,
+                ca_pem: Arc::new(self.local_tls.ca_pem.clone()),
+                member_id: self.target,
+            })
             .await
             .map_err(io::Error::other)?;
         Ok(RaftClient::new(channel))
@@ -78,6 +244,7 @@ impl PeerClient {
         let mut client = self.client().await?;
         let blob = Blob {
             json: serde_json::to_vec(&rpc).map_err(io::Error::other)?,
+            sender_id: self.local_id,
         };
         let resp = match kind {
             "append" => client.append_entries(blob).await,
@@ -137,9 +304,17 @@ mod tests {
     use super::*;
     use crate::catalog::Catalog;
     use crate::engine::Engine;
-    use crate::tls::{generate_ca, issue_node};
+    use crate::generated::{
+        Blob, ClockHealthRequest, ListRequest, PublishCatalogRequest, StartRequest,
+        client_client::ClientClient, raft_client::RaftClient,
+    };
+    use crate::tls::{
+        ClusterId, PeerRole, PrincipalId, PrincipalIdentity, generate_ca, issue_node,
+        issue_principal,
+    };
     use crate::value::Value;
     use std::time::Duration;
+    use tonic::Code;
 
     fn unused_addr() -> SocketAddr {
         std::net::TcpListener::bind("127.0.0.1:0")
@@ -159,48 +334,75 @@ mod tests {
         [crate::tls::TlsMaterial; 3],
         crate::tls::CertificateAuthority,
     ) {
-        let ca = generate_ca().unwrap();
-        let addrs = [unused_addr(), unused_addr(), unused_addr()];
-        let materials = [
-            issue_node(&ca, 1).unwrap(),
-            issue_node(&ca, 2).unwrap(),
-            issue_node(&ca, 3).unwrap(),
-        ];
-        let dirs = [
-            tempfile::tempdir().unwrap(),
-            tempfile::tempdir().unwrap(),
-            tempfile::tempdir().unwrap(),
-        ];
-        let mut members = Vec::new();
-        for node in 1u64..=3 {
-            let mut peers = BTreeMap::new();
-            for other in 1u64..=3 {
-                if other == node {
+        for _ in 0..3 {
+            let ca = generate_ca().unwrap();
+            let addrs = [unused_addr(), unused_addr(), unused_addr()];
+            let materials = [
+                issue_node(&ca, 1).unwrap(),
+                issue_node(&ca, 2).unwrap(),
+                issue_node(&ca, 3).unwrap(),
+            ];
+            let dirs = [
+                tempfile::tempdir().unwrap(),
+                tempfile::tempdir().unwrap(),
+                tempfile::tempdir().unwrap(),
+            ];
+            let mut members = Vec::new();
+            for node in 1u64..=3 {
+                let mut peers = BTreeMap::new();
+                for other in 1u64..=3 {
+                    if other == node {
+                        continue;
+                    }
+                    peers.insert(
+                        other,
+                        (
+                            addrs[(other - 1) as usize],
+                            materials[(other - 1) as usize].clone(),
+                        ),
+                    );
+                }
+                members.push(Engine::member(MemberConfig {
+                    data_dir: dirs[(node - 1) as usize].path().to_path_buf(),
+                    node_id: node,
+                    bind: addrs[(node - 1) as usize],
+                    peers,
+                    tls: materials[(node - 1) as usize].clone(),
+                    host_activities,
+                    initialize: node == 1,
+                }));
+            }
+            let engine2 = match members.remove(1).await {
+                Ok(engine) => engine,
+                Err(error) if error.message.starts_with("member listener") => {
+                    eprintln!("retrying fixture after {error}");
                     continue;
                 }
-                peers.insert(
-                    other,
-                    (
-                        addrs[(other - 1) as usize],
-                        materials[(other - 1) as usize].clone(),
-                    ),
-                );
-            }
-            members.push(Engine::member(MemberConfig {
-                data_dir: dirs[(node - 1) as usize].path().to_path_buf(),
-                node_id: node,
-                bind: addrs[(node - 1) as usize],
-                peers,
-                tls: materials[(node - 1) as usize].clone(),
-                host_activities,
-                initialize: node == 1,
-            }));
+                Err(error) => panic!("member 2 startup: {error}"),
+            };
+            let engine3 = match members.remove(1).await {
+                Ok(engine) => engine,
+                Err(error) if error.message.starts_with("member listener") => {
+                    eprintln!("retrying fixture after {error}");
+                    engine2.shutdown().await.unwrap();
+                    continue;
+                }
+                Err(error) => panic!("member 3 startup: {error}"),
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let engine1 = match members.remove(0).await {
+                Ok(engine) => engine,
+                Err(error) if error.message.starts_with("member listener") => {
+                    eprintln!("retrying fixture after {error}");
+                    engine2.shutdown().await.unwrap();
+                    engine3.shutdown().await.unwrap();
+                    continue;
+                }
+                Err(error) => panic!("member 1 startup: {error}"),
+            };
+            return (engine1, engine2, engine3, dirs, addrs, materials, ca);
         }
-        let engine2 = members.remove(1).await.unwrap();
-        let engine3 = members.remove(1).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let engine1 = members.remove(0).await.unwrap();
-        (engine1, engine2, engine3, dirs, addrs, materials, ca)
+        panic!("three-member fixture listener unavailable after three attempts")
     }
 
     async fn wait_leader<'a>(a: &'a Engine, b: &'a Engine) -> &'a Engine {
@@ -219,6 +421,352 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signed_roles_and_cluster_are_checked_before_request_decoding() {
+        let ca = generate_ca().unwrap();
+        let addr = unused_addr();
+        let server_tls = issue_node(&ca, 1).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let server = Engine::member(MemberConfig {
+            data_dir: dir.path().to_path_buf(),
+            node_id: 1,
+            bind: addr,
+            peers: BTreeMap::new(),
+            tls: server_tls.clone(),
+            host_activities: false,
+            initialize: true,
+        })
+        .await
+        .unwrap();
+        let cluster = crate::tls::cluster_id_from_ca(&ca.pem).unwrap();
+        let worker = PrincipalIdentity::new(
+            cluster,
+            PrincipalId::parse("1").unwrap(),
+            [PeerRole::Worker],
+        )
+        .unwrap();
+        let mut worker_tls = issue_principal(&ca, &worker, "worker.graphrun.local").unwrap();
+        worker_tls.server_name = server_tls.server_name.clone();
+        let rejected = Engine::member(MemberConfig {
+            data_dir: dir.path().join("forged-member"),
+            node_id: 1,
+            bind: unused_addr(),
+            peers: BTreeMap::new(),
+            tls: worker_tls.clone(),
+            host_activities: false,
+            initialize: false,
+        })
+        .await
+        .err()
+        .expect("worker-only certificate cannot start a member");
+        assert_eq!(rejected.kind, crate::error::ErrorKind::PermissionDenied);
+        let channel = tonic::transport::Channel::from_shared(format!("https://{addr}"))
+            .unwrap()
+            .tls_config(client_tls(&worker_tls).unwrap())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ClientClient::new(channel.clone());
+        let mut request = tonic::Request::new(ListRequest {});
+        request
+            .metadata_mut()
+            .insert("x-graphrun-role", "admin".parse().unwrap());
+        assert_eq!(
+            client.list(request).await.unwrap_err().code(),
+            Code::PermissionDenied
+        );
+        assert_eq!(
+            client
+                .start(StartRequest {
+                    command_id: String::new(),
+                    yaml: String::new(),
+                    catalog_json: Vec::new(),
+                    input_json: Vec::new(),
+                    workflow: String::new(),
+                    version: 0,
+                    start_key: String::new(),
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied,
+        );
+        assert_eq!(
+            client
+                .publish_catalog(PublishCatalogRequest {
+                    command_id: String::new(),
+                    version: 0,
+                    catalog_json: vec![0xff],
+                })
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+        assert_eq!(
+            RaftClient::new(channel.clone())
+                .clock_health(ClockHealthRequest { sender_id: 1 })
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+        let mut raft_client = RaftClient::new(channel);
+        let invalid_raft = Blob {
+            json: vec![0xff],
+            sender_id: 1,
+        };
+        for reply in [
+            raft_client.append_entries(invalid_raft.clone()).await,
+            raft_client.vote(invalid_raft.clone()).await,
+            raft_client.install_snapshot(invalid_raft).await,
+        ] {
+            assert_eq!(reply.unwrap_err().code(), Code::PermissionDenied);
+        }
+        let foreign = PrincipalIdentity::new(
+            ClusterId::parse("foreign-cluster").unwrap(),
+            PrincipalId::parse("client-1").unwrap(),
+            [PeerRole::Client],
+        )
+        .unwrap();
+        let mut foreign_tls = issue_principal(&ca, &foreign, "foreign.graphrun.local").unwrap();
+        foreign_tls.server_name = server_tls.server_name;
+        let channel = tonic::transport::Channel::from_shared(format!("https://{addr}"))
+            .unwrap()
+            .tls_config(client_tls(&foreign_tls).unwrap())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        assert_eq!(
+            ClientClient::new(channel)
+                .list(ListRequest {})
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_member_bind_does_not_open_or_initialize_storage() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ca = generate_ca().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let error = Engine::member(MemberConfig {
+            data_dir: dir.path().to_path_buf(),
+            node_id: 1,
+            bind: listener.local_addr().unwrap(),
+            peers: BTreeMap::new(),
+            tls: issue_node(&ca, 1).unwrap(),
+            host_activities: false,
+            initialize: true,
+        })
+        .await
+        .err()
+        .expect("the occupied listener cannot be served");
+        assert_eq!(error.kind, crate::error::ErrorKind::FailedPrecondition);
+        assert!(!dir.path().join("identity.json").exists());
+        assert!(!dir.path().join("member.redb").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outbound_member_checks_the_presented_certificate_not_only_dns() {
+        let ca = generate_ca().unwrap();
+        let local = issue_node(&ca, 1).unwrap();
+        let expected = issue_node(&ca, 2).unwrap();
+        for (principal, role) in [("2", PeerRole::Worker), ("3", PeerRole::Member)] {
+            let identity = PrincipalIdentity::new(
+                crate::tls::cluster_id_from_ca(&ca.pem).unwrap(),
+                PrincipalId::parse(principal).unwrap(),
+                [role],
+            )
+            .unwrap();
+            let server_tls = issue_principal(&ca, &identity, &expected.server_name).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let config = crate::tls::server_config(&server_tls).unwrap();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                tokio_rustls::TlsAcceptor::from(config).accept(socket).await
+            });
+            let peer = PeerClient {
+                target: 2,
+                peer: Some((addr, expected.clone())),
+                expected_endpoint: addr.to_string(),
+                local_id: 1,
+                local_tls: local.clone(),
+            };
+            assert!(
+                peer.client().await.is_err(),
+                "member {principal}/{role:?} must not impersonate member 2"
+            );
+            assert!(
+                server.await.unwrap().is_ok(),
+                "TLS handshake should have succeeded"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn raft_clock_rpc_rejects_forged_and_removed_members() {
+        let (leader, member2, member3, _dirs, addrs, materials, ca) = three_voters(false).await;
+        let peer_client = |mut tls: TlsMaterial| {
+            tls.server_name = materials[0].server_name.clone();
+            async move {
+                let channel =
+                    tonic::transport::Channel::from_shared(format!("https://{}", addrs[0]))
+                        .unwrap()
+                        .tls_config(client_tls(&tls).unwrap())
+                        .unwrap()
+                        .connect()
+                        .await
+                        .unwrap();
+                RaftClient::new(channel)
+            }
+        };
+        let mut member = peer_client(materials[1].clone()).await;
+        assert_eq!(
+            member
+                .clock_health(ClockHealthRequest { sender_id: 2 })
+                .await
+                .unwrap()
+                .into_inner()
+                .member_id,
+            1
+        );
+        assert_eq!(
+            member
+                .clock_health(ClockHealthRequest { sender_id: 3 })
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+        let foreign_member = PrincipalIdentity::new(
+            crate::tls::cluster_id_from_ca(&ca.pem).unwrap(),
+            PrincipalId::parse("4").unwrap(),
+            [PeerRole::Member],
+        )
+        .unwrap();
+        let mut missing =
+            peer_client(issue_principal(&ca, &foreign_member, "node-4.graphrun.local").unwrap())
+                .await;
+        assert_eq!(
+            missing
+                .clock_health(ClockHealthRequest { sender_id: 4 })
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+        let catalog = Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        leader
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                &catalog,
+                Value::Object(
+                    [
+                        ("order_id".to_owned(), Value::String("o1".to_owned())),
+                        ("amount".to_owned(), Value::Int(1000)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            )
+            .await
+            .unwrap();
+        leader.remove_voter(3).await.unwrap();
+        let mut old_owner = peer_client(materials[2].clone()).await;
+        assert_eq!(
+            old_owner
+                .clock_health(ClockHealthRequest { sender_id: 3 })
+                .await
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
+        leader.shutdown().await.unwrap();
+        member2.shutdown().await.unwrap();
+        member3.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grpc_client_redirects_follower_reads_and_writes() {
+        let (leader, member2, member3, _dirs, addrs, materials, _ca) = three_voters(false).await;
+        let catalog = Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let run = leader
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                &catalog,
+                Value::Object(
+                    [
+                        ("order_id".to_owned(), Value::String("o1".to_owned())),
+                        ("amount".to_owned(), Value::Int(1000)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            )
+            .await
+            .unwrap();
+        let mut client =
+            crate::client::GrpcClient::connect(&format!("https://{}", addrs[1]), &materials[1])
+                .await
+                .unwrap();
+        assert_eq!(client.inspect(run).await.unwrap()["run"], run.to_hex());
+        let list = client.list().await.unwrap();
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["run"] == run.to_hex())
+        );
+        assert!(
+            !client
+                .history(run)
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let mut follower =
+            crate::client::GrpcClient::connect(&format!("https://{}", addrs[2]), &materials[2])
+                .await
+                .unwrap();
+        let other = follower
+            .start_with_command(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                &catalog,
+                &Value::Object(
+                    [
+                        ("order_id".to_owned(), Value::String("o2".to_owned())),
+                        ("amount".to_owned(), Value::Int(2000)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                crate::ids::CommandId::generate(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            follower.inspect(other).await.unwrap()["run"],
+            other.to_hex()
+        );
+        leader.shutdown().await.unwrap();
+        member2.shutdown().await.unwrap();
+        member3.shutdown().await.unwrap();
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_voters_run_sequence() {
         let ca = generate_ca().unwrap();
@@ -666,9 +1214,12 @@ mod tests {
         }
         let before = engine1.inspect(run).await.unwrap();
         let ready_before = crate::domain::ready_activations(&before, run);
+        let index = engine1.last_applied_index().await;
         let replicated = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if engine2.inspect(run).await.is_ok() && engine3.inspect(run).await.is_ok() {
+            if engine2.last_applied_index().await >= index
+                && engine3.last_applied_index().await >= index
+            {
                 break;
             }
             if tokio::time::Instant::now() >= replicated {
@@ -730,21 +1281,24 @@ mod tests {
         .await
         .unwrap();
         let catch_up = tokio::time::Instant::now() + Duration::from_secs(10);
-        let restored_out = loop {
-            let restored = returned.inspect(run).await.unwrap();
-            if let Some(out) = crate::domain::run_output(&restored, run) {
-                break out;
+        assert_eq!(
+            returned.inspect(run).await.unwrap_err().kind,
+            crate::error::ErrorKind::Unavailable
+        );
+        let leader_index = leader.last_applied_index().await;
+        loop {
+            if returned.last_applied_index().await >= leader_index {
+                break;
             }
             if tokio::time::Instant::now() >= catch_up {
-                panic!(
-                    "old owner did not catch up; status={:?}",
-                    restored.runs.get(&run).map(|item| &item.status)
-                );
+                panic!("old owner did not catch up");
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        assert_eq!(restored_out, output);
+        }
         returned.shutdown().await.unwrap();
+        let restored = crate::engine::replay(dirs[0].path()).unwrap();
+        let restored_out = crate::domain::run_output(&restored, run).unwrap();
+        assert_eq!(restored_out, output);
         engine2.shutdown().await.unwrap();
         engine3.shutdown().await.unwrap();
     }
@@ -1037,13 +1591,20 @@ mod tests {
             matches!(err, Err(_) | Ok(Err(_))),
             "writes without quorum must fail or time out"
         );
-        let state = engine1.inspect(run).await.unwrap();
+        assert_eq!(
+            engine1.inspect(run).await.unwrap_err().kind,
+            crate::error::ErrorKind::Unavailable
+        );
+        let health = engine1.health().await;
+        assert_eq!(health["quorum_safe"], false);
+        assert_eq!(health["status"], "unavailable");
+        engine1.shutdown().await.unwrap();
+        let state = crate::engine::replay(engine1.data_dir()).unwrap();
         assert!(matches!(
             state.runs.get(&run).unwrap().status,
             crate::domain::RunStatus::Active
         ));
         assert!(run_output_missing(&state, run));
-        engine1.shutdown().await.unwrap();
     }
 
     fn run_output_missing(state: &crate::domain::State, run: crate::ids::RunId) -> bool {
@@ -1073,7 +1634,7 @@ mod tests {
             .unwrap()
             .as_millis() as u64
             + 10_000;
-        crate::write::inject_clock_watermark(future);
+        engine.inject_clock_watermark(future);
         let catalog = Catalog::from_json(include_bytes!(
             "../../docs/specs/v1/examples/activity-catalog.json"
         ))
@@ -1093,9 +1654,133 @@ mod tests {
             )
             .await
             .expect_err("clock rollback must fail closed");
-        assert!(err.to_string().contains("clock rollback"));
-        crate::write::clear_clock_watermark();
+        assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+        assert!(err.to_string().contains("clock unsafe"));
+        let health = engine.health().await;
+        assert_eq!(health["clock_safe"], false);
+        assert_eq!(health["status"], "unavailable");
+        engine.clear_clock_watermark();
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clock_fault_persists_until_admin_ack_after_healthy_window() {
+        let ca = generate_ca().unwrap();
+        let addr = unused_addr();
+        let tls = issue_node(&ca, 1).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = MemberConfig {
+            data_dir: dir.path().to_path_buf(),
+            node_id: 1,
+            bind: addr,
+            peers: BTreeMap::new(),
+            tls: tls.clone(),
+            host_activities: false,
+            initialize: true,
+        };
+        let catalog = Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let input = Value::Object(
+            [
+                ("order_id".to_owned(), Value::String("o1".to_owned())),
+                ("amount".to_owned(), Value::Int(1000)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let engine = Engine::member(config.clone()).await.unwrap();
+        engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                &catalog,
+                input.clone(),
+            )
+            .await
+            .unwrap();
+        let watermark = engine.health().await["engine_time_watermark_ms"]
+            .as_u64()
+            .unwrap();
+        engine.inject_clock_watermark(crate::time::wall_millis().unwrap() + 10_000);
+        assert_eq!(
+            engine
+                .start_yaml(
+                    include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                    &catalog,
+                    input.clone(),
+                )
+                .await
+                .unwrap_err()
+                .kind,
+            crate::error::ErrorKind::FailedPrecondition
+        );
+        engine.clear_clock_watermark();
+        engine.shutdown().await.unwrap();
+        let restored = Engine::member(MemberConfig {
+            initialize: false,
+            ..config
+        })
+        .await
+        .unwrap();
+        assert!(
+            restored.health().await["engine_time_watermark_ms"]
+                .as_u64()
+                .unwrap()
+                >= watermark,
+            "restart must retain the committed engine-time watermark"
+        );
+        assert_eq!(
+            restored
+                .start_yaml(
+                    include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                    &catalog,
+                    input.clone(),
+                )
+                .await
+                .unwrap_err()
+                .kind,
+            crate::error::ErrorKind::FailedPrecondition
+        );
+        let identity = PrincipalIdentity::new(
+            crate::tls::cluster_id_from_ca(&ca.pem).unwrap(),
+            PrincipalId::parse("operator").unwrap(),
+            [PeerRole::Admin],
+        )
+        .unwrap();
+        let mut operator_tls = issue_principal(&ca, &identity, "operator.graphrun.local").unwrap();
+        operator_tls.server_name = tls.server_name;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut operator =
+            crate::client::GrpcClient::connect(&format!("https://{addr}"), &operator_tls)
+                .await
+                .unwrap();
+        assert_eq!(
+            operator
+                .acknowledge_clock("clock checked")
+                .await
+                .unwrap_err()
+                .kind,
+            crate::error::ErrorKind::FailedPrecondition
+        );
+        tokio::time::sleep(Duration::from_millis(10_300)).await;
+        operator.acknowledge_clock("clock checked").await.unwrap();
+        restored
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                &catalog,
+                input,
+            )
+            .await
+            .unwrap();
+        assert!(
+            restored.health().await["engine_time_watermark_ms"]
+                .as_u64()
+                .unwrap()
+                >= watermark,
+            "acknowledgement cannot lower the committed engine-time watermark"
+        );
+        restored.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1178,18 +1863,15 @@ mod tests {
         engine1.shutdown().await.unwrap();
         let catch_up = tokio::time::Instant::now() + Duration::from_secs(10);
         let restored = loop {
-            let from_two = engine2
-                .inspect(run)
-                .await
-                .ok()
-                .and_then(|state| crate::domain::run_output(&state, run));
-            let from_three = engine3
-                .inspect(run)
-                .await
-                .ok()
-                .and_then(|state| crate::domain::run_output(&state, run));
-            if let Some(out) = from_two.or(from_three) {
-                break out;
+            if let Some(survivor) = [&engine2, &engine3, &engine4]
+                .into_iter()
+                .find(|engine| engine.is_leader())
+            {
+                if let Ok(state) = survivor.inspect(run).await {
+                    if let Some(output) = crate::domain::run_output(&state, run) {
+                        break output;
+                    }
+                }
             }
             if tokio::time::Instant::now() >= catch_up {
                 panic!("accepted state missing after voter replacement");

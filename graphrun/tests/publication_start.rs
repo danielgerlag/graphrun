@@ -956,12 +956,10 @@ async fn signed_principal_publishes_and_starts_over_grpc_with_scoped_receipts() 
     .unwrap();
     let mut wrong_tls = issue_principal(&ca, &wrong, "cross-cluster.graphrun.local").unwrap();
     wrong_tls.server_name = server_tls.server_name.clone();
-    let mut wrong_client = graphrun::GrpcClient::connect(&format!("https://{addr}"), &wrong_tls)
+    let wrong_client = graphrun::GrpcClient::connect(&format!("https://{addr}"), &wrong_tls)
         .await
-        .unwrap();
-    assert_eq!(
-        wrong_client.command_result(id).await.unwrap_err().kind,
-        ErrorKind::Unauthenticated
-    );
+        .err()
+        .expect("SDK must reject a cross-cluster identity before sending RPCs");
+    assert_eq!(wrong_client.kind, ErrorKind::Unauthenticated);
     engine.shutdown().await.unwrap();
 }

@@ -15,6 +15,7 @@ pub mod binding;
 pub mod builder;
 pub mod catalog;
 pub mod client;
+mod clock;
 pub mod cluster;
 pub mod compiler;
 pub mod domain;

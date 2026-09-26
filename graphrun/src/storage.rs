@@ -25,7 +25,9 @@ use std::io::{self, Cursor, Seek, SeekFrom};
 use std::ops::Bound;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use tokio::sync::oneshot;
@@ -151,6 +153,8 @@ enum Req {
     ),
     CurrentSnapshot(oneshot::Sender<std::result::Result<Option<Snapshot<TypeConfig>>, StoErr>>),
     QueryState(oneshot::Sender<State>),
+    QueryWatermark(oneshot::Sender<u64>),
+    SetClockFault(bool, oneshot::Sender<std::result::Result<(), StoErr>>),
     InstallDomain(Box<State>, oneshot::Sender<std::result::Result<(), StoErr>>),
     Shutdown,
 }
@@ -158,6 +162,8 @@ enum Req {
 #[derive(Clone)]
 pub struct StorageHandle {
     tx: mpsc::Sender<Req>,
+    clock: Arc<crate::clock::ClockAuthority>,
+    watermark: Arc<AtomicU64>,
 }
 
 impl StorageHandle {
@@ -171,6 +177,8 @@ impl StorageHandle {
 
     fn open_inner(path: impl AsRef<Path>, restoring: bool) -> Result<(Self, JoinHandle<()>)> {
         let path = path.as_ref().to_path_buf();
+        let mut clock_faulted = false;
+        let mut initial_watermark = 0;
         if path.exists() {
             let db = ReadOnlyDatabase::open(&path).map_err(|err| {
                 Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string())
@@ -189,6 +197,15 @@ impl StorageHandle {
                 )
             })?;
             validate_history_store(&state)?;
+            initial_watermark = state.engine_time_watermark_ms;
+            if let Some(bytes) = load_bytes(&db, "clock_fault") {
+                clock_faulted = serde_json::from_slice(&bytes).map_err(|_| {
+                    Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        "clock fault record is corrupt",
+                    )
+                })?;
+            }
         } else if !restoring
             && path
                 .parent()
@@ -204,12 +221,21 @@ impl StorageHandle {
         }
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let watermark = Arc::new(AtomicU64::new(initial_watermark));
+        let stored_watermark = watermark.clone();
         let handle = std::thread::Builder::new()
             .name("graphrun-storage".into())
-            .spawn(move || storage_thread(path, rx, ready_tx))
+            .spawn(move || storage_thread(path, rx, ready_tx, stored_watermark))
             .map_err(|err| Error::invalid(err.to_string()))?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok((Self { tx }, handle)),
+            Ok(Ok(())) => Ok((
+                Self {
+                    tx,
+                    clock: Arc::new(crate::clock::ClockAuthority::new(clock_faulted)),
+                    watermark,
+                },
+                handle,
+            )),
             Ok(Err(err)) => Err(Error::new(crate::error::ErrorKind::FailedPrecondition, err)),
             Err(_) => Err(Error::invalid("storage thread exited before opening")),
         }
@@ -225,6 +251,48 @@ impl StorageHandle {
         StateMachineStore {
             handle: self.clone(),
         }
+    }
+
+    pub fn clock(&self) -> &crate::clock::ClockAuthority {
+        &self.clock
+    }
+
+    pub fn engine_watermark_cached(&self) -> u64 {
+        self.watermark.load(Ordering::SeqCst)
+    }
+
+    pub async fn engine_watermark(&self) -> Result<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Req::QueryWatermark(tx)).map_err(|_| {
+            Error::new(
+                crate::error::ErrorKind::Unavailable,
+                "storage thread stopped",
+            )
+        })?;
+        rx.await.map_err(|_| {
+            Error::new(
+                crate::error::ErrorKind::Unavailable,
+                "storage thread dropped",
+            )
+        })
+    }
+
+    pub async fn persist_clock_fault(&self, faulted: bool) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Req::SetClockFault(faulted, tx)).map_err(|_| {
+            Error::new(
+                crate::error::ErrorKind::Unavailable,
+                "storage thread stopped",
+            )
+        })?;
+        rx.await
+            .map_err(|_| {
+                Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "storage thread dropped",
+                )
+            })?
+            .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))
     }
 
     pub async fn query_state(&self) -> State {
@@ -251,6 +319,29 @@ impl StorageHandle {
             Ok(Ok((Some(id), _))) => id.index,
             _ => 0,
         }
+    }
+
+    pub async fn applied_members(&self) -> Result<BTreeMap<u64, String>> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Req::AppliedState(tx)).map_err(|_| {
+            Error::new(
+                crate::error::ErrorKind::Unavailable,
+                "storage thread stopped",
+            )
+        })?;
+        let (_, membership) = rx
+            .await
+            .map_err(|_| {
+                Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "storage thread dropped",
+                )
+            })?
+            .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))?;
+        Ok(membership
+            .nodes()
+            .map(|(id, node)| (*id, node.addr.clone()))
+            .collect())
     }
 
     pub fn shutdown(&self) {
@@ -327,6 +418,7 @@ fn storage_thread(
     path: PathBuf,
     rx: mpsc::Receiver<Req>,
     ready: mpsc::Sender<std::result::Result<(), String>>,
+    watermark: Arc<AtomicU64>,
 ) {
     let db = match Database::create(&path) {
         Ok(db) => db,
@@ -395,6 +487,9 @@ fn storage_thread(
                     &mut domain,
                     entries,
                 );
+                if res.is_ok() {
+                    watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
+                }
                 let _ = tx.send(res);
             }
             Req::BuildSnapshot(tx) => {
@@ -436,6 +531,9 @@ fn storage_thread(
                     meta,
                     data,
                 );
+                if res.is_ok() {
+                    watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
+                }
                 let _ = tx.send(res);
             }
             Req::CurrentSnapshot(tx) => {
@@ -448,12 +546,23 @@ fn storage_thread(
             Req::QueryState(tx) => {
                 let _ = tx.send(domain.clone());
             }
+            Req::QueryWatermark(tx) => {
+                let _ = tx.send(domain.engine_time_watermark_ms);
+            }
+            Req::SetClockFault(faulted, tx) => {
+                let _ = tx.send(put_json(&db, "clock_fault", &faulted));
+            }
             Req::InstallDomain(next, tx) => {
+                let mut next = *next;
+                next.engine_time_watermark_ms = next
+                    .engine_time_watermark_ms
+                    .max(domain.engine_time_watermark_ms);
                 let res = validate_history_store(&next)
                     .map_err(|err| sto_err(ErrorVerb::Write, err))
                     .and_then(|()| put_json(&db, "domain", &next));
                 if res.is_ok() {
-                    domain = *next;
+                    domain = next;
+                    watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
                 }
                 let _ = tx.send(res);
             }
@@ -714,6 +823,7 @@ fn apply_entries(
         }
         let mut reply = RaftResponse::default();
         if let EntryPayload::Normal(req) = &entry.payload {
+            domain_changed = true;
             if let domain::CommandBody::Publication { key, operation } = &req.command.body {
                 if key.command_id != req.command.id
                     || key.cluster_id.is_empty()
@@ -721,9 +831,17 @@ fn apply_entries(
                 {
                     reply.error = Some("invalid authenticated command identity".to_owned());
                 } else {
+                    let mut command = req.command.clone();
+                    if !next_domain.command_results.contains_key(&key.storage_key()) {
+                        command.time = crate::time::EngineTime::from_millis(
+                            next_domain
+                                .engine_time_watermark_ms
+                                .max(command.time.as_millis()),
+                        );
+                        next_domain.engine_time_watermark_ms = command.time.as_millis();
+                    }
                     let receipt =
-                        crate::publication::apply(&mut next_domain, &req.command, key, operation);
-                    domain_changed = true;
+                        crate::publication::apply(&mut next_domain, &command, key, operation);
                     if let Err(err) = receipt.ensure_applied() {
                         reply.error = Some(err.to_string());
                     }
@@ -807,8 +925,11 @@ fn install_snapshot(
     meta: SnapMeta,
     data: Vec<u8>,
 ) -> std::result::Result<(), StoErr> {
-    let (applied, membership, restored): (Option<LogIdT>, MembershipT, State) =
+    let (applied, membership, mut restored): (Option<LogIdT>, MembershipT, State) =
         serde_json::from_slice(&data).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    restored.engine_time_watermark_ms = restored
+        .engine_time_watermark_ms
+        .max(domain.engine_time_watermark_ms);
     validate_history_store(&restored).map_err(|err| sto_err(ErrorVerb::Write, err))?;
     let mut txn = db
         .begin_write()

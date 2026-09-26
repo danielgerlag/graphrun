@@ -1,23 +1,14 @@
 use crate::domain::{Command, ObligationStatus, State, run_events};
 use crate::error::{Error, ErrorKind, Result};
 use crate::ids::RunId;
+use crate::storage::StorageHandle;
 use crate::storage::{RaftRequest, RaftResponse, TypeConfig};
 use crate::time::EngineTime;
-use openraft::Raft;
-use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-static WALL_WATERMARK_MS: AtomicU64 = AtomicU64::new(0);
-
-thread_local! {
-    static LOCAL_CLOCK_WATERMARK: Cell<Option<u64>> = const { Cell::new(None) };
-}
+use openraft::{Raft, ServerState};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) fn now() -> EngineTime {
-    let ms = wall_ms();
-    WALL_WATERMARK_MS.fetch_max(ms, Ordering::SeqCst);
-    EngineTime::from_millis(ms)
+    EngineTime::from_millis(wall_ms())
 }
 
 fn wall_ms() -> u64 {
@@ -27,26 +18,12 @@ fn wall_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub(crate) fn clock_is_safe() -> bool {
-    let ms = wall_ms();
-    let watermark = LOCAL_CLOCK_WATERMARK
-        .with(Cell::get)
-        .unwrap_or_else(|| WALL_WATERMARK_MS.load(Ordering::SeqCst));
-    ms.saturating_add(2_000) >= watermark
-}
-
-#[cfg(test)]
-pub fn inject_clock_watermark(ms: u64) {
-    LOCAL_CLOCK_WATERMARK.with(|cell| cell.set(Some(ms)));
-}
-
-#[cfg(test)]
-pub fn clear_clock_watermark() {
-    LOCAL_CLOCK_WATERMARK.with(|cell| cell.set(None));
-}
-
-pub(crate) async fn write_raft(raft: &Raft<TypeConfig>, command: Command) -> Result<()> {
-    let resp = write_raft_response(raft, command).await?;
+pub(crate) async fn write_raft(
+    raft: &Raft<TypeConfig>,
+    storage: &StorageHandle,
+    command: Command,
+) -> Result<()> {
+    let resp = write_raft_response(raft, storage, command).await?;
     if let Some(err) = resp.error {
         return Err(Error::invalid(err));
     }
@@ -55,11 +32,20 @@ pub(crate) async fn write_raft(raft: &Raft<TypeConfig>, command: Command) -> Res
 
 pub(crate) async fn write_raft_response(
     raft: &Raft<TypeConfig>,
+    storage: &StorageHandle,
     command: Command,
 ) -> Result<RaftResponse> {
-    if !clock_is_safe() {
-        return Err(Error::new(ErrorKind::FailedPrecondition, "clock rollback"));
+    let metrics = raft.metrics().borrow().clone();
+    if metrics.state != ServerState::Leader {
+        return Err(Error::new(
+            ErrorKind::Unavailable,
+            format!(
+                "not leader (leader={:?}); outcome unknown for command {}",
+                metrics.current_leader, command.id
+            ),
+        ));
     }
+    storage.clock().authorize(storage, raft).await?;
     let metrics = raft.metrics().borrow().clone();
     let last_log = metrics.last_log_index.unwrap_or(0);
     let applied = metrics.last_applied.map(|id| id.index).unwrap_or(0);
@@ -85,6 +71,24 @@ pub(crate) async fn write_raft_response(
             )
         })?;
     Ok(resp.data)
+}
+
+pub(crate) async fn linearizable_read(raft: &Raft<TypeConfig>) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), raft.ensure_linearizable())
+        .await
+        .map_err(|_| {
+            Error::new(
+                ErrorKind::DeadlineExceeded,
+                "read barrier deadline exceeded",
+            )
+        })?
+        .map_err(|err| {
+            Error::new(
+                ErrorKind::Unavailable,
+                format!("leader/quorum unavailable: {err}"),
+            )
+        })?;
+    Ok(())
 }
 
 pub(crate) fn inspect_view(state: &State, run: RunId) -> serde_json::Value {
@@ -246,12 +250,18 @@ pub(crate) fn health_view(
     last_log: Option<u64>,
     voters: Vec<u64>,
     state: &State,
+    clock_safe: bool,
+    clock_fault: Option<String>,
+    quorum_safe: bool,
 ) -> serde_json::Value {
     let applied = last_applied.unwrap_or(0);
     let log = last_log.unwrap_or(0);
     serde_json::json!({
-        "status": "ok",
-        "clock_safe": clock_is_safe(),
+        "status": if clock_safe && quorum_safe { "ok" } else { "unavailable" },
+        "clock_safe": clock_safe,
+        "clock_fault": clock_fault,
+        "quorum_safe": quorum_safe,
+        "engine_time_watermark_ms": state.engine_time_watermark_ms,
         "state": raft_state,
         "last_applied": last_applied,
         "last_log": last_log,

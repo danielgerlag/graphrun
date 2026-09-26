@@ -529,6 +529,8 @@ pub struct InboxEntry {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
+    #[serde(default)]
+    pub engine_time_watermark_ms: u64,
     pub runs: HashMap<RunId, RunState>,
     pub scopes: HashMap<ScopeId, ScopeState>,
     pub activations: HashMap<ActivationId, ActivationState>,
@@ -3878,6 +3880,10 @@ pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEv
     if let Some(events) = state.commands.get(&command.id) {
         return Ok(events.clone());
     }
+    let mut command = command;
+    command.time =
+        EngineTime::from_millis(command.time.as_millis().max(state.engine_time_watermark_ms));
+    state.engine_time_watermark_ms = command.time.as_millis();
     let decision = decide(state, &command)?;
     apply_events_with_cause(
         state,
@@ -3915,13 +3921,24 @@ pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEv
 }
 
 pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainEvent>> {
+    let mut command = command;
     if let CommandBody::PruneHistory { limit } = &command.body {
         if *limit == 0 || *limit > 1024 {
             return Err(Error::invalid("retention batch must be 1..=1024"));
         }
+        if let Some(events) = state.commands.get(&command.id) {
+            return Ok(events.clone());
+        }
+        command.time =
+            EngineTime::from_millis(command.time.as_millis().max(state.engine_time_watermark_ms));
         let mut provisional = state.clone();
+        provisional.engine_time_watermark_ms = command.time.as_millis();
         let events =
             crate::history::prune(&mut provisional, command.id, command.time, *limit as usize)?;
+        provisional.commands.insert(command.id, events.clone());
+        provisional
+            .command_times
+            .insert(command.id, command.time.as_millis());
         *state = provisional;
         return Ok(events);
     }
@@ -3929,6 +3946,12 @@ pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainE
         if key.command_id != command.id || key.cluster_id.is_empty() || key.principal_id.is_empty()
         {
             return Err(Error::invalid("invalid authenticated command identity"));
+        }
+        if !state.command_results.contains_key(&key.storage_key()) {
+            command.time = EngineTime::from_millis(
+                command.time.as_millis().max(state.engine_time_watermark_ms),
+            );
+            state.engine_time_watermark_ms = command.time.as_millis();
         }
         let receipt = crate::publication::apply(state, &command, key, operation);
         receipt.ensure_applied()?;

@@ -5,6 +5,9 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::collections::BTreeSet;
 use std::sync::{Arc, Once};
 use std::time::Duration;
+use x509_parser::extensions::{GeneralName, ParsedExtension};
+use x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME;
+use x509_parser::parse_x509_certificate;
 
 static PROVIDER: Once = Once::new();
 
@@ -213,32 +216,25 @@ pub fn generate_ca() -> Result<CertificateAuthority> {
     Ok(CertificateAuthority { cert, key, pem })
 }
 
+/// Fixture certificate granting all four roles. Issue narrowly scoped production
+/// identities with `issue_principal` instead.
 pub fn issue_node(ca: &CertificateAuthority, node_id: u64) -> Result<TlsMaterial> {
-    install_provider();
-    let server_name = format!("node-{node_id}.graphrun.local");
-    let key = rcgen::KeyPair::generate().map_err(|err| Error::invalid(err.to_string()))?;
-    let mut params = rcgen::CertificateParams::new(vec![server_name.clone()])
-        .map_err(|err| Error::invalid(err.to_string()))?;
-    params.distinguished_name = rcgen::DistinguishedName::new();
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, server_name.clone());
-    params.extended_key_usages = vec![
-        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
-        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
-    ];
-    params.not_before = rcgen::date_time_ymd(2024, 1, 1);
-    params.not_after = rcgen::date_time_ymd(2034, 1, 1);
-    params.serial_number = Some(rcgen::SerialNumber::from(node_id));
-    let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .map_err(|err| Error::invalid(err.to_string()))?;
-    Ok(TlsMaterial {
-        ca_pem: ca.pem.clone(),
-        cert_pem: cert.pem(),
-        key_pem: key.serialize_pem(),
-        server_name,
-    })
+    let identity = PrincipalIdentity::new(
+        cluster_id_from_ca(&ca.pem)?,
+        PrincipalId::parse(node_id.to_string())?,
+        [
+            PeerRole::Member,
+            PeerRole::Worker,
+            PeerRole::Client,
+            PeerRole::Admin,
+        ],
+    )?;
+    issue_principal(ca, &identity, &format!("node-{node_id}.graphrun.local"))
+}
+
+pub fn cluster_id_from_ca(ca_pem: &str) -> Result<ClusterId> {
+    use sha2::Digest;
+    ClusterId::parse(hex::encode(&sha2::Sha256::digest(ca_pem.as_bytes())[..16]))
 }
 
 /// Signs one URI SAN per role using the configured cluster CA.
@@ -321,120 +317,32 @@ fn unauthenticated(message: &'static str) -> Error {
     Error::new(ErrorKind::Unauthenticated, message)
 }
 
-struct DerReader<'a>(&'a [u8]);
-
-impl<'a> DerReader<'a> {
-    fn read(&mut self) -> Result<(u8, &'a [u8])> {
-        let (tag, rest) = self
-            .0
-            .split_first()
-            .ok_or_else(|| unauthenticated("malformed certificate SAN"))?;
-        let (&length_byte, mut rest) = rest
-            .split_first()
-            .ok_or_else(|| unauthenticated("malformed certificate SAN"))?;
-        let length = if length_byte & 0x80 == 0 {
-            usize::from(length_byte)
-        } else {
-            let count = usize::from(length_byte & 0x7f);
-            if count == 0 || count > std::mem::size_of::<usize>() || count > rest.len() {
-                return Err(unauthenticated("malformed certificate SAN"));
-            }
-            let mut length = 0usize;
-            for &byte in &rest[..count] {
-                length = (length << 8) | usize::from(byte);
-            }
-            if rest[0] == 0 || length < 128 {
-                return Err(unauthenticated("malformed certificate SAN"));
-            }
-            rest = &rest[count..];
-            length
-        };
-        if length > rest.len() {
-            return Err(unauthenticated("malformed certificate SAN"));
-        }
-        let (value, tail) = rest.split_at(length);
-        self.0 = tail;
-        Ok((*tag, value))
-    }
-
-    fn tagged(&mut self, expected: u8) -> Result<&'a [u8]> {
-        let (tag, value) = self.read()?;
-        if tag != expected {
-            return Err(unauthenticated("malformed certificate SAN"));
-        }
-        Ok(value)
-    }
-
-    fn sequence(&mut self) -> Result<Self> {
-        Ok(Self(self.tagged(0x30)?))
-    }
-
-    fn finish(&self) -> Result<()> {
-        if self.0.is_empty() {
-            Ok(())
-        } else {
-            Err(unauthenticated("malformed certificate SAN"))
-        }
-    }
-}
-
 fn parse_signed_sans(der: &[u8]) -> Result<PrincipalIdentity> {
-    let mut outer = DerReader(der);
-    let mut certificate = outer.sequence()?;
-    outer.finish()?;
-    let mut tbs = certificate.sequence()?;
-    if tbs.0.first() == Some(&0xa0) {
-        let mut version = DerReader(tbs.tagged(0xa0)?);
-        version.tagged(0x02)?;
-        version.finish()?;
+    let (remaining, certificate) =
+        parse_x509_certificate(der).map_err(|_| unauthenticated("malformed certificate"))?;
+    if !remaining.is_empty() {
+        return Err(unauthenticated("trailing certificate data"));
     }
-    for tag in [0x02, 0x30, 0x30, 0x30, 0x30, 0x30] {
-        tbs.tagged(tag)?;
-    }
-    let mut san = None;
-    let mut saw_extensions = false;
-    while !tbs.0.is_empty() {
-        match tbs.0[0] {
-            0x81 | 0x82 => {
-                tbs.read()?;
+    let mut names = None;
+    for extension in certificate.extensions() {
+        if extension.oid == OID_X509_EXT_SUBJECT_ALT_NAME {
+            if names.is_some() {
+                return Err(unauthenticated("duplicate certificate SAN"));
             }
-            0xa3 => {
-                if saw_extensions {
-                    return Err(unauthenticated("duplicate certificate extensions"));
-                }
-                saw_extensions = true;
-                let mut explicit = DerReader(tbs.tagged(0xa3)?);
-                let mut extensions = explicit.sequence()?;
-                explicit.finish()?;
-                while !extensions.0.is_empty() {
-                    let mut extension = extensions.sequence()?;
-                    let oid = extension.tagged(0x06)?;
-                    if extension.0.first() == Some(&0x01) {
-                        extension.tagged(0x01)?;
-                    }
-                    let value = extension.tagged(0x04)?;
-                    extension.finish()?;
-                    if oid == [0x55, 0x1d, 0x11] && san.replace(value).is_some() {
-                        return Err(unauthenticated("duplicate certificate SAN"));
-                    }
-                }
-            }
-            _ => return Err(unauthenticated("malformed certificate SAN")),
+            let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() else {
+                return Err(unauthenticated("malformed certificate SAN"));
+            };
+            names = Some(&san.general_names);
         }
     }
-    let mut san_value = DerReader(san.ok_or_else(|| unauthenticated("missing URI SAN"))?);
-    let mut names = san_value.sequence()?;
-    san_value.finish()?;
+    let names = names.ok_or_else(|| unauthenticated("missing URI SAN"))?;
     let mut cluster_id = None;
     let mut principal_id = None;
     let mut roles = BTreeSet::new();
-    while !names.0.is_empty() {
-        let (tag, value) = names.read()?;
-        if tag != 0x86 {
+    for name in names {
+        let GeneralName::URI(uri) = name else {
             continue;
-        }
-        let uri = std::str::from_utf8(value)
-            .map_err(|_| unauthenticated("malformed certificate URI SAN"))?;
+        };
         let parts: Vec<_> = uri
             .strip_prefix("spiffe://graphrun/")
             .ok_or_else(|| unauthenticated("malformed certificate URI SAN"))?
@@ -673,12 +581,17 @@ mod tests {
             ErrorKind::Unauthenticated
         );
         let fixture = issue_node(&ca, 1).unwrap();
-        assert_eq!(
-            verified(&ca, "cluster", &fixture.cert_pem)
-                .unwrap_err()
-                .kind,
-            ErrorKind::Unauthenticated
-        );
+        let cluster_id = cluster_id_from_ca(&ca.pem).unwrap();
+        let fixture_peer = verified(&ca, cluster_id.as_str(), &fixture.cert_pem).unwrap();
+        assert_eq!(fixture_peer.principal_id().as_str(), "1");
+        for role in [
+            PeerRole::Member,
+            PeerRole::Worker,
+            PeerRole::Client,
+            PeerRole::Admin,
+        ] {
+            fixture_peer.require_role(role).unwrap();
+        }
         let material = issue_principal(
             &ca,
             &PrincipalIdentity::new(

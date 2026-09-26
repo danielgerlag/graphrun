@@ -3,12 +3,23 @@ package graphrun.v1;
 
 message Blob {
   bytes json = 1;
+  uint64 sender_id = 2;
 }
 
 service Raft {
   rpc AppendEntries(Blob) returns (Blob);
   rpc Vote(Blob) returns (Blob);
   rpc InstallSnapshot(Blob) returns (Blob);
+  rpc ClockHealth(ClockHealthRequest) returns (ClockHealthResponse);
+}
+
+message ClockHealthRequest {
+  uint64 sender_id = 1;
+}
+
+message ClockHealthResponse {
+  uint64 member_id = 1;
+  uint64 wall_ms = 2;
 }
 
 message Ack {
@@ -107,6 +118,10 @@ message ReplayResponse {
   string error = 2;
 }
 
+message ClockAcknowledgeRequest {
+  string reason = 1;
+}
+
 service Client {
   rpc PublishCatalog(PublishCatalogRequest) returns (CommandResultResponse);
   rpc PublishDefinition(PublishDefinitionRequest) returns (CommandResultResponse);
@@ -118,6 +133,7 @@ service Client {
   rpc List(ListRequest) returns (ListResponse);
   rpc History(HistoryRequest) returns (HistoryResponse);
   rpc Replay(ReplayRequest) returns (ReplayResponse);
+  rpc AcknowledgeClock(ClockAcknowledgeRequest) returns (Ack);
 }
 
 message RegisterRequest {

@@ -10,7 +10,9 @@ use crate::limits;
 use crate::rpc::serve_grpc;
 use crate::storage::{LocalNetwork, StorageHandle, TypeConfig, load_domain_readonly};
 use crate::value::Value;
-use crate::write::{health_view, inspect_view, now, write_raft, write_raft_response};
+use crate::write::{
+    health_view, inspect_view, linearizable_read, now, write_raft, write_raft_response,
+};
 use openraft::{BasicNode, ChangeMembers, Config, Raft, ServerState, SnapshotPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -112,6 +114,7 @@ pub struct Engine {
     control: tokio::task::JoinHandle<()>,
     raft_server: Option<tokio::task::JoinHandle<()>>,
     snapshot_task: Option<tokio::task::JoinHandle<()>>,
+    clock_watchdog: tokio::task::JoinHandle<()>,
     cluster_net: Option<ClusterNetwork>,
     handlers: Handlers,
     publication_auth: crate::publication::AuthContext,
@@ -182,6 +185,9 @@ pub enum ControlRequest {
     Snapshot,
     Health,
     Acknowledge {
+        reason: String,
+    },
+    AcknowledgeClock {
         reason: String,
     },
     ResolveBlocked {
@@ -372,6 +378,7 @@ impl LocalBuilder {
             raft.clone(),
             storage.clone(),
         )));
+        let clock_watchdog = tokio::spawn(clock_watchdog_loop(storage.clone()));
         Ok(Engine {
             raft,
             storage,
@@ -383,6 +390,7 @@ impl LocalBuilder {
             control,
             raft_server: None,
             snapshot_task,
+            clock_watchdog,
             cluster_net: None,
             handlers,
             publication_auth,
@@ -393,6 +401,24 @@ impl LocalBuilder {
 impl Engine {
     pub async fn member(config: MemberConfig) -> Result<Self> {
         crate::tls::install_provider();
+        let expected_cluster = crate::tls::cluster_id_from_ca(&config.tls.ca_pem)?;
+        crate::tls::verify_peer_identity(
+            &config.tls.ca_pem,
+            &expected_cluster,
+            &crate::tls::load_certs(&config.tls.cert_pem)?,
+        )?
+        .require_member_identity(
+            &expected_cluster,
+            &crate::tls::PrincipalId::parse(config.node_id.to_string())?,
+        )?;
+        let listener = tokio::net::TcpListener::bind(config.bind)
+            .await
+            .map_err(|err| {
+                Error::new(
+                    ErrorKind::FailedPrecondition,
+                    format!("member listener {} unavailable: {err}", config.bind),
+                )
+            })?;
         let data_dir = config.data_dir.clone();
         std::fs::create_dir_all(&data_dir).map_err(|err| Error::invalid(err.to_string()))?;
         use sha2::Digest;
@@ -419,7 +445,8 @@ impl Engine {
         }
         .validate()
         .map_err(|err| Error::invalid(err.to_string()))?;
-        let network = ClusterNetwork::new(config.peers.clone());
+        let network = ClusterNetwork::new(config.node_id, config.tls.clone(), config.peers.clone());
+        storage.clock().configure_network(network.clone());
         let raft = Raft::<TypeConfig>::new(
             config.node_id,
             Arc::new(raft_config),
@@ -437,12 +464,28 @@ impl Engine {
         )));
         let raft_server = {
             let raft = raft.clone();
-            let bind = config.bind;
             let tls = config.tls.clone();
             let storage = storage.clone();
             let notify = notify.clone();
+            let node_id = config.node_id;
+            let mut genesis_members = BTreeMap::from([(node_id, config.bind)]);
+            genesis_members.extend(config.peers.iter().map(|(id, (addr, _))| (*id, *addr)));
+            let network = network.clone();
             tokio::spawn(async move {
-                let _ = serve_grpc(bind, tls, raft, storage, notify).await;
+                if let Err(error) = serve_grpc(
+                    listener,
+                    tls,
+                    raft,
+                    storage,
+                    notify,
+                    node_id,
+                    genesis_members,
+                    network,
+                )
+                .await
+                {
+                    tracing::error!(%error, "member gRPC listener stopped");
+                }
             })
         };
         if config.initialize {
@@ -496,6 +539,7 @@ impl Engine {
             raft.clone(),
             storage.clone(),
         )));
+        let clock_watchdog = tokio::spawn(clock_watchdog_loop(storage.clone()));
         Ok(Self {
             raft,
             storage,
@@ -507,6 +551,7 @@ impl Engine {
             control,
             raft_server: Some(raft_server),
             snapshot_task,
+            clock_watchdog,
             cluster_net: Some(network),
             handlers,
             publication_auth,
@@ -637,10 +682,7 @@ impl Engine {
         &self,
         command_id: CommandId,
     ) -> Result<crate::publication::CommandResult> {
-        self.raft
-            .ensure_linearizable()
-            .await
-            .map_err(|err| Error::new(ErrorKind::Unavailable, err.to_string()))?;
+        linearizable_read(&self.raft).await?;
         self.storage
             .query_state()
             .await
@@ -659,7 +701,14 @@ impl Engine {
         command_id: CommandId,
         operation: crate::publication::PublicationOperation,
     ) -> Result<crate::publication::CommandResult> {
-        publication_via_raft(&self.raft, &self.publication_auth, command_id, operation).await
+        publication_via_raft(
+            &self.raft,
+            &self.storage,
+            &self.publication_auth,
+            command_id,
+            operation,
+        )
+        .await
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -745,6 +794,7 @@ impl Engine {
     }
 
     pub async fn inspect(&self, run: RunId) -> Result<State> {
+        linearizable_read(&self.raft).await?;
         let state = self.storage.query_state().await;
         let run_state = state
             .runs
@@ -774,16 +824,25 @@ impl Engine {
     pub async fn health(&self) -> serde_json::Value {
         let metrics = self.raft.metrics().borrow().clone();
         let state = self.storage.query_state().await;
+        let clock_safe = self.storage.clock().sample(&self.storage).await.is_ok();
+        let quorum_safe =
+            tokio::time::timeout(Duration::from_secs(2), self.raft.ensure_linearizable())
+                .await
+                .is_ok_and(|result| result.is_ok());
         health_view(
             format!("{:?}", metrics.state),
             metrics.last_applied.map(|id| id.index),
             metrics.last_log_index,
             metrics.membership_config.voter_ids().collect(),
             &state,
+            clock_safe,
+            self.storage.clock().fault_reason().await,
+            quorum_safe,
         )
     }
 
-    pub async fn list(&self) -> serde_json::Value {
+    pub async fn list(&self) -> Result<serde_json::Value> {
+        linearizable_read(&self.raft).await?;
         let state = self.storage.query_state().await;
         let runs: Vec<_> = state
             .runs
@@ -807,7 +866,7 @@ impl Engine {
                 .values()
                 .map(crate::history::summary_view),
         );
-        serde_json::json!({ "runs": runs })
+        Ok(serde_json::json!({ "runs": runs }))
     }
 
     pub async fn history(&self, run: RunId) -> Result<Vec<crate::domain::DomainEvent>> {
@@ -990,6 +1049,13 @@ impl Engine {
             )
             .await
             .map_err(|err| Error::invalid(err.to_string()))?;
+        self.raft
+            .change_membership(
+                ChangeMembers::RemoveNodes(std::iter::once(id).collect()),
+                false,
+            )
+            .await
+            .map_err(|err| Error::invalid(err.to_string()))?;
         Ok(())
     }
 
@@ -1038,6 +1104,13 @@ impl Engine {
         self.write(command).await?;
         wake(&self.notify);
         Ok(())
+    }
+
+    pub async fn acknowledge_clock(&self, reason: &str) -> Result<()> {
+        self.storage
+            .clock()
+            .acknowledge(&self.storage, reason)
+            .await
     }
 
     pub fn backup(data_dir: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<()> {
@@ -1120,6 +1193,16 @@ impl Engine {
         self.storage.last_applied_index().await
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_clock_watermark(&self, watermark: u64) {
+        self.storage.clock().inject_watermark(watermark);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_clock_watermark(&self) {
+        self.storage.clock().clear_injected_watermark();
+    }
+
     pub fn raft_applied_index(&self) -> u64 {
         self.raft
             .metrics()
@@ -1138,10 +1221,12 @@ impl Engine {
         loop {
             let state = self.storage.query_state().await;
             if let Some(output) = run_output(&state, run) {
+                linearizable_read(&self.raft).await?;
                 return Ok(output);
             }
             if let Some(run_state) = state.runs.get(&run) {
                 if let RunStatus::Failed { error } = &run_state.status {
+                    linearizable_read(&self.raft).await?;
                     return Err(Error::invalid(format!(
                         "run failed: {} {}",
                         error.code, error.message
@@ -1189,6 +1274,7 @@ impl Engine {
         if let Some(task) = &self.snapshot_task {
             task.abort();
         }
+        self.clock_watchdog.abort();
         let _ = self.raft.shutdown().await;
         self.storage.shutdown();
         if let Some(thread) = self.storage_thread.lock().unwrap().take() {
@@ -1199,7 +1285,7 @@ impl Engine {
     }
 
     async fn write(&self, command: Command) -> Result<()> {
-        write_raft(&self.raft, command).await
+        write_raft(&self.raft, &self.storage, command).await
     }
 }
 
@@ -1211,6 +1297,7 @@ impl Drop for Engine {
         if let Some(scheduler) = &self.scheduler {
             scheduler.abort();
         }
+        self.clock_watchdog.abort();
         self.control.abort();
         if let Some(server) = &self.raft_server {
             server.abort();
@@ -1448,6 +1535,7 @@ async fn dispatch_control(
         } => match CommandId::from_hex(&command_id) {
             Ok(id) => publication_via_raft(
                 raft,
+                storage,
                 auth,
                 id,
                 crate::publication::PublicationOperation::Catalog { version, catalog },
@@ -1476,6 +1564,7 @@ async fn dispatch_control(
                 match definition {
                     Ok(definition) => publication_via_raft(
                         raft,
+                        storage,
                         auth,
                         id,
                         crate::publication::PublicationOperation::Definition {
@@ -1502,6 +1591,7 @@ async fn dispatch_control(
         } => match CommandId::from_hex(&command_id) {
             Ok(id) => match publication_via_raft(
                 raft,
+                storage,
                 auth,
                 id,
                 crate::publication::PublicationOperation::Start {
@@ -1528,7 +1618,7 @@ async fn dispatch_control(
             Err(err) => Err(Error::invalid(err)),
         },
         ControlRequest::CommandResult { command_id } => match CommandId::from_hex(&command_id) {
-            Ok(id) => match raft.ensure_linearizable().await {
+            Ok(id) => match linearizable_read(raft).await {
                 Ok(_) => storage
                     .query_state()
                     .await
@@ -1539,22 +1629,31 @@ async fn dispatch_control(
                         receipt.ensure_format()?;
                         serde_json::to_value(receipt).map_err(|err| Error::invalid(err.to_string()))
                     }),
-                Err(err) => Err(Error::new(ErrorKind::Unavailable, err.to_string())),
+                Err(err) => Err(err),
             },
             Err(err) => Err(Error::invalid(err)),
         },
         ControlRequest::Health => {
             let metrics = raft.metrics().borrow().clone();
             let state = storage.query_state().await;
+            let clock_safe = storage.clock().sample(storage).await.is_ok();
+            let quorum_safe =
+                tokio::time::timeout(Duration::from_secs(2), raft.ensure_linearizable())
+                    .await
+                    .is_ok_and(|result| result.is_ok());
             Ok(health_view(
                 format!("{:?}", metrics.state),
                 metrics.last_applied.map(|id| id.index),
                 metrics.last_log_index,
                 metrics.membership_config.voter_ids().collect(),
                 &state,
+                clock_safe,
+                storage.clock().fault_reason().await,
+                quorum_safe,
             ))
         }
         ControlRequest::List => {
+            let checked = linearizable_read(raft).await;
             let state = storage.query_state().await;
             let runs: Vec<_> = state
                 .runs
@@ -1571,14 +1670,14 @@ async fn dispatch_control(
                     })
                 })
                 .collect();
-            Ok(serde_json::json!({"runs": runs}))
+            checked.map(|_| serde_json::json!({"runs": runs}))
         }
         ControlRequest::Start {
             yaml,
             catalog,
             input,
             wait_ms,
-        } => match start_via_raft(raft, notify, &yaml, catalog, input).await {
+        } => match start_via_raft(raft, storage, notify, &yaml, catalog, input).await {
             Ok(run) => {
                 if let Some(ms) = wait_ms {
                     match wait_via_raft(raft, storage, notify, run, Duration::from_millis(ms)).await
@@ -1607,6 +1706,7 @@ async fn dispatch_control(
             match parsed {
                 Ok((run, event_id)) => write_raft(
                     raft,
+                    storage,
                     Command {
                         id: CommandId::generate(),
                         time: now(),
@@ -1630,6 +1730,7 @@ async fn dispatch_control(
         ControlRequest::Cancel { run, reason } => match RunId::from_hex(&run) {
             Ok(run) => write_raft(
                 raft,
+                storage,
                 Command {
                     id: CommandId::generate(),
                     time: now(),
@@ -1644,26 +1745,26 @@ async fn dispatch_control(
             Err(err) => Err(Error::invalid(err)),
         },
         ControlRequest::Inspect { run } => match RunId::from_hex(&run) {
-            Ok(run) => {
-                let state = storage.query_state().await;
-                if let Some(summary) = state.terminal_summaries.get(&run) {
-                    return ControlResponse {
-                        ok: true,
-                        error: None,
-                        body: crate::history::summary_view(summary),
-                    };
+            Ok(run) => match linearizable_read(raft).await {
+                Ok(()) => {
+                    let state = storage.query_state().await;
+                    if let Some(summary) = state.terminal_summaries.get(&run) {
+                        Ok(crate::history::summary_view(summary))
+                    } else {
+                        state
+                            .runs
+                            .get(&run)
+                            .ok_or_else(|| Error::new(ErrorKind::NotFound, "unknown run"))
+                            .and_then(|run_state| {
+                                if let Some(pinned) = &run_state.published {
+                                    pinned.verify(&run_state.definition, &run_state.catalog)?;
+                                }
+                                Ok(inspect_view(&state, run))
+                            })
+                    }
                 }
-                state
-                    .runs
-                    .get(&run)
-                    .ok_or_else(|| Error::new(ErrorKind::NotFound, "unknown run"))
-                    .and_then(|run_state| {
-                        if let Some(pinned) = &run_state.published {
-                            pinned.verify(&run_state.definition, &run_state.catalog)?;
-                        }
-                        Ok(inspect_view(&state, run))
-                    })
-            }
+                Err(err) => Err(err),
+            },
             Err(err) => Err(Error::invalid(err)),
         },
         ControlRequest::History {
@@ -1700,6 +1801,7 @@ async fn dispatch_control(
             .map_err(|err| Error::invalid(err.to_string())),
         ControlRequest::Acknowledge { reason } => write_raft(
             raft,
+            storage,
             Command {
                 id: CommandId::generate(),
                 time: now(),
@@ -1711,6 +1813,11 @@ async fn dispatch_control(
             wake(notify);
             serde_json::json!({"status":"ok"})
         }),
+        ControlRequest::AcknowledgeClock { reason } => storage
+            .clock()
+            .acknowledge(storage, &reason)
+            .await
+            .map(|_| serde_json::json!({"status":"ok"})),
         ControlRequest::ResolveBlocked {
             run,
             forward,
@@ -1721,6 +1828,7 @@ async fn dispatch_control(
         ) {
             (Ok(run), Ok(forward)) => write_raft(
                 raft,
+                storage,
                 Command {
                     id: CommandId::generate(),
                     time: now(),
@@ -1741,6 +1849,7 @@ async fn dispatch_control(
         ControlRequest::Abandon { run, reason } => match RunId::from_hex(&run) {
             Ok(run) => write_raft(
                 raft,
+                storage,
                 Command {
                     id: CommandId::generate(),
                     time: now(),
@@ -1789,14 +1898,25 @@ async fn dispatch_control(
             .await
             .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
             .map_err(|err| Error::invalid(err.to_string())),
-        ControlRequest::Remove { node_id } => raft
-            .change_membership(
-                ChangeMembers::RemoveVoters(std::iter::once(node_id).collect()),
-                false,
-            )
-            .await
-            .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
-            .map_err(|err| Error::invalid(err.to_string())),
+        ControlRequest::Remove { node_id } => {
+            match raft
+                .change_membership(
+                    ChangeMembers::RemoveVoters(std::iter::once(node_id).collect()),
+                    false,
+                )
+                .await
+            {
+                Ok(_) => raft
+                    .change_membership(
+                        ChangeMembers::RemoveNodes(std::iter::once(node_id).collect()),
+                        false,
+                    )
+                    .await
+                    .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
+                    .map_err(|err| Error::invalid(err.to_string())),
+                Err(err) => Err(Error::invalid(err.to_string())),
+            }
+        }
     };
     match result {
         Ok(body) => ControlResponse {
@@ -1820,6 +1940,7 @@ fn parse_run_event(run: &str, event_id: &str) -> Result<(RunId, EventId)> {
 
 async fn start_via_raft(
     raft: &Raft<TypeConfig>,
+    storage: &StorageHandle,
     notify: &Notify,
     yaml: &str,
     catalog: Catalog,
@@ -1829,6 +1950,7 @@ async fn start_via_raft(
     let run = RunId::generate();
     write_raft(
         raft,
+        storage,
         Command {
             id: CommandId::generate(),
             time: now(),
@@ -1847,12 +1969,13 @@ async fn start_via_raft(
 
 async fn publication_via_raft(
     raft: &Raft<TypeConfig>,
+    storage: &StorageHandle,
     auth: &crate::publication::AuthContext,
     command_id: CommandId,
     operation: crate::publication::PublicationOperation,
 ) -> Result<crate::publication::CommandResult> {
     let command = crate::publication::command(auth, command_id, now(), operation)?;
-    let reply = write_raft_response(raft, command).await?;
+    let reply = write_raft_response(raft, storage, command).await?;
     let receipt = reply.command_result.ok_or_else(|| {
         Error::new(
             ErrorKind::Unavailable,
@@ -1874,10 +1997,12 @@ async fn wait_via_raft(
     loop {
         let state = storage.query_state().await;
         if let Some(output) = run_output(&state, run) {
+            linearizable_read(raft).await?;
             return Ok(output);
         }
         if let Some(run_state) = state.runs.get(&run) {
             if let RunStatus::Failed { error } = &run_state.status {
+                linearizable_read(raft).await?;
                 return Err(Error::invalid(format!(
                     "run failed: {} {}",
                     error.code, error.message
@@ -1892,6 +2017,7 @@ async fn wait_via_raft(
         }
         let _ = write_raft(
             raft,
+            storage,
             Command {
                 id: CommandId::generate(),
                 time: now(),
@@ -1932,6 +2058,13 @@ async fn snapshot_controller(raft: Raft<TypeConfig>, _storage: StorageHandle) {
     }
 }
 
+async fn clock_watchdog_loop(storage: StorageHandle) {
+    loop {
+        let _ = storage.clock().sample(&storage).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc<Notify>) {
     let mut last_cleanup = tokio::time::Instant::now() - Duration::from_secs(5);
     loop {
@@ -1942,6 +2075,7 @@ async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: 
         if last_cleanup.elapsed() >= Duration::from_secs(5) {
             if write_raft(
                 &raft,
+                &storage,
                 Command {
                     id: CommandId::generate(),
                     time: now(),
@@ -1958,6 +2092,7 @@ async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: 
         for run in active_runs(&state) {
             let _ = write_raft(
                 &raft,
+                &storage,
                 Command {
                     id: CommandId::generate(),
                     time: now(),
@@ -1967,6 +2102,28 @@ async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: 
             .await;
         }
     }
+}
+
+async fn check_dispatch(
+    raft: &Raft<TypeConfig>,
+    storage: &StorageHandle,
+    session_expiry_ms: u64,
+    lease_expiry_ms: u64,
+    attempt_deadline_ms: u64,
+) -> Result<()> {
+    linearizable_read(raft).await?;
+    storage.clock().authorize(storage, raft).await?;
+    let wall = crate::time::wall_millis()?;
+    if wall >= attempt_deadline_ms
+        || wall.saturating_add(5_000) >= session_expiry_ms
+        || wall.saturating_add(5_000) >= lease_expiry_ms
+    {
+        return Err(Error::new(
+            ErrorKind::FailedPrecondition,
+            "assignment is at or beyond its execution or lease stop margin",
+        ));
+    }
+    Ok(())
 }
 
 async fn worker_loop(
@@ -1979,6 +2136,7 @@ async fn worker_loop(
     let blocking_slots = Arc::new(Semaphore::new(limits::BLOCKING_POOL_DEFAULT as usize));
     let _ = write_raft(
         &raft,
+        &storage,
         Command {
             id: CommandId::generate(),
             time: now(),
@@ -2003,9 +2161,10 @@ async fn worker_loop(
                 capacity: crate::limits::CLAIM_BATCH,
             },
         };
-        if write_raft(&raft, claim.clone()).await.is_err() {
+        if write_raft(&raft, &storage, claim.clone()).await.is_err() {
             let _ = write_raft(
                 &raft,
+                &storage,
                 Command {
                     id: CommandId::generate(),
                     time: now(),
@@ -2023,6 +2182,22 @@ async fn worker_loop(
         let state = storage.query_state().await;
         let events = state.commands.get(&claim.id).cloned().unwrap_or_default();
         for assignment in crate::domain::assignments_from(&events) {
+            let Some(session) = state.sessions.get(&assignment.session) else {
+                tracing::error!(session = %assignment.session, "committed assignment has no worker session");
+                break;
+            };
+            if let Err(error) = check_dispatch(
+                &raft,
+                &storage,
+                session.expires_ms,
+                assignment.lease_expiry_ms,
+                assignment.attempt_deadline_ms,
+            )
+            .await
+            {
+                tracing::warn!(%error, "worker dispatch stopped");
+                break;
+            }
             let blocking = state
                 .runs
                 .get(&assignment.run)
@@ -2044,6 +2219,7 @@ async fn worker_loop(
                 );
                 let _ = write_raft(
                     &raft,
+                    &storage,
                     Command {
                         id: CommandId::generate(),
                         time: now(),
@@ -2070,6 +2246,18 @@ async fn worker_loop(
                     let Ok(permit) = blocking_slots.clone().acquire_owned().await else {
                         continue;
                     };
+                    if let Err(error) = check_dispatch(
+                        &raft,
+                        &storage,
+                        session.expires_ms,
+                        assignment.lease_expiry_ms,
+                        assignment.attempt_deadline_ms,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, "blocking activity dispatch stopped");
+                        continue;
+                    }
                     tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         handlers.run_blocking(&name, version, input, Some(effect_key.as_str()))
@@ -2091,6 +2279,7 @@ async fn worker_loop(
                     Ok(output) => {
                         let _ = write_raft(
                             &raft,
+                            &storage,
                             Command {
                                 id: CommandId::generate(),
                                 time: now(),
@@ -2114,6 +2303,7 @@ async fn worker_loop(
                         };
                         let _ = write_raft(
                             &raft,
+                            &storage,
                             Command {
                                 id: CommandId::generate(),
                                 time: now(),
