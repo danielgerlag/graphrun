@@ -11,6 +11,7 @@ service Raft {
   rpc Vote(Blob) returns (Blob);
   rpc InstallSnapshot(Blob) returns (Blob);
   rpc ClockHealth(ClockHealthRequest) returns (ClockHealthResponse);
+  rpc RequestElection(ElectionRequest) returns (ElectionResponse);
 }
 
 message ClockHealthRequest {
@@ -20,6 +21,19 @@ message ClockHealthRequest {
 message ClockHealthResponse {
   uint64 member_id = 1;
   uint64 wall_ms = 2;
+}
+
+message ElectionRequest {
+  uint64 sender_id = 1;
+  uint64 expected_term = 2;
+  uint64 membership_index = 3;
+  uint64 min_applied_index = 4;
+  uint64 min_last_log_index = 5;
+}
+
+message ElectionResponse {
+  uint64 member_id = 1;
+  uint64 requested_from_term = 2;
 }
 
 message Ack {
@@ -187,6 +201,14 @@ message WatchReadyResponse {
   bool resync = 4;
 }
 
+message WatchMemberFaultRequest {
+  string session_id = 1;
+}
+
+message WatchMemberFaultResponse {
+  bool faulted = 1;
+}
+
 message ClaimRequest {
   string command_id = 1;
   string session_id = 2;
@@ -264,6 +286,7 @@ service Worker {
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc RenewSession(RenewSessionRequest) returns (RenewSessionResponse);
   rpc WatchReady(WatchReadyRequest) returns (WatchReadyResponse);
+  rpc WatchMemberFault(WatchMemberFaultRequest) returns (WatchMemberFaultResponse);
   rpc Claim(ClaimRequest) returns (ClaimResponse);
   rpc Renew(RenewRequest) returns (RenewResponse);
   rpc Report(ReportRequest) returns (Ack);

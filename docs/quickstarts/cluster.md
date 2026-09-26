@@ -77,6 +77,14 @@ a disconnected follower returns `Unavailable` instead of a stale view.
 
 If wall/boot divergence, a watchdog gap, or a future committed watermark
 stops dispatch, correct the clock and wait for ten seconds of healthy samples.
+The faulted member also requests cancellation of its active local and
+connected remote handlers. It stops heartbeats and, when a healthy candidate
+has a fresh voting quorum and a caught-up log, asks that voter to start an
+OpenRaft election. This is an election request, not a guaranteed transfer.
+With no healthy voter quorum or no caught-up voter, the member stays fenced;
+already committed records still apply. A returning old member remains fenced
+until acknowledgement. A handler or external operation may still be running,
+so reconcile uncertain effects before starting conflicting compensation.
 Then acknowledge the fault with an admin certificate or the owner-only socket:
 
 ```sh

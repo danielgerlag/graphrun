@@ -1,9 +1,10 @@
 use crate::catalog::{Catalog, ExecutionKind};
-use crate::cluster::{ClusterNetwork, MemberConfig};
+use crate::clock::ClockFaultState;
+use crate::cluster::{ClusterNetwork, ElectionEvidence, MemberConfig};
 use crate::compiler::compile_yaml;
 use crate::domain::{Command, CommandBody, RunStatus, State, active_runs, run_output};
 use crate::error::{Error, ErrorKind, Result};
-use crate::handlers::Handlers;
+use crate::handlers::{Handlers, LocalHandlerContext};
 use crate::ids::{CommandId, EventId, RunId};
 use crate::ir::Definition;
 use crate::limits;
@@ -269,6 +270,18 @@ impl LocalBuilder {
         Ok(self)
     }
 
+    /// Register an async activity that can observe local clock-fault cancellation.
+    pub fn activity_with_context<I, O, F, Fut>(self, name: &str, handler: F) -> Result<Self>
+    where
+        I: crate::schema::DurablePayload,
+        O: crate::schema::DurablePayload,
+        F: Fn(I, LocalHandlerContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<O>> + Send + 'static,
+    {
+        self.handlers.activity_with_context(name, handler)?;
+        Ok(self)
+    }
+
     /// Register a blocking activity handler at version 1.
     pub fn blocking<I, O, F>(self, name: &str, handler: F) -> Result<Self>
     where
@@ -277,6 +290,17 @@ impl LocalBuilder {
         F: Fn(I) -> Result<O> + Send + Sync + 'static,
     {
         self.handlers.blocking(name, handler)?;
+        Ok(self)
+    }
+
+    /// Register a blocking activity whose thread may observe cancellation.
+    pub fn blocking_with_context<I, O, F>(self, name: &str, handler: F) -> Result<Self>
+    where
+        I: crate::schema::DurablePayload,
+        O: crate::schema::DurablePayload,
+        F: Fn(I, LocalHandlerContext) -> Result<O> + Send + Sync + 'static,
+    {
+        self.handlers.blocking_with_context(name, handler)?;
         Ok(self)
     }
 
@@ -336,6 +360,14 @@ impl LocalBuilder {
             Raft::<TypeConfig>::new(1, Arc::new(config), LocalNetwork, log_store, state_machine)
                 .await
                 .map_err(|err| Error::invalid(err.to_string()))?;
+        let persisted_fault = matches!(
+            *storage.clock().subscribe_fault().borrow(),
+            ClockFaultState::Latched { .. }
+        );
+        if persisted_fault {
+            raft.runtime_config().heartbeat(false);
+            raft.runtime_config().elect(false);
+        }
         let members = BTreeMap::from([(1, BasicNode::new(""))]);
         match raft.initialize(members).await {
             Ok(()) => {}
@@ -346,10 +378,12 @@ impl LocalBuilder {
                 }
             }
         }
-        raft.wait(Some(Duration::from_secs(5)))
-            .state(ServerState::Leader, "local member is leader")
-            .await
-            .map_err(|err| Error::invalid(err.to_string()))?;
+        if !persisted_fault {
+            raft.wait(Some(Duration::from_secs(5)))
+                .state(ServerState::Leader, "local member is leader")
+                .await
+                .map_err(|err| Error::invalid(err.to_string()))?;
+        }
         let notify = Arc::new(Notify::new());
         let scheduler = Some(tokio::spawn(scheduler_loop(
             raft.clone(),
@@ -379,7 +413,7 @@ impl LocalBuilder {
             raft.clone(),
             storage.clone(),
         )));
-        let clock_watchdog = tokio::spawn(clock_watchdog_loop(storage.clone()));
+        let clock_watchdog = tokio::spawn(clock_watchdog_loop(raft.clone(), storage.clone(), None));
         Ok(Engine {
             raft,
             storage,
@@ -458,6 +492,14 @@ impl Engine {
         )
         .await
         .map_err(|err| Error::invalid(err.to_string()))?;
+        let persisted_fault = matches!(
+            *storage.clock().subscribe_fault().borrow(),
+            ClockFaultState::Latched { .. }
+        );
+        if persisted_fault {
+            raft.runtime_config().heartbeat(false);
+            raft.runtime_config().elect(false);
+        }
         let notify = Arc::new(Notify::new());
         let scheduler = Some(tokio::spawn(scheduler_loop(
             raft.clone(),
@@ -505,10 +547,12 @@ impl Engine {
                     }
                 }
             }
-            raft.wait(Some(Duration::from_secs(10)))
-                .state(ServerState::Leader, "member is leader")
-                .await
-                .map_err(|err| Error::invalid(err.to_string()))?;
+            if !persisted_fault {
+                raft.wait(Some(Duration::from_secs(10)))
+                    .state(ServerState::Leader, "member is leader")
+                    .await
+                    .map_err(|err| Error::invalid(err.to_string()))?;
+            }
         }
         let handlers = if config.host_activities {
             Handlers::fixtures()
@@ -542,7 +586,11 @@ impl Engine {
             raft.clone(),
             storage.clone(),
         )));
-        let clock_watchdog = tokio::spawn(clock_watchdog_loop(storage.clone()));
+        let clock_watchdog = tokio::spawn(clock_watchdog_loop(
+            raft.clone(),
+            storage.clone(),
+            Some(network.clone()),
+        ));
         Ok(Self {
             raft,
             storage,
@@ -1137,6 +1185,36 @@ impl Engine {
             .last_applied
             .map(|id| id.index)
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raft_epoch(&self) -> (u64, u64) {
+        let metrics = self.raft.metrics().borrow().clone();
+        (
+            metrics.current_term,
+            metrics
+                .membership_config
+                .log_id()
+                .map(|id| id.index)
+                .unwrap_or(0),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn membership_applied(&self) -> bool {
+        self.storage
+            .applied_membership()
+            .await
+            .is_ok_and(|membership| membership == *self.raft.metrics().borrow().membership_config)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn has_fresh_clock_quorum(&self) -> bool {
+        self.storage
+            .clock()
+            .fresh_voter_quorum(&self.storage, &self.raft)
+            .await
+            .is_ok()
     }
 
     /// Block until `run` succeeds or fails, or `timeout` elapses.
@@ -1997,10 +2075,147 @@ async fn snapshot_controller(raft: Raft<TypeConfig>, _storage: StorageHandle) {
     }
 }
 
-async fn clock_watchdog_loop(storage: StorageHandle) {
+async fn clock_watchdog_loop(
+    raft: Raft<TypeConfig>,
+    storage: StorageHandle,
+    network: Option<ClusterNetwork>,
+) {
+    let mut fault = storage.clock().subscribe_fault();
+    let mut latched = false;
+    let mut transfers = tokio::task::JoinSet::new();
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let _ = storage.clock().sample(&storage).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let current = matches!(&*fault.borrow(), ClockFaultState::Latched { .. });
+        if current != latched {
+            latched = current;
+            raft.runtime_config().heartbeat(!latched);
+            raft.runtime_config().elect(!latched);
+            if latched {
+                if let Some(network) = network.clone() {
+                    transfers.spawn(transfer_faulted_leader(
+                        raft.clone(),
+                        storage.clone(),
+                        network,
+                    ));
+                }
+            } else {
+                transfers.abort_all();
+            }
+        }
+        tokio::select! {
+            _ = transfers.join_next(), if !transfers.is_empty() => {}
+            _ = ticker.tick() => {
+                if let Err(error) = storage.clock().sample(&storage).await {
+                    if !matches!(&*fault.borrow(), ClockFaultState::Latched { .. }) {
+                        tracing::error!(%error, "clock sampling failed without a latched fault");
+                    }
+                }
+            }
+            changed = fault.changed() => {
+                if changed.is_err() {
+                    tracing::error!("clock fault watch closed");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn transfer_faulted_leader(
+    raft: Raft<TypeConfig>,
+    storage: StorageHandle,
+    network: ClusterNetwork,
+) {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut previous_requested: Option<u64> = None;
+    loop {
+        if !matches!(
+            &*storage.clock().subscribe_fault().borrow(),
+            ClockFaultState::Latched { .. }
+        ) {
+            return;
+        }
+        let metrics = raft.metrics().borrow().clone();
+        if metrics.state != ServerState::Leader {
+            if let Some(leader) = metrics
+                .current_leader
+                .filter(|leader| *leader != network.local_id())
+            {
+                tracing::info!(leader, "Raft observed a new leader after local clock fault");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        } else {
+            let roster = storage.applied_membership().await;
+            match roster {
+                Ok(roster) if roster == *metrics.membership_config => {
+                    let last_log = metrics.last_log_index.unwrap_or(0);
+                    let candidates: Vec<_> =
+                        metrics
+                            .replication
+                            .as_ref()
+                            .map_or_else(Vec::new, |replication| {
+                                roster
+                                    .voter_ids()
+                                    .filter(|id| *id != network.local_id())
+                                    .filter_map(|id| {
+                                        let matched = replication.get(&id).copied().flatten()?;
+                                        let endpoint = &roster.membership().get_node(&id)?.addr;
+                                        (matched.index >= last_log).then(|| (id, endpoint.clone()))
+                                    })
+                                    .collect()
+                            });
+                    if candidates.is_empty() {
+                        tracing::warn!(
+                            "no committed voter has a leader-matched log for clock fault transfer"
+                        );
+                    } else {
+                        let evidence = ElectionEvidence {
+                            expected_term: metrics.current_term,
+                            membership_index: roster.log_id().map(|id| id.index).unwrap_or(0),
+                            min_applied_index: metrics.last_applied.map(|id| id.index).unwrap_or(0),
+                            min_last_log_index: last_log,
+                        };
+                        let start = previous_requested
+                            .and_then(|id| {
+                                candidates
+                                    .iter()
+                                    .position(|(candidate, _)| *candidate == id)
+                            })
+                            .map(|index| (index + 1) % candidates.len())
+                            .unwrap_or(0);
+                        for offset in 0..candidates.len() {
+                            if raft.metrics().borrow().state != ServerState::Leader {
+                                break;
+                            }
+                            let (target, endpoint) =
+                                &candidates[(start + offset) % candidates.len()];
+                            match network.request_election(*target, endpoint, evidence).await {
+                                Ok(()) => {
+                                    previous_requested = Some(*target);
+                                    tracing::info!(
+                                        target,
+                                        term = evidence.expected_term,
+                                        "healthy voter accepted election request; leadership not yet observed"
+                                    );
+                                    break;
+                                }
+                                Err(error) => tracing::warn!(
+                                    target,
+                                    %error,
+                                    "candidate rejected clock fault election request"
+                                ),
+                            }
+                        }
+                    }
+                }
+                Ok(_) => tracing::warn!("clock fault transfer postponed for changing membership"),
+                Err(error) => tracing::warn!(%error, "committed voter roster unavailable"),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -2063,6 +2278,17 @@ async fn check_dispatch(
         ));
     }
     Ok(())
+}
+
+async fn await_local_handler<T>(
+    context: &LocalHandlerContext,
+    operation: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = context.cancelled() => None,
+        outcome = operation => Some(outcome),
+    }
 }
 
 async fn worker_loop(
@@ -2168,12 +2394,44 @@ async fn worker_loop(
                         ))
                 })
                 .is_some_and(|contract| contract.execution == ExecutionKind::Blocking);
+            let context = match LocalHandlerContext::new(
+                assignment.run,
+                assignment.activation,
+                assignment.role,
+                assignment.effect_key.to_hex(),
+                session.expires_ms,
+                assignment.lease_expiry_ms,
+                assignment.attempt_deadline_ms,
+                storage.clock().subscribe_fault(),
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(%error, "local handler clock unavailable");
+                    break;
+                }
+            };
+            if context.is_cancelled() {
+                break;
+            }
             if assignment.role == crate::ids::ExecutionRole::Reconciliation {
-                let outcome = handlers.reconcile(
-                    &assignment.activity_name,
-                    &assignment.input,
-                    Some(assignment.effect_key.to_hex().as_str()),
-                );
+                let handlers = handlers.clone();
+                let name = assignment.activity_name.clone();
+                let input = assignment.input.clone();
+                let effect_key = context.effect_key.clone();
+                let Some(Ok(outcome)) = await_local_handler(
+                    &context,
+                    tokio::task::spawn_blocking(move || {
+                        handlers.reconcile(&name, &input, Some(&effect_key))
+                    }),
+                )
+                .await
+                else {
+                    tracing::warn!(
+                        activation = %assignment.activation,
+                        "local reconciliation outcome unresolved after cancellation"
+                    );
+                    break;
+                };
                 let _ = write_raft(
                     &raft,
                     &storage,
@@ -2194,13 +2452,12 @@ async fn worker_loop(
                 )
                 .await;
             } else {
-                let effect_key = assignment.effect_key.to_hex();
                 let ran = if blocking {
                     let handlers = handlers.clone();
                     let name = assignment.activity_name.clone();
                     let version = assignment.activity_version;
                     let input = assignment.input.clone();
-                    let effect_key = effect_key.clone();
+                    let context_for_thread = context.clone();
                     let Ok(permit) = blocking_slots.clone().acquire_owned().await else {
                         continue;
                     };
@@ -2216,22 +2473,46 @@ async fn worker_loop(
                         tracing::warn!(%error, "blocking activity dispatch stopped");
                         continue;
                     }
-                    tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        handlers.run_blocking(&name, version, input, Some(effect_key.as_str()))
-                    })
+                    let Some(result) = await_local_handler(
+                        &context,
+                        tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            handlers.run_blocking_with_context(
+                                &name,
+                                version,
+                                input,
+                                context_for_thread,
+                            )
+                        }),
+                    )
                     .await
-                    .unwrap_or_else(|err| Err(Error::invalid(err.to_string())))
+                    else {
+                        tracing::warn!(
+                            activation = %assignment.activation,
+                            "blocking handler may still be running after clock fault"
+                        );
+                        break;
+                    };
+                    result.unwrap_or_else(|err| Err(Error::invalid(err.to_string())))
                 } else {
-                    handlers
-                        .run(
+                    let Some(result) = await_local_handler(
+                        &context,
+                        handlers.run_with_context(
                             &assignment.activity_name,
                             assignment.activity_version,
                             assignment.input.clone(),
-                            Some(effect_key.as_str()),
-                            false,
-                        )
-                        .await
+                            context.clone(),
+                        ),
+                    )
+                    .await
+                    else {
+                        tracing::warn!(
+                            activation = %assignment.activation,
+                            "async handler outcome unresolved after clock fault"
+                        );
+                        break;
+                    };
+                    result
                 };
                 match ran {
                     Ok(output) => {
@@ -3012,6 +3293,91 @@ nodes:
             state.runs.get(&run).unwrap().status,
             RunStatus::Failed { .. }
         ));
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clock_fault_cancels_blocking_wrapper_without_claiming_thread_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(Mutex::new(release_rx));
+        let running = Arc::new(AtomicBool::new(false));
+        let inside = running.clone();
+        let engine = Engine::builder(dir.path())
+            .blocking_with_context(
+                "test.block",
+                move |input: HandlerCounter, context: LocalHandlerContext| {
+                    inside.store(true, Ordering::SeqCst);
+                    entered_tx.send(context).unwrap();
+                    release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(3))
+                        .unwrap();
+                    inside.store(false, Ordering::SeqCst);
+                    Ok(input)
+                },
+            )
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+        let yaml = r#"
+dsl: graphrun/v1
+id: clock_blocking
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: block
+nodes:
+  block:
+    kind: activity
+    activity: {name: test.block, version: 1}
+    input: {from: workflow.input}
+    next: done
+  done:
+    kind: complete
+    output: {from: nodes.block.output}
+"#;
+        let run = engine
+            .start_yaml(
+                yaml,
+                &catalog(),
+                Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(1))])),
+            )
+            .await
+            .unwrap();
+        let context = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        engine.inject_clock_watermark(crate::time::wall_millis().unwrap() + 10_000);
+        assert_eq!(engine.health().await["clock_safe"], false);
+        context.cancelled().await;
+        assert!(!context.can_start_effect());
+        assert!(
+            running.load(Ordering::SeqCst),
+            "wrapper cannot stop an OS thread"
+        );
+        let state = engine.inspect(run).await.unwrap();
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Active
+        ));
+        release_tx.send(()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while running.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "blocking thread did not return"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(run_output(&engine.inspect(run).await.unwrap(), run).is_none());
         engine.shutdown().await.unwrap();
     }
 

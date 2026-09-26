@@ -1,4 +1,4 @@
-use crate::generated::{Blob, ClockHealthRequest, raft_client::RaftClient};
+use crate::generated::{Blob, ClockHealthRequest, ElectionRequest, raft_client::RaftClient};
 #[cfg(test)]
 use crate::rpc::client_tls;
 use crate::storage::TypeConfig;
@@ -39,6 +39,14 @@ pub struct ClusterNetwork {
     peers: Arc<Mutex<BTreeMap<u64, (SocketAddr, TlsMaterial)>>>,
     local_id: u64,
     local_tls: TlsMaterial,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ElectionEvidence {
+    pub expected_term: u64,
+    pub membership_index: u64,
+    pub min_applied_index: u64,
+    pub min_last_log_index: u64,
 }
 
 impl ClusterNetwork {
@@ -112,6 +120,55 @@ impl ClusterNetwork {
         {
             return Err(io::Error::other(
                 "clock member returned stale or skewed sample",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn request_election(
+        &self,
+        target: u64,
+        committed_endpoint: &str,
+        evidence: ElectionEvidence,
+    ) -> io::Result<()> {
+        if target == self.local_id {
+            return Err(io::Error::other("cannot request a local leader transfer"));
+        }
+        let peer = self.peers.lock().unwrap().get(&target).cloned();
+        let Some((addr, _)) = &peer else {
+            return Err(io::Error::other("election target is not configured"));
+        };
+        if addr.to_string() != committed_endpoint {
+            return Err(io::Error::other(
+                "election target endpoint differs from committed roster",
+            ));
+        }
+        let peer = PeerClient {
+            target,
+            peer,
+            expected_endpoint: committed_endpoint.to_owned(),
+            local_id: self.local_id,
+            local_tls: self.local_tls.clone(),
+        };
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            peer.client()
+                .await?
+                .request_election(ElectionRequest {
+                    sender_id: self.local_id,
+                    expected_term: evidence.expected_term,
+                    membership_index: evidence.membership_index,
+                    min_applied_index: evidence.min_applied_index,
+                    min_last_log_index: evidence.min_last_log_index,
+                })
+                .await
+                .map_err(io::Error::other)
+        })
+        .await
+        .map_err(io::Error::other)??
+        .into_inner();
+        if response.member_id != target || response.requested_from_term != evidence.expected_term {
+            return Err(io::Error::other(
+                "election receipt identity or term mismatch",
             ));
         }
         Ok(())
@@ -305,11 +362,13 @@ mod tests {
     use crate::catalog::Catalog;
     use crate::engine::Engine;
     use crate::generated::{
-        Blob, ClockHealthRequest, ListRequest, PublishCatalogRequest, StartRequest,
-        client_client::ClientClient, raft_client::RaftClient,
+        Blob, ClockHealthRequest, ElectionRequest, ListRequest, PublishCatalogRequest,
+        StartRequest, WatchMemberFaultRequest, client_client::ClientClient,
+        raft_client::RaftClient,
     };
     use crate::tls::{
-        ClusterId, PeerRole, PrincipalId, PrincipalIdentity, generate_ca, issue_principal,
+        ClusterId, PeerRole, PrincipalId, PrincipalIdentity, generate_ca, issue_node,
+        issue_principal,
     };
     use crate::value::Value;
     use std::time::Duration;
@@ -320,13 +379,6 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap()
-    }
-
-    fn issue_node(
-        ca: &crate::tls::CertificateAuthority,
-        id: u64,
-    ) -> crate::Result<crate::tls::TlsMaterial> {
-        crate::tls::issue_node(ca, id)
     }
 
     fn register_worker(
@@ -464,6 +516,378 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clock_fault_leaves_committed_state_and_a_healthy_voter_takes_over() {
+        let (old, second, third, dirs, addrs, tls, _ca) = three_voters(false).await;
+        let catalog = Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let definition = include_str!("../../docs/specs/v1/examples/events.yaml");
+        let input = Value::Object(
+            [("key".to_owned(), Value::String("clock-fault".to_owned()))]
+                .into_iter()
+                .collect(),
+        );
+        let committed = old
+            .start_yaml(definition, &catalog, input.clone())
+            .await
+            .unwrap();
+        let applied_before = old.raft_applied_index();
+        let started = tokio::time::Instant::now();
+        old.inject_clock_watermark(crate::time::wall_millis().unwrap() + 10_000);
+        assert_eq!(old.health().await["clock_safe"], false);
+        let survivor = wait_leader(&second, &third).await;
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(old.health().await["clock_safe"], false);
+        assert!(
+            old.start_yaml(definition, &catalog, input.clone())
+                .await
+                .is_err()
+        );
+        let observed = survivor.inspect(committed).await.unwrap();
+        assert!(observed.runs.contains_key(&committed));
+        old.shutdown().await.unwrap();
+
+        let mut peers = BTreeMap::new();
+        peers.insert(2, (addrs[1], tls[1].clone()));
+        peers.insert(3, (addrs[2], tls[2].clone()));
+        let returned = Engine::member(MemberConfig {
+            data_dir: dirs[0].path().to_path_buf(),
+            node_id: 1,
+            bind: addrs[0],
+            peers,
+            tls: tls[0].clone(),
+            host_activities: false,
+            initialize: false,
+        })
+        .await
+        .unwrap();
+        assert!(!returned.is_leader());
+        assert_eq!(returned.health().await["clock_safe"], false);
+        assert!(returned.raft_applied_index() >= applied_before);
+        assert!(
+            returned
+                .start_yaml(definition, &catalog, input.clone())
+                .await
+                .is_err()
+        );
+        assert!(returned.acknowledge_clock("clock repaired").await.is_err());
+        survivor
+            .start_yaml(definition, &catalog, input)
+            .await
+            .unwrap();
+        returned.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
+        third.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn election_request_rejects_unsigned_sender_identity() {
+        let (first, second, third, _dirs, addrs, tls, _ca) = three_voters(false).await;
+        let mut caller = tls[0].clone();
+        caller.server_name = tls[1].server_name.clone();
+        let channel = tonic::transport::Channel::from_shared(format!("https://{}", addrs[1]))
+            .unwrap()
+            .tls_config(client_tls(&caller).unwrap())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = RaftClient::new(channel);
+        let err = client
+            .request_election(ElectionRequest {
+                sender_id: 3,
+                expected_term: 1,
+                membership_index: 1,
+                min_applied_index: 1,
+                min_last_log_index: 1,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
+        third.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn election_request_rejects_caught_up_claim_for_stale_candidate() {
+        let (first, second, third, _dirs, addrs, tls, _ca) = three_voters(false).await;
+        let (term, membership_index) = first.raft_epoch();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while second.voter_ids() != [1, 2, 3]
+            || second.raft_epoch().1 != membership_index
+            || second.raft_applied_index() < first.raft_applied_index()
+            || !second.membership_applied().await
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "candidate never caught up"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut caller = tls[0].clone();
+        caller.server_name = tls[1].server_name.clone();
+        let channel = tonic::transport::Channel::from_shared(format!("https://{}", addrs[1]))
+            .unwrap()
+            .tls_config(client_tls(&caller).unwrap())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let err = RaftClient::new(channel)
+            .request_election(ElectionRequest {
+                sender_id: 1,
+                expected_term: term,
+                membership_index,
+                min_applied_index: 0,
+                min_last_log_index: u64::MAX,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("not caught up"), "{err:?}");
+        assert!(first.is_leader());
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
+        third.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn committed_voter_accepts_request_only_after_fresh_clock_quorum() {
+        let (first, second, third, _dirs, addrs, tls, _ca) = three_voters(false).await;
+        let (term, membership_index) = first.raft_epoch();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while second.voter_ids() != [1, 2, 3]
+            || !second.membership_applied().await
+            || second.raft_epoch().1 != membership_index
+            || second.raft_applied_index() < first.raft_applied_index()
+        {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut caller = tls[0].clone();
+        caller.server_name = tls[1].server_name.clone();
+        let channel = tonic::transport::Channel::from_shared(format!("https://{}", addrs[1]))
+            .unwrap()
+            .tls_config(client_tls(&caller).unwrap())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let receipt = RaftClient::new(channel)
+            .request_election(ElectionRequest {
+                sender_id: 1,
+                expected_term: term,
+                membership_index,
+                min_applied_index: first.raft_applied_index(),
+                min_last_log_index: first.raft_applied_index(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(receipt.member_id, 2);
+        assert_eq!(receipt.requested_from_term, term);
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
+        third.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn faulted_member_and_missing_voter_cannot_certify_transfer() {
+        let (first, second, third, _dirs, _addrs, _tls, _ca) = three_voters(false).await;
+        third.shutdown().await.unwrap();
+        first.inject_clock_watermark(crate::time::wall_millis().unwrap() + 10_000);
+        assert_eq!(first.health().await["clock_safe"], false);
+        assert!(!second.has_fresh_clock_quorum().await);
+        assert!(!first.has_fresh_clock_quorum().await);
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn signed_worker_receives_fault_even_with_no_free_capacity() {
+        let (first, second, third, _dirs, addrs, tls, _ca) = three_voters(false).await;
+        let catalog = Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        first
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                &catalog,
+                Value::Object(
+                    [
+                        ("order_id".to_owned(), Value::String("watch".to_owned())),
+                        ("amount".to_owned(), Value::Int(1000)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            )
+            .await
+            .unwrap();
+        let session = crate::ids::WorkerSessionId::generate();
+        let mut worker = worker_rpc(addrs[0], &tls[0]).await;
+        let mut registration = register_worker(session, &catalog);
+        registration.capacity = 1;
+        worker.register(registration).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let claimed = worker
+                .claim(crate::generated::ClaimRequest {
+                    command_id: crate::ids::CommandId::generate().to_hex(),
+                    session_id: session.to_hex(),
+                    capacity: 1,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            if !claimed.assignments.is_empty() {
+                assert_eq!(claimed.assignments.len(), 1);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no ready assignment"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut wrong_identity = tls[1].clone();
+        wrong_identity.server_name = tls[0].server_name.clone();
+        let mut outsider = worker_rpc(addrs[0], &wrong_identity).await;
+        let err = outsider
+            .watch_member_fault(WatchMemberFaultRequest {
+                session_id: session.to_hex(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        let mut watching = worker.clone();
+        let response = tokio::spawn(async move {
+            watching
+                .watch_member_fault(WatchMemberFaultRequest {
+                    session_id: session.to_hex(),
+                })
+                .await
+        });
+        first.inject_clock_watermark(crate::time::wall_millis().unwrap() + 10_000);
+        assert_eq!(first.health().await["clock_safe"], false);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), response)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_inner()
+                .faulted
+        );
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
+        third.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remote_handler_observes_fault_without_reporting_a_result() {
+        const YAML: &str = r#"
+dsl: graphrun/v1
+id: faulted_remote_handler
+version: 1
+input_schema: integer/v1
+output_schema: integer/v1
+start: effect
+nodes:
+  effect:
+    kind: activity
+    activity: {name: sdk.hold, version: 1}
+    input: {from: workflow.input}
+    next: done
+  done:
+    kind: complete
+    output: {from: nodes.effect.output}
+"#;
+        let (first, second, third, _dirs, addrs, tls, _ca) = three_voters(false).await;
+        let catalog = Catalog::from_json(
+            br#"{"format":"graphrun.catalog/v1","schemas":{},"activities":[{
+              "name":"sdk.hold","version":1,"input_schema":"integer/v1",
+              "output_schema":"integer/v1","execution":"async","effects":"external",
+              "recovery":"RetrySafe","error_codes":[]}]}"#,
+        )
+        .unwrap();
+        let run = first
+            .start_yaml(YAML, &catalog, Value::Int(7))
+            .await
+            .unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(Mutex::new(Some(entered_tx)));
+        let cancelled = Arc::new(Mutex::new(Some(cancelled_tx)));
+        let worker = crate::worker::Worker::builder(
+            format!("https://{}", addrs[0]),
+            tls[0].clone(),
+            catalog,
+        )
+        .capacity(1)
+        .unwrap()
+        .activity("sdk.hold", 1, move |input: i64, context| {
+            let entered = entered.clone();
+            let cancelled = cancelled.clone();
+            async move {
+                if let Some(tx) = entered.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                context.cancelled().await;
+                if let Some(tx) = cancelled.lock().unwrap().take() {
+                    let _ = tx.send(context.can_start_effect());
+                }
+                Ok::<_, crate::worker::ActivityError>(input)
+            }
+        })
+        .unwrap()
+        .open()
+        .await
+        .unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let worker_task = tokio::spawn(worker.run_until(async move {
+            let _ = stop_rx.await;
+        }));
+        tokio::time::timeout(Duration::from_secs(8), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        first.inject_clock_watermark(crate::time::wall_millis().unwrap() + 10_000);
+        assert_eq!(first.health().await["clock_safe"], false);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(3), cancelled_rx)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        let survivor = wait_leader(&second, &third).await;
+        assert!(matches!(
+            survivor
+                .inspect(run)
+                .await
+                .unwrap()
+                .runs
+                .get(&run)
+                .unwrap()
+                .status,
+            crate::domain::RunStatus::Active
+        ));
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), worker_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
+        third.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,15 +1,14 @@
 use crate::cluster::ClusterNetwork;
 use crate::error::{Error, ErrorKind, Result};
 use crate::storage::{StorageHandle, TypeConfig};
-use crate::time::{boot_millis, wall_millis};
-use openraft::Raft;
+use crate::time::{ClockDeltaFault, boot_millis, clock_delta_fault, wall_millis};
+use openraft::{LogId, Raft};
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, watch};
 
-const MAX_DISCREPANCY_MS: u64 = 250;
-const MAX_WATCHDOG_GAP_MS: u64 = 2_000;
 const QUORUM_REFRESH_MS: u64 = 5_000;
 const QUORUM_EXPIRY_MS: u64 = 10_000;
 
@@ -17,6 +16,7 @@ const QUORUM_EXPIRY_MS: u64 = 10_000;
 struct Monitor {
     previous: Option<(u64, u64)>,
     faulted: bool,
+    fault_recorded: bool,
     healthy_since: Option<u64>,
     fault_reason: Option<String>,
 }
@@ -29,17 +29,16 @@ impl Monitor {
             )
         });
         if let Some((previous_wall, previous_boot)) = self.previous {
-            let elapsed = boot.saturating_sub(previous_boot);
-            let wall_elapsed = wall as i128 - previous_wall as i128;
-            let discrepancy = (wall_elapsed - elapsed as i128).unsigned_abs();
-            if boot < previous_boot {
-                fault = Some("boot clock reversed".to_owned());
-            } else if discrepancy > u128::from(MAX_DISCREPANCY_MS + elapsed / 1_000) {
-                fault = Some(format!(
-                    "wall/boot delta differs by {discrepancy} ms over {elapsed} ms"
-                ));
-            } else if elapsed > MAX_WATCHDOG_GAP_MS {
-                fault = Some(format!("watchdog gap {elapsed} ms exceeds 2000 ms"));
+            if let Some(delta) = clock_delta_fault(previous_wall, previous_boot, wall, boot) {
+                fault = Some(match delta {
+                    ClockDeltaFault::BootReversed => "boot clock reversed".to_owned(),
+                    ClockDeltaFault::WatchdogGap(elapsed) => {
+                        format!("watchdog gap {elapsed} ms exceeds 2000 ms")
+                    }
+                    ClockDeltaFault::WallBootSkew(discrepancy, elapsed) => {
+                        format!("wall/boot delta differs by {discrepancy} ms over {elapsed} ms")
+                    }
+                });
             }
         }
         self.previous = Some((wall, boot));
@@ -54,31 +53,49 @@ impl Monitor {
     }
 }
 
-struct QuorumSample {
-    checked_boot_ms: u64,
-    membership_index: Option<u64>,
-    voters: Vec<u64>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClockFaultState {
+    Healthy,
+    Latched { reason: String },
+}
+
+#[derive(Clone)]
+pub(crate) struct FreshVoterQuorum {
+    pub membership_log_id: Option<LogId<u64>>,
+    pub sampled_voters: BTreeSet<u64>,
+    pub checked_boot_ms: u64,
+    voter_configs: Vec<BTreeSet<u64>>,
 }
 
 pub struct ClockAuthority {
     monitor: AsyncMutex<Monitor>,
     network: Mutex<Option<ClusterNetwork>>,
-    last_quorum: AsyncMutex<Option<QuorumSample>>,
+    last_quorum: AsyncMutex<Option<FreshVoterQuorum>>,
+    fault_signal: watch::Sender<ClockFaultState>,
     #[cfg(test)]
     test_watermark: AtomicU64,
 }
 
 impl ClockAuthority {
     pub fn new(faulted: bool) -> Self {
+        let reason = "clock fault persisted from previous process".to_owned();
+        let (fault_signal, _) = watch::channel(if faulted {
+            ClockFaultState::Latched {
+                reason: reason.clone(),
+            }
+        } else {
+            ClockFaultState::Healthy
+        });
         Self {
             monitor: AsyncMutex::new(Monitor {
                 faulted,
-                fault_reason: faulted
-                    .then(|| "clock fault persisted from previous process".to_owned()),
+                fault_recorded: faulted,
+                fault_reason: faulted.then_some(reason),
                 ..Monitor::default()
             }),
             network: Mutex::new(None),
             last_quorum: AsyncMutex::new(None),
+            fault_signal,
             #[cfg(test)]
             test_watermark: AtomicU64::new(0),
         }
@@ -86,6 +103,10 @@ impl ClockAuthority {
 
     pub fn configure_network(&self, network: ClusterNetwork) {
         *self.network.lock().unwrap() = Some(network);
+    }
+
+    pub(crate) fn subscribe_fault(&self) -> watch::Receiver<ClockFaultState> {
+        self.fault_signal.subscribe()
     }
 
     pub async fn sample(&self, storage: &StorageHandle) -> Result<(u64, u64)> {
@@ -98,8 +119,16 @@ impl ClockAuthority {
                 monitor.healthy_since = None;
                 monitor.fault_reason = Some(error.to_string());
                 if newly_faulted {
-                    storage.persist_clock_fault(true).await?;
+                    self.fault_signal.send_replace(ClockFaultState::Latched {
+                        reason: error.to_string(),
+                    });
                     tracing::error!(%error, "clock source failed; scheduling and effects disabled");
+                }
+                if !monitor.fault_recorded {
+                    storage.persist_clock_fault(true).await.inspect_err(|persist| {
+                        tracing::error!(%persist, "clock fault could not be persisted; member remains fenced");
+                    })?;
+                    monitor.fault_recorded = true;
                 }
                 return Err(error);
             }
@@ -110,11 +139,19 @@ impl ClockAuthority {
         let was_faulted = monitor.faulted;
         monitor.observe(wall, boot, watermark);
         if monitor.faulted && !was_faulted {
-            storage.persist_clock_fault(true).await?;
+            self.fault_signal.send_replace(ClockFaultState::Latched {
+                reason: monitor.fault_reason.clone().expect("fault has a reason"),
+            });
             tracing::error!(
                 reason = monitor.fault_reason.as_deref().unwrap_or("unknown"),
                 "clock fault latched; scheduling and effects disabled"
             );
+        }
+        if monitor.faulted && !monitor.fault_recorded {
+            storage.persist_clock_fault(true).await.inspect_err(|error| {
+                tracing::error!(%error, "clock fault could not be persisted; member remains fenced");
+            })?;
+            monitor.fault_recorded = true;
         }
         if monitor.faulted {
             return Err(Error::new(
@@ -139,6 +176,12 @@ impl ClockAuthority {
                 "no clock fault to acknowledge",
             ));
         }
+        if !monitor.fault_recorded {
+            return Err(Error::new(
+                ErrorKind::Unavailable,
+                "clock fault must be persisted before acknowledgement",
+            ));
+        }
         let wall = wall_millis()?;
         let boot = boot_millis()?;
         let watermark = storage.engine_watermark().await?;
@@ -153,69 +196,148 @@ impl ClockAuthority {
         }
         storage.persist_clock_fault(false).await?;
         monitor.faulted = false;
+        monitor.fault_recorded = false;
         monitor.fault_reason = None;
         *self.last_quorum.lock().await = None;
+        self.fault_signal.send_replace(ClockFaultState::Healthy);
         Ok(())
     }
 
     pub async fn authorize(&self, storage: &StorageHandle, raft: &Raft<TypeConfig>) -> Result<()> {
+        self.sample_quorum(storage, raft, true).await.map(|_| ())
+    }
+
+    pub(crate) async fn fresh_voter_quorum(
+        &self,
+        storage: &StorageHandle,
+        raft: &Raft<TypeConfig>,
+    ) -> Result<FreshVoterQuorum> {
+        self.sample_quorum(storage, raft, false).await
+    }
+
+    async fn sample_quorum(
+        &self,
+        storage: &StorageHandle,
+        raft: &Raft<TypeConfig>,
+        allow_cached: bool,
+    ) -> Result<FreshVoterQuorum> {
         let (_, before_boot) = self.sample(storage).await?;
         let metrics = raft.metrics().borrow().clone();
-        let voters: Vec<u64> = metrics.membership_config.voter_ids().collect();
-        let membership_index = metrics.membership_config.log_id().map(|id| id.index);
-        if voters.len() <= 1 {
-            return Ok(());
+        let voter_configs = metrics
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .clone();
+        let voters: BTreeSet<u64> = metrics.membership_config.voter_ids().collect();
+        let membership_log_id = *metrics.membership_config.log_id();
+        if voter_configs.is_empty() || voters.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Unavailable,
+                "committed voting membership unavailable",
+            ));
+        }
+        if voters.len() == 1 {
+            let sampled_voters = BTreeSet::from([metrics.id]);
+            if !joint_quorum(&voter_configs, &sampled_voters) {
+                return Err(Error::new(
+                    ErrorKind::Unavailable,
+                    "local member is not the voting quorum",
+                ));
+            }
+            return Ok(FreshVoterQuorum {
+                checked_boot_ms: before_boot,
+                membership_log_id,
+                sampled_voters,
+                voter_configs,
+            });
         }
         let mut last = self.last_quorum.lock().await;
-        if last.as_ref().is_some_and(|sample| {
-            sample.membership_index == membership_index
-                && sample.voters == voters
-                && before_boot.saturating_sub(sample.checked_boot_ms) < QUORUM_REFRESH_MS
-        }) {
-            return Ok(());
+        if allow_cached
+            && last.as_ref().is_some_and(|sample| {
+                sample.membership_log_id == membership_log_id
+                    && sample.voter_configs == voter_configs
+                    && before_boot.saturating_sub(sample.checked_boot_ms) < QUORUM_REFRESH_MS
+            })
+        {
+            return Ok(last.as_ref().expect("checked cached quorum").clone());
         }
-        let network = self.network.lock().unwrap().clone().ok_or_else(|| {
-            Error::new(ErrorKind::Unavailable, "cluster clock network unavailable")
-        })?;
-        let mut roster = storage.applied_members().await?;
-        if roster.is_empty() {
+        let mut roster = storage.applied_membership().await?;
+        if roster.membership().get_joint_config().is_empty() {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-            while roster.is_empty() && tokio::time::Instant::now() < deadline {
+            while roster.membership().get_joint_config().is_empty()
+                && tokio::time::Instant::now() < deadline
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                roster = storage.applied_members().await?;
+                roster = storage.applied_membership().await?;
             }
         }
-        let mut healthy = usize::from(voters.contains(&network.local_id()));
+        if roster != *metrics.membership_config {
+            return Err(Error::new(
+                ErrorKind::Unavailable,
+                "applied voting membership differs from Raft membership",
+            ));
+        }
+        let local_id = metrics.id;
+        if !voters.contains(&local_id) {
+            return Err(Error::new(
+                ErrorKind::Unavailable,
+                "local member is not a committed voter",
+            ));
+        }
+        let network = if voters.len() > 1 {
+            Some(self.network.lock().unwrap().clone().ok_or_else(|| {
+                Error::new(ErrorKind::Unavailable, "cluster clock network unavailable")
+            })?)
+        } else {
+            None
+        };
+        let mut healthy = BTreeSet::from([local_id]);
         let mut failures = Vec::new();
-        for id in voters
-            .iter()
-            .copied()
-            .filter(|id| *id != network.local_id())
-        {
-            let Some(endpoint) = roster.get(&id) else {
+        for id in voters.iter().copied().filter(|id| *id != local_id) {
+            let Some(endpoint) = roster.membership().get_node(&id) else {
                 failures.push(format!("member {id}: not in committed roster"));
                 continue;
             };
-            match network.probe_clock(id, endpoint).await {
-                Ok(()) => healthy += 1,
+            match network
+                .as_ref()
+                .expect("multi-voter clock network")
+                .probe_clock(id, &endpoint.addr)
+                .await
+            {
+                Ok(()) => {
+                    healthy.insert(id);
+                    if joint_quorum(&voter_configs, &healthy) {
+                        break;
+                    }
+                }
                 Err(err) => failures.push(format!("member {id}: {err}")),
             }
         }
         let (_, after_boot) = self.sample(storage).await?;
-        if healthy > voters.len() / 2 {
-            *last = Some(QuorumSample {
-                checked_boot_ms: after_boot,
-                membership_index,
-                voters,
-            });
-            return Ok(());
+        if raft.metrics().borrow().membership_config.as_ref() != &roster {
+            return Err(Error::new(
+                ErrorKind::Unavailable,
+                "voting membership changed during clock probes",
+            ));
         }
-        if last.as_ref().is_some_and(|sample| {
-            sample.membership_index == membership_index
-                && sample.voters == voters
-                && after_boot.saturating_sub(sample.checked_boot_ms) < QUORUM_EXPIRY_MS
-        }) {
-            return Ok(());
+        if joint_quorum(&voter_configs, &healthy) {
+            let sample = FreshVoterQuorum {
+                checked_boot_ms: after_boot,
+                membership_log_id,
+                sampled_voters: healthy,
+                voter_configs,
+            };
+            *last = Some(sample.clone());
+            return Ok(sample);
+        }
+        if allow_cached
+            && last.as_ref().is_some_and(|sample| {
+                sample.membership_log_id == membership_log_id
+                    && sample.voter_configs == voter_configs
+                    && after_boot.saturating_sub(sample.checked_boot_ms) < QUORUM_EXPIRY_MS
+            })
+        {
+            return Ok(last.as_ref().expect("checked cached quorum").clone());
         }
         Err(Error::new(
             ErrorKind::Unavailable,
@@ -241,6 +363,13 @@ impl ClockAuthority {
     }
 }
 
+fn joint_quorum(configs: &[BTreeSet<u64>], healthy: &BTreeSet<u64>) -> bool {
+    !configs.is_empty()
+        && configs.iter().all(|voters| {
+            !voters.is_empty() && voters.intersection(healthy).count() > voters.len() / 2
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +384,31 @@ mod tests {
         assert!(!clock.observe(100_249, 10_750, 100_250));
         assert!(clock.faulted);
         assert!(clock.observe(103_000, 13_000, 100_250));
+    }
+
+    #[test]
+    fn joint_quorum_requires_majority_in_both_configs() {
+        let configs = vec![BTreeSet::from([1, 2, 3]), BTreeSet::from([3, 4, 5])];
+        assert!(!joint_quorum(&configs, &BTreeSet::from([1, 2, 4])));
+        assert!(joint_quorum(&configs, &BTreeSet::from([1, 2, 3, 4])));
+        assert!(!joint_quorum(&[], &BTreeSet::from([1])));
+    }
+
+    #[test]
+    fn watchdog_gap_is_strictly_greater_than_two_seconds() {
+        let mut at_limit = Monitor::default();
+        assert!(!at_limit.observe(100_000, 100_000, 0));
+        assert!(!at_limit.observe(102_000, 102_000, 0));
+        let mut beyond_limit = Monitor::default();
+        assert!(!beyond_limit.observe(100_000, 100_000, 0));
+        assert!(beyond_limit.observe(102_001, 102_001, 0));
+        assert!(beyond_limit.faulted);
+    }
+
+    #[tokio::test]
+    async fn persisted_fault_is_visible_to_late_subscribers() {
+        let authority = ClockAuthority::new(true);
+        let fault = authority.subscribe_fault();
+        assert!(matches!(&*fault.borrow(), ClockFaultState::Latched { .. }));
     }
 }

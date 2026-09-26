@@ -1,4 +1,5 @@
 use crate::catalog::Catalog;
+use crate::clock::ClockFaultState;
 use crate::cluster::ClusterNetwork;
 use crate::compiler::compile_yaml;
 use crate::domain::{Command, CommandBody, DomainEvent, assignments_from, worker_has_ready};
@@ -9,10 +10,11 @@ use crate::generated::worker_server::{Worker as WorkerSvc, WorkerServer};
 use crate::generated::{
     Ack, Blob, CancelRequest, ClaimRequest, ClaimResponse, ClockAcknowledgeRequest,
     ClockHealthRequest, ClockHealthResponse, CommandResultRequest, CommandResultResponse,
-    HistoryRequest, HistoryResponse, InspectRequest, InspectResponse, ListRequest, ListResponse,
-    PublishCatalogRequest, PublishDefinitionRequest, ReconcileRequest, RegisterRequest,
-    RegisterResponse, RenewRequest, RenewResponse, RenewSessionRequest, RenewSessionResponse,
-    ReplayRequest, ReplayResponse, ReportRequest, SignalRequest, StartRequest, StartResponse,
+    ElectionRequest, ElectionResponse, HistoryRequest, HistoryResponse, InspectRequest,
+    InspectResponse, ListRequest, ListResponse, PublishCatalogRequest, PublishDefinitionRequest,
+    ReconcileRequest, RegisterRequest, RegisterResponse, RenewRequest, RenewResponse,
+    RenewSessionRequest, RenewSessionResponse, ReplayRequest, ReplayResponse, ReportRequest,
+    SignalRequest, StartRequest, StartResponse, WatchMemberFaultRequest, WatchMemberFaultResponse,
     WatchReadyRequest, WatchReadyResponse,
 };
 use crate::ids::{
@@ -265,6 +267,49 @@ impl GraphServices {
         }
         Ok(peer)
     }
+
+    async fn validate_election_request(&self, req: &ElectionRequest) -> Result<(), Status> {
+        let metrics = self.raft.metrics().borrow().clone();
+        let roster = self
+            .storage
+            .applied_membership()
+            .await
+            .map_err(status_error)?;
+        if roster != *metrics.membership_config {
+            return Err(Status::unavailable(
+                "applied voting membership differs from Raft membership",
+            ));
+        }
+        if roster.log_id().map(|id| id.index) != Some(req.membership_index) {
+            return Err(Status::failed_precondition(
+                "election request membership index is stale",
+            ));
+        }
+        if !roster.voter_ids().any(|id| id == req.sender_id)
+            || !roster.voter_ids().any(|id| id == self.node_id)
+            || roster.voter_ids().count() < 2
+        {
+            return Err(Status::failed_precondition(
+                "election requester or candidate is not a committed voter",
+            ));
+        }
+        if metrics.current_term != req.expected_term
+            || metrics.current_leader != Some(req.sender_id)
+            || metrics.state != ServerState::Follower
+        {
+            return Err(Status::failed_precondition(
+                "election request is not from the current leader and term",
+            ));
+        }
+        if metrics.last_applied.map(|id| id.index).unwrap_or(0) < req.min_applied_index
+            || metrics.last_log_index.unwrap_or(0) < req.min_last_log_index
+        {
+            return Err(Status::failed_precondition(
+                "election candidate has not caught up with the leader",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn status_error(err: crate::error::Error) -> Status {
@@ -405,6 +450,46 @@ impl RaftSvc for GraphServices {
         Ok(Response::new(ClockHealthResponse {
             member_id: self.node_id,
             wall_ms: crate::write::now().as_millis(),
+        }))
+    }
+
+    async fn request_election(
+        &self,
+        request: Request<ElectionRequest>,
+    ) -> Result<Response<ElectionResponse>, Status> {
+        self.member_context(&request, request.get_ref().sender_id)
+            .await?;
+        let req = request.into_inner();
+        self.validate_election_request(&req).await?;
+        let proof = self
+            .storage
+            .clock()
+            .fresh_voter_quorum(&self.storage, &self.raft)
+            .await
+            .map_err(status_error)?;
+        if proof.membership_log_id.map(|id| id.index) != Some(req.membership_index)
+            || !proof.sampled_voters.contains(&self.node_id)
+            || crate::time::boot_millis()
+                .map_err(status_error)?
+                .saturating_sub(proof.checked_boot_ms)
+                >= 10_000
+        {
+            return Err(Status::unavailable("fresh candidate clock quorum expired"));
+        }
+        self.validate_election_request(&req).await?;
+        self.storage
+            .clock()
+            .sample(&self.storage)
+            .await
+            .map_err(status_error)?;
+        self.raft
+            .trigger()
+            .elect()
+            .await
+            .map_err(|err| Status::unavailable(format!("election request failed: {err}")))?;
+        Ok(Response::new(ElectionResponse {
+            member_id: self.node_id,
+            requested_from_term: req.expected_term,
         }))
     }
 }
@@ -894,6 +979,59 @@ impl WorkerSvc for GraphServices {
         }
     }
 
+    async fn watch_member_fault(
+        &self,
+        request: Request<WatchMemberFaultRequest>,
+    ) -> Result<Response<WatchMemberFaultResponse>, Status> {
+        let peer = self.verified_peer(&request)?;
+        peer.require_role(crate::tls::PeerRole::Worker)
+            .map_err(status_error)?;
+        let session = WorkerSessionId::from_hex(&request.get_ref().session_id)
+            .map_err(Status::invalid_argument)?;
+        self.storage
+            .applied_membership()
+            .await
+            .map_err(status_error)?;
+        let state = self.storage.query_state().await;
+        let owner = state
+            .sessions
+            .get(&session)
+            .ok_or_else(|| Status::unauthenticated("unknown worker session"))?;
+        if owner.principal_id.is_empty() || owner.principal_id != peer.principal_id().as_str() {
+            return Err(Status::permission_denied(
+                "worker session belongs to another principal",
+            ));
+        }
+        let mut fault = self.storage.clock().subscribe_fault();
+        if !matches!(*fault.borrow(), ClockFaultState::Latched { .. }) {
+            self.require_leader()?;
+            let mut metrics = self.raft.metrics();
+            let heartbeat = tokio::time::sleep(std::time::Duration::from_secs(10));
+            tokio::pin!(heartbeat);
+            loop {
+                tokio::select! {
+                    changed = fault.changed() => {
+                        changed.map_err(|_| Status::unavailable("clock fault watch closed"))?;
+                        if matches!(*fault.borrow(), ClockFaultState::Latched { .. }) {
+                            break;
+                        }
+                    }
+                    changed = metrics.changed() => {
+                        changed.map_err(|_| Status::unavailable("Raft leadership watch closed"))?;
+                        self.require_leader()?;
+                    }
+                    _ = &mut heartbeat => {
+                        self.require_leader()?;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(Response::new(WatchMemberFaultResponse {
+            faulted: matches!(*fault.borrow(), ClockFaultState::Latched { .. }),
+        }))
+    }
+
     async fn claim(
         &self,
         request: Request<ClaimRequest>,
@@ -1125,6 +1263,17 @@ impl WorkerSvc for GraphServices {
             .authenticated_peer(&peer),
         )
         .await;
+        if matches!(
+            &*self.storage.clock().subscribe_fault().borrow(),
+            ClockFaultState::Latched { .. }
+        ) && result
+            .as_ref()
+            .is_err_and(|err| err.kind == ErrorKind::FailedPrecondition)
+        {
+            return Err(Status::unavailable(
+                "member clock faulted; result outcome unknown",
+            ));
+        }
         if result.is_ok() {
             self.notify.notify_one();
             #[cfg(any(test, feature = "fault-injection"))]
@@ -1217,6 +1366,17 @@ impl WorkerSvc for GraphServices {
             .authenticated_peer(&peer),
         )
         .await;
+        if matches!(
+            &*self.storage.clock().subscribe_fault().borrow(),
+            ClockFaultState::Latched { .. }
+        ) && result
+            .as_ref()
+            .is_err_and(|err| err.kind == ErrorKind::FailedPrecondition)
+        {
+            return Err(Status::unavailable(
+                "member clock faulted; probe outcome unknown",
+            ));
+        }
         if result.is_ok() {
             self.notify.notify_one();
             #[cfg(any(test, feature = "fault-injection"))]

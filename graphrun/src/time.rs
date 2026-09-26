@@ -78,6 +78,33 @@ pub fn boot_millis() -> Result<u64> {
     ))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClockDeltaFault {
+    BootReversed,
+    WatchdogGap(u64),
+    WallBootSkew(u128, u64),
+}
+
+pub(crate) fn clock_delta_fault(
+    previous_wall: u64,
+    previous_boot: u64,
+    wall: u64,
+    boot: u64,
+) -> Option<ClockDeltaFault> {
+    let Some(elapsed) = boot.checked_sub(previous_boot) else {
+        return Some(ClockDeltaFault::BootReversed);
+    };
+    if elapsed > 2_000 {
+        return Some(ClockDeltaFault::WatchdogGap(elapsed));
+    }
+    let difference =
+        (i128::from(wall) - i128::from(previous_wall) - i128::from(elapsed)).unsigned_abs();
+    if difference > u128::from(250 + elapsed / 1_000) {
+        return Some(ClockDeltaFault::WallBootSkew(difference, elapsed));
+    }
+    None
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EngineTime(u64);
 

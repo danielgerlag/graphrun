@@ -3,19 +3,23 @@
 //! Register implementations before [`crate::Engine::start`]. Unregistered
 //! catalog names fail instead of echoing input.
 
+use crate::clock::ClockFaultState;
 use crate::domain::ReconcileOutcome;
 use crate::error::{Error, Result};
-use crate::ids::{ActivityKey, ExecutionRole, valid_ascii_name};
+use crate::ids::{ActivationId, ActivityKey, ExecutionRole, RunId, valid_ascii_name};
 use crate::schema::DurablePayload;
 use crate::value::Value;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::watch;
 
 type BoxFuture = Pin<Box<dyn Future<Output = Result<Value>> + Send>>;
 type AsyncFn = Arc<dyn Fn(Value) -> BoxFuture + Send + Sync>;
 type BlockingFn = Arc<dyn Fn(Value) -> Result<Value> + Send + Sync>;
+type ContextAsyncFn = Arc<dyn Fn(Value, LocalHandlerContext) -> BoxFuture + Send + Sync>;
+type ContextBlockingFn = Arc<dyn Fn(Value, LocalHandlerContext) -> Result<Value> + Send + Sync>;
 type ReconcileFn =
     Arc<dyn Fn(&Value, Option<&str>) -> (ReconcileOutcome, Option<Value>) + Send + Sync>;
 
@@ -27,8 +31,101 @@ pub struct Handlers {
 struct Inner {
     async_handlers: HashMap<(String, u32), AsyncFn>,
     blocking: HashMap<(String, u32), BlockingFn>,
+    contextual_async: HashMap<(String, u32), ContextAsyncFn>,
+    contextual_blocking: HashMap<(String, u32), ContextBlockingFn>,
     reconcilers: HashMap<(String, u32), ReconcileFn>,
     fixtures: bool,
+}
+
+#[derive(Clone)]
+pub struct LocalHandlerContext {
+    pub run: RunId,
+    pub activation: ActivationId,
+    pub role: ExecutionRole,
+    pub effect_key: String,
+    pub attempt_deadline_ms: u64,
+    session_expiry_ms: u64,
+    claim_expiry_ms: u64,
+    fault: watch::Receiver<ClockFaultState>,
+    cancelled: watch::Sender<bool>,
+    clock_sample: Arc<Mutex<(u64, u64)>>,
+}
+
+impl LocalHandlerContext {
+    pub(crate) fn new(
+        run: RunId,
+        activation: ActivationId,
+        role: ExecutionRole,
+        effect_key: String,
+        session_expiry_ms: u64,
+        claim_expiry_ms: u64,
+        attempt_deadline_ms: u64,
+        fault: watch::Receiver<ClockFaultState>,
+    ) -> Result<Self> {
+        let wall = crate::time::wall_millis()?;
+        let boot = crate::time::boot_millis()?;
+        let (cancelled, _) = watch::channel(false);
+        Ok(Self {
+            run,
+            activation,
+            role,
+            effect_key,
+            attempt_deadline_ms,
+            session_expiry_ms,
+            claim_expiry_ms,
+            fault,
+            cancelled,
+            clock_sample: Arc::new(Mutex::new((wall, boot))),
+        })
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        if matches!(&*self.fault.borrow(), ClockFaultState::Latched { .. }) {
+            self.cancelled.send_replace(true);
+        }
+        *self.cancelled.borrow()
+    }
+
+    pub async fn cancelled(&self) {
+        let mut fault = self.fault.clone();
+        let mut cancelled = self.cancelled.subscribe();
+        while !self.is_cancelled() {
+            tokio::select! {
+                changed = fault.changed() => {
+                    if changed.is_err() {
+                        self.cancelled.send_replace(true);
+                    }
+                }
+                changed = cancelled.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn can_start_effect(&self) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        let (wall, boot) = match (crate::time::wall_millis(), crate::time::boot_millis()) {
+            (Ok(wall), Ok(boot)) => (wall, boot),
+            _ => {
+                self.cancelled.send_replace(true);
+                return false;
+            }
+        };
+        let mut sample = self.clock_sample.lock().expect("local handler clock");
+        if crate::time::clock_delta_fault(sample.0, sample.1, wall, boot).is_some() {
+            self.cancelled.send_replace(true);
+            return false;
+        }
+        *sample = (wall, boot);
+        wall < self.session_expiry_ms.saturating_sub(5_000)
+            && wall < self.claim_expiry_ms.saturating_sub(5_000)
+            && wall < self.attempt_deadline_ms
+    }
 }
 
 impl Default for Handlers {
@@ -43,6 +140,8 @@ impl Handlers {
             inner: Arc::new(RwLock::new(Inner {
                 async_handlers: HashMap::new(),
                 blocking: HashMap::new(),
+                contextual_async: HashMap::new(),
+                contextual_blocking: HashMap::new(),
                 reconcilers: HashMap::new(),
                 fixtures: false,
             })),
@@ -107,6 +206,50 @@ impl Handlers {
         self.blocking_version(name, 1, handler)
     }
 
+    pub(crate) fn activity_with_context<I, O, F, Fut>(&self, name: &str, handler: F) -> Result<()>
+    where
+        I: DurablePayload,
+        O: DurablePayload,
+        F: Fn(I, LocalHandlerContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O>> + Send + 'static,
+    {
+        validate_handler_key(name, 1)?;
+        let handler = Arc::new(handler);
+        let wrapped: ContextAsyncFn = Arc::new(move |value, context| {
+            let handler = handler.clone();
+            Box::pin(async move {
+                let input: I = decode(&value)?;
+                encode(&handler(input, context).await?)
+            })
+        });
+        self.inner
+            .write()
+            .expect("handlers")
+            .contextual_async
+            .insert((name.to_owned(), 1), wrapped);
+        Ok(())
+    }
+
+    pub(crate) fn blocking_with_context<I, O, F>(&self, name: &str, handler: F) -> Result<()>
+    where
+        I: DurablePayload,
+        O: DurablePayload,
+        F: Fn(I, LocalHandlerContext) -> Result<O> + Send + Sync + 'static,
+    {
+        validate_handler_key(name, 1)?;
+        let handler = Arc::new(handler);
+        let wrapped: ContextBlockingFn = Arc::new(move |value, context| {
+            let input: I = decode(&value)?;
+            encode(&handler(input, context)?)
+        });
+        self.inner
+            .write()
+            .expect("handlers")
+            .contextual_blocking
+            .insert((name.to_owned(), 1), wrapped);
+        Ok(())
+    }
+
     pub fn blocking_version<I, O, F>(&self, name: &str, version: u32, handler: F) -> Result<()>
     where
         I: DurablePayload,
@@ -162,6 +305,8 @@ impl Handlers {
             ExecutionRole::Forward | ExecutionRole::Compensation => {
                 inner.async_handlers.contains_key(&k)
                     || inner.blocking.contains_key(&k)
+                    || inner.contextual_async.contains_key(&k)
+                    || inner.contextual_blocking.contains_key(&k)
                     || (inner.fixtures && key.version == 1 && is_fixture_activity(&key.name))
             }
             ExecutionRole::Reconciliation => {
@@ -178,6 +323,8 @@ impl Handlers {
             .async_handlers
             .keys()
             .chain(inner.blocking.keys())
+            .chain(inner.contextual_async.keys())
+            .chain(inner.contextual_blocking.keys())
             .map(|(name, version)| ActivityKey::new(name.clone(), *version))
             .collect();
         let mut reconcilers: BTreeSet<_> = inner
@@ -243,6 +390,47 @@ impl Handlers {
         Err(Error::invalid(format!(
             "activity.unregistered: {name}/v{version}"
         )))
+    }
+
+    pub(crate) fn run_blocking_with_context(
+        &self,
+        name: &str,
+        version: u32,
+        input: Value,
+        context: LocalHandlerContext,
+    ) -> Result<Value> {
+        let handler = self
+            .inner
+            .read()
+            .expect("handlers")
+            .contextual_blocking
+            .get(&(name.to_owned(), version))
+            .cloned();
+        if let Some(handler) = handler {
+            return handler(input, context);
+        }
+        self.run_blocking(name, version, input, Some(&context.effect_key))
+    }
+
+    pub(crate) async fn run_with_context(
+        &self,
+        name: &str,
+        version: u32,
+        input: Value,
+        context: LocalHandlerContext,
+    ) -> Result<Value> {
+        let handler = self
+            .inner
+            .read()
+            .expect("handlers")
+            .contextual_async
+            .get(&(name.to_owned(), version))
+            .cloned();
+        if let Some(handler) = handler {
+            return handler(input, context).await;
+        }
+        self.run(name, version, input, Some(&context.effect_key), false)
+            .await
     }
 
     pub async fn run(
@@ -572,5 +760,49 @@ mod tests {
             handlers.reconcile_version("test.lookup", 2, &Value::Int(8), None),
             (ReconcileOutcome::Unknown, None)
         );
+    }
+
+    #[tokio::test]
+    async fn contextual_handler_cancellation_stays_latched_after_acknowledgement() {
+        let handlers = Handlers::empty();
+        handlers
+            .activity_with_context(
+                "waiting",
+                |input: i64, context: LocalHandlerContext| async move {
+                    context.cancelled().await;
+                    Ok(input)
+                },
+            )
+            .unwrap();
+        let (fault, receiver) = watch::channel(ClockFaultState::Healthy);
+        let now = crate::time::wall_millis().unwrap();
+        let context = LocalHandlerContext::new(
+            RunId::generate(),
+            ActivationId::generate(),
+            ExecutionRole::Forward,
+            "effect".to_owned(),
+            now + 60_000,
+            now + 60_000,
+            now + 60_000,
+            receiver,
+        )
+        .unwrap();
+        assert!(context.can_start_effect());
+        let waiting = tokio::spawn({
+            let handlers = handlers.clone();
+            let context = context.clone();
+            async move {
+                handlers
+                    .run_with_context("waiting", 1, Value::Int(5), context)
+                    .await
+            }
+        });
+        fault.send_replace(ClockFaultState::Latched {
+            reason: "test rollback".to_owned(),
+        });
+        assert_eq!(waiting.await.unwrap().unwrap(), Value::Int(5));
+        fault.send_replace(ClockFaultState::Healthy);
+        assert!(context.is_cancelled());
+        assert!(!context.can_start_effect());
     }
 }
