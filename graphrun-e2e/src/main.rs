@@ -216,7 +216,7 @@ fn verify(cli: &Path, matrix: &Path, artifacts: &Path, strict: bool) -> ExitCode
         )),
         Err(err) => Some(format!("cannot execute CLI {}: {err}", cli.display())),
     };
-    let evidence = if cli_error.is_none() {
+    let evidence = if cli_error.is_none() && rows.iter().any(|row| row.id != "E2E-003") {
         match collect_evidence(&run_dir) {
             Ok(evidence) => Some(evidence),
             Err(err) => {
@@ -288,12 +288,11 @@ fn verify(cli: &Path, matrix: &Path, artifacts: &Path, strict: bool) -> ExitCode
     let coverage = validate_coverage(&rows, &results, &run_dir, &context);
     let (exit_code, release_certified) = verification_gate(&results, strict);
     let canonical_matrix = release_matrix_complete(&rows);
-    let matrix_complete = canonical_matrix.as_ref().is_ok_and(|complete| *complete);
+    let matrix_complete = canonical_matrix.is_ok();
     let failed = exit_code != ExitCode::SUCCESS
         || integrity.is_some()
         || coverage.is_err()
-        || canonical_matrix.is_err()
-        || (strict && !matrix_complete);
+        || !matrix_complete;
     let certified = release_certified && matrix_complete && !failed;
     let report = serde_json::json!({
         "run_id": context.run_id,
@@ -585,18 +584,36 @@ fn load_matrix(path: &Path) -> Result<Vec<MatrixRow>, String> {
     parse_matrix(&text)
 }
 
-fn release_matrix_complete(rows: &[MatrixRow]) -> Result<bool, String> {
+fn release_matrix_complete(rows: &[MatrixRow]) -> Result<(), String> {
     let expected = parse_matrix(include_str!("../../docs/specs/v1/verification-matrix.tsv"))?;
-    Ok(rows.len() == expected.len()
-        && expected.iter().all(|case| {
-            rows.iter().any(|row| {
-                row.id == case.id
-                    && row.requirement == case.requirement
-                    && row.layer == case.layer
-                    && row.scenario == case.scenario
-                    && row.pass_criterion == case.pass_criterion
-            })
-        }))
+    let mut supplied = HashMap::new();
+    for row in rows {
+        if supplied.insert(row.id.as_str(), row).is_some() {
+            return Err(format!("duplicate matrix ID {}", row.id));
+        }
+    }
+    for case in &expected {
+        let row = supplied
+            .get(case.id.as_str())
+            .ok_or_else(|| format!("missing mandatory matrix ID {}", case.id))?;
+        if row.requirement != case.requirement
+            || row.layer != case.layer
+            || row.scenario != case.scenario
+            || row.pass_criterion != case.pass_criterion
+        {
+            return Err(format!(
+                "matrix row {} differs from canonical matrix",
+                case.id
+            ));
+        }
+    }
+    if let Some(row) = rows
+        .iter()
+        .find(|row| !expected.iter().any(|case| case.id == row.id))
+    {
+        return Err(format!("unexpected matrix ID {}", row.id));
+    }
+    Ok(())
 }
 
 fn parse_matrix(text: &str) -> Result<Vec<MatrixRow>, String> {
@@ -4642,10 +4659,10 @@ mod tests {
         fs::create_dir(&run_dir).unwrap();
         let context = context(&run_dir);
         let functional = row("LOCAL-001");
-        assert!(!release_matrix_complete(&[functional.clone()]).unwrap());
+        assert!(release_matrix_complete(std::slice::from_ref(&functional)).is_err());
         let passing = passing_case(&functional, &run_dir, &context);
         assert_eq!(
-            verification_gate(&[passing.clone()], false),
+            verification_gate(std::slice::from_ref(&passing), false),
             (ExitCode::SUCCESS, true)
         );
         let failure = context.bind(fail(&functional, "test", "missing"));
@@ -4695,6 +4712,143 @@ mod tests {
             verification_gate(&[measured], false),
             (ExitCode::from(1), false)
         );
+    }
+
+    #[test]
+    fn canonical_matrix_rejects_missing_duplicate_and_malformed_rows() {
+        let canonical =
+            parse_matrix(include_str!("../../docs/specs/v1/verification-matrix.tsv")).unwrap();
+        assert!(release_matrix_complete(&canonical).is_ok());
+
+        let subset = vec![
+            canonical
+                .iter()
+                .find(|row| row.id == "E2E-003")
+                .unwrap()
+                .clone(),
+        ];
+        assert!(
+            release_matrix_complete(&subset)
+                .unwrap_err()
+                .contains("missing mandatory matrix ID")
+        );
+
+        let mut mismatched = canonical.clone();
+        mismatched[0].pass_criterion.push_str(" changed");
+        assert!(
+            release_matrix_complete(&mismatched)
+                .unwrap_err()
+                .contains("differs from canonical")
+        );
+
+        let mut duplicate = canonical.clone();
+        duplicate.push(canonical[0].clone());
+        assert!(
+            release_matrix_complete(&duplicate)
+                .unwrap_err()
+                .contains("duplicate matrix ID")
+        );
+        let mut unexpected = canonical;
+        unexpected.push(row("OTHER-001"));
+        assert!(
+            release_matrix_complete(&unexpected)
+                .unwrap_err()
+                .contains("unexpected matrix ID")
+        );
+        let header = "id\trequirement\tlayer\tscenario\tpass_criterion\n";
+        let valid = "E2E-003\tREQ-E2E\te2e\treport\tcomplete\n";
+        assert!(
+            parse_matrix(&format!("{header}{valid}{valid}"))
+                .err()
+                .unwrap()
+                .contains("duplicates ID")
+        );
+        assert!(parse_matrix(&format!("{header}E2E-003\tREQ-E2E\te2e\treport\n")).is_err());
+        assert!(
+            parse_matrix(&format!("{header}bad/id\tREQ-E2E\te2e\treport\tcomplete\n")).is_err()
+        );
+    }
+
+    #[test]
+    fn passing_subset_with_real_cli_fails_normal_verification() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    workspace.join(path)
+                }
+            })
+            .unwrap_or_else(|| workspace.join("target"));
+        let build = Command::new("cargo")
+            .current_dir(workspace)
+            .args([
+                "build",
+                "-p",
+                "graphrun-cli",
+                "--bin",
+                "graphrun",
+                "--locked",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "CLI build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let cli = target_dir
+            .join("debug")
+            .join(format!("graphrun{}", std::env::consts::EXE_SUFFIX));
+        assert!(cli.is_file());
+
+        let temp = tempfile::Builder::new()
+            .prefix("matrix-gate-")
+            .tempdir_in(&target_dir)
+            .unwrap();
+        let matrix = temp.path().join("matrix.tsv");
+        let artifacts = temp.path().join("evidence");
+        let case = parse_matrix(include_str!("../../docs/specs/v1/verification-matrix.tsv"))
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == "E2E-003")
+            .unwrap();
+        fs::write(
+            &matrix,
+            format!(
+                "id\trequirement\tlayer\tscenario\tpass_criterion\n{}\t{}\t{}\t{}\t{}\n",
+                case.id, case.requirement, case.layer, case.scenario, case.pass_criterion
+            ),
+        )
+        .unwrap();
+
+        assert_ne!(verify(&cli, &matrix, &artifacts, false), ExitCode::SUCCESS);
+        let first: serde_json::Value =
+            serde_json::from_slice(&fs::read(artifacts.join("report.json")).unwrap()).unwrap();
+        assert_eq!(first["results"][0]["status"], "PASS");
+        assert_eq!(first["coverage_error"], serde_json::Value::Null);
+        assert_eq!(first["source_integrity_error"], serde_json::Value::Null);
+        assert_eq!(first["release_matrix_complete"], false);
+        assert_eq!(first["release_certified"], false);
+        assert!(
+            first["release_matrix_error"]
+                .as_str()
+                .unwrap()
+                .contains("missing mandatory matrix ID")
+        );
+        assert!(first["cli_version"].as_str().unwrap().contains("graphrun"));
+
+        assert_ne!(verify(&cli, &matrix, &artifacts, false), ExitCode::SUCCESS);
+        let second: serde_json::Value =
+            serde_json::from_slice(&fs::read(artifacts.join("report.json")).unwrap()).unwrap();
+        assert_ne!(first["run_id"], second["run_id"]);
+        for report in [&first, &second] {
+            let run_dir = artifacts.join(report["run_id"].as_str().unwrap());
+            assert!(run_dir.join("E2E-003.json").is_file());
+            assert!(run_dir.join("report.json").is_file());
+        }
     }
 
     #[test]
