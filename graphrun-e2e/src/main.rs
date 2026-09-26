@@ -1850,7 +1850,7 @@ fn issue_test_node(
     let cluster = ClusterId::parse(hex::encode(&sha2::Sha256::digest(ca.pem.as_bytes())[..16]))?;
     let identity = PrincipalIdentity::new(
         cluster,
-        PrincipalId::parse(format!("node-{id}"))?,
+        PrincipalId::parse(id.to_string())?,
         [
             PeerRole::Member,
             PeerRole::Worker,
@@ -3856,7 +3856,7 @@ fn forged_worker_process(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
                     session_id: session.to_hex(),
                     capacity: 8,
                     capabilities: vec![capability.to_wire()],
-                    principal_id: "node-1".to_owned(),
+                    principal_id: "1".to_owned(),
                     protocol_min: 1,
                     protocol_max: 1,
                     command_id: graphrun::ids::CommandId::generate().to_hex(),
@@ -4730,6 +4730,34 @@ fn fixture_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixture_node_cert_uses_numeric_member_id_and_node_dns() {
+        use graphrun::tls::{PeerRole, PrincipalId};
+
+        let ca = graphrun::generate_ca().unwrap();
+        let tls = issue_test_node(&ca, 2).unwrap();
+        assert_eq!(tls.server_name, "node-2.graphrun.local");
+        let cluster = graphrun::tls::cluster_id_from_ca(&ca.pem).unwrap();
+        let peer = graphrun::tls::verify_peer_identity(
+            &ca.pem,
+            &cluster,
+            &graphrun::tls::load_certs(&tls.cert_pem).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(*peer.principal_id(), PrincipalId::parse("2").unwrap());
+        assert_eq!(
+            peer.roles().collect::<Vec<_>>(),
+            [
+                PeerRole::Member,
+                PeerRole::Worker,
+                PeerRole::Client,
+                PeerRole::Admin,
+            ]
+        );
+        peer.require_member_identity(&cluster, &PrincipalId::parse("2").unwrap())
+            .unwrap();
+    }
 
     fn row(id: &str) -> MatrixRow {
         MatrixRow {
