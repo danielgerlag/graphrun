@@ -10,6 +10,11 @@ pub(crate) const FRAGMENT_FORMAT: &str = "graphrun.record-fragments/v1";
 const NESTED_FIELDS: &[&str] = &["published_definitions", "start_keys"];
 const HISTORY_FIELDS: &[&str] = &["history", "history_records"];
 const LIST_FIELDS: &[&str] = &["inbox", "obligations"];
+const OMITTED_EMPTY_MAP_FIELDS: &[&str] = &[
+    "command_actors",
+    "command_external_ids",
+    "authenticated_request_digests",
+];
 const FRAGMENT_BYTES: usize = 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 65 * 1024 * 1024;
 
@@ -291,7 +296,9 @@ pub(crate) fn encode(
                 );
                 insert(&mut rows, key, value, revision)?;
             }
-        } else if defaults.get(&field).is_some_and(Value::is_object) {
+        } else if defaults.get(&field).is_some_and(Value::is_object)
+            || OMITTED_EMPTY_MAP_FIELDS.contains(&field.as_str())
+        {
             let Value::Object(entries) = value else {
                 return Err(invalid(format!("{field} must be an object")));
             };
@@ -352,7 +359,7 @@ pub(crate) fn decode(
         let pieces: Vec<_> = key.split('/').collect();
         if pieces.len() != 6
             || pieces[0] != format!("{generation:016x}")
-            || !root.contains_key(pieces[2])
+            || (!root.contains_key(pieces[2]) && !OMITTED_EMPTY_MAP_FIELDS.contains(&pieces[2]))
         {
             return Err(invalid("unknown or cross-generation state record key"));
         }
@@ -370,8 +377,9 @@ pub(crate) fn decode(
             }
             "map" if pieces[5].is_empty() => {
                 let map = root
-                    .get_mut(field)
-                    .and_then(Value::as_object_mut)
+                    .entry(field.to_owned())
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
                     .ok_or_else(|| invalid(format!("{field} is not a map")))?;
                 if map.insert(primary, value.value).is_some() {
                     return Err(invalid("duplicate state map record"));
@@ -582,6 +590,43 @@ mod tests {
         assert_eq!(
             restore_records(corrupt).unwrap_err().kind,
             ErrorKind::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn scoped_actor_receipt_keys_remain_individual_records() {
+        let external = CommandId::from_bytes([1; 16]);
+        let internal = crate::domain::authenticated_command_id("local-owner", external).unwrap();
+        let mut state = State::default();
+        state
+            .command_actors
+            .insert(internal, "local-owner".to_owned());
+        state.command_external_ids.insert(internal, external);
+        state
+            .authenticated_request_digests
+            .insert(internal, "body-digest".to_owned());
+        let rows = encode(&state, 1, 1).unwrap();
+        for field in [
+            "command_actors",
+            "command_external_ids",
+            "authenticated_request_digests",
+        ] {
+            assert!(
+                rows.keys()
+                    .any(|key| key.contains(&format!("/{field}/map/")))
+            );
+            assert!(
+                !rows
+                    .keys()
+                    .any(|key| key.contains(&format!("/{field}/scalar/")))
+            );
+        }
+        let restored = decode(rows, 1).unwrap();
+        assert_eq!(restored.command_actors[&internal], "local-owner");
+        assert_eq!(restored.command_external_ids[&internal], external);
+        assert_eq!(
+            restored.authenticated_request_digests[&internal],
+            "body-digest"
         );
     }
 }

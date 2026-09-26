@@ -674,6 +674,7 @@ fn apply_operation(
                     status: RunStatus::Active,
                     root: ScopeId::from_bytes([0; 16]),
                     next_sequence: RunSequence::new(1),
+                    next_ready_order: 0,
                     admitted_ms: 0,
                     terminal_ms: 0,
                     published: Some(pinned_identity),

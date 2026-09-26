@@ -530,6 +530,8 @@ pub struct RunState {
     pub root: ScopeId,
     pub next_sequence: RunSequence,
     #[serde(default)]
+    pub next_ready_order: u64,
+    #[serde(default)]
     pub admitted_ms: u64,
     #[serde(default)]
     pub terminal_ms: u64,
@@ -725,8 +727,6 @@ pub struct State {
     pub next_generation: u64,
     #[serde(default)]
     pub fair_cursor: Option<RunId>,
-    #[serde(default)]
-    pub ready_order_counter: u64,
     #[serde(default)]
     pub interventions: HashMap<ActivationId, String>,
     #[serde(default)]
@@ -4031,7 +4031,9 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             // Nested bodies need the child region, not the root. Mark activity nodes Ready
             // by scanning the owning scope's region more carefully below.
             let ready = is_activity_node(state, *scope, node);
-            state.ready_order_counter = state.ready_order_counter.saturating_add(1);
+            let run_state = state.runs.get_mut(run).expect("activation run missing");
+            run_state.next_ready_order = run_state.next_ready_order.saturating_add(1);
+            let ready_order = run_state.next_ready_order;
             state.activations.insert(
                 *activation,
                 ActivationState {
@@ -4047,7 +4049,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     role: ExecutionRole::Forward,
                     claim: None,
                     attempts: 0,
-                    ready_order: state.ready_order_counter,
+                    ready_order,
                 },
             );
             if let Some(scope_state) = state.scopes.get_mut(scope) {
@@ -4249,7 +4251,9 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 .map(|act| act.scope)
                 .or_else(|| state.scopes.values().find(|s| s.run == *run).map(|s| s.id));
             if let Some(scope) = scope {
-                state.ready_order_counter = state.ready_order_counter.saturating_add(1);
+                let run_state = state.runs.get_mut(run).expect("compensation run missing");
+                run_state.next_ready_order = run_state.next_ready_order.saturating_add(1);
+                let ready_order = run_state.next_ready_order;
                 state.activations.insert(
                     *activation,
                     ActivationState {
@@ -4261,7 +4265,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                         role: ExecutionRole::Compensation,
                         claim: None,
                         attempts: 0,
-                        ready_order: state.ready_order_counter,
+                        ready_order,
                     },
                 );
             }
@@ -4545,6 +4549,7 @@ pub fn start_run(
             status: RunStatus::Active,
             root: ScopeId::from_bytes([0; 16]),
             next_sequence: RunSequence::new(1),
+            next_ready_order: 0,
             admitted_ms: 0,
             terminal_ms: 0,
             published: None,
@@ -4871,6 +4876,7 @@ pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainE
                     status: RunStatus::Active,
                     root: ScopeId::from_bytes([0; 16]),
                     next_sequence: RunSequence::new(1),
+                    next_ready_order: 0,
                     admitted_ms: 0,
                     terminal_ms: 0,
                     published: None,
@@ -5131,6 +5137,7 @@ pub fn reconstruct(
             status: RunStatus::Active,
             root: *root,
             next_sequence: RunSequence::new(1),
+            next_ready_order: 0,
             admitted_ms: 0,
             terminal_ms: 0,
             published: None,

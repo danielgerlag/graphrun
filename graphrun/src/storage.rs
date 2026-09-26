@@ -2811,10 +2811,15 @@ fn apply_entries(
                                     .or_insert(progress.then_some(true));
                             }
                         }
-                        if matches!(
-                            &req.command.body,
-                            domain::CommandBody::AcknowledgeRecovery { .. }
-                        ) {
+                        let acknowledged = match &req.command.body {
+                            domain::CommandBody::AcknowledgeRecovery { .. } => true,
+                            domain::CommandBody::Authenticated { body, .. } => matches!(
+                                body.as_ref(),
+                                domain::CommandBody::AcknowledgeRecovery { .. }
+                            ),
+                            _ => false,
+                        };
+                        if acknowledged {
                             for run in domain::active_runs(&candidate) {
                                 affected.insert(run, Some(true));
                             }
