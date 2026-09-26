@@ -2130,20 +2130,27 @@ nodes:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clock_rollback_fails_closed() {
         let ca = generate_ca().unwrap();
-        let addr = unused_addr();
         let tls = issue_node(&ca, 1).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let engine = Engine::member(MemberConfig {
-            data_dir: dir.path().to_path_buf(),
-            node_id: 1,
-            bind: addr,
-            peers: BTreeMap::new(),
-            tls: tls.clone(),
-            host_activities: true,
-            initialize: true,
-        })
-        .await
-        .unwrap();
+        let mut attempts = 0;
+        let engine = loop {
+            attempts += 1;
+            match Engine::member(MemberConfig {
+                data_dir: dir.path().to_path_buf(),
+                node_id: 1,
+                bind: unused_addr(),
+                peers: BTreeMap::new(),
+                tls: tls.clone(),
+                host_activities: true,
+                initialize: true,
+            })
+            .await
+            {
+                Ok(engine) => break engine,
+                Err(error) if error.message.starts_with("member listener") && attempts < 5 => {}
+                Err(error) => panic!("clock test member startup: {error}"),
+            }
+        };
         tokio::time::sleep(Duration::from_millis(150)).await;
         let future = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
