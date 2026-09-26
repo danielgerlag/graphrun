@@ -162,6 +162,14 @@ pub struct StorageHandle {
 
 impl StorageHandle {
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, JoinHandle<()>)> {
+        Self::open_inner(path, false)
+    }
+
+    pub(crate) fn open_restored(path: impl AsRef<Path>) -> Result<(Self, JoinHandle<()>)> {
+        Self::open_inner(path, true)
+    }
+
+    fn open_inner(path: impl AsRef<Path>, restoring: bool) -> Result<(Self, JoinHandle<()>)> {
         let path = path.as_ref().to_path_buf();
         if path.exists() {
             let db = ReadOnlyDatabase::open(&path).map_err(|err| {
@@ -180,6 +188,15 @@ impl StorageHandle {
                     "domain missing or unreadable (directory left untouched)",
                 ));
             }
+        } else if !restoring
+            && path
+                .parent()
+                .is_some_and(|parent| parent.join("identity.json").exists())
+        {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "member store missing for existing identity (directory left untouched)",
+            ));
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| Error::invalid(err.to_string()))?;
@@ -1020,6 +1037,21 @@ mod tests {
             tempfile::TempDir,
         >::test_all(RedbStoreBuilder)
         .unwrap();
+    }
+
+    #[test]
+    fn missing_member_store_with_identity_does_not_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity.json");
+        let bytes = b"existing identity";
+        std::fs::write(&identity, bytes).unwrap();
+        let db_path = dir.path().join("member.redb");
+
+        let err = StorageHandle::open(&db_path).err().unwrap();
+        assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+        assert!(err.message.contains("member store missing"));
+        assert!(!db_path.exists());
+        assert_eq!(std::fs::read(&identity).unwrap(), bytes);
     }
 
     #[test]

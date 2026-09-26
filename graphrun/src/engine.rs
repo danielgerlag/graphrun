@@ -272,17 +272,39 @@ impl LocalBuilder {
         let data_dir = self.data_dir;
         let handlers = self.handlers;
         std::fs::create_dir_all(&data_dir).map_err(|err| Error::invalid(err.to_string()))?;
-        let publication_auth = write_identity(&data_dir, None)?;
         let db_path = data_dir.join("member.redb");
-        let (storage, storage_thread) = StorageHandle::open(&db_path)?;
+        let existing_identity = read_identity(&data_dir, None)?;
         let restored_path = data_dir.join("restored-domain.json");
-        if restored_path.exists() {
+        let restored_domain = if restored_path.exists() {
+            if !existing_identity
+                .as_ref()
+                .is_some_and(|(_, restored)| *restored)
+            {
+                return Err(Error::new(
+                    ErrorKind::FailedPrecondition,
+                    "restored domain has no matching restored identity (directory left untouched)",
+                ));
+            }
             let bytes =
                 std::fs::read(&restored_path).map_err(|err| Error::invalid(err.to_string()))?;
-            let domain: State =
-                serde_json::from_slice(&bytes).map_err(|err| Error::invalid(err.to_string()))?;
+            let domain: State = serde_json::from_slice(&bytes)
+                .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+            Some(domain)
+        } else {
+            None
+        };
+        let (storage, storage_thread) = if restored_domain.is_some() {
+            StorageHandle::open_restored(&db_path)?
+        } else {
+            StorageHandle::open(&db_path)?
+        };
+        let publication_auth = match existing_identity {
+            Some((auth, _)) => auth,
+            None => write_identity(&data_dir, None)?,
+        };
+        if let Some(domain) = restored_domain {
             storage.install_domain(domain).await?;
-            let _ = std::fs::remove_file(&restored_path);
+            std::fs::remove_file(&restored_path).map_err(|err| Error::invalid(err.to_string()))?;
         }
         let log_store = storage.log_store();
         let state_machine = storage.state_machine();
@@ -370,9 +392,13 @@ impl Engine {
         use sha2::Digest;
         let ca_digest = sha2::Sha256::digest(config.tls.ca_pem.as_bytes());
         let cluster_id = hex::encode(&ca_digest[..16]);
-        let publication_auth = write_identity(&data_dir, Some(&cluster_id))?;
         let db_path = data_dir.join("member.redb");
+        let existing_identity = read_identity(&data_dir, Some(&cluster_id))?;
         let (storage, storage_thread) = StorageHandle::open(&db_path)?;
+        let publication_auth = match existing_identity {
+            Some((auth, _)) => auth,
+            None => write_identity(&data_dir, Some(&cluster_id))?,
+        };
         let log_store = storage.log_store();
         let state_machine = storage.state_machine();
         let raft_config = Config {
@@ -1186,10 +1212,10 @@ pub async fn connect_control(
     serde_json::from_str(&response).map_err(|err| Error::invalid(err.to_string()))
 }
 
-fn write_identity(
+fn read_identity(
     dir: &Path,
     expected_cluster: Option<&str>,
-) -> Result<crate::publication::AuthContext> {
+) -> Result<Option<(crate::publication::AuthContext, bool)>> {
     let path = dir.join("identity.json");
     if path.exists() {
         let bytes = std::fs::read(&path).map_err(|err| Error::invalid(err.to_string()))?;
@@ -1212,16 +1238,25 @@ fn write_identity(
                 "cluster identity does not match configured CA",
             ));
         }
-        return Ok(crate::publication::AuthContext::local_owner(
-            cluster.to_owned(),
-        ));
+        return Ok(Some((
+            crate::publication::AuthContext::local_owner(cluster.to_owned()),
+            identity["restored"] == true,
+        )));
     }
-    if dir.join("member.redb").exists() {
+    if dir.join("member.redb").exists() || dir.join("restored-domain.json").exists() {
         return Err(Error::new(
             ErrorKind::FailedPrecondition,
-            "pre-publication member store has no compatible identity (directory left untouched)",
+            "member store or restored domain has no compatible identity (directory left untouched)",
         ));
     }
+    Ok(None)
+}
+
+fn write_identity(
+    dir: &Path,
+    expected_cluster: Option<&str>,
+) -> Result<crate::publication::AuthContext> {
+    let path = dir.join("identity.json");
     let cluster_id = expected_cluster
         .map(str::to_owned)
         .unwrap_or_else(|| crate::ids::ClusterId::generate().to_hex());
@@ -1232,7 +1267,13 @@ fn write_identity(
         "node_id": 1u64,
         "cluster_name": "graphrun-local",
     });
-    std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap())
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|err| Error::invalid(err.to_string()))?;
+    file.write_all(&serde_json::to_vec_pretty(&body).unwrap())
         .map_err(|err| Error::invalid(err.to_string()))?;
     Ok(crate::publication::AuthContext::local_owner(cluster_id))
 }
@@ -2151,6 +2192,102 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_directory_initializes_store_before_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        assert!(dir.path().join("identity.json").exists());
+        assert!(dir.path().join("member.redb").exists());
+        engine.shutdown().await.unwrap();
+
+        let engine = Engine::local(dir.path()).await.unwrap();
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn existing_identity_with_missing_member_store_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = CommandId::generate();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        engine
+            .publish_catalog_with_command(1, Catalog::default(), id)
+            .await
+            .unwrap();
+        engine.shutdown().await.unwrap();
+
+        let identity = dir.path().join("identity.json");
+        let bytes = std::fs::read(&identity).unwrap();
+        let db_path = dir.path().join("member.redb");
+        std::fs::remove_file(&db_path).unwrap();
+
+        let err = Engine::local(dir.path()).await.err().unwrap();
+        assert_eq!(err.kind, ErrorKind::FailedPrecondition);
+        assert!(err.message.contains("member store missing"));
+        assert!(!db_path.exists());
+        assert_eq!(std::fs::read(identity).unwrap(), bytes);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_catalog_receipt_survives_restart_and_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = CommandId::generate();
+        let bad_catalog = |multiple_of| {
+            let mut catalog = Catalog::default();
+            catalog.schemas.insert(
+                crate::schema::SchemaKey::parse("fraction/v1").unwrap(),
+                serde_json::json!({"type":"number","multipleOf":multiple_of}),
+            );
+            catalog
+        };
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let err = engine
+            .publish_catalog_with_command(1, bad_catalog(0.5), id)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidArgument);
+        let receipt = engine.command_result(id).await.unwrap();
+        assert_eq!(receipt.ensure_applied().unwrap_err().kind, err.kind);
+
+        let retry = engine
+            .publish_catalog_with_command(1, bad_catalog(0.5), id)
+            .await
+            .unwrap_err();
+        assert_eq!(retry, err);
+        assert_eq!(
+            serde_json::to_value(engine.command_result(id).await.unwrap()).unwrap(),
+            serde_json::to_value(&receipt).unwrap()
+        );
+        let conflict = engine
+            .publish_catalog_with_command(1, bad_catalog(0.25), id)
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.kind, ErrorKind::AlreadyExists);
+        engine.publish_catalog(1, Catalog::default()).await.unwrap();
+        engine.shutdown().await.unwrap();
+
+        let engine = Engine::local(dir.path()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(engine.command_result(id).await.unwrap()).unwrap(),
+            serde_json::to_value(&receipt).unwrap()
+        );
+        assert_eq!(
+            engine
+                .publish_catalog_with_command(1, bad_catalog(0.5), id)
+                .await
+                .unwrap_err(),
+            err
+        );
+        assert_eq!(
+            engine
+                .publish_catalog_with_command(1, bad_catalog(0.25), id)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::AlreadyExists
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_sequence_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = include_str!("../../docs/specs/v1/examples/sequence.yaml");
@@ -2974,5 +3111,15 @@ nodes:
             .unwrap();
         assert_eq!(output.pointer("/approved").unwrap(), &Value::Bool(true));
         engine.shutdown().await.unwrap();
+
+        assert!(!dest.path().join("restored-domain.json").exists());
+        let identity_path = dest.path().join("identity.json");
+        let identity = std::fs::read(&identity_path).unwrap();
+        let db_path = dest.path().join("member.redb");
+        std::fs::remove_file(&db_path).unwrap();
+        let err = Engine::local(dest.path()).await.err().unwrap();
+        assert_eq!(err.kind, ErrorKind::FailedPrecondition);
+        assert!(!db_path.exists());
+        assert_eq!(std::fs::read(identity_path).unwrap(), identity);
     }
 }

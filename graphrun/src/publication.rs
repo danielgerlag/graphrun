@@ -339,9 +339,22 @@ pub fn apply(
     key: &CommandKey,
     operation: &PublicationOperation,
 ) -> CommandResult {
-    let request_bytes =
-        canonical_bytes(operation, usize::MAX).expect("serializable publication request");
-    let request_digest = hex::encode(Sha256::digest(&request_bytes));
+    let (request_digest, request_bytes) = match canonical_bytes(operation, usize::MAX) {
+        Ok(bytes) => (hex::encode(Sha256::digest(&bytes)), Ok(bytes)),
+        Err(err) => {
+            let (bytes, rejection) = match serde_json::to_vec(operation) {
+                Ok(bytes) => (bytes, err),
+                Err(encode_err) => (
+                    format!("{operation:?}").into_bytes(),
+                    Error::invalid(format!("publication request encoding: {encode_err}")),
+                ),
+            };
+            let mut hasher = Sha256::new();
+            hasher.update(b"graphrun.uncanonical-publication-request/v1\0");
+            hasher.update(bytes);
+            (hex::encode(hasher.finalize()), Err(rejection))
+        }
+    };
     if let Some(previous) = state.command_results.get(&key.storage_key()) {
         if previous.request_digest == request_digest && previous.format == RESULT_FORMAT {
             return previous.clone();
@@ -360,13 +373,13 @@ pub fn apply(
             recorded_ms: command.time.as_millis(),
         };
     }
-    let result = if request_bytes.len() > crate::limits::PUBLIC_COMMAND_ENVELOPE {
-        Err(Error::new(
+    let result = match request_bytes {
+        Err(err) => Err(err),
+        Ok(bytes) if bytes.len() > crate::limits::PUBLIC_COMMAND_ENVELOPE => Err(Error::new(
             ErrorKind::ResourceExhausted,
             "publication command exceeds envelope limit",
-        ))
-    } else {
-        apply_operation(state, command, key, operation)
+        )),
+        Ok(_) => apply_operation(state, command, key, operation),
     };
     let (outcome, event_range) = match result {
         Ok((outcome, range)) => (outcome, range),
@@ -852,6 +865,99 @@ mod tests {
             corrupt.ensure_applied().unwrap_err().kind,
             ErrorKind::FailedPrecondition
         );
+    }
+
+    #[test]
+    fn uncanonical_requests_keep_distinct_durable_identities() {
+        let auth = AuthContext::local_owner("cluster".to_owned());
+        let id = CommandId::generate();
+        let mut state = State::default();
+        let commit = |state: &mut State, time, operation| {
+            let command =
+                super::command(&auth, id, EngineTime::from_millis(time), operation).unwrap();
+            let CommandBody::Publication { key, operation } = &command.body else {
+                unreachable!()
+            };
+            super::apply(state, &command, key, operation)
+        };
+        let bad_catalog = |multiple_of| {
+            let mut catalog = Catalog::default();
+            catalog.schemas.insert(
+                crate::schema::SchemaKey::parse("float/v1").unwrap(),
+                serde_json::json!({"type":"number","multipleOf":multiple_of}),
+            );
+            PublicationOperation::Catalog {
+                version: 1,
+                catalog,
+            }
+        };
+        let first = commit(&mut state, 10, bad_catalog(0.5));
+        assert_eq!(
+            first.ensure_applied().unwrap_err().kind,
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(first.request_digest.len(), 64);
+        assert!(state.published_catalogs.is_empty());
+
+        let retry = commit(&mut state, 20, bad_catalog(0.5));
+        assert_eq!(
+            serde_json::to_value(&retry).unwrap(),
+            serde_json::to_value(&first).unwrap()
+        );
+        let conflict = commit(&mut state, 30, bad_catalog(0.25));
+        assert_eq!(
+            conflict.ensure_applied().unwrap_err().kind,
+            ErrorKind::AlreadyExists
+        );
+        assert_ne!(conflict.request_digest, first.request_digest);
+
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let mut restarted: State = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(commit(&mut restarted, 40, bad_catalog(0.5))).unwrap(),
+            serde_json::to_value(&first).unwrap()
+        );
+        assert_eq!(
+            restarted.command_results[&auth.key(id).storage_key()].request_digest,
+            first.request_digest
+        );
+    }
+
+    #[test]
+    fn overly_deep_input_is_rejected_without_losing_receipt() {
+        let auth = AuthContext::local_owner("cluster".to_owned());
+        let mut input = Value::Null;
+        for _ in 0..=crate::limits::MAX_DATA_DEPTH {
+            input = Value::Array(vec![input]);
+        }
+        let operation = PublicationOperation::Start {
+            workflow: "deep".to_owned(),
+            version: None,
+            start_key: "key".to_owned(),
+            input,
+        };
+        assert!(serde_json::to_vec(&operation).is_ok());
+        let command = super::command(
+            &auth,
+            CommandId::generate(),
+            EngineTime::from_millis(1),
+            operation,
+        )
+        .unwrap();
+        let CommandBody::Publication { key, operation } = &command.body else {
+            unreachable!()
+        };
+        let mut state = State::default();
+        let receipt = super::apply(&mut state, &command, key, operation);
+        assert_eq!(
+            receipt.ensure_applied().unwrap_err().kind,
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            receipt.request_digest,
+            super::apply(&mut state, &command, key, operation).request_digest
+        );
+        assert!(state.command_results.contains_key(&key.storage_key()));
     }
 
     #[test]
