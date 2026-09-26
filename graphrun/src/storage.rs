@@ -1204,6 +1204,7 @@ fn storage_thread(
                             &txn,
                             &next,
                             schedule_revision,
+                            generation,
                             last_applied.map_or(0, |id| id.index),
                         )?;
                         commit_immediate(txn)?;
@@ -1466,6 +1467,14 @@ fn load_schedule_view(db: &Database) -> std::result::Result<ScheduleView, StoErr
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
     let retention_ms = serde_json::from_slice(&read("schedule_retention")?)
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let generation: u64 = serde_json::from_slice(&read("active_generation")?)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    if runs.iter().any(|(_, row)| row.generation != generation) {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "schedule row belongs to an inactive generation",
+        ));
+    }
     Ok(ScheduleView {
         revision,
         runs,
@@ -1829,6 +1838,7 @@ fn update_schedule(
     state: &State,
     affected: &BTreeMap<crate::ids::RunId, Option<bool>>,
     current_revision: u64,
+    generation: u64,
     applied_index: u64,
     now_ms: u64,
 ) -> std::result::Result<Option<u64>, StoErr> {
@@ -1856,6 +1866,7 @@ fn update_schedule(
                 *run,
                 progress.unwrap_or(previous.as_ref().is_some_and(|row| row.progress)),
                 now_ms,
+                generation,
                 applied_index,
             );
             if match (&previous, &next) {
@@ -1912,6 +1923,7 @@ fn replace_schedule(
     txn: &redb::WriteTransaction,
     state: &State,
     current_revision: u64,
+    generation: u64,
     applied_index: u64,
 ) -> std::result::Result<u64, StoErr> {
     {
@@ -1942,6 +1954,7 @@ fn replace_schedule(
         state,
         &affected,
         current_revision,
+        generation,
         applied_index,
         state.engine_time_watermark_ms,
     )?;
@@ -2848,6 +2861,7 @@ fn apply_entries(
         &next_domain,
         &affected,
         *schedule_revision,
+        generation,
         next_applied.map_or(0, |id| id.index),
         next_domain.engine_time_watermark_ms,
     )?;
@@ -3187,6 +3201,7 @@ fn install_snapshot(
         &txn,
         &restored,
         *schedule_revision,
+        generation,
         applied.map_or(0, |id| id.index),
     )?;
     recount_unapplied_credits(&txn, applied)?;

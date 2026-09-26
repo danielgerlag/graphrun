@@ -525,6 +525,8 @@ pub struct ActivationState {
     pub claim: Option<ClaimState>,
     #[serde(default)]
     pub attempts: u32,
+    #[serde(default)]
+    pub ready_order: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -663,6 +665,10 @@ pub struct State {
     pub sessions: HashMap<WorkerSessionId, WorkerSession>,
     #[serde(default)]
     pub next_generation: u64,
+    #[serde(default)]
+    pub fair_cursor: Option<RunId>,
+    #[serde(default)]
+    pub ready_order_counter: u64,
     #[serde(default)]
     pub interventions: HashMap<ActivationId, String>,
     #[serde(default)]
@@ -1683,6 +1689,11 @@ fn decide_claim(
         return Ok(Decision { events });
     }
     runs.sort();
+    if let Some(last) = state.fair_cursor {
+        let next = runs.partition_point(|run| *run <= last);
+        let offset = next % runs.len();
+        runs.rotate_left(offset);
+    }
     let mut granted_ids = Vec::new();
     while granted < cap {
         let mut progressed = false;
@@ -1691,7 +1702,10 @@ fn decide_claim(
                 break;
             }
             let mut ready = unclaimed_ready(state, *run, time);
-            ready.sort();
+            ready.sort_by_key(|id| {
+                let act = &state.activations[id];
+                (act.ready_order, *id)
+            });
             let mut selected = None;
             for id in ready {
                 if granted_ids.contains(&id) {
@@ -3955,6 +3969,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             // Nested bodies need the child region, not the root. Mark activity nodes Ready
             // by scanning the owning scope's region more carefully below.
             let ready = is_activity_node(state, *scope, node);
+            state.ready_order_counter = state.ready_order_counter.saturating_add(1);
             state.activations.insert(
                 *activation,
                 ActivationState {
@@ -3970,6 +3985,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     role: ExecutionRole::Forward,
                     claim: None,
                     attempts: 0,
+                    ready_order: state.ready_order_counter,
                 },
             );
             if let Some(scope_state) = state.scopes.get_mut(scope) {
@@ -4171,6 +4187,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 .map(|act| act.scope)
                 .or_else(|| state.scopes.values().find(|s| s.run == *run).map(|s| s.id));
             if let Some(scope) = scope {
+                state.ready_order_counter = state.ready_order_counter.saturating_add(1);
                 state.activations.insert(
                     *activation,
                     ActivationState {
@@ -4182,6 +4199,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                         role: ExecutionRole::Compensation,
                         claim: None,
                         attempts: 0,
+                        ready_order: state.ready_order_counter,
                     },
                 );
             }
@@ -4324,6 +4342,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             }
         }
         DomainEvent::ClaimGranted {
+            run,
             activation,
             session,
             generation,
@@ -4335,6 +4354,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             ..
         } => {
             state.next_generation = state.next_generation.saturating_add(1);
+            state.fair_cursor = Some(*run);
             if let Some(act) = state.activations.get_mut(activation) {
                 act.claim = Some(ClaimState {
                     session: *session,
@@ -8031,6 +8051,99 @@ nodes:
         assert_eq!(claimed_runs.len(), 2);
         assert!(claimed_runs.contains(&runs[0]));
         assert!(claimed_runs.contains(&runs[1]));
+    }
+
+    #[test]
+    fn claim_rotation_and_within_run_fifo_survive_multiple_batches() {
+        let catalog = catalog();
+        let mut state = State::default();
+        let runs = [RunId::from_bytes([1; 16]), RunId::from_bytes([2; 16])];
+        for (run, yaml) in [
+            (
+                runs[0],
+                include_str!("../../docs/specs/v1/examples/parallel.yaml"),
+            ),
+            (
+                runs[1],
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            ),
+        ] {
+            let definition = compile_yaml(yaml, &catalog).unwrap();
+            start_run(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Start {
+                        run,
+                        definition: Box::new(definition.clone()),
+                        input: order_input(),
+                        catalog: Box::new(catalog.clone()),
+                    },
+                },
+                definition,
+                catalog.clone(),
+            )
+            .unwrap();
+            apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Progress { run },
+                },
+            )
+            .unwrap();
+        }
+        assert!(ready_activations(&state, runs[0]).len() >= 2);
+        let session = WorkerSessionId::generate();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        let mut chosen = Vec::new();
+        for time in 3..=5 {
+            let events = apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(time),
+                    body: CommandBody::Claim {
+                        session,
+                        capacity: 1,
+                    },
+                },
+            )
+            .unwrap();
+            let (run, activation) = events
+                .iter()
+                .find_map(|event| match event {
+                    DomainEvent::ClaimGranted {
+                        run, activation, ..
+                    } => Some((*run, *activation)),
+                    _ => None,
+                })
+                .expect("one ready activation per claim");
+            chosen.push(run);
+            if time == 3 {
+                let scope = &state.scopes[&state.activations[&activation].scope];
+                assert!(matches!(
+                    &scope.role,
+                    ScopeRole::ParallelBranch { name, .. } if name == "tax"
+                ));
+            }
+        }
+        assert_eq!(chosen, [runs[0], runs[1], runs[0]]);
+        assert_eq!(state.fair_cursor, Some(runs[0]));
     }
 
     fn order_input() -> Value {

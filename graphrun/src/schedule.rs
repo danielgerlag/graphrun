@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RunSchedule {
     pub format: u16,
+    pub generation: u64,
     pub progress: bool,
     pub ready: bool,
     pub deadline_ms: Option<u64>,
@@ -17,6 +18,7 @@ impl RunSchedule {
         run: RunId,
         progress: bool,
         now_ms: u64,
+        generation: u64,
         source_revision: u64,
     ) -> Option<Self> {
         let current = state.runs.get(&run)?;
@@ -50,6 +52,7 @@ impl RunSchedule {
         }
         Some(Self {
             format: 1,
+            generation,
             progress,
             ready,
             deadline_ms,
@@ -58,7 +61,8 @@ impl RunSchedule {
     }
 
     pub fn changed_from(&self, previous: &Self) -> bool {
-        self.progress != previous.progress
+        self.generation != previous.generation
+            || self.progress != previous.progress
             || self.ready != previous.ready
             || self.deadline_ms != previous.deadline_ms
     }
