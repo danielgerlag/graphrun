@@ -18,6 +18,26 @@ pub struct ClockHealthResponse {
     #[prost(uint64, tag = "2")]
     pub wall_ms: u64,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ElectionRequest {
+    #[prost(uint64, tag = "1")]
+    pub sender_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub expected_term: u64,
+    #[prost(uint64, tag = "3")]
+    pub membership_index: u64,
+    #[prost(uint64, tag = "4")]
+    pub min_applied_index: u64,
+    #[prost(uint64, tag = "5")]
+    pub min_last_log_index: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ElectionResponse {
+    #[prost(uint64, tag = "1")]
+    pub member_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub requested_from_term: u64,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Ack {
     #[prost(string, tag = "1")]
@@ -238,6 +258,16 @@ pub struct WatchReadyResponse {
     pub ready: bool,
     #[prost(bool, tag = "4")]
     pub resync: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchMemberFaultRequest {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchMemberFaultResponse {
+    #[prost(bool, tag = "1")]
+    pub faulted: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClaimRequest {
@@ -539,6 +569,30 @@ pub mod raft_client {
                 .insert(GrpcMethod::new("graphrun.v1.Raft", "ClockHealth"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn request_election(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ElectionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ElectionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/graphrun.v1.Raft/RequestElection",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("graphrun.v1.Raft", "RequestElection"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -571,6 +625,13 @@ pub mod raft_server {
             request: tonic::Request<super::ClockHealthRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ClockHealthResponse>,
+            tonic::Status,
+        >;
+        async fn request_election(
+            &self,
+            request: tonic::Request<super::ElectionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ElectionResponse>,
             tonic::Status,
         >;
     }
@@ -807,6 +868,49 @@ pub mod raft_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ClockHealthSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/graphrun.v1.Raft/RequestElection" => {
+                    #[allow(non_camel_case_types)]
+                    struct RequestElectionSvc<T: Raft>(pub Arc<T>);
+                    impl<T: Raft> tonic::server::UnaryService<super::ElectionRequest>
+                    for RequestElectionSvc<T> {
+                        type Response = super::ElectionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ElectionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Raft>::request_election(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RequestElectionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -2019,6 +2123,30 @@ pub mod worker_client {
                 .insert(GrpcMethod::new("graphrun.v1.Worker", "WatchReady"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn watch_member_fault(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WatchMemberFaultRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::WatchMemberFaultResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/graphrun.v1.Worker/WatchMemberFault",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("graphrun.v1.Worker", "WatchMemberFault"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn claim(
             &mut self,
             request: impl tonic::IntoRequest<super::ClaimRequest>,
@@ -2130,6 +2258,13 @@ pub mod worker_server {
             request: tonic::Request<super::WatchReadyRequest>,
         ) -> std::result::Result<
             tonic::Response<super::WatchReadyResponse>,
+            tonic::Status,
+        >;
+        async fn watch_member_fault(
+            &self,
+            request: tonic::Request<super::WatchMemberFaultRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::WatchMemberFaultResponse>,
             tonic::Status,
         >;
         async fn claim(
@@ -2341,6 +2476,51 @@ pub mod worker_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = WatchReadySvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/graphrun.v1.Worker/WatchMemberFault" => {
+                    #[allow(non_camel_case_types)]
+                    struct WatchMemberFaultSvc<T: Worker>(pub Arc<T>);
+                    impl<
+                        T: Worker,
+                    > tonic::server::UnaryService<super::WatchMemberFaultRequest>
+                    for WatchMemberFaultSvc<T> {
+                        type Response = super::WatchMemberFaultResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WatchMemberFaultRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Worker>::watch_member_fault(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WatchMemberFaultSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -3,7 +3,7 @@ use crate::catalog::{Catalog, ExecutionKind};
 use crate::error::{Error, ErrorKind, Result};
 use crate::generated::{
     Assignment, ClaimRequest, ReconcileRequest, RegisterRequest, RenewRequest, RenewSessionRequest,
-    ReportRequest, WatchReadyRequest, worker_client::WorkerClient,
+    ReportRequest, WatchMemberFaultRequest, WatchReadyRequest, worker_client::WorkerClient,
 };
 use crate::ids::{
     ActivationId, ActivityKey, CommandId, ExecutionRole, RunId, ScopeId, WorkerSessionId,
@@ -21,8 +21,8 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
+use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tonic::transport::{Channel, Endpoint};
 
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<Outcome>> + Send>>;
@@ -116,15 +116,17 @@ async fn monitor_clock<F: Future>(clock: &ClockGuard, operation: F) -> Result<F:
 }
 
 fn clock_fault(previous: ClockSample, current: ClockSample) -> Option<&'static str> {
-    let Some(elapsed) = current.boot_ms.checked_sub(previous.boot_ms) else {
-        return Some("worker boot clock reversed");
-    };
-    if elapsed > 2_000 {
-        return Some("worker watchdog gap");
+    match crate::time::clock_delta_fault(
+        previous.wall_ms,
+        previous.boot_ms,
+        current.wall_ms,
+        current.boot_ms,
+    ) {
+        Some(crate::time::ClockDeltaFault::BootReversed) => Some("worker boot clock reversed"),
+        Some(crate::time::ClockDeltaFault::WatchdogGap(_)) => Some("worker watchdog gap"),
+        Some(crate::time::ClockDeltaFault::WallBootSkew(..)) => Some("worker wall/boot clock skew"),
+        None => None,
     }
-    let wall_delta = i128::from(current.wall_ms) - i128::from(previous.wall_ms);
-    let difference = (wall_delta - i128::from(elapsed)).unsigned_abs();
-    (difference > u128::from(250 + elapsed / 1_000)).then_some("worker wall/boot clock skew")
 }
 #[cfg(target_os = "linux")]
 fn boot_ms() -> Result<u64> {
@@ -188,14 +190,23 @@ pub struct HandlerContext {
     pub role: ExecutionRole,
     pub effect_key: String,
     pub attempt_deadline_ms: u64,
-    cancelled: Arc<AtomicBool>,
+    cancelled: watch::Receiver<bool>,
     permission: Arc<Mutex<Permission>>,
     clock: Arc<ClockGuard>,
 }
 
 impl HandlerContext {
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        *self.cancelled.borrow()
+    }
+
+    pub async fn cancelled(&self) {
+        let mut receiver = self.cancelled.clone();
+        while !*receiver.borrow() {
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Check immediately before starting another external effect.
@@ -858,11 +869,61 @@ fn tls_for(tls: &TlsMaterial, endpoint: &WorkerEndpoint) -> TlsMaterial {
 struct Active {
     assignment: Assignment,
     permission: Arc<Mutex<Permission>>,
-    cancelled: Arc<AtomicBool>,
+    cancelled: watch::Sender<bool>,
     outcome: Option<Outcome>,
     pending_result: Option<PendingResult>,
     submitted: bool,
     renew_id: Option<CommandId>,
+}
+
+struct FaultWatch {
+    task: JoinHandle<()>,
+    events: mpsc::Receiver<std::result::Result<bool, tonic::Status>>,
+}
+
+impl FaultWatch {
+    fn new(mut client: WorkerClient<Channel>, session: WorkerSessionId) -> Self {
+        let (tx, events) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            loop {
+                let mut request = tonic::Request::new(WatchMemberFaultRequest {
+                    session_id: session.to_hex(),
+                });
+                request.set_timeout(Duration::from_secs(12));
+                match client.watch_member_fault(request).await {
+                    Ok(response) if !response.get_ref().faulted => {}
+                    Ok(_) => {
+                        let _ = tx.send(Ok(true)).await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                }
+            }
+        });
+        Self { task, events }
+    }
+
+    async fn next(&mut self) -> std::result::Result<bool, tonic::Status> {
+        self.events
+            .recv()
+            .await
+            .unwrap_or_else(|| Err(tonic::Status::unavailable("member fault watch ended")))
+    }
+}
+
+impl Drop for FaultWatch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.cancelled.send_replace(true);
+    }
 }
 
 #[derive(Clone)]
@@ -913,9 +974,23 @@ impl Worker {
         Ok(())
     }
 
+    fn rotate_observers(
+        &mut self,
+        status: &tonic::Status,
+        watcher: &mut WorkerClient<Channel>,
+        fault_watch: &mut FaultWatch,
+    ) -> Result<()> {
+        self.rotate_endpoint(status)?;
+        *watcher = self.client.clone();
+        *fault_watch = FaultWatch::new(self.client.clone(), self.session);
+        Ok(())
+    }
+
     /// Run until the shutdown future completes, then stop claiming and drain running handlers.
     pub async fn run_until<F: Future<Output = ()>>(mut self, shutdown: F) -> Result<()> {
         let mut watcher = self.client.clone();
+        let mut fault_watch = FaultWatch::new(self.client.clone(), self.session);
+        let mut observed_endpoint = self.endpoint_index;
         let mut active: BTreeMap<String, Active> = BTreeMap::new();
         let mut tasks: JoinSet<(String, Result<Outcome>)> = JoinSet::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
@@ -924,31 +999,66 @@ impl Worker {
         clock_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut shutdown = Box::pin(shutdown);
         let mut draining = false;
+        let mut recovering_authority = false;
         let mut generation = 0u64;
         let mut cursor = 0u64;
         let mut session_renew_id: Option<CommandId> = None;
         let mut pending_claim: Option<(CommandId, u32)> = None;
+        let mut cancel_after = None;
         loop {
-            if draining && active.is_empty() {
+            if observed_endpoint != self.endpoint_index {
+                watcher = self.client.clone();
+                fault_watch = FaultWatch::new(self.client.clone(), self.session);
+                observed_endpoint = self.endpoint_index;
+                generation = 0;
+                cursor = 0;
+            }
+            if draining && active.is_empty() && !recovering_authority {
                 return Ok(());
             }
             tokio::select! {
+                observed = fault_watch.next(), if !draining => {
+                    let status = match observed {
+                        Ok(true) => tonic::Status::unavailable("member clock faulted"),
+                        Err(status) => status,
+                        Ok(false) => continue,
+                    };
+                    for claim in active.values() {
+                        claim.cancelled.send_replace(true);
+                    }
+                    cancel_after = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+                    draining = true;
+                    recovering_authority = true;
+                    pending_claim = None;
+                    self.rotate_observers(&status, &mut watcher, &mut fault_watch)?;
+                    generation = 0;
+                    cursor = 0;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                _ = async {
+                    tokio::time::sleep_until(cancel_after.expect("enabled fault drain")).await;
+                }, if cancel_after.is_some() => {
+                    active.retain(|_, claim| claim.outcome.is_some() || claim.pending_result.is_some());
+                    tasks = JoinSet::new();
+                    cancel_after = None;
+                }
                 _ = clock_tick.tick() => {
                     if let Err(err) = self.clock.check() {
                         for claim in active.values() {
-                            claim.cancelled.store(true, Ordering::SeqCst);
+                            claim.cancelled.send_replace(true);
                         }
                         return Err(err);
                     }
                 }
-                _ = &mut shutdown, if !draining => {
+                _ = &mut shutdown, if !draining || recovering_authority => {
                     draining = true;
+                    recovering_authority = false;
                     for claim in active.values() {
-                        claim.cancelled.store(true, Ordering::SeqCst);
+                        claim.cancelled.send_replace(true);
                     }
                 }
                 _ = ticker.tick() => {
-                    if active.is_empty() && draining { return Ok(()); }
+                    if active.is_empty() && draining && !recovering_authority { return Ok(()); }
                     self.clock.check()?;
                     let id = *session_renew_id.get_or_insert_with(CommandId::generate);
                     let mut request = tonic::Request::new(RenewSessionRequest {
@@ -963,14 +1073,20 @@ impl Worker {
                             self.session_revision = response.revision;
                             self.session_expiry_ms = response.lease_expiry_ms;
                             session_renew_id = None;
+                            if recovering_authority && active.is_empty() && cancel_after.is_none() {
+                                recovering_authority = false;
+                                draining = false;
+                                fault_watch = FaultWatch::new(self.client.clone(), self.session);
+                                generation = 0;
+                                cursor = 0;
+                            }
                         }
-                        Err(err) if uncertain_rpc(&err) => {
+                        Err(err) if uncertain_rpc(&err) || (err.code() == tonic::Code::FailedPrecondition && (!active.is_empty() || recovering_authority)) => {
                             if wall_ms()? >= self.session_expiry_ms.saturating_sub(5_000) {
-                                for claim in active.values() { claim.cancelled.store(true, Ordering::SeqCst); }
+                                for claim in active.values() { claim.cancelled.send_replace(true); }
                                 return Err(rpc_error(err));
                             }
-                            self.rotate_endpoint(&err)?;
-                            watcher = self.client.clone();
+                            self.rotate_observers(&err, &mut watcher, &mut fault_watch)?;
                             generation = 0;
                             cursor = 0;
                             continue;
@@ -983,7 +1099,7 @@ impl Worker {
                             continue;
                         }
                         if wall_ms()? >= claim.assignment.attempt_deadline_ms {
-                            claim.cancelled.store(true, Ordering::SeqCst);
+                            claim.cancelled.send_replace(true);
                             return Err(Error::new(ErrorKind::FailedPrecondition,
                                 format!("attempt deadline elapsed for {}", claim.assignment.activation_id)));
                         }
@@ -1000,7 +1116,7 @@ impl Worker {
                             Ok(response) => {
                                 let response = response.into_inner();
                                 if !response.error.is_empty() {
-                                    claim.cancelled.store(true, Ordering::SeqCst);
+                                    claim.cancelled.send_replace(true);
                                     return Err(Error::new(ErrorKind::FailedPrecondition, response.error));
                                 }
                                 claim.assignment.revision = response.revision;
@@ -1010,12 +1126,11 @@ impl Worker {
                             }
                             Err(err) if uncertain_rpc(&err) => {
                                 if wall_ms()? >= claim.assignment.lease_expiry_ms.saturating_sub(5_000) {
-                                    claim.cancelled.store(true, Ordering::SeqCst);
+                                    claim.cancelled.send_replace(true);
                                     return Err(rpc_error(err));
                                 }
                                 tracing::warn!(activation = %claim.assignment.activation_id, "claim renewal uncertain; retrying same command");
-                                self.rotate_endpoint(&err)?;
-                                watcher = self.client.clone();
+                                self.rotate_observers(&err, &mut watcher, &mut fault_watch)?;
                                 generation = 0;
                                 cursor = 0;
                             }
@@ -1023,16 +1138,20 @@ impl Worker {
                         }
                     }
                     let completed: Vec<_> = active.iter().filter(|(_,claim)| claim.outcome.is_some() && claim.renew_id.is_none()).map(|(id,_)| id.clone()).collect();
-                    for id in completed { self.report(&id, &mut active).await?; }
+                    for id in completed { self.report(&id, &mut active, draining).await?; }
                 }
                 result = tasks.join_next(), if !tasks.is_empty() => {
                     let (id, result) = result.expect("join set nonempty").map_err(|err| Error::invalid(format!("worker handler task panicked: {err}")))?;
                     let claim = active.get_mut(&id).ok_or_else(|| Error::invalid("completed handler claim unavailable"))?;
+                    if *claim.cancelled.borrow() {
+                        active.remove(&id);
+                        continue;
+                    }
                     claim.outcome = Some(match result {
                         Ok(outcome) => outcome,
                         Err(err) => Outcome::Failure(ActivityError::new("worker.handler_error", err.to_string())),
                     });
-                    if claim.renew_id.is_none() { self.report(&id, &mut active).await?; }
+                    if claim.renew_id.is_none() { self.report(&id, &mut active, draining).await?; }
                 }
                 claim = async {
                     let (id, capacity) = pending_claim.expect("enabled claim branch");
@@ -1048,16 +1167,14 @@ impl Worker {
                             let claimed = response.into_inner();
                             if !claimed.error.is_empty() { return Err(Error::invalid(claimed.error)); }
                             for assignment in claimed.assignments {
-                                let (id, input, context, handler) = self.prepare(&assignment)?;
+                                let (id, input, context, cancelled, handler) = self.prepare(&assignment)?;
                                 let permission = context.permission.clone();
-                                let cancelled = context.cancelled.clone();
                                 active.insert(id.clone(), Active { assignment, permission, cancelled, outcome: None, pending_result: None, submitted: false, renew_id: None });
                                 tasks.spawn(async move { (id, handler(input, context).await) });
                             }
                         }
                         Err(err) if uncertain_rpc(&err) => {
-                            self.rotate_endpoint(&err)?;
-                            watcher = self.client.clone();
+                            self.rotate_observers(&err, &mut watcher, &mut fault_watch)?;
                             generation = 0;
                             cursor = 0;
                             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1083,8 +1200,7 @@ impl Worker {
                             generation = 0;
                             cursor = 0;
                             tokio::time::sleep(Duration::from_secs(1)).await;
-                            self.rotate_endpoint(&err)?;
-                            watcher = self.client.clone();
+                            self.rotate_observers(&err, &mut watcher, &mut fault_watch)?;
                         }
                         Err(err) => return Err(rpc_error(err)),
                     }
@@ -1097,7 +1213,10 @@ impl Worker {
         self.run_until(std::future::pending()).await
     }
 
-    fn prepare(&self, assignment: &Assignment) -> Result<(String, Value, HandlerContext, Handler)> {
+    fn prepare(
+        &self,
+        assignment: &Assignment,
+    ) -> Result<(String, Value, HandlerContext, watch::Sender<bool>, Handler)> {
         self.clock.check()?;
         let now = wall_ms()?;
         let role = parse_role(&assignment.role)?;
@@ -1143,6 +1262,7 @@ impl Worker {
             ))
             .ok_or_else(|| Error::invalid("advertised handler unavailable"))?
             .clone();
+        let (cancelled, cancellation) = watch::channel(false);
         let context = HandlerContext {
             run: RunId::from_hex(&assignment.run_id).map_err(Error::invalid)?,
             scope: ScopeId::from_hex(&assignment.scope_id).map_err(Error::invalid)?,
@@ -1152,7 +1272,7 @@ impl Worker {
             role,
             effect_key: assignment.effect_key.clone(),
             attempt_deadline_ms: assignment.attempt_deadline_ms,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled: cancellation,
             permission: Arc::new(Mutex::new(Permission {
                 session_expiry_ms: self.session_expiry_ms,
                 claim_expiry_ms: assignment.lease_expiry_ms,
@@ -1166,7 +1286,13 @@ impl Worker {
                 "assignment is inside lease stop margin",
             ));
         }
-        Ok((assignment.activation_id.clone(), input, context, handler))
+        Ok((
+            assignment.activation_id.clone(),
+            input,
+            context,
+            cancelled,
+            handler,
+        ))
     }
 
     fn prepare_result(&self, claim: &Active) -> Result<PendingResult> {
@@ -1296,7 +1422,12 @@ impl Worker {
         }
     }
 
-    async fn report(&mut self, id: &str, active: &mut BTreeMap<String, Active>) -> Result<()> {
+    async fn report(
+        &mut self,
+        id: &str,
+        active: &mut BTreeMap<String, Active>,
+        draining: bool,
+    ) -> Result<()> {
         self.clock.check()?;
         let claim = active
             .get(id)
@@ -1315,7 +1446,7 @@ impl Worker {
         let permission = *claim.permission.lock().expect("worker permission");
         let now = wall_ms()?;
         if now >= self.session_expiry_ms {
-            claim.cancelled.store(true, Ordering::SeqCst);
+            claim.cancelled.send_replace(true);
             return Err(Error::new(
                 ErrorKind::FailedPrecondition,
                 format!(
@@ -1333,7 +1464,7 @@ impl Worker {
                 || now >= permission.claim_expiry_ms.saturating_sub(5_000)
                 || now >= permission.attempt_deadline_ms)
         {
-            claim.cancelled.store(true, Ordering::SeqCst);
+            claim.cancelled.send_replace(true);
             return Err(Error::new(
                 ErrorKind::FailedPrecondition,
                 "handler completed without live reporting permission",
@@ -1378,7 +1509,10 @@ impl Worker {
         };
         let reply = match response {
             Ok(Ok(response)) => response.into_inner(),
-            Ok(Err(err)) if uncertain_rpc(&err) => {
+            Ok(Err(err))
+                if uncertain_rpc(&err)
+                    || (draining && err.code() == tonic::Code::FailedPrecondition) =>
+            {
                 tracing::warn!(activation = %id, command = %command_id, "worker result uncertain; retrying same command");
                 self.rotate_endpoint(&err)?;
                 return Ok(());
@@ -1501,5 +1635,42 @@ mod tests {
         assert!(!uncertain_rpc(&tonic::Status::failed_precondition(
             "stale claim"
         )));
+    }
+
+    #[tokio::test]
+    async fn active_claim_drop_requests_cancellation_without_reviving_permission() {
+        let (cancelled, receiver) = watch::channel(false);
+        let now = wall_ms().unwrap();
+        let permission = Arc::new(Mutex::new(Permission {
+            session_expiry_ms: now + 60_000,
+            claim_expiry_ms: now + 60_000,
+            attempt_deadline_ms: now + 60_000,
+        }));
+        let context = HandlerContext {
+            run: RunId::generate(),
+            scope: ScopeId::generate(),
+            activation: ActivationId::generate(),
+            attempt: 1,
+            role: ExecutionRole::Forward,
+            effect_key: "key".to_owned(),
+            attempt_deadline_ms: now + 60_000,
+            cancelled: receiver,
+            permission: permission.clone(),
+            clock: Arc::new(ClockGuard::new().unwrap()),
+        };
+        assert!(context.can_start_effect());
+        let active = Active {
+            assignment: Assignment::default(),
+            permission,
+            cancelled,
+            outcome: None,
+            pending_result: None,
+            submitted: false,
+            renew_id: None,
+        };
+        drop(active);
+        context.cancelled().await;
+        assert!(context.is_cancelled());
+        assert!(!context.can_start_effect());
     }
 }

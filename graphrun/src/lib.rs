@@ -61,7 +61,7 @@ pub use engine::{
 };
 pub use error::{Error, ErrorKind, Result};
 pub use flow::{region, workflow};
-pub use handlers::Handlers;
+pub use handlers::{Handlers, LocalHandlerContext};
 pub use history::{HistoryPage, RecordedEvent, reconstruct_at};
 pub use ids::{EventId, RunId};
 pub use ir::Definition;

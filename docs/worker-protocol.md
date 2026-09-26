@@ -13,6 +13,7 @@ array, or object. Empty bytes are **not** JSON null.
 | `Register` | New `session_id`, stable `command_id`, signed `principal_id`, `protocol_min`, `protocol_max`, `capacity`, and exact `capabilities` | `revision` and `lease_expiry_ms` |
 | `RenewSession` | Original `session_id`, expected `revision`, and stable `command_id` | New `revision` and `lease_expiry_ms` |
 | `WatchReady` | `session_id`, last `generation`, and last `cursor` | Current `generation`, `cursor`, `ready`, and `resync` |
+| `WatchMemberFault` | `session_id` | Member-local `faulted`; a false reply is a heartbeat, not permission to start an effect |
 | `Claim` | `session_id`, stable `command_id`, and requested `capacity` | At most 16 assignments, subject to the session's remaining capacity |
 
 The signed worker URI SAN supplies the authenticated principal. The member
@@ -32,6 +33,15 @@ returns an authoritative view with `resync=true`; a disconnected worker sends
 `generation=0` and `cursor=0` before claiming again. The cursor represents
 committed apply progress, not a sequence of retained notifications. A worker
 with no free capacity is not ready.
+The worker also keeps `WatchMemberFault` open while every slot is occupied.
+The member checks the signed worker principal against the committed session
+before returning its local clock-fault state. On a fault or a lost watch, the
+worker requests cancellation of active handlers and stops claiming. A handler
+can await `HandlerContext::cancelled()` or call `can_start_effect()` before
+another effect. Blocking threads and provider operations can continue after
+the wrapper stops; the worker does not report a failure merely because it
+requested cancellation. Completed results retain their original command IDs
+for guarded settlement through a healthy leader.
 On a signed follower redirect, read both
 `graphrun-leader-endpoint: https://host:port` and
 `graphrun-leader-server-name`. Keep the worker CA, certificate, and key.
