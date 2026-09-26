@@ -539,6 +539,8 @@ pub struct ClaimState {
     pub role: ExecutionRole,
     #[serde(default)]
     pub probes: u32,
+    #[serde(default)]
+    pub unknown_reported: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2012,6 +2014,12 @@ fn decide_reconcile(
     }
     if let Some(value) = &output {
         validate_leaf_output(state, act, value)?;
+    }
+    if outcome == ReconcileOutcome::Unknown && claim.unknown_reported {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "unknown reconciliation already reported for claim",
+        ));
     }
     let probes = claim.probes.saturating_add(1);
     let mut events = vec![DomainEvent::ReconciliationRecorded {
@@ -4336,7 +4344,12 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     attempt_deadline_ms: *attempt_deadline_ms,
                     effect_key: *effect_key,
                     role: *role,
-                    probes: 0,
+                    probes: if *role == ExecutionRole::Reconciliation {
+                        act.claim.as_ref().map_or(0, |claim| claim.probes)
+                    } else {
+                        0
+                    },
+                    unknown_reported: false,
                 });
                 act.attempts = act.attempts.saturating_add(1);
             }
@@ -4361,11 +4374,17 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
         }
         DomainEvent::ReconciliationFailed { .. } => {}
         DomainEvent::ReconciliationRecorded {
-            activation, probes, ..
+            activation,
+            outcome,
+            probes,
+            ..
         } => {
             if let Some(act) = state.activations.get_mut(activation) {
                 if let Some(claim) = &mut act.claim {
                     claim.probes = *probes;
+                    if *outcome == ReconcileOutcome::Unknown {
+                        claim.unknown_reported = true;
+                    }
                 }
             }
         }
@@ -5910,115 +5929,313 @@ nodes:
 
     #[test]
     fn unknown_probes_enter_intervention() {
-        let catalog = catalog();
-        let definition = compile_yaml(manual_yaml(), &catalog).unwrap();
-        let mut state = State::default();
-        let run = RunId::generate();
-        start_run(
-            &mut state,
-            Command {
-                id: CommandId::generate(),
-                time: EngineTime::from_millis(0),
-                body: CommandBody::Start {
-                    run,
-                    definition: Box::new(definition.clone()),
-                    input: Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(1))])),
-                    catalog: Box::new(catalog.clone()),
-                },
-            },
-            definition,
-            catalog,
-        )
-        .unwrap();
-        apply_command(
-            &mut state,
-            Command {
-                id: CommandId::generate(),
-                time: EngineTime::from_millis(1),
-                body: CommandBody::Progress { run },
-            },
-        )
-        .unwrap();
-        let session = WorkerSessionId::generate();
-        apply_command(
-            &mut state,
-            Command {
-                id: CommandId::generate(),
-                time: EngineTime::from_millis(1),
-                body: CommandBody::RegisterSession {
-                    session,
-                    activities: vec!["*".to_owned()],
-                    capacity: 8,
-                },
-            },
-        )
-        .unwrap();
-        apply_command(
-            &mut state,
-            Command {
-                id: CommandId::generate(),
-                time: EngineTime::from_millis(1),
-                body: CommandBody::Claim {
-                    session,
-                    capacity: 8,
-                },
-            },
-        )
-        .unwrap();
-        let activation = ready_activations(&state, run)[0];
-        let later = crate::policy::SESSION_LEASE.as_millis() as u64 + 2;
-        apply_command(
-            &mut state,
-            Command {
-                id: CommandId::generate(),
-                time: EngineTime::from_millis(later),
-                body: CommandBody::RegisterSession {
-                    session,
-                    activities: vec!["*".to_owned()],
-                    capacity: 8,
-                },
-            },
-        )
-        .unwrap();
-        apply_command(
-            &mut state,
-            Command {
-                id: CommandId::generate(),
-                time: EngineTime::from_millis(later),
-                body: CommandBody::Claim {
-                    session,
-                    capacity: 8,
-                },
-            },
-        )
-        .unwrap();
-        for _ in 0..3 {
-            let (generation, revision) = {
-                let claim = state.activations[&activation].claim.clone().unwrap();
-                (claim.generation, claim.revision)
+        let (mut state, run, activation, first_session) = manual_recon_claim();
+        let lease = crate::policy::SESSION_LEASE.as_millis() as u64;
+        let budget = crate::policy::RECONCILIATION_PROBES;
+        assert_eq!(budget, 3);
+        let effect_key = state.activations[&activation]
+            .claim
+            .as_ref()
+            .unwrap()
+            .effect_key;
+        let mut previous = None;
+
+        for probe in 1..=budget {
+            let now = (lease + 2) * u64::from(probe);
+            let session = if probe == 1 {
+                first_session
+            } else {
+                let session = WorkerSessionId::generate();
+                apply(
+                    &mut state,
+                    now,
+                    CommandBody::RegisterSession {
+                        session,
+                        activities: vec!["*".to_owned()],
+                        capacity: 8,
+                    },
+                )
+                .unwrap();
+                apply(
+                    &mut state,
+                    now,
+                    CommandBody::Claim {
+                        session,
+                        capacity: 8,
+                    },
+                )
+                .unwrap();
+                session
             };
-            apply_command(
-                &mut state,
-                Command {
-                    id: CommandId::generate(),
-                    time: EngineTime::from_millis(
-                        crate::policy::SESSION_LEASE.as_millis() as u64 + 2,
-                    ),
-                    body: CommandBody::Reconcile {
+            let claim = state.activations[&activation].claim.clone().unwrap();
+            assert_eq!(claim.role, ExecutionRole::Reconciliation);
+            assert_eq!(claim.probes, probe - 1);
+            assert!(!claim.unknown_reported);
+            assert_eq!(claim.effect_key, effect_key);
+
+            if let Some((old_session, old_generation, old_revision)) = previous {
+                assert_ne!(claim.generation, old_generation);
+                let err = apply(
+                    &mut state,
+                    now,
+                    CommandBody::Reconcile {
                         run,
                         activation,
-                        session,
-                        generation,
-                        revision,
+                        session: old_session,
+                        generation: old_generation,
+                        revision: old_revision,
                         outcome: ReconcileOutcome::Unknown,
                         output: None,
                     },
+                )
+                .unwrap_err();
+                assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+                assert_eq!(
+                    state.activations[&activation]
+                        .claim
+                        .as_ref()
+                        .unwrap()
+                        .probes,
+                    probe - 1
+                );
+            }
+
+            let command = Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(now),
+                body: CommandBody::Reconcile {
+                    run,
+                    activation,
+                    session,
+                    generation: claim.generation,
+                    revision: claim.revision,
+                    outcome: ReconcileOutcome::Unknown,
+                    output: None,
+                },
+            };
+            let events = apply_command(&mut state, command.clone()).unwrap();
+            assert!(matches!(
+                events.as_slice(),
+                [DomainEvent::ReconciliationRecorded {
+                    outcome: ReconcileOutcome::Unknown,
+                    probes,
+                    ..
+                }, ..] if *probes == probe
+            ));
+            assert_eq!(
+                state.interventions.contains_key(&activation),
+                probe == budget
+            );
+            let history_len = state.history[&run].len();
+            assert_eq!(apply_command(&mut state, command).unwrap(), events);
+            assert_eq!(state.history[&run].len(), history_len);
+
+            if probe < budget {
+                assert_eq!(
+                    state.activations[&activation]
+                        .claim
+                        .as_ref()
+                        .unwrap()
+                        .probes,
+                    probe
+                );
+                let err = apply(
+                    &mut state,
+                    now + 1,
+                    CommandBody::Reconcile {
+                        run,
+                        activation,
+                        session,
+                        generation: claim.generation,
+                        revision: claim.revision,
+                        outcome: ReconcileOutcome::Unknown,
+                        output: None,
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+                assert_eq!(
+                    state.activations[&activation]
+                        .claim
+                        .as_ref()
+                        .unwrap()
+                        .probes,
+                    probe
+                );
+                assert_eq!(state.history[&run].len(), history_len);
+            } else {
+                assert!(state.activations[&activation].claim.is_none());
+            }
+
+            let run_state = &state.runs[&run];
+            let rebuilt = reconstruct(
+                run_state.definition.clone(),
+                run_state.catalog.clone(),
+                &state.history[&run],
+            )
+            .unwrap();
+            assert_eq!(rebuilt.next_generation, state.next_generation);
+            assert_eq!(rebuilt.interventions, state.interventions);
+            assert_eq!(rebuilt.history[&run], state.history[&run]);
+            assert_eq!(
+                rebuilt.activations[&activation]
+                    .claim
+                    .as_ref()
+                    .map(|claim| claim.probes),
+                state.activations[&activation]
+                    .claim
+                    .as_ref()
+                    .map(|claim| claim.probes)
+            );
+            let snapshot: State =
+                serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+            assert_eq!(
+                snapshot.activations[&activation]
+                    .claim
+                    .as_ref()
+                    .map(|claim| claim.probes),
+                rebuilt.activations[&activation]
+                    .claim
+                    .as_ref()
+                    .map(|claim| claim.probes)
+            );
+            state = rebuilt;
+            previous = Some((session, claim.generation, claim.revision));
+        }
+
+        let history = &state.history[&run];
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event, DomainEvent::ReconciliationRecorded { .. }))
+                .count(),
+            budget as usize
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    DomainEvent::ClaimGranted {
+                        role: ExecutionRole::Forward,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event, DomainEvent::InterventionRequired { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn terminal_reconciliation_after_unknown_does_not_repeat_forward_effect() {
+        for outcome in [ReconcileOutcome::Applied, ReconcileOutcome::NotApplied] {
+            let (mut state, run, activation, first_session) = manual_recon_claim();
+            let now = crate::policy::SESSION_LEASE.as_millis() as u64 + 2;
+            let first_claim = state.activations[&activation].claim.clone().unwrap();
+            apply(
+                &mut state,
+                now,
+                CommandBody::Reconcile {
+                    run,
+                    activation,
+                    session: first_session,
+                    generation: first_claim.generation,
+                    revision: first_claim.revision,
+                    outcome: ReconcileOutcome::Unknown,
+                    output: None,
                 },
             )
             .unwrap();
+
+            let session = WorkerSessionId::generate();
+            let later = now + crate::policy::SESSION_LEASE.as_millis() as u64 + 2;
+            apply(
+                &mut state,
+                later,
+                CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            )
+            .unwrap();
+            apply(
+                &mut state,
+                later,
+                CommandBody::Claim {
+                    session,
+                    capacity: 8,
+                },
+            )
+            .unwrap();
+            let claim = state.activations[&activation].claim.clone().unwrap();
+            assert_eq!(claim.role, ExecutionRole::Reconciliation);
+            assert_eq!(claim.probes, 1);
+            assert_eq!(claim.effect_key, first_claim.effect_key);
+            assert_eq!(
+                state.history[&run]
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        DomainEvent::ClaimGranted {
+                            role: ExecutionRole::Forward,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
+            );
+
+            let output = Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(2))]));
+            let events = apply(
+                &mut state,
+                later,
+                CommandBody::Reconcile {
+                    run,
+                    activation,
+                    session,
+                    generation: claim.generation,
+                    revision: claim.revision,
+                    outcome,
+                    output: (outcome == ReconcileOutcome::Applied).then_some(output.clone()),
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                events.first(),
+                Some(DomainEvent::ReconciliationRecorded { probes: 2, .. })
+            ));
+            assert!(!state.interventions.contains_key(&activation));
+            if outcome == ReconcileOutcome::Applied {
+                apply(&mut state, later + 1, CommandBody::Progress { run }).unwrap();
+                assert_eq!(run_output(&state, run), Some(output));
+            } else {
+                assert!(state.activations[&activation].claim.is_none());
+                assert_eq!(
+                    state.activations[&activation].status,
+                    ActivationStatus::Ready
+                );
+                apply(
+                    &mut state,
+                    later,
+                    CommandBody::Claim {
+                        session,
+                        capacity: 8,
+                    },
+                )
+                .unwrap();
+                let retry = state.activations[&activation].claim.as_ref().unwrap();
+                assert_eq!(retry.role, ExecutionRole::Forward);
+                assert_eq!(retry.probes, 0);
+            }
         }
-        assert!(state.interventions.contains_key(&activation));
-        assert!(state.activations[&activation].claim.is_none());
     }
 
     #[test]
