@@ -4,6 +4,17 @@ This is a release gate, not a suggested test list. Implement the executable veri
 
 Compilation, mocked execution, matching two projections produced by the same bug, or screenshots alone do not establish completion.
 
+<!-- TODO(CONTRACT-001, final verifier): Run a fresh three-voter, authenticated
+     integration case that concurrently republishes equal and changed catalog
+     and definition bytes, retries one command ID across leader loss and restart,
+     checks Applied/Rejected v1 receipts and inclusive event ranges against
+     independently read history, and verifies every retained definition,
+     catalog, and payload artifact digest after snapshot import. The
+     publication-start tests cover domain/redb/Raft, local CLI, and signed
+     gRPC principal behavior; do not report PASS until immutable payload
+     artifact retention is integrated and the complete case actually
+     executes. -->
+
 ## Test layers
 
 | Layer | Required coverage |

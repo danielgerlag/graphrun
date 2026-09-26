@@ -60,3 +60,12 @@ graphrun start \
 ```
 
 Workers register over gRPC. They do not change the voter set. `--key` on `signal` is the wait correlation key; certificate keys are `--tls-key` / `--peer-tls-key`.
+
+For immutable catalog/definition publication and keyed starts, use the
+owner-only `--local-dir` control interface shown in the README, or present a
+CA-signed URI SAN principal on `--endpoint`: `admin` for publishing and
+`client` for starting. Use the cluster ID from the member's `identity.json`
+when issuing the principal certificate. `issue_node` certificates are
+roleless and do not authorize these operations; `--cert` is the client's
+principal certificate. The legacy inline `--definition` start above remains
+available.

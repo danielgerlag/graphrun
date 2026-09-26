@@ -241,6 +241,10 @@ pub enum ScopeRole {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CommandBody {
+    Publication {
+        key: crate::publication::CommandKey,
+        operation: crate::publication::PublicationOperation,
+    },
     Start {
         run: RunId,
         definition: Box<Definition>,
@@ -392,6 +396,8 @@ pub struct RunState {
     pub admitted_ms: u64,
     #[serde(default)]
     pub terminal_ms: u64,
+    #[serde(default)]
+    pub published: Option<crate::publication::PinnedPublication>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +525,17 @@ pub struct State {
     pub waits: HashMap<WaitId, WaitState>,
     pub inbox: Vec<InboxEntry>,
     pub commands: HashMap<CommandId, Vec<DomainEvent>>,
+    #[serde(default)]
+    pub legacy_start_digests: HashMap<CommandId, String>,
+    #[serde(default)]
+    pub published_catalogs: BTreeMap<u32, crate::publication::PublishedCatalog>,
+    #[serde(default)]
+    pub published_definitions:
+        BTreeMap<String, BTreeMap<u32, crate::publication::PublishedDefinition>>,
+    #[serde(default)]
+    pub start_keys: BTreeMap<String, BTreeMap<String, crate::publication::StartKeyRecord>>,
+    #[serde(default)]
+    pub command_results: BTreeMap<String, crate::publication::CommandResult>,
     pub loop_carry: HashMap<ActivationId, (Value, u32)>,
     pub foreach_items: HashMap<ActivationId, Vec<Value>>,
     pub foreach_done: HashMap<ActivationId, Vec<(u32, Value)>>,
@@ -558,6 +575,9 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
     }
     let mut ids = IdGen::new(command.id);
     match &command.body {
+        CommandBody::Publication { .. } => {
+            Err(Error::invalid("publication requires replicated apply"))
+        }
         CommandBody::Start {
             run,
             definition,
@@ -3730,6 +3750,7 @@ pub fn start_run(
             next_sequence: RunSequence::new(1),
             admitted_ms: 0,
             terminal_ms: 0,
+            published: None,
         },
     );
     let decision = decide(state, &command)?;
@@ -3761,7 +3782,41 @@ pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEv
 }
 
 pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainEvent>> {
+    if let CommandBody::Publication { key, operation } = &command.body {
+        if key.command_id != command.id || key.cluster_id.is_empty() || key.principal_id.is_empty()
+        {
+            return Err(Error::invalid("invalid authenticated command identity"));
+        }
+        let receipt = crate::publication::apply(state, &command, key, operation);
+        receipt.ensure_applied()?;
+        return Ok(Vec::new());
+    }
+    let start_digest = if let CommandBody::Start {
+        definition,
+        input,
+        catalog,
+        ..
+    } = &command.body
+    {
+        let logical = serde_json::to_value((&**definition, input, &**catalog))
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        let bytes = crate::value::canonical_json(&logical)?;
+        Some(hex::encode(Sha256::digest(bytes)))
+    } else {
+        None
+    };
     if let Some(events) = state.commands.get(&command.id) {
+        if let (Some(expected), Some(actual)) = (
+            state.legacy_start_digests.get(&command.id),
+            start_digest.as_ref(),
+        ) {
+            if expected != actual {
+                return Err(Error::new(
+                    crate::error::ErrorKind::AlreadyExists,
+                    "command ID reused with a different inline start request",
+                ));
+            }
+        }
         return Ok(events.clone());
     }
     if let CommandBody::Start {
@@ -3785,11 +3840,17 @@ pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainE
                     next_sequence: RunSequence::new(1),
                     admitted_ms: 0,
                     terminal_ms: 0,
+                    published: None,
                 },
             );
         }
     }
-    apply_command(state, command)
+    let id = command.id;
+    let events = apply_command(state, command)?;
+    if let Some(digest) = start_digest {
+        state.legacy_start_digests.insert(id, digest);
+    }
+    Ok(events)
 }
 
 pub fn active_runs(state: &State) -> Vec<RunId> {
@@ -3990,6 +4051,7 @@ pub fn reconstruct(
             next_sequence: RunSequence::new(1),
             admitted_ms: 0,
             terminal_ms: 0,
+            published: None,
         },
     );
     apply_events(&mut state, events);
@@ -4145,7 +4207,7 @@ mod tests {
                 body: CommandBody::Start {
                     run: retry_run,
                     definition: Box::new(definition.clone()),
-                    input: Value::String("different".to_owned()),
+                    input: Value::String("original".to_owned()),
                     catalog: Box::new(catalog.clone()),
                 },
             },
@@ -4153,6 +4215,24 @@ mod tests {
         .unwrap();
         assert_eq!(replayed, events);
         assert_eq!(state.commands[&id], events);
+        assert!(!state.runs.contains_key(&retry_run));
+        assert_eq!(serde_json::to_value(&state).unwrap(), before_retry);
+
+        let conflict = commit_command(
+            &mut state,
+            Command {
+                id,
+                time: EngineTime::from_millis(25),
+                body: CommandBody::Start {
+                    run: retry_run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::String("different".to_owned()),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(conflict.kind, crate::error::ErrorKind::AlreadyExists);
         assert!(!state.runs.contains_key(&retry_run));
         assert_eq!(serde_json::to_value(&state).unwrap(), before_retry);
 

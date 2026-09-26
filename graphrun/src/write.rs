@@ -1,7 +1,7 @@
 use crate::domain::{Command, ObligationStatus, State, run_events};
 use crate::error::{Error, ErrorKind, Result};
 use crate::ids::RunId;
-use crate::storage::{RaftRequest, TypeConfig};
+use crate::storage::{RaftRequest, RaftResponse, TypeConfig};
 use crate::time::EngineTime;
 use openraft::Raft;
 use std::cell::Cell;
@@ -46,6 +46,17 @@ pub fn clear_clock_watermark() {
 }
 
 pub(crate) async fn write_raft(raft: &Raft<TypeConfig>, command: Command) -> Result<()> {
+    let resp = write_raft_response(raft, command).await?;
+    if let Some(err) = resp.error {
+        return Err(Error::invalid(err));
+    }
+    Ok(())
+}
+
+pub(crate) async fn write_raft_response(
+    raft: &Raft<TypeConfig>,
+    command: Command,
+) -> Result<RaftResponse> {
     if !clock_is_safe() {
         return Err(Error::new(ErrorKind::FailedPrecondition, "clock rollback"));
     }
@@ -57,14 +68,23 @@ pub(crate) async fn write_raft(raft: &Raft<TypeConfig>, command: Command) -> Res
         .map(|bytes| bytes.len() as u64)
         .unwrap_or(0);
     admit_unapplied(pending, pending.saturating_add(1).saturating_mul(encoded))?;
+    let identity = match &command.body {
+        crate::domain::CommandBody::Publication { key, .. } => format!(
+            "cluster={} principal={} command={}",
+            key.cluster_id, key.principal_id, key.command_id
+        ),
+        _ => format!("command={}", command.id),
+    };
     let resp = raft
         .client_write(RaftRequest { command })
         .await
-        .map_err(|err| Error::invalid(err.to_string()))?;
-    if let Some(err) = resp.data.error {
-        return Err(Error::invalid(err));
-    }
-    Ok(())
+        .map_err(|err| {
+            Error::new(
+                ErrorKind::Unavailable,
+                format!("unknown outcome ({identity}); retry or query the same command ID: {err}"),
+            )
+        })?;
+    Ok(resp.data)
 }
 
 pub(crate) fn inspect_view(state: &State, run: RunId) -> serde_json::Value {
@@ -108,6 +128,7 @@ pub(crate) fn inspect_view(state: &State, run: RunId) -> serde_json::Value {
         "run": run.to_hex(),
         "definition": run_state.definition.id,
         "version": run_state.definition.version,
+        "published": run_state.published,
         "status": match &run_state.status {
             crate::domain::RunStatus::Active => "active",
             crate::domain::RunStatus::Succeeded { .. } => "succeeded",

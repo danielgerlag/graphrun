@@ -49,6 +49,10 @@ pub struct RaftRequest {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RaftResponse {
     pub error: Option<String>,
+    #[serde(default)]
+    pub command_result: Option<crate::publication::CommandResult>,
+    #[serde(default)]
+    pub run_id: Option<crate::ids::RunId>,
 }
 
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
@@ -159,6 +163,24 @@ pub struct StorageHandle {
 impl StorageHandle {
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, JoinHandle<()>)> {
         let path = path.as_ref().to_path_buf();
+        if path.exists() {
+            let db = ReadOnlyDatabase::open(&path).map_err(|err| {
+                Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string())
+            })?;
+            let format: Option<String> = load_json(&db, "publication_start_format");
+            if format.as_deref() != Some("graphrun.publication-store/v1") {
+                return Err(Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "incompatible pre-publication store; migrate explicitly (directory left untouched)",
+                ));
+            }
+            if load_json::<_, State>(&db, "domain").is_none() {
+                return Err(Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "domain missing or unreadable (directory left untouched)",
+                ));
+            }
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| Error::invalid(err.to_string()))?;
         }
@@ -220,7 +242,19 @@ impl StorageHandle {
 pub fn load_domain_readonly(path: impl AsRef<Path>) -> Result<State> {
     let db = ReadOnlyDatabase::open(path.as_ref())
         .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))?;
-    Ok(load_json(&db, "domain").unwrap_or_default())
+    let format: Option<String> = load_json(&db, "publication_start_format");
+    if format.as_deref() != Some("graphrun.publication-store/v1") {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "incompatible store format",
+        ));
+    }
+    load_json(&db, "domain").ok_or_else(|| {
+        Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "domain missing or unreadable",
+        )
+    })
 }
 
 fn storage_thread(
@@ -235,12 +269,13 @@ fn storage_thread(
             return;
         }
     };
-    let _ = ready.send(Ok(()));
-    if let Ok(txn) = db.begin_write() {
-        let _ = txn.open_table(META);
-        let _ = txn.open_table(LOG);
-        let _ = txn.commit();
+    if load_json::<_, String>(&db, "publication_start_format").is_none() {
+        if let Err(err) = initialize_publication_store(&db) {
+            let _ = ready.send(Err(err.to_string()));
+            return;
+        }
     }
+    let _ = ready.send(Ok(()));
     let mut last_purged: Option<LogIdT> = load_json(&db, "last_purged");
     let mut last_applied: Option<LogIdT> = load_json(&db, "last_applied");
     let mut last_membership: MembershipT = load_json(&db, "membership")
@@ -354,6 +389,30 @@ fn storage_thread(
             }
         }
     }
+}
+
+fn initialize_publication_store(db: &Database) -> std::result::Result<(), StoErr> {
+    let mut txn = db
+        .begin_write()
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    txn.set_durability(Durability::Immediate)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    {
+        let mut meta = txn
+            .open_table(META)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let format = serde_json::to_vec("graphrun.publication-store/v1")
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let domain =
+            serde_json::to_vec(&State::default()).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("publication_start_format", format.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("domain", domain.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    }
+    txn.open_table(LOG)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))
 }
 
 fn load_json<D, T>(db: &D, key: &str) -> Option<T>
@@ -585,13 +644,34 @@ fn apply_entries(
         }
         let mut reply = RaftResponse::default();
         if let EntryPayload::Normal(req) = &entry.payload {
-            match domain::commit_command(&mut next_domain, req.command.clone()) {
-                Ok(events) => {
-                    if !events.is_empty() {
-                        domain_changed = true;
+            if let domain::CommandBody::Publication { key, operation } = &req.command.body {
+                if key.command_id != req.command.id
+                    || key.cluster_id.is_empty()
+                    || key.principal_id.is_empty()
+                {
+                    reply.error = Some("invalid authenticated command identity".to_owned());
+                } else {
+                    let receipt =
+                        crate::publication::apply(&mut next_domain, &req.command, key, operation);
+                    domain_changed = true;
+                    if let Err(err) = receipt.ensure_applied() {
+                        reply.error = Some(err.to_string());
                     }
+                    reply.command_result = Some(receipt);
                 }
-                Err(err) => reply.error = Some(err.to_string()),
+            } else {
+                match domain::commit_command(&mut next_domain, req.command.clone()) {
+                    Ok(events) => {
+                        if !events.is_empty() {
+                            domain_changed = true;
+                        }
+                        reply.run_id = events.iter().find_map(|event| match event {
+                            domain::DomainEvent::RunAdmitted { run, .. } => Some(*run),
+                            _ => None,
+                        });
+                    }
+                    Err(err) => reply.error = Some(err.to_string()),
+                }
             }
         }
         replies.push(reply);

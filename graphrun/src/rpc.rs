@@ -6,9 +6,11 @@ use crate::generated::client_server::{Client, ClientServer};
 use crate::generated::raft_server::{Raft as RaftSvc, RaftServer};
 use crate::generated::worker_server::{Worker as WorkerSvc, WorkerServer};
 use crate::generated::{
-    Ack, Blob, CancelRequest, ClaimRequest, ClaimResponse, HistoryRequest, HistoryResponse,
-    InspectRequest, InspectResponse, ListRequest, ListResponse, ReconcileRequest, RegisterRequest,
-    RenewRequest, RenewResponse, ReportRequest, SignalRequest, StartRequest, StartResponse,
+    Ack, Blob, CancelRequest, ClaimRequest, ClaimResponse, CommandResultRequest,
+    CommandResultResponse, HistoryRequest, HistoryResponse, InspectRequest, InspectResponse,
+    ListRequest, ListResponse, PublishCatalogRequest, PublishDefinitionRequest, ReconcileRequest,
+    RegisterRequest, RenewRequest, RenewResponse, ReportRequest, SignalRequest, StartRequest,
+    StartResponse,
 };
 use crate::ids::{
     ActivationId, CommandId, EventId, LeaseRevision, OwnerGeneration, RunId, WorkerSessionId,
@@ -16,7 +18,7 @@ use crate::ids::{
 use crate::storage::{StorageHandle, TypeConfig};
 use crate::tls::TlsMaterial;
 use crate::value::Value;
-use crate::write::{admit_unapplied, inspect_view, now, write_raft};
+use crate::write::{admit_unapplied, inspect_view, now, write_raft, write_raft_response};
 use openraft::Raft;
 use openraft::raft::AppendEntriesRequest;
 use std::net::SocketAddr;
@@ -30,16 +32,108 @@ pub struct GraphServices {
     raft: Raft<TypeConfig>,
     storage: StorageHandle,
     notify: Arc<Notify>,
+    publication_ca: Arc<String>,
+    publication_cluster: crate::tls::ClusterId,
 }
 
 impl GraphServices {
-    pub fn new(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc<Notify>) -> Self {
+    pub fn new(
+        raft: Raft<TypeConfig>,
+        storage: StorageHandle,
+        notify: Arc<Notify>,
+        ca_pem: String,
+    ) -> Self {
+        use sha2::Digest;
+        let cluster = hex::encode(&sha2::Sha256::digest(ca_pem.as_bytes())[..16]);
         Self {
             raft,
             storage,
             notify,
+            publication_ca: Arc::new(ca_pem),
+            publication_cluster: crate::tls::ClusterId::parse(cluster).expect("hex cluster id"),
         }
     }
+
+    fn verified_peer<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<crate::tls::VerifiedPeerIdentity, Status> {
+        let certs = request
+            .peer_certs()
+            .ok_or_else(|| Status::unauthenticated("mTLS peer certificate required"))?;
+        let chain: Vec<rustls::pki_types::CertificateDer<'static>> = certs
+            .iter()
+            .map(|cert| rustls::pki_types::CertificateDer::from(cert.as_ref().to_vec()))
+            .collect();
+        crate::tls::verify_peer_identity(&self.publication_ca, &self.publication_cluster, &chain)
+            .map_err(status_error)
+    }
+
+    fn authenticated_context<T>(
+        &self,
+        request: &Request<T>,
+        role: crate::tls::PeerRole,
+    ) -> Result<crate::publication::AuthContext, Status> {
+        let peer = self.verified_peer(request)?;
+        peer.require_role(role).map_err(status_error)?;
+        Ok(crate::publication::AuthContext::verified_peer(&peer))
+    }
+
+    fn query_context<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<crate::publication::AuthContext, Status> {
+        let peer = self.verified_peer(request)?;
+        if !peer.roles().any(|role| role == crate::tls::PeerRole::Admin) {
+            peer.require_role(crate::tls::PeerRole::Client)
+                .map_err(status_error)?;
+        }
+        Ok(crate::publication::AuthContext::verified_peer(&peer))
+    }
+
+    async fn publication_write(
+        &self,
+        auth: &crate::publication::AuthContext,
+        id: CommandId,
+        operation: crate::publication::PublicationOperation,
+    ) -> Result<crate::publication::CommandResult, Status> {
+        let command =
+            crate::publication::command(auth, id, now(), operation).map_err(status_error)?;
+        let reply = write_raft_response(&self.raft, command)
+            .await
+            .map_err(status_error)?;
+        let receipt = reply.command_result.ok_or_else(|| {
+            Status::unavailable(format!(
+                "unknown outcome for command {id}; query or retry the same identity"
+            ))
+        })?;
+        receipt.ensure_applied().map_err(status_error)?;
+        Ok(receipt)
+    }
+}
+
+fn status_error(err: crate::error::Error) -> Status {
+    use crate::error::ErrorKind;
+    match err.kind {
+        ErrorKind::InvalidArgument => Status::invalid_argument(err.to_string()),
+        ErrorKind::AlreadyExists => Status::already_exists(err.to_string()),
+        ErrorKind::FailedPrecondition => Status::failed_precondition(err.to_string()),
+        ErrorKind::Unauthenticated => Status::unauthenticated(err.to_string()),
+        ErrorKind::PermissionDenied => Status::permission_denied(err.to_string()),
+        ErrorKind::NotFound => Status::not_found(err.to_string()),
+        ErrorKind::Unavailable => Status::unavailable(err.to_string()),
+        ErrorKind::ResourceExhausted => Status::resource_exhausted(err.to_string()),
+        ErrorKind::DeadlineExceeded => Status::deadline_exceeded(err.to_string()),
+    }
+}
+
+fn receipt_response(
+    receipt: &crate::publication::CommandResult,
+) -> Result<CommandResultResponse, Status> {
+    Ok(CommandResultResponse {
+        result_json: serde_json::to_vec(receipt)
+            .map_err(|err| Status::internal(err.to_string()))?,
+    })
 }
 
 #[tonic::async_trait]
@@ -110,11 +204,111 @@ impl RaftSvc for GraphServices {
 
 #[tonic::async_trait]
 impl Client for GraphServices {
+    async fn publish_catalog(
+        &self,
+        request: Request<PublishCatalogRequest>,
+    ) -> Result<Response<CommandResultResponse>, Status> {
+        let auth = self.authenticated_context(&request, crate::tls::PeerRole::Admin)?;
+        let req = request.into_inner();
+        let catalog: Catalog = serde_json::from_slice(&req.catalog_json)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let receipt = self
+            .publication_write(
+                &auth,
+                parse_publication_command_id(&req.command_id)?,
+                crate::publication::PublicationOperation::Catalog {
+                    version: req.version,
+                    catalog,
+                },
+            )
+            .await?;
+        Ok(Response::new(receipt_response(&receipt)?))
+    }
+
+    async fn publish_definition(
+        &self,
+        request: Request<PublishDefinitionRequest>,
+    ) -> Result<Response<CommandResultResponse>, Status> {
+        let auth = self.authenticated_context(&request, crate::tls::PeerRole::Admin)?;
+        let req = request.into_inner();
+        let state = self.storage.query_state().await;
+        let catalog = state
+            .published_catalogs
+            .get(&req.catalog_version)
+            .ok_or_else(|| Status::not_found("published catalog not found"))?;
+        catalog.verify().map_err(status_error)?;
+        let definition = compile_yaml(&req.yaml, &catalog.catalog)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let receipt = self
+            .publication_write(
+                &auth,
+                parse_publication_command_id(&req.command_id)?,
+                crate::publication::PublicationOperation::Definition {
+                    definition: Box::new(definition),
+                    catalog_version: req.catalog_version,
+                },
+            )
+            .await?;
+        Ok(Response::new(receipt_response(&receipt)?))
+    }
+
+    async fn get_command_result(
+        &self,
+        request: Request<CommandResultRequest>,
+    ) -> Result<Response<CommandResultResponse>, Status> {
+        let auth = self.query_context(&request)?;
+        let id = parse_publication_command_id(&request.into_inner().command_id)?;
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|err| Status::unavailable(err.to_string()))?;
+        let state = self.storage.query_state().await;
+        let receipt = state
+            .command_results
+            .get(&auth.key(id).storage_key())
+            .ok_or_else(|| Status::not_found("command result not found"))?;
+        receipt.ensure_format().map_err(status_error)?;
+        Ok(Response::new(receipt_response(receipt)?))
+    }
+
     async fn start(
         &self,
         request: Request<StartRequest>,
     ) -> Result<Response<StartResponse>, Status> {
+        let auth = if !request.get_ref().workflow.is_empty() {
+            Some(self.authenticated_context(&request, crate::tls::PeerRole::Client)?)
+        } else {
+            None
+        };
         let req = request.into_inner();
+        if !req.workflow.is_empty() {
+            if !req.yaml.is_empty() || !req.catalog_json.is_empty() {
+                return Err(Status::invalid_argument(
+                    "published start cannot include inline source/catalog",
+                ));
+            }
+            let input: Value = serde_json::from_slice(&req.input_json)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?;
+            let receipt = self
+                .publication_write(
+                    auth.as_ref().expect("checked"),
+                    parse_publication_command_id(&req.command_id)?,
+                    crate::publication::PublicationOperation::Start {
+                        workflow: req.workflow,
+                        version: (req.version != 0).then_some(req.version),
+                        start_key: req.start_key,
+                        input,
+                    },
+                )
+                .await?;
+            self.notify.notify_one();
+            return Ok(Response::new(StartResponse {
+                run_id: receipt.applied_run().map_err(status_error)?.to_hex(),
+                error: String::new(),
+                command_result_json: serde_json::to_vec(&receipt)
+                    .map_err(|err| Status::internal(err.to_string()))?,
+            }));
+        }
         let catalog: Catalog = serde_json::from_slice(&req.catalog_json)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let input: Value = serde_json::from_slice(&req.input_json)
@@ -123,7 +317,7 @@ impl Client for GraphServices {
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let run = RunId::generate();
         let command_id = parse_command_id(&req.command_id)?;
-        let result = write_raft(
+        let result = write_raft_response(
             &self.raft,
             Command {
                 id: command_id,
@@ -139,14 +333,23 @@ impl Client for GraphServices {
         .await;
         self.notify.notify_one();
         match result {
-            Ok(()) => Ok(Response::new(StartResponse {
-                run_id: run.to_hex(),
+            Ok(reply) if reply.error.is_none() => Ok(Response::new(StartResponse {
+                run_id: reply
+                    .run_id
+                    .ok_or_else(|| Status::internal("missing committed run identity"))?
+                    .to_hex(),
                 error: String::new(),
+                command_result_json: Vec::new(),
             })),
-            Err(err) => Ok(Response::new(StartResponse {
-                run_id: run.to_hex(),
-                error: err.to_string(),
-            })),
+            Ok(reply) => {
+                let error = reply.error.unwrap_or_default();
+                if error.starts_with("AlreadyExists") {
+                    Err(Status::already_exists(error))
+                } else {
+                    Err(Status::failed_precondition(error))
+                }
+            }
+            Err(err) => Err(status_error(err)),
         }
     }
 
@@ -197,11 +400,16 @@ impl Client for GraphServices {
     ) -> Result<Response<InspectResponse>, Status> {
         let run = parse_run(&request.into_inner().run_id)?;
         let state = self.storage.query_state().await;
-        if !state.runs.contains_key(&run) {
+        let Some(run_state) = state.runs.get(&run) else {
             return Ok(Response::new(InspectResponse {
                 view_json: Vec::new(),
                 error: "unknown run".to_owned(),
             }));
+        };
+        if let Some(pinned) = &run_state.published {
+            pinned
+                .verify(&run_state.definition, &run_state.catalog)
+                .map_err(status_error)?;
         }
         let view = inspect_view(&state, run);
         Ok(Response::new(InspectResponse {
@@ -233,6 +441,13 @@ impl Client for GraphServices {
     ) -> Result<Response<HistoryResponse>, Status> {
         let run = parse_run(&request.into_inner().run_id)?;
         let state = self.storage.query_state().await;
+        if let Some(run_state) = state.runs.get(&run) {
+            if let Some(pinned) = &run_state.published {
+                pinned
+                    .verify(&run_state.definition, &run_state.catalog)
+                    .map_err(status_error)?;
+            }
+        }
         let events = crate::domain::run_events(&state, run);
         Ok(Response::new(HistoryResponse {
             events_json: serde_json::to_vec(events).unwrap_or_default(),
@@ -428,10 +643,10 @@ pub async fn serve_grpc(
     notify: Arc<Notify>,
 ) -> crate::error::Result<()> {
     crate::tls::install_provider();
+    let svc = GraphServices::new(raft, storage, notify, tls.ca_pem.clone());
     let identity = Identity::from_pem(tls.cert_pem, tls.key_pem);
     let ca = Certificate::from_pem(tls.ca_pem);
     let tls_config = ServerTlsConfig::new().identity(identity).client_ca_root(ca);
-    let svc = GraphServices::new(raft, storage, notify);
     Server::builder()
         .tls_config(tls_config)
         .map_err(|err| crate::error::Error::invalid(err.to_string()))?
@@ -460,6 +675,14 @@ fn parse_command_id(text: &str) -> Result<CommandId, Status> {
         return Ok(CommandId::generate());
     }
     CommandId::from_hex(text).map_err(Status::invalid_argument)
+}
+
+fn parse_publication_command_id(text: &str) -> Result<CommandId, Status> {
+    let id = CommandId::from_hex(text).map_err(Status::invalid_argument)?;
+    if id.as_bytes() == &[0; 16] {
+        return Err(Status::invalid_argument("command ID must be nonempty"));
+    }
+    Ok(id)
 }
 
 fn ack(result: Result<(), crate::error::Error>) -> Result<Response<Ack>, Status> {

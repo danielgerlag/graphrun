@@ -29,6 +29,7 @@ pub mod ir;
 pub mod limits;
 pub mod policy;
 pub mod provider;
+pub mod publication;
 #[doc(hidden)]
 pub mod rpc;
 pub mod schema;

@@ -20,11 +20,36 @@ message StartRequest {
   string yaml = 2;
   bytes catalog_json = 3;
   bytes input_json = 4;
+  // Published start: workflow name, 0 means latest; yaml/catalog_json must be empty.
+  string workflow = 5;
+  uint32 version = 6;
+  string start_key = 7;
 }
 
 message StartResponse {
   string run_id = 1;
   string error = 2;
+  bytes command_result_json = 3;
+}
+
+message PublishCatalogRequest {
+  string command_id = 1;
+  uint32 version = 2;
+  bytes catalog_json = 3;
+}
+
+message PublishDefinitionRequest {
+  string command_id = 1;
+  uint32 catalog_version = 2;
+  string yaml = 3;
+}
+
+message CommandResultRequest {
+  string command_id = 1;
+}
+
+message CommandResultResponse {
+  bytes result_json = 1;
 }
 
 message SignalRequest {
@@ -67,6 +92,9 @@ message HistoryResponse {
 }
 
 service Client {
+  rpc PublishCatalog(PublishCatalogRequest) returns (CommandResultResponse);
+  rpc PublishDefinition(PublishDefinitionRequest) returns (CommandResultResponse);
+  rpc GetCommandResult(CommandResultRequest) returns (CommandResultResponse);
   rpc Start(StartRequest) returns (StartResponse);
   rpc Signal(SignalRequest) returns (Ack);
   rpc Cancel(CancelRequest) returns (Ack);

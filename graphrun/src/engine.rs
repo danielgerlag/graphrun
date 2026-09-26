@@ -12,7 +12,7 @@ use crate::limits;
 use crate::rpc::serve_grpc;
 use crate::storage::{LocalNetwork, StorageHandle, TypeConfig, load_domain_readonly};
 use crate::value::Value;
-use crate::write::{health_view, inspect_view, now, write_raft};
+use crate::write::{health_view, inspect_view, now, write_raft, write_raft_response};
 use openraft::{BasicNode, ChangeMembers, Config, Raft, ServerState, SnapshotPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -116,6 +116,7 @@ pub struct Engine {
     snapshot_task: Option<tokio::task::JoinHandle<()>>,
     cluster_net: Option<ClusterNetwork>,
     handlers: Handlers,
+    publication_auth: crate::publication::AuthContext,
 }
 
 /// Build a local engine and register activity handlers before it opens.
@@ -127,6 +128,27 @@ pub struct LocalBuilder {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ControlRequest {
+    PublishCatalog {
+        version: u32,
+        catalog: Catalog,
+        command_id: String,
+    },
+    PublishDefinition {
+        yaml: String,
+        catalog_version: u32,
+        command_id: String,
+    },
+    StartPublished {
+        workflow: String,
+        version: Option<u32>,
+        start_key: String,
+        input: Value,
+        command_id: String,
+        wait_ms: Option<u64>,
+    },
+    CommandResult {
+        command_id: String,
+    },
     Start {
         yaml: String,
         catalog: Catalog,
@@ -250,7 +272,7 @@ impl LocalBuilder {
         let data_dir = self.data_dir;
         let handlers = self.handlers;
         std::fs::create_dir_all(&data_dir).map_err(|err| Error::invalid(err.to_string()))?;
-        write_identity(&data_dir)?;
+        let publication_auth = write_identity(&data_dir, None)?;
         let db_path = data_dir.join("member.redb");
         let (storage, storage_thread) = StorageHandle::open(&db_path)?;
         let restored_path = data_dir.join("restored-domain.json");
@@ -309,12 +331,14 @@ impl LocalBuilder {
         let sock = data_dir.join("control.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).map_err(|err| Error::invalid(err.to_string()))?;
+        restrict_control_socket(&sock)?;
         let control = tokio::spawn(control_loop(
             listener,
             raft.clone(),
             storage.clone(),
             notify.clone(),
             None,
+            publication_auth.clone(),
         ));
         let snapshot_task = Some(tokio::spawn(snapshot_controller(
             raft.clone(),
@@ -333,6 +357,7 @@ impl LocalBuilder {
             snapshot_task,
             cluster_net: None,
             handlers,
+            publication_auth,
         })
     }
 }
@@ -342,7 +367,10 @@ impl Engine {
         crate::tls::install_provider();
         let data_dir = config.data_dir.clone();
         std::fs::create_dir_all(&data_dir).map_err(|err| Error::invalid(err.to_string()))?;
-        write_identity(&data_dir)?;
+        use sha2::Digest;
+        let ca_digest = sha2::Sha256::digest(config.tls.ca_pem.as_bytes());
+        let cluster_id = hex::encode(&ca_digest[..16]);
+        let publication_auth = write_identity(&data_dir, Some(&cluster_id))?;
         let db_path = data_dir.join("member.redb");
         let (storage, storage_thread) = StorageHandle::open(&db_path)?;
         let log_store = storage.log_store();
@@ -423,12 +451,14 @@ impl Engine {
         let sock = data_dir.join("control.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).map_err(|err| Error::invalid(err.to_string()))?;
+        restrict_control_socket(&sock)?;
         let control = tokio::spawn(control_loop(
             listener,
             raft.clone(),
             storage.clone(),
             notify.clone(),
             Some(network.clone()),
+            publication_auth.clone(),
         ));
         let snapshot_task = Some(tokio::spawn(snapshot_controller(
             raft.clone(),
@@ -447,7 +477,157 @@ impl Engine {
             snapshot_task,
             cluster_net: Some(network),
             handlers,
+            publication_auth,
         })
+    }
+
+    /// Commit an immutable catalog of versioned activity and schema contracts.
+    pub async fn publish_catalog(
+        &self,
+        version: u32,
+        catalog: Catalog,
+    ) -> Result<crate::publication::CommandResult> {
+        self.publish_catalog_with_command(version, catalog, CommandId::generate())
+            .await
+    }
+
+    pub async fn publish_catalog_with_command(
+        &self,
+        version: u32,
+        catalog: Catalog,
+        command_id: CommandId,
+    ) -> Result<crate::publication::CommandResult> {
+        self.publish_with_command(
+            command_id,
+            crate::publication::PublicationOperation::Catalog { version, catalog },
+        )
+        .await
+    }
+
+    /// Publish a compiled definition against an already published catalog.
+    pub async fn publish_definition(
+        &self,
+        definition: Definition,
+        catalog_version: u32,
+    ) -> Result<crate::publication::CommandResult> {
+        self.publish_definition_with_command(definition, catalog_version, CommandId::generate())
+            .await
+    }
+
+    pub async fn publish_definition_with_command(
+        &self,
+        definition: Definition,
+        catalog_version: u32,
+        command_id: CommandId,
+    ) -> Result<crate::publication::CommandResult> {
+        self.publish_with_command(
+            command_id,
+            crate::publication::PublicationOperation::Definition {
+                definition: Box::new(definition),
+                catalog_version,
+            },
+        )
+        .await
+    }
+
+    pub async fn publish_definition_yaml(
+        &self,
+        yaml: &str,
+        catalog_version: u32,
+    ) -> Result<crate::publication::CommandResult> {
+        self.publish_definition_yaml_with_command(yaml, catalog_version, CommandId::generate())
+            .await
+    }
+
+    pub async fn publish_definition_yaml_with_command(
+        &self,
+        yaml: &str,
+        catalog_version: u32,
+        command_id: CommandId,
+    ) -> Result<crate::publication::CommandResult> {
+        let state = self.storage.query_state().await;
+        let catalog = state
+            .published_catalogs
+            .get(&catalog_version)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "published catalog not found"))?;
+        catalog.verify()?;
+        self.publish_definition_with_command(
+            compile_yaml(yaml, &catalog.catalog)?,
+            catalog_version,
+            command_id,
+        )
+        .await
+    }
+
+    pub async fn start_published(
+        &self,
+        workflow: &str,
+        version: Option<u32>,
+        start_key: &str,
+        input: Value,
+    ) -> Result<RunId> {
+        self.start_published_with_command(
+            workflow,
+            version,
+            start_key,
+            input,
+            CommandId::generate(),
+        )
+        .await
+    }
+
+    /// Reuse `command_id` for all retries, including across leader changes.
+    pub async fn start_published_with_command(
+        &self,
+        workflow: &str,
+        version: Option<u32>,
+        start_key: &str,
+        input: Value,
+        command_id: CommandId,
+    ) -> Result<RunId> {
+        let receipt = self
+            .publish_with_command(
+                command_id,
+                crate::publication::PublicationOperation::Start {
+                    workflow: workflow.to_owned(),
+                    version,
+                    start_key: start_key.to_owned(),
+                    input,
+                },
+            )
+            .await?;
+        let run = receipt.applied_run()?;
+        wake(&self.notify);
+        Ok(run)
+    }
+
+    pub async fn command_result(
+        &self,
+        command_id: CommandId,
+    ) -> Result<crate::publication::CommandResult> {
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|err| Error::new(ErrorKind::Unavailable, err.to_string()))?;
+        self.storage
+            .query_state()
+            .await
+            .command_results
+            .get(&self.publication_auth.key(command_id).storage_key())
+            .cloned()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "command result not found"))
+            .and_then(|receipt| {
+                receipt.ensure_format()?;
+                Ok(receipt)
+            })
+    }
+
+    async fn publish_with_command(
+        &self,
+        command_id: CommandId,
+        operation: crate::publication::PublicationOperation,
+    ) -> Result<crate::publication::CommandResult> {
+        publication_via_raft(&self.raft, &self.publication_auth, command_id, operation).await
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -534,8 +714,12 @@ impl Engine {
 
     pub async fn inspect(&self, run: RunId) -> Result<State> {
         let state = self.storage.query_state().await;
-        if !state.runs.contains_key(&run) {
-            return Err(Error::new(ErrorKind::NotFound, "unknown run"));
+        let run_state = state
+            .runs
+            .get(&run)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "unknown run"))?;
+        if let Some(pinned) = &run_state.published {
+            pinned.verify(&run_state.definition, &run_state.catalog)?;
         }
         Ok(state)
     }
@@ -818,6 +1002,8 @@ impl Engine {
             "mode": "local",
             "node_id": 1u64,
             "cluster_name": cluster,
+            "format": "graphrun.local-identity/v1",
+            "cluster_id": crate::ids::ClusterId::generate().to_hex(),
             "restored": true,
         });
         std::fs::write(
@@ -958,6 +1144,9 @@ pub fn replay(data_dir: impl AsRef<Path>) -> Result<State> {
         let Some(run_state) = state.runs.get(run) else {
             continue;
         };
+        if let Some(pinned) = &run_state.published {
+            pinned.verify(&run_state.definition, &run_state.catalog)?;
+        }
         let rebuilt = reconstruct(
             run_state.definition.clone(),
             run_state.catalog.clone(),
@@ -997,17 +1186,60 @@ pub async fn connect_control(
     serde_json::from_str(&response).map_err(|err| Error::invalid(err.to_string()))
 }
 
-fn write_identity(dir: &Path) -> Result<()> {
+fn write_identity(
+    dir: &Path,
+    expected_cluster: Option<&str>,
+) -> Result<crate::publication::AuthContext> {
     let path = dir.join("identity.json");
     if path.exists() {
-        return Ok(());
+        let bytes = std::fs::read(&path).map_err(|err| Error::invalid(err.to_string()))?;
+        let identity: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        if identity["format"] != "graphrun.local-identity/v1" {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "incompatible pre-publication identity (directory left untouched)",
+            ));
+        }
+        let cluster = identity["cluster_id"]
+            .as_str()
+            .ok_or_else(|| Error::new(ErrorKind::FailedPrecondition, "missing cluster identity"))?;
+        crate::ids::ClusterId::from_hex(cluster)
+            .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err))?;
+        if expected_cluster.is_some_and(|expected| expected != cluster) {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "cluster identity does not match configured CA",
+            ));
+        }
+        return Ok(crate::publication::AuthContext::local_owner(
+            cluster.to_owned(),
+        ));
     }
+    if dir.join("member.redb").exists() {
+        return Err(Error::new(
+            ErrorKind::FailedPrecondition,
+            "pre-publication member store has no compatible identity (directory left untouched)",
+        ));
+    }
+    let cluster_id = expected_cluster
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::ids::ClusterId::generate().to_hex());
     let body = serde_json::json!({
+        "format": "graphrun.local-identity/v1",
+        "cluster_id": cluster_id,
         "mode": "local",
         "node_id": 1u64,
         "cluster_name": "graphrun-local",
     });
     std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap())
+        .map_err(|err| Error::invalid(err.to_string()))?;
+    Ok(crate::publication::AuthContext::local_owner(cluster_id))
+}
+
+fn restrict_control_socket(sock: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))
         .map_err(|err| Error::invalid(err.to_string()))
 }
 
@@ -1017,6 +1249,7 @@ async fn control_loop(
     storage: StorageHandle,
     notify: Arc<Notify>,
     cluster_net: Option<ClusterNetwork>,
+    auth: crate::publication::AuthContext,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -1026,8 +1259,9 @@ async fn control_loop(
         let storage = storage.clone();
         let notify = notify.clone();
         let cluster_net = cluster_net.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
-            let _ = handle_control(stream, raft, storage, notify, cluster_net).await;
+            let _ = handle_control(stream, raft, storage, notify, cluster_net, auth).await;
         });
     }
 }
@@ -1038,7 +1272,29 @@ async fn handle_control(
     storage: StorageHandle,
     notify: Arc<Notify>,
     cluster_net: Option<ClusterNetwork>,
+    auth: crate::publication::AuthContext,
 ) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(
+        stream
+            .local_addr()
+            .map_err(|err| Error::invalid(err.to_string()))?
+            .as_pathname()
+            .ok_or_else(|| Error::invalid("control socket has no pathname"))?,
+    )
+    .map_err(|err| Error::invalid(err.to_string()))?
+    .uid();
+    if stream
+        .peer_cred()
+        .map_err(|err| Error::invalid(err.to_string()))?
+        .uid()
+        != owner
+    {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "control socket owner only",
+        ));
+    }
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader
@@ -1047,7 +1303,7 @@ async fn handle_control(
         .map_err(|err| Error::invalid(err.to_string()))?;
     let req: ControlRequest =
         serde_json::from_str(&line).map_err(|err| Error::invalid(err.to_string()))?;
-    let resp = dispatch_control(req, &raft, &storage, &notify, cluster_net.as_ref()).await;
+    let resp = dispatch_control(req, &raft, &storage, &notify, cluster_net.as_ref(), &auth).await;
     let mut out = serde_json::to_string(&resp).unwrap();
     out.push('\n');
     let mut stream = reader.into_inner();
@@ -1064,8 +1320,111 @@ async fn dispatch_control(
     storage: &StorageHandle,
     notify: &Notify,
     cluster_net: Option<&ClusterNetwork>,
+    auth: &crate::publication::AuthContext,
 ) -> ControlResponse {
     let result = match req {
+        ControlRequest::PublishCatalog {
+            version,
+            catalog,
+            command_id,
+        } => match CommandId::from_hex(&command_id) {
+            Ok(id) => publication_via_raft(
+                raft,
+                auth,
+                id,
+                crate::publication::PublicationOperation::Catalog { version, catalog },
+            )
+            .await
+            .and_then(|receipt| {
+                serde_json::to_value(receipt).map_err(|err| Error::invalid(err.to_string()))
+            }),
+            Err(err) => Err(Error::invalid(err)),
+        },
+        ControlRequest::PublishDefinition {
+            yaml,
+            catalog_version,
+            command_id,
+        } => match CommandId::from_hex(&command_id) {
+            Ok(id) => {
+                let state = storage.query_state().await;
+                let definition = state
+                    .published_catalogs
+                    .get(&catalog_version)
+                    .ok_or_else(|| Error::new(ErrorKind::NotFound, "published catalog not found"))
+                    .and_then(|published| {
+                        published.verify()?;
+                        compile_yaml(&yaml, &published.catalog)
+                    });
+                match definition {
+                    Ok(definition) => publication_via_raft(
+                        raft,
+                        auth,
+                        id,
+                        crate::publication::PublicationOperation::Definition {
+                            definition: Box::new(definition),
+                            catalog_version,
+                        },
+                    )
+                    .await
+                    .and_then(|receipt| {
+                        serde_json::to_value(receipt).map_err(|err| Error::invalid(err.to_string()))
+                    }),
+                    Err(err) => Err(err),
+                }
+            }
+            Err(err) => Err(Error::invalid(err)),
+        },
+        ControlRequest::StartPublished {
+            workflow,
+            version,
+            start_key,
+            input,
+            command_id,
+            wait_ms,
+        } => match CommandId::from_hex(&command_id) {
+            Ok(id) => match publication_via_raft(
+                raft,
+                auth,
+                id,
+                crate::publication::PublicationOperation::Start {
+                    workflow,
+                    version,
+                    start_key,
+                    input,
+                },
+            )
+            .await
+            .and_then(|receipt| receipt.applied_run())
+            {
+                Ok(run) => {
+                    wake(notify);
+                    if let Some(ms) = wait_ms {
+                        wait_via_raft(raft, storage, notify, run, Duration::from_millis(ms)).await
+                                .map(|output| serde_json::json!({"run":run.to_hex(),"status":"succeeded","output":output}))
+                    } else {
+                        Ok(serde_json::json!({"run":run.to_hex(),"status":"started"}))
+                    }
+                }
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(Error::invalid(err)),
+        },
+        ControlRequest::CommandResult { command_id } => match CommandId::from_hex(&command_id) {
+            Ok(id) => match raft.ensure_linearizable().await {
+                Ok(_) => storage
+                    .query_state()
+                    .await
+                    .command_results
+                    .get(&auth.key(id).storage_key())
+                    .ok_or_else(|| Error::new(ErrorKind::NotFound, "command result not found"))
+                    .and_then(|receipt| {
+                        receipt.ensure_format()?;
+                        serde_json::to_value(receipt).map_err(|err| Error::invalid(err.to_string()))
+                    }),
+                Err(err) => Err(Error::new(ErrorKind::Unavailable, err.to_string())),
+            },
+            Err(err) => Err(Error::invalid(err)),
+        },
         ControlRequest::Health => {
             let metrics = raft.metrics().borrow().clone();
             let state = storage.query_state().await;
@@ -1111,11 +1470,7 @@ async fn dispatch_control(
                             "status": "succeeded",
                             "output": output,
                         })),
-                        Err(err) => Ok(serde_json::json!({
-                            "run": run.to_hex(),
-                            "status": "pending",
-                            "error": err.to_string(),
-                        })),
+                        Err(err) => Err(err),
                     }
                 } else {
                     Ok(serde_json::json!({"run": run.to_hex(), "status": "started"}))
@@ -1173,21 +1528,39 @@ async fn dispatch_control(
         ControlRequest::Inspect { run } => match RunId::from_hex(&run) {
             Ok(run) => {
                 let state = storage.query_state().await;
-                if state.runs.contains_key(&run) {
-                    Ok(inspect_view(&state, run))
-                } else {
-                    Err(Error::new(ErrorKind::NotFound, "unknown run"))
-                }
+                state
+                    .runs
+                    .get(&run)
+                    .ok_or_else(|| Error::new(ErrorKind::NotFound, "unknown run"))
+                    .and_then(|run_state| {
+                        if let Some(pinned) = &run_state.published {
+                            pinned.verify(&run_state.definition, &run_state.catalog)?;
+                        }
+                        Ok(inspect_view(&state, run))
+                    })
             }
             Err(err) => Err(Error::invalid(err)),
         },
         ControlRequest::History { run } => match RunId::from_hex(&run) {
             Ok(run) => {
                 let state = storage.query_state().await;
-                match serde_json::to_value(run_events(&state, run)) {
-                    Ok(body) => Ok(body),
-                    Err(err) => Err(Error::invalid(err.to_string())),
-                }
+                let verified = state
+                    .runs
+                    .get(&run)
+                    .and_then(|run_state| {
+                        run_state
+                            .published
+                            .as_ref()
+                            .map(|pinned| (pinned, run_state))
+                    })
+                    .map(|(pinned, run_state)| {
+                        pinned.verify(&run_state.definition, &run_state.catalog)
+                    })
+                    .unwrap_or(Ok(()));
+                verified.and_then(|_| {
+                    serde_json::to_value(run_events(&state, run))
+                        .map_err(|err| Error::invalid(err.to_string()))
+                })
             }
             Err(err) => Err(Error::invalid(err)),
         },
@@ -1342,6 +1715,24 @@ async fn start_via_raft(
     .await?;
     wake(notify);
     Ok(run)
+}
+
+async fn publication_via_raft(
+    raft: &Raft<TypeConfig>,
+    auth: &crate::publication::AuthContext,
+    command_id: CommandId,
+    operation: crate::publication::PublicationOperation,
+) -> Result<crate::publication::CommandResult> {
+    let command = crate::publication::command(auth, command_id, now(), operation)?;
+    let reply = write_raft_response(raft, command).await?;
+    let receipt = reply.command_result.ok_or_else(|| {
+        Error::new(
+            ErrorKind::Unavailable,
+            format!("unknown outcome for command {command_id}; query or retry the same ID"),
+        )
+    })?;
+    receipt.ensure_applied()?;
+    Ok(receipt)
 }
 
 async fn wait_via_raft(
