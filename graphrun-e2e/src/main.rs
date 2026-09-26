@@ -7199,6 +7199,31 @@ fn spawn_provider(dir: &Path) -> Result<(ChildProc, String), String> {
     Ok((ChildProc::new(provider), url))
 }
 
+fn manual_recovery_catalog(
+    cluster: &mut LiveCluster,
+    activity_name: &str,
+) -> Result<graphrun::Catalog, String> {
+    let mut catalog_json: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../docs/specs/v1/examples/activity-catalog.json"
+    ))
+    .map_err(|err| err.to_string())?;
+    let activity = catalog_json["activities"]
+        .as_array_mut()
+        .ok_or("fixture catalog lacks activities")?
+        .iter_mut()
+        .find(|activity| activity["name"] == activity_name)
+        .ok_or_else(|| format!("fixture catalog lacks {activity_name}"))?;
+    if activity["recovery"] != "RetrySafe" {
+        return Err(format!("fixture {activity_name} recovery mode changed"));
+    }
+    activity["recovery"] = serde_json::json!("Manual");
+    let bytes = serde_json::to_vec_pretty(&catalog_json).map_err(|err| err.to_string())?;
+    let path = cluster.dir.join("reconciliation-catalog.json");
+    fs::write(&path, &bytes).map_err(|err| err.to_string())?;
+    cluster.catalog_path = Some(path);
+    graphrun::Catalog::from_json(&bytes).map_err(|err| err.to_string())
+}
+
 fn verify_lost_result_retry(
     history: &serde_json::Value,
     ledger: &serde_json::Value,
@@ -7374,27 +7399,7 @@ fn provider_recon_outcomes(cli: &Path, artifacts: &Path, row: &MatrixRow) -> Cas
         let (_provider, url) = spawn_provider(&provider_dir)?;
         let mut cluster = boot_three(artifacts, row, 0)?;
         cluster.provider_url = Some(url.clone());
-        let mut catalog_json: serde_json::Value = serde_json::from_slice(include_bytes!(
-            "../../docs/specs/v1/examples/activity-catalog.json"
-        ))
-        .map_err(|err| err.to_string())?;
-        let inventory = catalog_json["activities"]
-            .as_array_mut()
-            .ok_or("fixture catalog lacks activities")?
-            .iter_mut()
-            .find(|activity| activity["name"] == "inventory.reserve")
-            .ok_or("fixture catalog lacks inventory.reserve")?;
-        if inventory["recovery"] != "RetrySafe" {
-            return Err("fixture inventory recovery mode changed".to_owned());
-        }
-        inventory["recovery"] = serde_json::json!("Manual");
-        let fixture_catalog = cluster.dir.join("reconciliation-catalog.json");
-        fs::write(
-            &fixture_catalog,
-            serde_json::to_vec_pretty(&catalog_json).map_err(|err| err.to_string())?,
-        )
-        .map_err(|err| err.to_string())?;
-        cluster.catalog_path = Some(fixture_catalog);
+        let catalog = manual_recovery_catalog(&mut cluster, "inventory.reserve")?;
         let definition = cluster.dir.join("provider-reconciliation.yaml");
         fs::write(&definition, DEFINITION).map_err(|err| err.to_string())?;
         let mut runs = HashMap::new();
@@ -7403,10 +7408,6 @@ fn provider_recon_outcomes(cli: &Path, artifacts: &Path, row: &MatrixRow) -> Cas
             let run = cluster_start_definition(cli, &cluster, &definition, &input, false)?;
             runs.insert(label, run);
         }
-        let catalog = graphrun::Catalog::from_json(
-            &serde_json::to_vec(&catalog_json).map_err(|err| err.to_string())?,
-        )
-        .map_err(|err| err.to_string())?;
         let tls = contract_identity(
             &cluster.ca,
             "reconciliation-fixture",
@@ -7641,162 +7642,274 @@ fn provider_recon_outcomes(cli: &Path, artifacts: &Path, row: &MatrixRow) -> Cas
     }
 }
 
-fn provider_delayed_forward(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
-    let dir = artifacts.join(format!("{}-delay", row.id));
-    if let Err(err) = fs::create_dir_all(&dir) {
-        return fail(row, "provider settlement directory", err.to_string());
-    }
-    let (_provider, url) = match spawn_provider(&dir) {
-        Ok(pair) => pair,
-        Err(err) => return fail(row, "fixture-provider", err),
-    };
-    if let Err(err) = graphrun::provider::hold_effect(&url, "*") {
-        return fail(row, "hold *", err.to_string());
-    }
-    let local = dir.join("local");
-    if let Err(err) = fs::create_dir_all(&local) {
-        return fail(row, "local store", err.to_string());
-    }
-    let log = dir.join("serve.log");
-    let log_file = match fs::File::create(&log) {
-        Ok(file) => file,
-        Err(err) => return fail(row, "local server log", err.to_string()),
-    };
-    let serve = match Command::new(cli)
-        .args(["serve", "--local-dir", local.to_str().unwrap()])
-        .env("GRAPHUN_PROVIDER_URL", &url)
-        .stdout(Stdio::from(match log_file.try_clone() {
-            Ok(file) => file,
-            Err(err) => return fail(row, "local server log", err.to_string()),
-        }))
-        .stderr(Stdio::from(log_file))
-        .spawn()
-    {
-        Ok(child) => ChildProc::new(child),
-        Err(err) => return fail(row, "graphrun serve", err.to_string()),
-    };
-    if !wait_path(&local.join("control.sock"), Duration::from_secs(10)) {
-        return fail(row, "graphrun serve", "control socket missing");
-    }
-    let proof = (|| -> Result<(serde_json::Value, PathBuf), String> {
-        let input = dir.join("input.json");
-        fs::write(
-            &input,
-            r#"{"order_id":"o1","amount":1000,"fail_after_payment":true}"#,
-        )
-        .map_err(|err| err.to_string())?;
-        let (ok, stdout, stderr) = run_cli(
-            cli,
-            &[
-                "start",
-                "--definition",
-                examples().join("saga.yaml").to_str().unwrap(),
-                "--catalog",
-                catalog().to_str().unwrap(),
-                "--input",
-                input.to_str().unwrap(),
-                "--local-dir",
-                local.to_str().unwrap(),
-                "--no-wait",
-            ],
-        );
-        if !ok {
-            return Err(format!("start saga: {stdout}\n{stderr}"));
-        }
-        let start: serde_json::Value =
-            serde_json::from_str(&stdout).map_err(|err| err.to_string())?;
-        let run = start["run"].as_str().ok_or("start did not return run ID")?;
-        graphrun::RunId::from_hex(run).map_err(|err| err.to_string())?;
-        let inspect = || -> Result<serde_json::Value, String> {
-            let (ok, body, err) = run_cli_timeout(
-                cli,
-                &[
-                    "inspect",
-                    "--run",
-                    run,
-                    "--local-dir",
-                    local.to_str().unwrap(),
-                ],
-                Duration::from_secs(3),
-            );
-            if !ok {
-                return Err(format!("inspect: {body}\n{err}"));
-            }
-            serde_json::from_str(&body).map_err(|err| err.to_string())
-        };
-        let pending_deadline = Instant::now() + Duration::from_secs(4);
-        let (before, pending) = loop {
-            let ledger = graphrun::provider::dump_ledger(&url).map_err(|err| err.to_string())?;
-            if ledger["entries"].as_object().is_some_and(|entries| {
-                entries.len() == 1
-                    && entries.values().any(|entry| {
-                        entry["status"] == "pending"
-                            && entry["physical"] == 1
-                            && entry["logical"] == 0
-                    })
-            }) {
-                let view = inspect()?;
-                if view["run"] != run
-                    || view["status"] != "active"
-                    || view["obligations"]
-                        .as_array()
-                        .is_none_or(|items| !items.is_empty())
-                {
-                    return Err(format!(
-                        "forward is unsettled but saga advanced: view={view} ledger={ledger}"
-                    ));
-                }
-                break (view, ledger);
-            }
-            if Instant::now() >= pending_deadline {
-                return Err(format!("forward never reached provider barrier: {ledger}"));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        graphrun::provider::release_effect(&url, "*").map_err(|err| err.to_string())?;
-        let terminal_deadline = Instant::now() + Duration::from_secs(25);
-        let after = loop {
-            let view = inspect()?;
-            if view["status"] == "failed" && view["open_scopes"] == 0 {
-                break view;
-            }
-            if Instant::now() >= terminal_deadline {
-                return Err(format!("released provider never settled saga: {view}"));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        };
-        let ledger = graphrun::provider::dump_ledger(&url).map_err(|err| err.to_string())?;
-        let entries = ledger["entries"]
-            .as_object()
-            .ok_or_else(|| format!("invalid settled ledger: {ledger}"))?;
-        let forward = entries
-            .values()
-            .filter(|entry| {
-                entry["kind"] == "forward" && entry["status"] == "applied" && entry["logical"] == 1
+fn verify_saga_reconciliation(
+    history: &serde_json::Value,
+    ledger: &serde_json::Value,
+    inventory_key: &str,
+    payment_key: &str,
+) -> Result<(u64, u64), String> {
+    let events = history["events"]
+        .as_array()
+        .ok_or("saga proof has no committed history page")?;
+    let payment_activation = events
+        .iter()
+        .find(|entry| {
+            entry["event"]["kind"] == "claim_granted"
+                && entry["event"]["handler"] == "payment.charge"
+                && entry["event"]["role"] == "forward"
+                && entry["event"]["effect_key"] == payment_key
+        })
+        .and_then(|entry| entry["event"]["activation"].as_str())
+        .ok_or("saga proof lacks the unsettled payment claim")?;
+    let reconciliation = |outcome: &str| {
+        events
+            .iter()
+            .find(|entry| {
+                entry["event"]["kind"] == "reconciliation_recorded"
+                    && entry["event"]["activation"] == payment_activation
+                    && entry["event"]["outcome"] == outcome
             })
-            .count();
-        let undo = entries
-            .values()
-            .filter(|entry| {
-                entry["kind"] == "compensate"
+            .and_then(|entry| entry["sequence"].as_u64())
+    };
+    let unknown =
+        reconciliation("unknown").ok_or("saga proof has no committed Unknown reconciliation")?;
+    let applied =
+        reconciliation("applied").ok_or("saga proof has no committed Applied reconciliation")?;
+    let compensation: Vec<_> = events
+        .iter()
+        .filter(|entry| entry["event"]["kind"] == "compensation_started")
+        .filter_map(|entry| entry["sequence"].as_u64())
+        .collect();
+    if unknown >= applied
+        || compensation.len() != 2
+        || compensation.iter().any(|seq| *seq <= applied)
+    {
+        return Err(
+            "saga undo began before the uncertain forward effect was conclusively reconciled"
+                .to_owned(),
+        );
+    }
+    let entries = ledger["entries"]
+        .as_object()
+        .ok_or("saga proof lacks durable provider ledger entries")?;
+    if inventory_key == payment_key
+        || entries.len() != 4
+        || [inventory_key, payment_key].iter().any(|key| {
+            entries.get(*key).is_none_or(|entry| {
+                entry["kind"] != "forward" || entry["status"] != "applied" || entry["logical"] != 1
+            })
+        })
+        || entries
+            .iter()
+            .filter(|(key, entry)| {
+                key.as_str() != inventory_key
+                    && key.as_str() != payment_key
+                    && entry["kind"] == "compensate"
                     && entry["status"] == "applied"
                     && entry["logical"] == 1
             })
-            .count();
-        if forward != 2
-            || undo != 2
-            || entries.len() != 4
-            || after["error"]["code"] != "fixture.failed"
+            .count()
+            != 2
+    {
+        return Err(format!(
+            "saga proof lacks distinct durable forward/undo effects: {ledger}"
+        ));
+    }
+    Ok((unknown, applied))
+}
+
+fn provider_delayed_forward(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
+    let dir = artifacts.join(format!("{}-data", row.id));
+    let provider_dir = artifacts.join("SAGA-007-provider");
+    let proof = (|| -> Result<(serde_json::Value, PathBuf), String> {
+        let (_provider, url) = spawn_provider(&provider_dir)?;
+        let mut cluster = boot_three(artifacts, row, 0)?;
+        cluster.provider_url = Some(url.clone());
+        let _catalog = manual_recovery_catalog(&mut cluster, "payment.charge")?;
+        let run = cluster_start_definition(
+            cli,
+            &cluster,
+            &examples().join("saga.yaml"),
+            r#"{"order_id":"o1","amount":1000,"fail_after_payment":true}"#,
+            false,
+        )?;
+        let rt = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
+        let mut inventory_probes = Vec::new();
+        let inventory_key = rt.block_on(contract_worker_rpc_probes(
+            &cluster,
+            &run,
+            &url,
+            &mut inventory_probes,
+        ))?;
+        fs::write(
+            cluster.dir.join("inventory-probes.log"),
+            inventory_probes.join("\n"),
+        )
+        .map_err(|err| err.to_string())?;
+        graphrun::provider::hold_effect(&url, "*").map_err(|err| err.to_string())?;
+        let first = spawn_fixture_worker(&cluster, 0)?;
+        let first_pid = first.0.id();
+        cluster.workers.push(first);
+        let pending_deadline = Instant::now() + Duration::from_secs(4);
+        let (payment_key, pending) = loop {
+            let ledger = graphrun::provider::dump_ledger(&url).map_err(|err| err.to_string())?;
+            let pending = ledger["entries"].as_object().and_then(|entries| {
+                entries.iter().find(|(key, entry)| {
+                    key.as_str() != inventory_key
+                        && entry["kind"] == "forward"
+                        && entry["status"] == "pending"
+                        && entry["physical"] == 1
+                        && entry["logical"] == 0
+                })
+            });
+            if let Some((key, _)) = pending {
+                break (key.clone(), ledger);
+            }
+            if Instant::now() >= pending_deadline {
+                return Err(format!("payment never reached the held provider: {ledger}"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if cluster.workers[0]
+            .0
+            .try_wait()
+            .map_err(|err| err.to_string())?
+            .is_some()
+        {
+            return Err("forward worker stopped before the fixture barrier".to_owned());
+        }
+        cluster.workers[0].0.kill().map_err(|err| err.to_string())?;
+        let first_exit = cluster.workers[0]
+            .0
+            .wait()
+            .map_err(|err| err.to_string())?
+            .to_string();
+        let worker = spawn_fixture_worker(&cluster, 1)?;
+        let second_pid = worker.0.id();
+        cluster.workers.push(worker);
+        let history = |cluster: &LiveCluster| -> Result<serde_json::Value, String> {
+            let args = cluster_connect(cluster, 0, &["history", "--run", &run]);
+            let parts: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (ok, body, err) = run_cli_timeout(cli, &parts, Duration::from_secs(3));
+            if !ok {
+                return Err(format!("committed history: {body}\n{err}"));
+            }
+            serde_json::from_str(&body).map_err(|err| err.to_string())
+        };
+        let unknown_deadline = Instant::now() + Duration::from_secs(55);
+        let unknown_history = loop {
+            let page = history(&cluster)?;
+            if page["events"].as_array().is_some_and(|events| {
+                events.iter().any(|entry| {
+                    entry["event"]["kind"] == "reconciliation_recorded"
+                        && entry["event"]["outcome"] == "unknown"
+                })
+            }) {
+                break page;
+            }
+            if Instant::now() >= unknown_deadline {
+                return Err(format!(
+                    "abandoned payment never reconciled as Unknown: {page}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        if unknown_history["events"].as_array().is_some_and(|events| {
+            events
+                .iter()
+                .any(|entry| entry["event"]["kind"] == "compensation_started")
+        }) {
+            return Err("compensation started before the held payment was settled".to_owned());
+        }
+        let still_pending = graphrun::provider::dump_ledger(&url).map_err(|err| err.to_string())?;
+        if still_pending["entries"][&payment_key]["status"] != "pending"
+            || still_pending["entries"][&payment_key]["logical"] != 0
+            || still_pending["entries"]
+                .as_object()
+                .is_none_or(|entries| entries.len() != 2)
         {
             return Err(format!(
-                "released saga did not apply then undo both effects: view={after} ledger={ledger}"
+                "Unknown invented a conclusive provider outcome: {still_pending}"
+            ));
+        }
+        graphrun::provider::release_effect(&url, "*").map_err(|err| err.to_string())?;
+        let settled = graphrun::provider::dump_ledger(&url).map_err(|err| err.to_string())?;
+        if settled["entries"][&payment_key]["status"] != "applied"
+            || settled["entries"][&payment_key]["logical"] != 1
+        {
+            return Err(format!("released payment did not settle: {settled}"));
+        }
+        let second_exit = match cluster.workers[1]
+            .0
+            .try_wait()
+            .map_err(|err| err.to_string())?
+        {
+            Some(status) => status,
+            None => {
+                cluster.workers[1].0.kill().map_err(|err| err.to_string())?;
+                cluster.workers[1].0.wait().map_err(|err| err.to_string())?
+            }
+        }
+        .to_string();
+        let worker = spawn_fixture_worker(&cluster, 2)?;
+        let third_pid = worker.0.id();
+        cluster.workers.push(worker);
+        let terminal_deadline = Instant::now() + Duration::from_secs(60);
+        let after = loop {
+            let body = cluster_inspect(cli, &cluster, 0, &run);
+            if let Ok(view) = serde_json::from_str::<serde_json::Value>(&body)
+                && view["status"] == "failed"
+                && view["error"]["code"] == "fixture.failed"
+                && view["open_scopes"] == 0
+            {
+                break view;
+            }
+            if Instant::now() >= terminal_deadline {
+                return Err(format!(
+                    "settled payment never completed saga cleanup: {body}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let completed_history = history(&cluster)?;
+        let completed_ledger =
+            graphrun::provider::dump_ledger(&url).map_err(|err| err.to_string())?;
+        let (unknown_seq, applied_seq) = verify_saga_reconciliation(
+            &completed_history,
+            &completed_ledger,
+            &inventory_key,
+            &payment_key,
+        )?;
+        if after["obligations"].as_array().is_none_or(|obligations| {
+            obligations.len() != 2
+                || obligations
+                    .iter()
+                    .any(|obligation| obligation["status"] != "compensated")
+        }) {
+            return Err(format!(
+                "saga returned without both completed obligations: {after}"
             ));
         }
         let observed = serde_json::json!({
-            "run": run, "before": before, "pending_ledger": pending,
-            "after": after, "settled_ledger": ledger,
+            "run": run,
+            "inventory_effect_key": inventory_key,
+            "payment_effect_key": payment_key,
+            "forward_worker_pid": first_pid,
+            "forward_worker_exit": first_exit,
+            "unknown_worker_pid": second_pid,
+            "unknown_worker_exit": second_exit,
+            "settling_worker_pid": third_pid,
+            "pending_ledger": pending,
+            "unknown_history": unknown_history,
+            "still_pending_ledger": still_pending,
+            "settled_ledger": settled,
+            "final_history": completed_history,
+            "final_ledger": completed_ledger,
+            "view": after,
+            "unknown_sequence": unknown_seq,
+            "applied_sequence": applied_seq,
         });
-        let path = dir.join("settlement-observation.json");
+        let path = cluster.dir.join("settlement-observation.json");
         fs::write(
             &path,
             serde_json::to_vec_pretty(&observed).map_err(|err| err.to_string())?,
@@ -7804,19 +7917,28 @@ fn provider_delayed_forward(cli: &Path, artifacts: &Path, row: &MatrixRow) -> Ca
         .map_err(|err| err.to_string())?;
         Ok((observed, path))
     })();
-    drop(serve);
     match proof {
         Ok((observed, path)) => finish(
             row,
             "PASS",
-            "release CLI saga with a held provider request, barrier release, and independent durable effect ledger",
+            "release CLI saga; crash the held forward worker, record Unknown then Applied reconciliation before any provider undo",
             format!(
-                "no undo while pending; two forward effects and two compensations after release: {}",
-                observed["after"]
+                "Unknown at event {}, Applied at event {}, then two distinct compensations: {}",
+                observed["unknown_sequence"], observed["applied_sequence"], observed["view"]
             ),
-            vec![dir, path],
+            vec![dir, provider_dir.join("provider").join("ledger.json"), path],
         ),
-        Err(err) => fail(row, "pending provider forward and causal compensation", err),
+        Err(err) => {
+            let mut result = fail(
+                row,
+                "abandoned forward reconciliation and causal compensation",
+                err,
+            );
+            if dir.is_dir() {
+                result.artifacts.push(dir.display().to_string());
+            }
+            result
+        }
     }
 }
 
@@ -8862,6 +8984,38 @@ mod tests {
                 .unwrap_err()
                 .contains("same durable effect key")
         );
+    }
+
+    #[test]
+    fn saga_undo_cannot_pass_without_committed_reconciliation() {
+        let history = serde_json::json!({
+            "events":[
+                {"sequence":1,"event":{"kind":"claim_granted","handler":"payment.charge","role":"forward","activation":"payment","effect_key":"payment-key"}},
+                {"sequence":2,"event":{"kind":"reconciliation_recorded","activation":"payment","outcome":"unknown"}},
+                {"sequence":3,"event":{"kind":"reconciliation_recorded","activation":"payment","outcome":"applied"}},
+                {"sequence":4,"event":{"kind":"compensation_started"}},
+                {"sequence":5,"event":{"kind":"compensation_started"}}
+            ]
+        });
+        let ledger = serde_json::json!({"entries":{
+            "inventory-key":{"kind":"forward","status":"applied","logical":1},
+            "payment-key":{"kind":"forward","status":"applied","logical":1},
+            "inventory-undo":{"kind":"compensate","status":"applied","logical":1},
+            "payment-undo":{"kind":"compensate","status":"applied","logical":1}
+        }});
+        let check = |history: &serde_json::Value| {
+            verify_saga_reconciliation(history, &ledger, "inventory-key", "payment-key")
+        };
+        assert_eq!(check(&history).unwrap(), (2, 3));
+        let mut no_applied = history.clone();
+        no_applied["events"].as_array_mut().unwrap().remove(2);
+        assert!(check(&no_applied).unwrap_err().contains("Applied"));
+        let mut no_unknown = history.clone();
+        no_unknown["events"].as_array_mut().unwrap().remove(1);
+        assert!(check(&no_unknown).unwrap_err().contains("Unknown"));
+        let mut premature = history;
+        premature["events"][3]["sequence"] = serde_json::json!(2);
+        assert!(check(&premature).unwrap_err().contains("before"));
     }
 
     #[test]
