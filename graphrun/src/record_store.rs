@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-const FORMAT: &str = "graphrun.state-record/v1";
+pub(crate) const FORMAT: &str = "graphrun.state-record/v1";
 const NESTED_FIELDS: &[&str] = &["published_definitions", "start_keys"];
 const HISTORY_FIELDS: &[&str] = &["history", "history_records"];
 const LIST_FIELDS: &[&str] = &["inbox", "obligations"];
@@ -95,6 +95,18 @@ fn insert(
         return Err(invalid("duplicate state record identity"));
     }
     Ok(())
+}
+
+pub(crate) fn same_value(left: &[u8], right: &[u8]) -> Result<bool> {
+    let left: VersionedRecord = serde_json::from_slice(left)
+        .map_err(|err| invalid(format!("stored state record is corrupt: {err}")))?;
+    let right: VersionedRecord = serde_json::from_slice(right)
+        .map_err(|err| invalid(format!("new state record is corrupt: {err}")))?;
+    if left.format != FORMAT || right.format != FORMAT || left.revision == 0 || right.revision == 0
+    {
+        return Err(invalid("unsupported state record version"));
+    }
+    Ok(left.value == right.value)
 }
 
 pub(crate) fn encode(

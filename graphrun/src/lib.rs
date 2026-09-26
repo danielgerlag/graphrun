@@ -32,7 +32,6 @@ pub mod limits;
 pub mod policy;
 pub mod provider;
 pub mod publication;
-#[cfg(test)]
 mod record_store;
 #[doc(hidden)]
 pub mod rpc;

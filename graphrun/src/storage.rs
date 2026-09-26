@@ -2,6 +2,7 @@
 
 use crate::domain::{self, Command, State};
 use crate::error::{Error, Result};
+use crate::record_store;
 use crate::schedule::{RunSchedule, retention_deadline};
 use crate::snapshot_framing::{
     SnapshotManifest, SnapshotStream, copy_payload, verify_snapshot, write_snapshot,
@@ -63,6 +64,7 @@ pub struct RaftResponse {
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
 const LOG: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("log");
 const SCHEDULE: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("schedule");
+const APP_ROWS: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("app_records_v2");
 
 #[derive(Clone, Serialize, Deserialize)]
 struct StoreManifest {
@@ -71,6 +73,7 @@ struct StoreManifest {
     writer_format: u16,
     active_generation: u64,
     domain_format: String,
+    state_record_format: String,
     event_format: String,
     checkpoint_format: String,
     result_format: String,
@@ -84,6 +87,7 @@ impl StoreManifest {
             writer_format: 2,
             active_generation: 1,
             domain_format: "graphrun.domain/v1".to_owned(),
+            state_record_format: record_store::FORMAT.to_owned(),
             event_format: crate::history::EVENT_FORMAT.to_owned(),
             checkpoint_format: crate::history::CHECKPOINT_FORMAT.to_owned(),
             result_format: crate::publication::RESULT_FORMAT.to_owned(),
@@ -96,6 +100,7 @@ impl StoreManifest {
             || self.writer_format != 2
             || self.active_generation == 0
             || self.domain_format != "graphrun.domain/v1"
+            || self.state_record_format != record_store::FORMAT
             || self.event_format != crate::history::EVENT_FORMAT
             || self.checkpoint_format != crate::history::CHECKPOINT_FORMAT
             || self.result_format != crate::publication::RESULT_FORMAT
@@ -332,6 +337,7 @@ impl StorageHandle {
             })?;
             validate_history_store(&state)?;
             let store_manifest = verified_store_manifest(&db)?;
+            verify_app_mirror(&db, &state, store_manifest.active_generation)?;
             if let Some(registry) = optional_json::<_, SnapshotRegistry>(&db, "snapshot_registry")?
             {
                 if registry.generation != store_manifest.active_generation {
@@ -683,6 +689,7 @@ pub fn load_domain_readonly(path: impl AsRef<Path>) -> Result<State> {
     })?;
     validate_history_store(&state)?;
     let store_manifest = verified_store_manifest(&db)?;
+    verify_app_mirror(&db, &state, store_manifest.active_generation)?;
     if let Some(registry) = optional_json::<_, SnapshotRegistry>(&db, "snapshot_registry")? {
         if registry.generation != store_manifest.active_generation {
             return Err(Error::new(
@@ -722,9 +729,10 @@ pub fn compact_offline(path: impl AsRef<Path>) -> Result<CompactOutcome> {
             format!("offline compaction requires an existing, unowned member store: {err}"),
         )
     })?;
-    verified_store_manifest(&db)?;
+    let manifest = verified_store_manifest(&db)?;
     let state: State = required_json(&db, "domain")?;
     validate_history_store(&state)?;
+    verify_app_mirror(&db, &state, manifest.active_generation)?;
     let mut passes = 0;
     while passes < 16 {
         let compacted = db.compact().map_err(|err| {
@@ -824,6 +832,8 @@ fn storage_thread(
             .unwrap_or_else(|| StoredMembership::new(None, Membership::new(vec![], None)));
         let domain: State = required_json(&db, "domain")?;
         validate_history_store(&domain)?;
+        let manifest = verified_store_manifest(&db)?;
+        verify_app_mirror(&db, &domain, manifest.active_generation)?;
         optional_json::<_, VoteT>(&db, "vote")?;
         Ok((last_purged, last_applied, membership, domain))
     })();
@@ -879,6 +889,7 @@ fn storage_thread(
         }
     };
     let mut gc_pending = true;
+    let mut app_gc_pending = true;
     schedule_watch.send_replace(schedule_revision);
     let _ = ready.send(Ok(()));
     while let Some(req) = rx.blocking_recv() {
@@ -977,6 +988,7 @@ fn storage_thread(
                     watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
                     schedule_watch.send_replace(schedule_revision);
                     gc_pending = true;
+                    app_gc_pending = true;
                 }
                 let _ = tx.send(res);
                 cleanup_pending = true;
@@ -1009,6 +1021,9 @@ fn storage_thread(
                 let res = validate_history_store(&next)
                     .map_err(|err| sto_err(ErrorVerb::Write, err))
                     .and_then(|()| {
+                        let generation = verified_store_manifest(&db)
+                            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+                            .active_generation;
                         let txn = begin_immediate(&db)?;
                         {
                             let mut meta = txn
@@ -1019,6 +1034,13 @@ fn storage_thread(
                             meta.insert("domain", bytes.as_slice())
                                 .map_err(|err| sto_err(ErrorVerb::Write, err))?;
                         }
+                        write_app_delta(
+                            &txn,
+                            &domain,
+                            &next,
+                            generation,
+                            last_applied.map_or(0, |id| id.index).saturating_add(1),
+                        )?;
                         let revision = replace_schedule(
                             &txn,
                             &next,
@@ -1055,6 +1077,15 @@ fn storage_thread(
                 Ok(more) => gc_pending = more,
                 Err(err) => {
                     tracing::error!(%err, "invisible log cleanup failed; member must reopen");
+                    break;
+                }
+            }
+        }
+        if app_gc_pending {
+            match gc_inactive_app_rows(&db) {
+                Ok(more) => app_gc_pending = more,
+                Err(err) => {
+                    tracing::error!(%err, "inactive application generation cleanup failed");
                     break;
                 }
             }
@@ -1115,6 +1146,17 @@ fn initialize_publication_store(db: &Database) -> std::result::Result<(), StoErr
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     txn.open_table(SCHEDULE)
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    {
+        let mut app = txn
+            .open_table(APP_ROWS)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        for (key, value) in record_store::encode(&State::default(), 1, 1)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?
+        {
+            app.insert(key.as_str(), value.as_slice())
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        }
+    }
     commit_immediate(txn)
 }
 
@@ -1269,6 +1311,291 @@ fn load_schedule_view(db: &Database) -> std::result::Result<ScheduleView, StoErr
         runs,
         retention_ms,
     })
+}
+
+fn load_app_generation<D: ReadableDatabase>(
+    db: &D,
+    generation: u64,
+) -> std::result::Result<State, StoErr> {
+    let txn = db
+        .begin_read()
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let table = txn
+        .open_table(APP_ROWS)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let prefix = format!("{generation:016x}/");
+    let mut rows = Vec::new();
+    for record in table
+        .range(prefix.as_str()..)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+    {
+        let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        if !key.value().starts_with(&prefix) {
+            break;
+        }
+        rows.push((key.value().to_owned(), value.value().to_vec()));
+    }
+    record_store::decode(rows, generation).map_err(|err| sto_err(ErrorVerb::Read, err))
+}
+
+#[cfg(test)]
+fn load_app_run<D: ReadableDatabase>(
+    db: &D,
+    generation: u64,
+    run: crate::ids::RunId,
+) -> std::result::Result<State, StoErr> {
+    let txn = db
+        .begin_read()
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let table = txn
+        .open_table(APP_ROWS)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let prefixes = [
+        format!("{generation:016x}/global/"),
+        format!("{generation:016x}/run-{}/", run.to_hex()),
+    ];
+    let mut rows = Vec::new();
+    for prefix in &prefixes {
+        for record in table
+            .range(prefix.as_str()..)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        {
+            let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+            if !key.value().starts_with(prefix) {
+                break;
+            }
+            rows.push((key.value().to_owned(), value.value().to_vec()));
+        }
+    }
+    record_store::decode(rows, generation).map_err(|err| sto_err(ErrorVerb::Read, err))
+}
+
+fn verify_app_mirror<D: ReadableDatabase>(db: &D, state: &State, generation: u64) -> Result<()> {
+    let records = load_app_generation(db, generation)
+        .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))?;
+    let expected = serde_json::to_value(state).map_err(|err| Error::invalid(err.to_string()))?;
+    let actual = serde_json::to_value(records).map_err(|err| Error::invalid(err.to_string()))?;
+    if actual != expected {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "generation records disagree with the materialized state",
+        ));
+    }
+    Ok(())
+}
+
+fn write_app_delta(
+    txn: &redb::WriteTransaction,
+    before: &State,
+    after: &State,
+    generation: u64,
+    revision: u64,
+) -> std::result::Result<(), StoErr> {
+    let previous = record_store::encode(before, generation, 1)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let next = record_store::encode(after, generation, revision.max(1))
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let mut table = txn
+        .open_table(APP_ROWS)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    for (key, old) in &previous {
+        if !next.contains_key(key) {
+            let stored = table
+                .remove(key.as_str())
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?
+                .ok_or_else(|| sto_err(ErrorVerb::Read, "required application record missing"))?;
+            if !record_store::same_value(stored.value(), old)
+                .map_err(|err| sto_err(ErrorVerb::Read, err))?
+            {
+                return Err(sto_err(
+                    ErrorVerb::Read,
+                    "application record changed unexpectedly",
+                ));
+            }
+        }
+    }
+    for (key, value) in &next {
+        if let Some(old) = previous.get(key) {
+            if record_store::same_value(old, value).map_err(|err| sto_err(ErrorVerb::Read, err))? {
+                continue;
+            }
+        }
+        match (table.get(key.as_str()), previous.get(key)) {
+            (Ok(Some(stored)), Some(old))
+                if record_store::same_value(stored.value(), old)
+                    .map_err(|err| sto_err(ErrorVerb::Read, err))? => {}
+            (Ok(None), None) => {}
+            (Ok(_), _) => {
+                return Err(sto_err(
+                    ErrorVerb::Read,
+                    "application record changed or disappeared",
+                ));
+            }
+            (Err(err), _) => return Err(sto_err(ErrorVerb::Read, err)),
+        }
+        table
+            .insert(key.as_str(), value.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ImportStats {
+    transactions: u32,
+    records: u64,
+    largest_batch_bytes: usize,
+    largest_batch_records: usize,
+}
+
+fn clear_inactive_generation(db: &Database, generation: u64) -> std::result::Result<(), StoErr> {
+    let prefix = format!("{generation:016x}/");
+    loop {
+        let txn = begin_immediate(db)?;
+        let mut table = txn
+            .open_table(APP_ROWS)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let mut keys = Vec::new();
+        let mut bytes = 0usize;
+        for record in table
+            .range(prefix.as_str()..)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        {
+            let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+            if !key.value().starts_with(&prefix) {
+                break;
+            }
+            let size = key.value().len() + value.value().len();
+            if keys.len() == 4_096
+                || (!keys.is_empty() && bytes.saturating_add(size) > 4 * 1024 * 1024)
+            {
+                break;
+            }
+            keys.push(key.value().to_owned());
+            bytes += size;
+        }
+        for key in &keys {
+            table
+                .remove(key.as_str())
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        }
+        drop(table);
+        if keys.is_empty() {
+            return Ok(());
+        }
+        commit_immediate(txn)?;
+        after_persist("after-generation-cleanup")?;
+    }
+}
+
+fn persist_import_batch(
+    db: &Database,
+    batch: &[(String, Vec<u8>)],
+) -> std::result::Result<(), StoErr> {
+    let txn = begin_immediate(db)?;
+    let mut table = txn
+        .open_table(APP_ROWS)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    for (key, value) in batch {
+        table
+            .insert(key.as_str(), value.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    }
+    drop(table);
+    commit_immediate(txn)?;
+    after_persist("after-generation-batch")
+}
+
+fn stage_app_generation(
+    db: &Database,
+    state: &State,
+    generation: u64,
+    revision: u64,
+) -> std::result::Result<ImportStats, StoErr> {
+    clear_inactive_generation(db, generation)?;
+    let mut stats = ImportStats::default();
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0usize;
+    for (key, value) in record_store::encode(state, generation, revision)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?
+    {
+        let size = key.len() + value.len();
+        if size > 4 * 1024 * 1024 {
+            return Err(sto_err(
+                ErrorVerb::Write,
+                "single state record exceeds bounded snapshot import batch",
+            ));
+        }
+        if batch.len() == 4_096 || batch_bytes.saturating_add(size) > 4 * 1024 * 1024 {
+            persist_import_batch(db, &batch)?;
+            stats.transactions += 1;
+            stats.largest_batch_bytes = stats.largest_batch_bytes.max(batch_bytes);
+            stats.largest_batch_records = stats.largest_batch_records.max(batch.len());
+            batch.clear();
+            batch_bytes = 0;
+        }
+        batch_bytes += size;
+        batch.push((key, value));
+        stats.records += 1;
+    }
+    if !batch.is_empty() {
+        persist_import_batch(db, &batch)?;
+        stats.transactions += 1;
+        stats.largest_batch_bytes = stats.largest_batch_bytes.max(batch_bytes);
+        stats.largest_batch_records = stats.largest_batch_records.max(batch.len());
+    }
+    verify_app_mirror(db, state, generation).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    Ok(stats)
+}
+
+fn gc_inactive_app_rows(db: &Database) -> std::result::Result<bool, StoErr> {
+    let active = verified_store_manifest(db)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        .active_generation;
+    let active_prefix = format!("{active:016x}/");
+    let txn = begin_immediate(db)?;
+    let mut table = txn
+        .open_table(APP_ROWS)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let mut keys = Vec::new();
+    let mut bytes = 0usize;
+    let mut more = false;
+    for record in table
+        .range(..active_prefix.as_str())
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+    {
+        let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        let size = key.value().len() + value.value().len();
+        if !select_gc_key(&mut keys, &mut bytes, key.value().to_owned(), size) {
+            more = true;
+            break;
+        }
+    }
+    if !more && let Some(next) = active.checked_add(1) {
+        let next_prefix = format!("{next:016x}/");
+        for record in table
+            .range(next_prefix.as_str()..)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        {
+            let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+            let size = key.value().len() + value.value().len();
+            if !select_gc_key(&mut keys, &mut bytes, key.value().to_owned(), size) {
+                more = true;
+                break;
+            }
+        }
+    }
+    for key in &keys {
+        table
+            .remove(key.as_str())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    }
+    drop(table);
+    if !keys.is_empty() {
+        commit_immediate(txn)?;
+        after_persist("after-generation-cleanup")?;
+    }
+    Ok(more)
 }
 
 fn update_schedule(
@@ -1981,7 +2308,7 @@ fn get_logs(db: &Database, start: u64, end: u64) -> std::result::Result<Vec<Entr
     Ok(out)
 }
 
-fn select_gc_key(keys: &mut Vec<u64>, bytes: &mut usize, index: u64, size: usize) -> bool {
+fn select_gc_key<K>(keys: &mut Vec<K>, bytes: &mut usize, index: K, size: usize) -> bool {
     if keys.len() == 4_096 || (!keys.is_empty() && bytes.saturating_add(size) > 4 * 1024 * 1024) {
         return false;
     }
@@ -2160,6 +2487,9 @@ fn apply_entries(
         .applied_bytes
         .checked_add(applied_bytes)
         .ok_or_else(|| sto_err(ErrorVerb::Write, "applied byte counter overflow"))?;
+    let generation = verified_store_manifest(db)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        .active_generation;
     let txn = begin_immediate(db)?;
     {
         let mut meta = txn
@@ -2186,6 +2516,11 @@ fn apply_entries(
                 .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         }
     }
+    let record_revision = next_applied
+        .map_or(0, |id| id.index)
+        .checked_add(1)
+        .ok_or_else(|| sto_err(ErrorVerb::Write, "record revision exhausted"))?;
+    write_app_delta(&txn, domain, &next_domain, generation, record_revision)?;
     release_applied_credits(&txn, previous_applied, next_applied)?;
     let next_revision = update_schedule(
         &txn,
@@ -2372,6 +2707,19 @@ fn install_snapshot(
         .checked_add(1)
         .ok_or_else(|| sto_err(ErrorVerb::Write, "snapshot generation exhausted"))?;
     store_manifest.active_generation = generation;
+    let record_revision = applied
+        .map_or(0, |id| id.index)
+        .checked_add(1)
+        .ok_or_else(|| sto_err(ErrorVerb::Write, "record revision exhausted"))?;
+    let imported = stage_app_generation(db, &restored, generation, record_revision)?;
+    tracing::info!(
+        generation,
+        records = imported.records,
+        transactions = imported.transactions,
+        max_batch_bytes = imported.largest_batch_bytes,
+        max_batch_records = imported.largest_batch_records,
+        "snapshot generation staged"
+    );
     let file_name = format!(
         "received-{}.snap",
         crate::ids::CommandId::generate().to_hex()
@@ -3086,6 +3434,106 @@ nodes:
         assert_eq!(after.last_snapshot_bytes, after.applied_bytes);
         assert_eq!(after.last_snapshot_applied, 2);
         assert!(after.last_snapshot_ms >= before.last_snapshot_ms);
+    }
+
+    #[test]
+    fn snapshot_import_batches_are_bounded_before_generation_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("member.redb")).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let mut state = State::default();
+        for n in 0u64..5_000 {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&n.to_be_bytes());
+            state
+                .command_times
+                .insert(crate::ids::CommandId::from_bytes(bytes), n);
+        }
+        let stats = stage_app_generation(&db, &state, 2, 7).unwrap();
+        assert_eq!(
+            stats.records,
+            record_store::encode(&State::default(), 2, 7).unwrap().len() as u64 + 5_000
+        );
+        assert!(stats.transactions >= 2);
+        assert!(stats.largest_batch_records <= 4_096);
+        assert!(stats.largest_batch_bytes <= 4 * 1024 * 1024);
+        assert_eq!(
+            serde_json::to_value(load_app_generation(&db, 2).unwrap()).unwrap(),
+            serde_json::to_value(&state).unwrap()
+        );
+        let manifest = verified_store_manifest(&db).unwrap();
+        assert_eq!(manifest.active_generation, 1);
+        assert!(
+            load_app_generation(&db, 1)
+                .unwrap()
+                .command_times
+                .is_empty()
+        );
+        assert!(gc_inactive_app_rows(&db).unwrap());
+        assert!(!gc_inactive_app_rows(&db).unwrap());
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(APP_ROWS).unwrap();
+        let first = table.range("0000000000000002/"..).unwrap().next();
+        assert!(
+            first
+                .transpose()
+                .unwrap()
+                .is_none_or(|(key, _)| !key.value().starts_with("0000000000000002/"))
+        );
+    }
+
+    #[test]
+    fn scoped_run_read_does_not_load_other_runs_history() {
+        use crate::domain::{Command, CommandBody};
+
+        let catalog = crate::Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let definition = crate::compile_yaml(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let runs = [
+            crate::ids::RunId::from_bytes([1; 16]),
+            crate::ids::RunId::from_bytes([2; 16]),
+        ];
+        for (index, run) in runs.iter().copied().enumerate() {
+            crate::domain::start_run(
+                &mut state,
+                Command {
+                    id: crate::ids::CommandId::from_bytes([index as u8 + 1; 16]),
+                    time: crate::time::EngineTime::from_millis(1),
+                    body: CommandBody::Start {
+                        run,
+                        definition: Box::new(definition.clone()),
+                        catalog: Box::new(catalog.clone()),
+                        input: crate::Value::Object(
+                            [
+                                ("order_id".to_owned(), crate::Value::String("r1".to_owned())),
+                                ("amount".to_owned(), crate::Value::Int(1)),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        ),
+                    },
+                },
+                definition.clone(),
+                catalog.clone(),
+            )
+            .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("member.redb")).unwrap();
+        initialize_publication_store(&db).unwrap();
+        stage_app_generation(&db, &state, 2, 1).unwrap();
+        let scoped = load_app_run(&db, 2, runs[0]).unwrap();
+        assert_eq!(scoped.runs.len(), 1);
+        assert!(scoped.runs.contains_key(&runs[0]));
+        assert!(scoped.history.contains_key(&runs[0]));
+        assert!(!scoped.history.contains_key(&runs[1]));
     }
 
     #[test]
