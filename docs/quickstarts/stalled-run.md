@@ -44,8 +44,14 @@ Read these fields in order:
 6. `error`. Domain failure, not a transport timeout.
 
 ```sh
-graphrun history --run <run-id> --local-dir ./graphrun-data
-graphrun replay --run <run-id> --local-dir ./graphrun-data
+graphrun history --run <run-id> --page-size 100 --local-dir ./graphrun-data
+graphrun replay --run <run-id> --through-sequence 4 --local-dir ./graphrun-data
 ```
 
-`replay` is read-only. It does not start activities or write the store.
+`history` returns `retained_from`, `retained_through`, `events`, and `next_cursor`. Each event has a per-run `sequence`, a version, a command cause when available, and a verified payload reference. To read the next page, pass its `next_cursor` as `--after-sequence`. A page contains at most 1,000 events.
+
+`replay --through-sequence` returns the run view after that event, including pending waits and compensation progress. Omit the flag to replay through the last retained event. Both the live control socket and the offline `replay` command read recorded facts without running activities or writing to the store. You can also use `--endpoint`, `--ca`, `--cert`, `--tls-key`, and `--server-name` for a cluster member.
+
+Active runs keep their history. Terminal runs keep full history for 30 days, then keep a summary without a typed output for another 60 days. After the full history expires, a history request either reports the unavailable range or returns `unavailable: true` with `unavailable_range: {first, last}` and an empty page. Do not treat a missing page as an empty run.
+
+The engine rejects an older data directory if its runs lack versioned history records or use an unsupported checkpoint format. It reports `FailedPrecondition` before starting workers and leaves the directory unchanged. There is no automatic migration for these records.

@@ -36,6 +36,7 @@ Dropping one of these requirements is not an acceptable way to simplify implemen
 | [Storage and consensus](06-storage-and-consensus.md) | redb/OpenRaft integration, time, snapshots, resources, and restore |
 | [API and operations](07-api-and-operations.md) | RPC/CLI contracts, authentication, local loop, deployment, and observability |
 | [Policies and defaults](10-policies-and-defaults.md) | Attempt/run timeouts, retry selection, compensation defaults, retention, and checkpoints |
+| [Foundational contracts](11-foundational-contracts.md) | Versioned command results, artifacts, store/readers, worker identity, history, and verification statuses |
 | [Testing and verification](08-testing-and-verification.md) | Required suites, executable commands, scenario matrix, and evidence |
 | [Implementation plan](09-implementation-plan.md) | Ordered delivery units and completion gates |
 | [Coding-agent prompt](IMPLEMENTATION_PROMPT.md) | Copy-ready end-to-end implementation instructions |

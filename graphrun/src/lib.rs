@@ -15,6 +15,7 @@ pub mod binding;
 pub mod builder;
 pub mod catalog;
 pub mod client;
+mod clock;
 pub mod cluster;
 pub mod compiler;
 pub mod domain;
@@ -24,11 +25,13 @@ pub mod flow;
 #[doc(hidden)]
 pub mod generated;
 pub mod handlers;
+pub mod history;
 pub mod ids;
 pub mod ir;
 pub mod limits;
 pub mod policy;
 pub mod provider;
+pub mod publication;
 #[doc(hidden)]
 pub mod rpc;
 pub mod schema;
@@ -37,6 +40,8 @@ pub mod storage;
 pub mod time;
 pub mod tls;
 pub mod value;
+pub mod worker;
+pub mod worker_contract;
 #[doc(hidden)]
 pub mod write;
 pub mod yaml;
@@ -56,9 +61,12 @@ pub use engine::{
 };
 pub use error::{Error, ErrorKind, Result};
 pub use flow::{region, workflow};
-pub use handlers::Handlers;
+pub use handlers::{Handlers, LocalHandlerContext};
+pub use history::{HistoryPage, RecordedEvent, reconstruct_at};
 pub use ids::{EventId, RunId};
 pub use ir::Definition;
 pub use schema::{DurablePayload, SchemaRef};
 pub use tls::{CertificateAuthority, TlsMaterial, generate_ca, issue_node};
 pub use value::Value;
+pub use worker::{ActivityError, HandlerContext, Observed, Worker, WorkerBuilder};
+pub use worker_contract::WorkerCapability;

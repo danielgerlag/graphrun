@@ -162,9 +162,36 @@ cargo install graphrun-cli --locked
 graphrun inspect --run <run-id> --local-dir ./graphrun-data
 ```
 
+Publish a catalog, then a compiled definition, before starting by workflow name.
+The catalog version and YAML's explicit workflow version are separate:
+
+```sh
+graphrun publish --catalog catalog.json --catalog-version 1 --local-dir ./graphrun-data
+graphrun publish --definition workflow.yaml --catalog-version 1 --local-dir ./graphrun-data
+graphrun start --workflow my_workflow --version 1 --start-key order-42 \
+  --input order.json --local-dir ./graphrun-data
+```
+
+Omit `--version` to resolve latest once. A matching start key returns the original
+run, even after a newer definition is published; differing input or explicit
+version conflicts. Use `--command-id <32-hex>` across retries and
+`graphrun command-result --command-id <32-hex> --local-dir ...` to query a
+committed result after an uncertain outcome. Publication is immutable: the
+same version/content is idempotent, changed same-version content is rejected.
+Waiting for a failed run or timing out exits nonzero (use `--no-wait` to submit
+only). Existing pre-publication stores require an explicit format migration;
+opening them does not silently rewrite or initialize them.
+
+The same operations are available through `Engine::publish_catalog`,
+`publish_definition_yaml`, and `start_published_with_command`. For gRPC,
+present a cluster-CA-signed URI SAN principal (`issue_principal`): the `admin`
+role publishes, the `client` role starts. The cluster ID must match the
+member's `identity.json`; a roleless node certificate or caller-supplied
+principal text is not authority. The local socket remains owner-only.
+
 ## Cluster
 
-After a local run works: `Engine::member` is a storage replica, `Engine::run_worker` claims activities over gRPC/mTLS. Same write path as local. [Cluster how-to](https://github.com/danielgerlag/graphrun/blob/main/docs/quickstarts/cluster.md).
+After a local run works, `Engine::member` hosts storage without running handlers. An independent process uses `Worker::builder(endpoint, tls, catalog)` to register its application handlers, claim exact pinned contracts, and report results over gRPC/mTLS. It opens no replica or data directory. Fixture handlers are confined to tests and the explicitly enabled `fixture-worker` feature used by the non-published verification driver. [Worker how-to](https://github.com/danielgerlag/graphrun/blob/main/docs/quickstarts/worker.md) and [cluster how-to](https://github.com/danielgerlag/graphrun/blob/main/docs/quickstarts/cluster.md).
 
 ## Limits
 

@@ -6,8 +6,8 @@ REQ-PARALLEL	Concurrent branches and exactly-once all-join	03-loops-and-parallel
 REQ-SAGA	Durable compensation settlement and nested sagas	04-activities-and-compensation.md	SAGA-001,SAGA-002,SAGA-003,SAGA-004,SAGA-005,SAGA-006,SAGA-007,SAGA-008,SAGA-009,SAGA-010,SAGA-011,SAGA-012,SAGA-013,SAGA-014
 REQ-EVENTS	Correlated durable external input and repeated waits	02-language-and-primitives.md	EVT-001,EVT-002,EVT-003,EVT-004,EVT-005,EVT-006,EVT-007,EVT-008
 REQ-ACTIVITIES	Async blocking remote compensation and reconciliation contracts	04-activities-and-compensation.md	ACT-001,ACT-002,ACT-003,ACT-004,ACT-005,ACT-006,ACT-007,ACT-008
-REQ-DURABILITY	Atomic real redb OpenRaft command and event application	06-storage-and-consensus.md	DOM-001,DOM-002,DOM-004,POLICY-001,STORE-001,STORE-002,STORE-003,STORE-004,STORE-005,STORE-006
-REQ-CLUSTER	Independent members workers and supported failure recovery	06-storage-and-consensus.md	STORE-007,STORE-008,CLUSTER-001,CLUSTER-002,CLUSTER-003,CLUSTER-004,CLUSTER-005,CLUSTER-006,SEC-001
+REQ-DURABILITY	Atomic real redb OpenRaft command and event application	06-storage-and-consensus.md	DOM-001,DOM-002,DOM-004,POLICY-001,STORE-001,STORE-002,STORE-003,STORE-004,STORE-005,STORE-006,CONTRACT-001,CONTRACT-002
+REQ-CLUSTER	Independent members workers and supported failure recovery	06-storage-and-consensus.md	STORE-007,STORE-008,CLUSTER-001,CLUSTER-002,CLUSTER-003,CLUSTER-004,CLUSTER-005,CLUSTER-006,SEC-001,CONTRACT-003
 REQ-LOCAL	Service-free durable local loop and inspection	07-api-and-operations.md	LOCAL-001,LOCAL-002,LOCAL-003
 REQ-REPLAY	Event-sourced history and pure read-only reconstruction	01-domain-model.md	REPLAY-001,REPLAY-002,REPLAY-003,REPLAY-004
-REQ-E2E	Real release-artifact end-to-end evidence and no silent skips	08-testing-and-verification.md	E2E-001,E2E-002,E2E-003,PERF-001,PERF-002
+REQ-E2E	Real release-artifact end-to-end evidence and no silent skips	08-testing-and-verification.md	E2E-001,E2E-002,E2E-003,PERF-001,PERF-002,GATE-001,GATE-002

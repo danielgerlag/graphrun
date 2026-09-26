@@ -176,6 +176,30 @@ impl Catalog {
         Ok(())
     }
 
+    pub(crate) fn validate_for_publication(&self) -> Result<()> {
+        for key in self.schemas.keys() {
+            if !valid_ascii_name(&key.name) || key.version == 0 {
+                return Err(Error::invalid(format!("invalid published schema {key}")));
+            }
+        }
+        for (key, contract) in &self.activities {
+            if key != &contract.key || !valid_ascii_name(&key.name) || key.version == 0 {
+                return Err(Error::invalid("invalid published activity identity"));
+            }
+        }
+        for (key, contract) in &self.reconcilers {
+            if key != &contract.key || !valid_ascii_name(&key.name) || key.version == 0 {
+                return Err(Error::invalid("invalid published reconciler identity"));
+            }
+            if !self.activities.contains_key(&contract.forward) {
+                return Err(Error::invalid(format!(
+                    "reconciler {key} refers to missing activity"
+                )));
+            }
+        }
+        self.validate_refs()
+    }
+
     pub fn require_schema(&self, schema: &SchemaRef) -> Result<()> {
         match schema {
             SchemaRef::Named { key } => {
@@ -205,7 +229,7 @@ impl Catalog {
         }
     }
 
-    fn schema_json(&self, schema: &SchemaRef) -> Result<serde_json::Value> {
+    pub(crate) fn schema_json(&self, schema: &SchemaRef) -> Result<serde_json::Value> {
         match schema {
             SchemaRef::Named { key } => self
                 .schemas

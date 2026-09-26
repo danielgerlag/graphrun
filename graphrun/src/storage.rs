@@ -25,7 +25,9 @@ use std::io::{self, Cursor, Seek, SeekFrom};
 use std::ops::Bound;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use tokio::sync::oneshot;
@@ -49,6 +51,12 @@ pub struct RaftRequest {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RaftResponse {
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<crate::error::ErrorKind>,
+    #[serde(default)]
+    pub command_result: Option<crate::publication::CommandResult>,
+    #[serde(default)]
+    pub run_id: Option<crate::ids::RunId>,
 }
 
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
@@ -147,6 +155,8 @@ enum Req {
     ),
     CurrentSnapshot(oneshot::Sender<std::result::Result<Option<Snapshot<TypeConfig>>, StoErr>>),
     QueryState(oneshot::Sender<State>),
+    QueryWatermark(oneshot::Sender<u64>),
+    SetClockFault(bool, oneshot::Sender<std::result::Result<(), StoErr>>),
     InstallDomain(Box<State>, oneshot::Sender<std::result::Result<(), StoErr>>),
     Shutdown,
 }
@@ -154,22 +164,80 @@ enum Req {
 #[derive(Clone)]
 pub struct StorageHandle {
     tx: mpsc::Sender<Req>,
+    clock: Arc<crate::clock::ClockAuthority>,
+    watermark: Arc<AtomicU64>,
 }
 
 impl StorageHandle {
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, JoinHandle<()>)> {
+        Self::open_inner(path, false)
+    }
+
+    pub(crate) fn open_restored(path: impl AsRef<Path>) -> Result<(Self, JoinHandle<()>)> {
+        Self::open_inner(path, true)
+    }
+
+    fn open_inner(path: impl AsRef<Path>, restoring: bool) -> Result<(Self, JoinHandle<()>)> {
         let path = path.as_ref().to_path_buf();
+        let mut clock_faulted = false;
+        let mut initial_watermark = 0;
+        if path.exists() {
+            let db = ReadOnlyDatabase::open(&path).map_err(|err| {
+                Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string())
+            })?;
+            let format: Option<String> = load_json(&db, "publication_start_format");
+            if format.as_deref() != Some("graphrun.publication-store/v1") {
+                return Err(Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "incompatible pre-publication store; migrate explicitly (directory left untouched)",
+                ));
+            }
+            let state = load_json::<_, State>(&db, "domain").ok_or_else(|| {
+                Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "domain missing or unreadable (directory left untouched)",
+                )
+            })?;
+            validate_history_store(&state)?;
+            initial_watermark = state.engine_time_watermark_ms;
+            if let Some(bytes) = load_bytes(&db, "clock_fault") {
+                clock_faulted = serde_json::from_slice(&bytes).map_err(|_| {
+                    Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        "clock fault record is corrupt",
+                    )
+                })?;
+            }
+        } else if !restoring
+            && path
+                .parent()
+                .is_some_and(|parent| parent.join("identity.json").exists())
+        {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "member store missing for existing identity (directory left untouched)",
+            ));
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| Error::invalid(err.to_string()))?;
         }
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let watermark = Arc::new(AtomicU64::new(initial_watermark));
+        let stored_watermark = watermark.clone();
         let handle = std::thread::Builder::new()
             .name("graphrun-storage".into())
-            .spawn(move || storage_thread(path, rx, ready_tx))
+            .spawn(move || storage_thread(path, rx, ready_tx, stored_watermark))
             .map_err(|err| Error::invalid(err.to_string()))?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok((Self { tx }, handle)),
+            Ok(Ok(())) => Ok((
+                Self {
+                    tx,
+                    clock: Arc::new(crate::clock::ClockAuthority::new(clock_faulted)),
+                    watermark,
+                },
+                handle,
+            )),
             Ok(Err(err)) => Err(Error::new(crate::error::ErrorKind::FailedPrecondition, err)),
             Err(_) => Err(Error::invalid("storage thread exited before opening")),
         }
@@ -187,6 +255,48 @@ impl StorageHandle {
         }
     }
 
+    pub fn clock(&self) -> &crate::clock::ClockAuthority {
+        &self.clock
+    }
+
+    pub fn engine_watermark_cached(&self) -> u64 {
+        self.watermark.load(Ordering::SeqCst)
+    }
+
+    pub async fn engine_watermark(&self) -> Result<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Req::QueryWatermark(tx)).map_err(|_| {
+            Error::new(
+                crate::error::ErrorKind::Unavailable,
+                "storage thread stopped",
+            )
+        })?;
+        rx.await.map_err(|_| {
+            Error::new(
+                crate::error::ErrorKind::Unavailable,
+                "storage thread dropped",
+            )
+        })
+    }
+
+    pub async fn persist_clock_fault(&self, faulted: bool) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Req::SetClockFault(faulted, tx)).map_err(|_| {
+            Error::new(
+                crate::error::ErrorKind::Unavailable,
+                "storage thread stopped",
+            )
+        })?;
+        rx.await
+            .map_err(|_| {
+                Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "storage thread dropped",
+                )
+            })?
+            .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))
+    }
+
     pub async fn query_state(&self) -> State {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(Req::QueryState(tx));
@@ -194,6 +304,7 @@ impl StorageHandle {
     }
 
     pub async fn install_domain(&self, state: State) -> Result<()> {
+        validate_history_store(&state)?;
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Req::InstallDomain(Box::new(state), tx))
@@ -212,6 +323,35 @@ impl StorageHandle {
         }
     }
 
+    pub async fn applied_membership(&self) -> Result<StoredMembership<u64, BasicNode>> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Req::AppliedState(tx)).map_err(|_| {
+            Error::new(
+                crate::error::ErrorKind::Unavailable,
+                "storage thread stopped",
+            )
+        })?;
+        let (_, membership) = rx
+            .await
+            .map_err(|_| {
+                Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "storage thread dropped",
+                )
+            })?
+            .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))?;
+        Ok(membership)
+    }
+
+    pub async fn applied_members(&self) -> Result<BTreeMap<u64, String>> {
+        Ok(self
+            .applied_membership()
+            .await?
+            .nodes()
+            .map(|(id, node)| (*id, node.addr.clone()))
+            .collect())
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.send(Req::Shutdown);
     }
@@ -220,13 +360,73 @@ impl StorageHandle {
 pub fn load_domain_readonly(path: impl AsRef<Path>) -> Result<State> {
     let db = ReadOnlyDatabase::open(path.as_ref())
         .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))?;
-    Ok(load_json(&db, "domain").unwrap_or_default())
+    let format: Option<String> = load_json(&db, "publication_start_format");
+    if format.as_deref() != Some("graphrun.publication-store/v1") {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "incompatible store format",
+        ));
+    }
+    let state = load_json(&db, "domain").ok_or_else(|| {
+        Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "domain missing or unreadable",
+        )
+    })?;
+    validate_history_store(&state)?;
+    Ok(state)
+}
+
+fn validate_history_store(state: &State) -> Result<()> {
+    for run in state.runs.keys() {
+        let incompatible = || {
+            Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                format!(
+                    "run {} has incompatible pre-history records; migrate explicitly (directory left untouched)",
+                    run.to_hex()
+                ),
+            )
+        };
+        let (history, records) = match (
+            state.history.get(run),
+            state.history_records.get(run),
+            state.history_dependencies.get(run),
+        ) {
+            (Some(history), Some(records), Some(_))
+                if !history.is_empty() && records.len() == history.len() =>
+            {
+                (history, records)
+            }
+            _ => return Err(incompatible()),
+        };
+        let history_len = history.len() as u64;
+        if records.iter().enumerate().any(|(i, record)| {
+            record.format != crate::history::EVENT_FORMAT
+                || record.run != *run
+                || record.sequence != i as u64 + 1
+        }) || state.checkpoints.get(run).is_some_and(|checkpoint| {
+            checkpoint.format != crate::history::CHECKPOINT_FORMAT
+                || checkpoint.through_run_sequence == 0
+                || checkpoint.through_run_sequence > history_len
+        }) {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                format!(
+                    "run {} has unsupported history or checkpoint format; migrate explicitly (directory left untouched)",
+                    run.to_hex()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn storage_thread(
     path: PathBuf,
     rx: mpsc::Receiver<Req>,
     ready: mpsc::Sender<std::result::Result<(), String>>,
+    watermark: Arc<AtomicU64>,
 ) {
     let db = match Database::create(&path) {
         Ok(db) => db,
@@ -235,12 +435,13 @@ fn storage_thread(
             return;
         }
     };
-    let _ = ready.send(Ok(()));
-    if let Ok(txn) = db.begin_write() {
-        let _ = txn.open_table(META);
-        let _ = txn.open_table(LOG);
-        let _ = txn.commit();
+    if load_json::<_, String>(&db, "publication_start_format").is_none() {
+        if let Err(err) = initialize_publication_store(&db) {
+            let _ = ready.send(Err(err.to_string()));
+            return;
+        }
     }
+    let _ = ready.send(Ok(()));
     let mut last_purged: Option<LogIdT> = load_json(&db, "last_purged");
     let mut last_applied: Option<LogIdT> = load_json(&db, "last_applied");
     let mut last_membership: MembershipT = load_json(&db, "membership")
@@ -294,6 +495,9 @@ fn storage_thread(
                     &mut domain,
                     entries,
                 );
+                if res.is_ok() {
+                    watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
+                }
                 let _ = tx.send(res);
             }
             Req::BuildSnapshot(tx) => {
@@ -335,6 +539,9 @@ fn storage_thread(
                     meta,
                     data,
                 );
+                if res.is_ok() {
+                    watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
+                }
                 let _ = tx.send(res);
             }
             Req::CurrentSnapshot(tx) => {
@@ -347,13 +554,52 @@ fn storage_thread(
             Req::QueryState(tx) => {
                 let _ = tx.send(domain.clone());
             }
+            Req::QueryWatermark(tx) => {
+                let _ = tx.send(domain.engine_time_watermark_ms);
+            }
+            Req::SetClockFault(faulted, tx) => {
+                let _ = tx.send(put_json(&db, "clock_fault", &faulted));
+            }
             Req::InstallDomain(next, tx) => {
-                domain = *next;
-                let res = put_json(&db, "domain", &domain);
+                let mut next = *next;
+                next.engine_time_watermark_ms = next
+                    .engine_time_watermark_ms
+                    .max(domain.engine_time_watermark_ms);
+                let res = validate_history_store(&next)
+                    .map_err(|err| sto_err(ErrorVerb::Write, err))
+                    .and_then(|()| put_json(&db, "domain", &next));
+                if res.is_ok() {
+                    domain = next;
+                    watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
+                }
                 let _ = tx.send(res);
             }
         }
     }
+}
+
+fn initialize_publication_store(db: &Database) -> std::result::Result<(), StoErr> {
+    let mut txn = db
+        .begin_write()
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    txn.set_durability(Durability::Immediate)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    {
+        let mut meta = txn
+            .open_table(META)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let format = serde_json::to_vec("graphrun.publication-store/v1")
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let domain =
+            serde_json::to_vec(&State::default()).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("publication_start_format", format.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("domain", domain.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    }
+    txn.open_table(LOG)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))
 }
 
 fn load_json<D, T>(db: &D, key: &str) -> Option<T>
@@ -585,13 +831,48 @@ fn apply_entries(
         }
         let mut reply = RaftResponse::default();
         if let EntryPayload::Normal(req) = &entry.payload {
-            match domain::commit_command(&mut next_domain, req.command.clone()) {
-                Ok(events) => {
-                    if !events.is_empty() {
+            domain_changed = true;
+            if let domain::CommandBody::Publication { key, operation } = &req.command.body {
+                if key.command_id != req.command.id
+                    || key.cluster_id.is_empty()
+                    || key.principal_id.is_empty()
+                {
+                    reply.error = Some("invalid authenticated command identity".to_owned());
+                    reply.error_kind = Some(crate::error::ErrorKind::InvalidArgument);
+                } else {
+                    let mut command = req.command.clone();
+                    if !next_domain.command_results.contains_key(&key.storage_key()) {
+                        command.time = crate::time::EngineTime::from_millis(
+                            next_domain
+                                .engine_time_watermark_ms
+                                .max(command.time.as_millis()),
+                        );
+                        next_domain.engine_time_watermark_ms = command.time.as_millis();
+                    }
+                    let receipt =
+                        crate::publication::apply(&mut next_domain, &command, key, operation);
+                    if let Err(err) = receipt.ensure_applied() {
+                        reply.error_kind = Some(err.kind);
+                        reply.error = Some(err.to_string());
+                    }
+                    reply.command_result = Some(receipt);
+                }
+            } else {
+                let mut candidate = next_domain.clone();
+                match domain::commit_command(&mut candidate, req.command.clone()) {
+                    Ok(events) => {
+                        next_domain = candidate;
                         domain_changed = true;
+                        reply.run_id = events.iter().find_map(|event| match event {
+                            domain::DomainEvent::RunAdmitted { run, .. } => Some(*run),
+                            _ => None,
+                        });
+                    }
+                    Err(err) => {
+                        reply.error_kind = Some(err.kind);
+                        reply.error = Some(err.to_string());
                     }
                 }
-                Err(err) => reply.error = Some(err.to_string()),
             }
         }
         replies.push(reply);
@@ -657,8 +938,12 @@ fn install_snapshot(
     meta: SnapMeta,
     data: Vec<u8>,
 ) -> std::result::Result<(), StoErr> {
-    let (applied, membership, restored): (Option<LogIdT>, MembershipT, State) =
+    let (applied, membership, mut restored): (Option<LogIdT>, MembershipT, State) =
         serde_json::from_slice(&data).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    restored.engine_time_watermark_ms = restored
+        .engine_time_watermark_ms
+        .max(domain.engine_time_watermark_ms);
+    validate_history_store(&restored).map_err(|err| sto_err(ErrorVerb::Write, err))?;
     let mut txn = db
         .begin_write()
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
@@ -943,6 +1228,21 @@ mod tests {
     }
 
     #[test]
+    fn missing_member_store_with_identity_does_not_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity.json");
+        let bytes = b"existing identity";
+        std::fs::write(&identity, bytes).unwrap();
+        let db_path = dir.path().join("member.redb");
+
+        let err = StorageHandle::open(&db_path).err().unwrap();
+        assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+        assert!(err.message.contains("member store missing"));
+        assert!(!db_path.exists());
+        assert_eq!(std::fs::read(&identity).unwrap(), bytes);
+    }
+
+    #[test]
     fn log_cut_after_persist_keeps_entries() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("member.redb");
@@ -963,6 +1263,89 @@ mod tests {
         assert!(err.to_string().contains("fault cut"));
         let loaded = get_logs(&db, 1, 2).unwrap();
         assert_eq!(loaded.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn open_rejects_pre_history_active_run_before_starting_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let catalog = crate::catalog::Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let definition = crate::compiler::compile_yaml(
+            "\
+dsl: graphrun/v1
+id: old_active_store
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {literal: null}
+",
+            &catalog,
+        )
+        .unwrap();
+        let run = crate::ids::RunId::from_bytes([8; 16]);
+        let mut domain = State::default();
+        domain::commit_command(
+            &mut domain,
+            Command {
+                id: crate::ids::CommandId::from_bytes([9; 16]),
+                time: crate::time::EngineTime::from_millis(1),
+                body: domain::CommandBody::Start {
+                    run,
+                    definition: Box::new(definition),
+                    input: crate::value::Value::Null,
+                    catalog: Box::new(catalog),
+                },
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            domain.runs[&run].status,
+            domain::RunStatus::Active
+        ));
+        let compatible = domain.clone();
+        domain.history_records.clear();
+        domain.history_dependencies.clear();
+        put_json(&db, "domain", &domain).unwrap();
+        drop(db);
+
+        let error = StorageHandle::open(&path)
+            .err()
+            .expect("pre-history active store must be rejected");
+        assert_eq!(error.kind, crate::error::ErrorKind::FailedPrecondition);
+        assert!(
+            error.message.contains("history") && error.message.contains("migrate"),
+            "error must explain the incompatible store: {error}"
+        );
+        let db = ReadOnlyDatabase::open(&path).unwrap();
+        let untouched: State = load_json(&db, "domain").unwrap();
+        assert!(untouched.runs.contains_key(&run));
+        assert!(untouched.history_records.is_empty());
+
+        let fresh = dir.path().join("fresh.redb");
+        let (handle, thread) = StorageHandle::open(&fresh).unwrap();
+        let restore_error = handle.install_domain(domain).await.unwrap_err();
+        assert_eq!(
+            restore_error.kind,
+            crate::error::ErrorKind::FailedPrecondition
+        );
+        assert!(handle.query_state().await.runs.is_empty());
+        handle.install_domain(compatible).await.unwrap();
+        assert!(handle.query_state().await.runs.contains_key(&run));
+        handle.shutdown();
+        thread.join().unwrap();
+        let (handle, thread) = StorageHandle::open(&fresh).unwrap();
+        assert!(handle.query_state().await.runs.contains_key(&run));
+        handle.shutdown();
+        thread.join().unwrap();
     }
 
     #[test]
@@ -1104,6 +1487,118 @@ mod tests {
         assert_eq!(loaded_again.history, domain.history);
         let resurrected = get_logs(&db, 1, 3).unwrap();
         assert!(resurrected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_history_cleanup_survives_restart_after_log_purge() {
+        use crate::domain::{CommandBody, RunStatus};
+        use crate::ids::{CommandId, RunId};
+        use crate::time::EngineTime;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let catalog = crate::catalog::Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let definition = crate::compiler::compile_yaml(
+            "\
+dsl: graphrun/v1
+id: persisted_history
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {literal: null}
+",
+            &catalog,
+        )
+        .unwrap();
+        let run = RunId::from_bytes([7; 16]);
+        let entry = |index, time_ms, body| Entry::<TypeConfig> {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(RaftRequest {
+                command: Command {
+                    id: CommandId::from_bytes([index as u8; 16]),
+                    time: EngineTime::from_millis(time_ms),
+                    body,
+                },
+            }),
+        };
+        let start = entry(
+            1,
+            1,
+            CommandBody::Start {
+                run,
+                definition: Box::new(definition),
+                catalog: Box::new(catalog),
+                input: crate::value::Value::Null,
+            },
+        );
+        let progress = entry(2, 2, CommandBody::Progress { run });
+        append_logs(&db, &[start.clone(), progress.clone()]).unwrap();
+        let mut applied = None;
+        let mut membership = StoredMembership::new(None, Membership::new(vec![], None));
+        let mut state = State::default();
+        let responses = apply_entries(
+            &db,
+            &mut applied,
+            &mut membership,
+            &mut state,
+            vec![start, progress],
+        )
+        .unwrap();
+        assert!(responses.iter().all(|reply| reply.error.is_none()));
+        assert!(matches!(
+            state.runs[&run].status,
+            RunStatus::Succeeded { .. }
+        ));
+        let through = state.history[&run].len() as u64;
+        assert_eq!(state.checkpoints[&run].through_run_sequence, through);
+        purge_logs(
+            &db,
+            2,
+            &LogId::new(openraft::CommittedLeaderId::new(1, 1), 2),
+        )
+        .unwrap();
+        assert!(get_logs(&db, 1, 3).unwrap().is_empty());
+        assert_eq!(
+            crate::history::page(&state, run, 0, 100, EngineTime::from_millis(3))
+                .unwrap()
+                .retained_through,
+            through
+        );
+
+        let expiry = entry(
+            3,
+            2 + 30 * 24 * 60 * 60 * 1000,
+            CommandBody::PruneHistory { limit: 128 },
+        );
+        let response =
+            apply_entries(&db, &mut applied, &mut membership, &mut state, vec![expiry]).unwrap();
+        assert!(response[0].error.is_none());
+        assert!(!state.runs.contains_key(&run));
+        drop(db);
+
+        let (handle, thread) = StorageHandle::open(&path).unwrap();
+        let restored = handle.query_state().await;
+        let page = crate::history::page(
+            &restored,
+            run,
+            0,
+            100,
+            EngineTime::from_millis(2 + 30 * 24 * 60 * 60 * 1000),
+        )
+        .unwrap();
+        assert!(page.unavailable);
+        assert_eq!(page.unavailable_range.unwrap().last, through);
+        handle.shutdown();
+        thread.join().unwrap();
     }
 
     #[test]

@@ -4,6 +4,17 @@ This is a release gate, not a suggested test list. Implement the executable veri
 
 Compilation, mocked execution, matching two projections produced by the same bug, or screenshots alone do not establish completion.
 
+<!-- TODO(CONTRACT-001, final verifier): Run a fresh three-voter, authenticated
+     integration case that concurrently republishes equal and changed catalog
+     and definition bytes, retries one command ID across leader loss and restart,
+     checks Applied/Rejected v1 receipts and inclusive event ranges against
+     independently read history, and verifies every retained definition,
+     catalog, and payload artifact digest after snapshot import. The
+     publication-start tests cover domain/redb/Raft, local CLI, and signed
+     gRPC principal behavior; do not report PASS until immutable payload
+     artifact retention is integrated and the complete case actually
+     executes. -->
+
 ## Test layers
 
 | Layer | Required coverage |
@@ -129,23 +140,42 @@ cargo run --locked -p graphrun-e2e -- verify \
 	--artifacts target/e2e-artifacts
 ```
 
+For final release signoff add `--release-certification` to `verify`. The
+default verification mode still rejects any functional `FAIL`, `BLOCKED`, or
+missing case; it allows only measured `PERF-*` hardware blockers and reports
+`release_certified=false`. Strict release certification also exits nonzero on
+any blocked performance case or a substituted/incomplete matrix.
+
 Also run the workspace on the selected minimum toolchain. If the pinned dependencies cannot meet it, resolve and document the compatibility change instead of asserting untested support.
 
 The release build command must not enable test-only features through workspace feature unification. Assert that the resulting binary exposes no test fault controls.
 
 ## Evidence format
 
-The driver writes a machine-readable report with one result per matrix ID.
+The driver writes a machine-readable report with one result per matrix ID in
+a fresh invocation-specific directory under `--artifacts`, plus a latest
+`report.json` at the requested artifacts root. Reusing the same artifacts
+root must never reuse old case evidence. The report records unique run ID,
+source and binary fingerprints, certification flag, and per-case status.
 
 Each result records status, command/configuration, binary/version identifiers, duration, expected and actual observations, and artifact paths.
 
 The final `verify` command must be self-contained. It runs the required test targets or collects their per-case evidence within the same fresh verification run. It must not infer unit/property/compile coverage from an unrelated earlier Cargo exit code.
 
-Give each test case its own evidence file and aggregate afterward. Bind evidence to a fresh run ID and current source/binary fingerprints. Stale, missing, ignored, or mismatched evidence fails the coverage gate.
+Give each test case its own evidence file and aggregate afterward. Bind
+evidence to a fresh run ID and current source/binary fingerprints. Require
+successful test processes and executed named tests, not matching log text
+alone. Stale, missing, ignored, filtered, or mismatched evidence fails the
+coverage gate. Preserve every result even when a different case fails.
 
 Retain node and worker logs, provider effect records, queried run/history JSON, snapshot metadata, process exit statuses, and failing seeds/traces.
 
-The report must distinguish `PASS`, `FAIL`, and `BLOCKED`. Missing, filtered-out, ignored, or silently skipped mandatory cases are not pass.
+The report must distinguish `PASS`, `FAIL`, and `BLOCKED`. Missing,
+filtered-out, ignored, or silently skipped mandatory cases are not pass.
+Only `PERF-*` may be `BLOCKED`, and only for unavailable reference hardware
+after actual measurements and observed hardware details are retained.
+Missing measurements or a failed performance scenario are `FAIL`, not
+`BLOCKED`. A report with any `BLOCKED` result cannot be release-certified.
 
 A nonzero scenario outcome produces a nonzero driver exit status. The driver validates matrix coverage, not merely the scenarios its author remembered to register.
 

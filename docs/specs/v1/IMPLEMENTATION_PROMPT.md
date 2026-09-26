@@ -22,6 +22,7 @@ The normative documents are:
 - `08-testing-and-verification.md`
 - `09-implementation-plan.md`
 - `10-policies-and-defaults.md`
+- `11-foundational-contracts.md`
 
 Use `docs/specs/v1/examples/` as required fixtures and build equivalent Rust definitions.
 

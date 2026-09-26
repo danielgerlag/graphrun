@@ -1,0 +1,11 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/wrong_region_return.rs:5:5
+  |
+3 | fn wrong_region_return() -> Region<String, i64> {
+  |                             ------------------- expected `graphrun::Region<std::string::String, i64>` because of return type
+4 |     let body = RegionBuilder::<String>::new();
+5 |     body.complete("done", body.input()).unwrap()
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Region<String, i64>`, found `Region<String, String>`
+  |
+  = note: expected struct `graphrun::Region<std::string::String, i64>`
+             found struct `graphrun::Region<std::string::String, std::string::String>`
