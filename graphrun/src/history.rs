@@ -483,6 +483,7 @@ pub fn checkpoint_after_command(state: &mut State, run: RunId, time: EngineTime)
     projection.commands.clear();
     projection.command_results.clear();
     projection.legacy_start_digests.clear();
+    projection.worker_command_digests.clear();
     projection.command_times.clear();
     projection.published_catalogs.clear();
     projection.published_definitions.clear();
@@ -534,6 +535,7 @@ pub(crate) fn prune(
         state.command_times.remove(&id);
         state.commands.remove(&id);
         state.legacy_start_digests.remove(&id);
+        state.worker_command_digests.remove(&id);
         remaining -= 1;
     }
     let expired_inbox = earliest_due(
@@ -701,4 +703,129 @@ pub fn replay_view(
 
 pub fn projection_view(projection: &State, run: RunId) -> serde_json::Value {
     crate::write::inspect_view(projection, run)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Command, CommandBody};
+    use crate::publication::{
+        CommandKey, CommandResult, Disposition, RESULT_FORMAT, StartKeyRecord,
+    };
+
+    fn id(index: u128) -> CommandId {
+        CommandId::from_bytes(index.to_be_bytes())
+    }
+
+    fn state_with_worker_commands(reverse: bool, now: u64) -> State {
+        let mut state = State::default();
+        let mut indices: Vec<_> = (1..=11).collect();
+        if reverse {
+            indices.reverse();
+        }
+        for index in indices {
+            let command_id = id(index);
+            let recorded_ms = match index {
+                10 => now - DAY_MS,
+                11 => now - DAY_MS + 1,
+                _ => (index as u64 - 1) / 2,
+            };
+            state.command_times.insert(command_id, recorded_ms);
+            state.commands.insert(command_id, Vec::new());
+            state
+                .worker_command_digests
+                .insert(command_id, format!("digest-{index}"));
+        }
+        state.legacy_start_digests.insert(id(1), "legacy".into());
+
+        let key = CommandKey {
+            cluster_id: "cluster".into(),
+            principal_id: "owner".into(),
+            command_id: id(1),
+        };
+        state.command_results.insert(
+            key.storage_key(),
+            CommandResult {
+                format: RESULT_FORMAT.into(),
+                key,
+                request_digest: "receipt".into(),
+                operation: "start".into(),
+                target: "workflow".into(),
+                outcome: Disposition::Applied {
+                    run: None,
+                    digest: None,
+                    version: None,
+                },
+                event_range: None,
+                recorded_ms: now - 1,
+            },
+        );
+        state
+            .start_keys
+            .entry("cluster".into())
+            .or_default()
+            .insert(
+                "start".into(),
+                StartKeyRecord {
+                    run: RunId::from_bytes([7; 16]),
+                    version: 1,
+                    input_digest: "start-digest".into(),
+                    admitted_ms: 0,
+                },
+            );
+        state
+    }
+
+    #[test]
+    fn worker_digests_expire_with_commands_in_deterministic_batches() {
+        let now = DAY_MS + 1_000;
+        let mut forward = state_with_worker_commands(false, now);
+        let mut reverse = state_with_worker_commands(true, now);
+
+        for batch in 0..4u128 {
+            let prune_command = Command {
+                id: id(100 + batch),
+                time: EngineTime::from_millis(now),
+                body: CommandBody::PruneHistory { limit: 3 },
+            };
+            assert!(
+                domain::commit_command(&mut forward, prune_command.clone())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                domain::commit_command(&mut reverse, prune_command)
+                    .unwrap()
+                    .is_empty()
+            );
+
+            for state in [&forward, &reverse] {
+                for index in 1..=10 {
+                    let retained = index > ((batch + 1) * 3).min(10);
+                    assert_eq!(state.command_times.contains_key(&id(index)), retained);
+                    assert_eq!(state.commands.contains_key(&id(index)), retained);
+                    assert_eq!(
+                        state.worker_command_digests.contains_key(&id(index)),
+                        retained
+                    );
+                }
+                assert!(!state.legacy_start_digests.contains_key(&id(1)));
+                assert!(state.command_times.contains_key(&id(11)));
+                assert!(state.commands.contains_key(&id(11)));
+                assert_eq!(
+                    state.worker_command_digests.get(&id(11)).unwrap(),
+                    "digest-11"
+                );
+                assert_eq!(state.command_results.len(), 1);
+                assert_eq!(
+                    state.command_results.values().next().unwrap().recorded_ms,
+                    now - 1
+                );
+                assert_eq!(
+                    state.start_keys["cluster"]["start"].input_digest,
+                    "start-digest"
+                );
+            }
+        }
+    }
 }
