@@ -42,6 +42,12 @@ enum Commands {
         #[arg(long)]
         artifacts: PathBuf,
     },
+    ContractArtifactProof {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
     Verify {
         #[arg(long)]
         cli: PathBuf,
@@ -76,6 +82,8 @@ enum Commands {
         peer: Vec<String>,
         #[arg(long)]
         remove_voter_on_file: Option<PathBuf>,
+        #[arg(long)]
+        shutdown_on_file: Option<PathBuf>,
     },
     #[command(name = "fixture-worker")]
     FixtureWorker {
@@ -135,6 +143,9 @@ fn main() -> ExitCode {
         Commands::ContractWorkerProof { cli, artifacts } => {
             focused_contract_worker_proof(&cli, &artifacts)
         }
+        Commands::ContractArtifactProof { cli, artifacts } => {
+            focused_contract_artifact_proof(&cli, &artifacts)
+        }
         Commands::Verify {
             cli,
             matrix,
@@ -153,6 +164,7 @@ fn main() -> ExitCode {
             host_activities,
             peer,
             remove_voter_on_file,
+            shutdown_on_file,
         } => fixture_member(
             data_dir,
             bind,
@@ -165,6 +177,7 @@ fn main() -> ExitCode {
             host_activities,
             peer,
             remove_voter_on_file,
+            shutdown_on_file,
         ),
         Commands::FixtureWorker {
             endpoint,
@@ -262,6 +275,61 @@ fn focused_contract_worker_proof(cli: &Path, artifacts: &Path) -> ExitCode {
         }
         Err(err) => {
             eprintln!("CONTRACT-003 focused proof: {err}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn focused_contract_artifact_proof(cli: &Path, artifacts: &Path) -> ExitCode {
+    let result = (|| -> Result<CaseResult, String> {
+        fs::create_dir_all(artifacts).map_err(|err| err.to_string())?;
+        let run_dir = tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(artifacts)
+            .map_err(|err| err.to_string())?
+            .keep();
+        let row = parse_matrix(include_str!("../../docs/specs/v1/verification-matrix.tsv"))?
+            .into_iter()
+            .find(|row| row.id == "CONTRACT-001")
+            .ok_or("CONTRACT-001 missing from canonical matrix")?;
+        let mut context = RunContext::new(cli, &run_dir)?;
+        let (ok, version, error) = run_cli_timeout(cli, &["--version"], Duration::from_secs(3));
+        if !ok {
+            return Err(format!("CLI preflight: {error}"));
+        }
+        context.cli_version = version.trim().to_owned();
+        if context.cli_version.is_empty() || context.cli_sha256.starts_with("UNAVAILABLE: ") {
+            return Err("CLI preflight lacks binary hash/version".to_owned());
+        }
+        let mut case = enforce_case(&row, contract_artifact_proof(cli, &run_dir, &row), &run_dir);
+        if case.status == "PASS" {
+            let driver = std::env::current_exe().map_err(|err| err.to_string())?;
+            if source_fingerprint(&run_dir)? != context.source_sha256
+                || hash_file(cli)? != context.cli_sha256
+                || hash_file(&driver)? != context.driver_sha256
+            {
+                case.status = "FAIL".to_owned();
+                case.actual = "source, CLI, or driver changed during proof".to_owned();
+            }
+        }
+        let case = context.bind(case);
+        write_case(&run_dir, &case)?;
+        Ok(case)
+    })();
+    match result {
+        Ok(case) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&case).unwrap_or_default()
+            );
+            if case.status == "PASS" {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(err) => {
+            eprintln!("CONTRACT-001 focused proof: {err}");
             ExitCode::from(2)
         }
     }
@@ -1396,7 +1464,8 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             &["tests::status_and_certification_gate"],
         ),
         "CONTRACT-003" => contract_worker_proof(cli, artifacts, row),
-        "CONTRACT-001" | "CONTRACT-002" => fail(
+        "CONTRACT-001" => contract_artifact_proof(cli, artifacts, row),
+        "CONTRACT-002" => fail(
             row,
             "contract acceptance",
             "normative contract defined; runtime acceptance not implemented yet",
@@ -2722,6 +2791,18 @@ fn spawn_fixture_member(
         cmd.arg("--remove-voter-on-file")
             .arg(cluster.dir.join("remove-voter.request"));
     }
+    if cluster
+        .dir
+        .parent()
+        .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "cluster"))
+        && cluster
+            .dir
+            .file_name()
+            .is_some_and(|name| name == "CONTRACT-001-data")
+    {
+        cmd.arg("--shutdown-on-file")
+            .arg(cluster.dir.join(format!("shutdown-{node}.request")));
+    }
     let log = fs::File::create(log).map_err(|err| err.to_string())?;
     cmd.stdout(Stdio::from(log.try_clone().map_err(|err| err.to_string())?))
         .stderr(Stdio::from(log));
@@ -3554,6 +3635,1647 @@ async fn contract_worker_rpc_probes(
         observations,
     )?;
     Ok(assignment.effect_key)
+}
+
+const CONTRACT_ARTIFACT_YAML: &str = "\
+dsl: graphrun/v1
+id: artifact_proof
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: increment
+nodes:
+  increment:
+    kind: activity
+    activity: {name: counter.increment, version: 1}
+    input: {from: workflow.input}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.increment.output}
+";
+
+struct ArtifactFixture {
+    definition: PathBuf,
+    changed_definition: PathBuf,
+    next_definition: PathBuf,
+    catalog: PathBuf,
+    changed_catalog: PathBuf,
+    input: PathBuf,
+    changed_input: PathBuf,
+}
+
+fn artifact_fixture(dir: &Path) -> Result<ArtifactFixture, String> {
+    fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+    let fixture = ArtifactFixture {
+        definition: dir.join("definition.yaml"),
+        changed_definition: dir.join("changed-definition.yaml"),
+        next_definition: dir.join("next-definition.yaml"),
+        catalog: dir.join("catalog.json"),
+        changed_catalog: dir.join("changed-catalog.json"),
+        input: dir.join("input.json"),
+        changed_input: dir.join("changed-input.json"),
+    };
+    fs::write(&fixture.definition, CONTRACT_ARTIFACT_YAML).map_err(|err| err.to_string())?;
+    fs::write(
+        &fixture.changed_definition,
+        CONTRACT_ARTIFACT_YAML.replace("nodes.increment.output", "workflow.input"),
+    )
+    .map_err(|err| err.to_string())?;
+    fs::write(
+        &fixture.next_definition,
+        CONTRACT_ARTIFACT_YAML.replace("version: 1\ninput_schema", "version: 2\ninput_schema"),
+    )
+    .map_err(|err| err.to_string())?;
+    let catalog_bytes =
+        fs::read(catalog()).map_err(|err| format!("read fixture catalog: {err}"))?;
+    fs::write(&fixture.catalog, &catalog_bytes).map_err(|err| err.to_string())?;
+    let mut changed: serde_json::Value =
+        serde_json::from_slice(&catalog_bytes).map_err(|err| err.to_string())?;
+    changed["schemas"]["artifact_extra/v1"] = serde_json::json!({"type":"null"});
+    fs::write(
+        &fixture.changed_catalog,
+        serde_json::to_vec(&changed).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+    fs::write(&fixture.input, r#"{"value":3}"#).map_err(|err| err.to_string())?;
+    fs::write(&fixture.changed_input, r#"{"value":8}"#).map_err(|err| err.to_string())?;
+    Ok(fixture)
+}
+
+fn artifact_command(
+    cli: &Path,
+    connect: &[String],
+    args: &[String],
+    label: &str,
+    observations: &mut Vec<String>,
+) -> Result<serde_json::Value, String> {
+    let mut command = args.to_vec();
+    command.extend_from_slice(connect);
+    let parts: Vec<&str> = command.iter().map(String::as_str).collect();
+    let (ok, out, err) = run_cli_timeout(cli, &parts, Duration::from_secs(12));
+    observations.push(format!(
+        "{label}: success={ok}; stdout={out:?}; stderr={err:?}"
+    ));
+    if !ok {
+        return Err(format!("{label}: {err}; stdout={out}"));
+    }
+    serde_json::from_str(&out).map_err(|err| format!("{label}: invalid JSON: {err}: {out}"))
+}
+
+fn artifact_reject(
+    cli: &Path,
+    connect: &[String],
+    args: &[String],
+    label: &str,
+    expected: &str,
+    observations: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut command = args.to_vec();
+    command.extend_from_slice(connect);
+    let parts: Vec<&str> = command.iter().map(String::as_str).collect();
+    let (ok, out, err) = run_cli_timeout(cli, &parts, Duration::from_secs(12));
+    observations.push(format!(
+        "{label}: success={ok}; stdout={out:?}; stderr={err:?}"
+    ));
+    if ok || !err.contains("AlreadyExists") || !err.contains(expected) {
+        return Err(format!(
+            "{label}: expected typed AlreadyExists ({expected}), got success={ok}: {out} {err}"
+        ));
+    }
+    Ok(())
+}
+
+fn artifact_canonical_json(value: &serde_json::Value, bytes: &mut Vec<u8>) -> Result<(), String> {
+    match value {
+        serde_json::Value::Null => bytes.extend_from_slice(b"null"),
+        serde_json::Value::Bool(value) => {
+            bytes.extend_from_slice(if *value { b"true" } else { b"false" })
+        }
+        serde_json::Value::Number(number) => {
+            if !number.is_i64() && !number.is_u64() {
+                return Err("non-integer in canonical request".to_owned());
+            }
+            bytes.extend_from_slice(number.to_string().as_bytes());
+        }
+        serde_json::Value::String(value) => {
+            bytes.extend(serde_json::to_vec(value).map_err(|err| err.to_string())?)
+        }
+        serde_json::Value::Array(values) => {
+            bytes.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    bytes.push(b',');
+                }
+                artifact_canonical_json(value, bytes)?;
+            }
+            bytes.push(b']');
+        }
+        serde_json::Value::Object(values) => {
+            bytes.push(b'{');
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    bytes.push(b',');
+                }
+                bytes.extend(serde_json::to_vec(key).map_err(|err| err.to_string())?);
+                bytes.push(b':');
+                artifact_canonical_json(value, bytes)?;
+            }
+            bytes.push(b'}');
+        }
+    }
+    Ok(())
+}
+
+fn artifact_canonical_sha256(value: &serde_json::Value) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    artifact_canonical_json(value, &mut bytes)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn artifact_expect_request_digest(
+    receipt: &serde_json::Value,
+    request: &serde_json::Value,
+    label: &str,
+) -> Result<(), String> {
+    let expected = artifact_canonical_sha256(request)?;
+    if receipt["request_digest"] != expected {
+        return Err(format!(
+            "{label}: request digest is not SHA-256 of the canonical submitted request: expected {expected}, got {}",
+            receipt["request_digest"]
+        ));
+    }
+    Ok(())
+}
+
+fn artifact_receipt(
+    receipt: &serde_json::Value,
+    command: &str,
+    operation: &str,
+    target: &str,
+    cluster: &str,
+    principal: &str,
+    version: u64,
+    run: Option<&str>,
+) -> Result<(), String> {
+    let outcome = &receipt["outcome"];
+    if receipt["format"] != "graphrun.command-result/v1"
+        || receipt["key"]["cluster_id"] != cluster
+        || receipt["key"]["principal_id"] != principal
+        || receipt["key"]["command_id"] != command
+        || receipt["operation"] != operation
+        || receipt["target"] != target
+        || receipt["request_digest"].as_str().is_none_or(|digest| {
+            digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+        || outcome["disposition"] != "applied"
+        || outcome["version"] != version
+    {
+        return Err(format!("invalid typed {operation} receipt: {receipt}"));
+    }
+    match run {
+        Some(run) => {
+            let range = &receipt["event_range"];
+            if outcome["run"] != run
+                || range["run"] != run
+                || range["first"].as_u64() != Some(1)
+                || range["last"].as_u64().is_none_or(|last| last < 1)
+            {
+                return Err(format!(
+                    "start lacks its committed run/event range: {receipt}"
+                ));
+            }
+        }
+        None if !receipt["event_range"].is_null() || !outcome["run"].is_null() => {
+            return Err(format!(
+                "publication unexpectedly emitted run events: {receipt}"
+            ));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn artifact_published(
+    body: &serde_json::Value,
+    command: &str,
+    operation: &str,
+    cluster: &str,
+    principal: &str,
+    version: u64,
+) -> Result<serde_json::Value, String> {
+    let receipts = body["results"]
+        .as_array()
+        .ok_or_else(|| format!("publish lacks typed results: {body}"))?;
+    if body["status"] != "ok" || receipts.len() != 1 {
+        return Err(format!("publish returned unexpected receipt count: {body}"));
+    }
+    let target = match operation {
+        "publish_catalog" => format!("catalog/v{version}"),
+        "publish_definition" => format!("artifact_proof/v{version}"),
+        _ => return Err(format!("unexpected publication operation: {operation}")),
+    };
+    artifact_receipt(
+        &receipts[0],
+        command,
+        operation,
+        &target,
+        cluster,
+        principal,
+        version,
+        None,
+    )?;
+    Ok(receipts[0].clone())
+}
+
+struct ArtifactOutcome {
+    run: String,
+    latest_run: String,
+    receipt: serde_json::Value,
+    history: serde_json::Value,
+    latest_receipt: serde_json::Value,
+    latest_history: serde_json::Value,
+}
+
+fn artifact_commands(
+    cli: &Path,
+    connect: &[String],
+    fixture: &ArtifactFixture,
+    cluster: &str,
+    principal: &str,
+    observations: &mut Vec<String>,
+) -> Result<ArtifactOutcome, String> {
+    let id = || graphrun::ids::CommandId::generate().to_hex();
+    let catalog_id = id();
+    let definition_id = id();
+    let start_id = id();
+    let cat = |file: &Path, cmd: &str| {
+        vec![
+            "publish".into(),
+            "--catalog".into(),
+            file.display().to_string(),
+            "--catalog-version".into(),
+            "1".into(),
+            "--catalog-command-id".into(),
+            cmd.into(),
+        ]
+    };
+    let def = |file: &Path, cmd: &str| {
+        vec![
+            "publish".into(),
+            "--definition".into(),
+            file.display().to_string(),
+            "--catalog-version".into(),
+            "1".into(),
+            "--definition-command-id".into(),
+            cmd.into(),
+        ]
+    };
+    let start = |input: &Path, cmd: &str, key: &str, version: Option<u32>| {
+        let mut args = vec![
+            "start".into(),
+            "--workflow".into(),
+            "artifact_proof".into(),
+            "--start-key".into(),
+            key.into(),
+            "--command-id".into(),
+            cmd.into(),
+            "--input".into(),
+            input.display().to_string(),
+            "--wait-ms".into(),
+            "10000".into(),
+        ];
+        if let Some(version) = version {
+            args.extend(["--version".into(), version.to_string()]);
+        }
+        args
+    };
+    let query = |cmd: &str| vec!["command-result".into(), "--command-id".into(), cmd.into()];
+    let page = |run: &str| vec!["history".into(), "--run".into(), run.into()];
+
+    let published = artifact_command(
+        cli,
+        connect,
+        &cat(&fixture.catalog, &catalog_id),
+        "catalog publish",
+        observations,
+    )?;
+    let catalog_receipt = artifact_published(
+        &published,
+        &catalog_id,
+        "publish_catalog",
+        cluster,
+        principal,
+        1,
+    )?;
+    let initial_catalog =
+        graphrun::Catalog::from_json(&fs::read(&fixture.catalog).map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+    artifact_expect_request_digest(
+        &catalog_receipt,
+        &serde_json::json!({
+            "operation": "catalog",
+            "version": 1,
+            "catalog": &initial_catalog,
+        }),
+        "catalog publish",
+    )?;
+    let expected_catalog_digest = artifact_canonical_sha256(
+        &serde_json::to_value(&initial_catalog).map_err(|err| err.to_string())?,
+    )?;
+    if catalog_receipt["outcome"]["digest"] != expected_catalog_digest {
+        return Err(format!(
+            "catalog receipt digest differs from original fixture: expected {expected_catalog_digest}, got {}",
+            catalog_receipt["outcome"]["digest"]
+        ));
+    }
+    let retry = artifact_command(
+        cli,
+        connect,
+        &cat(&fixture.catalog, &catalog_id),
+        "catalog retry",
+        observations,
+    )?;
+    if artifact_published(
+        &retry,
+        &catalog_id,
+        "publish_catalog",
+        cluster,
+        principal,
+        1,
+    )? != catalog_receipt
+        || artifact_command(
+            cli,
+            connect,
+            &query(&catalog_id),
+            "catalog committed lookup",
+            observations,
+        )? != catalog_receipt
+    {
+        return Err("catalog retry or committed lookup changed typed receipt".into());
+    }
+    let repeated_id = id();
+    let repeated = artifact_command(
+        cli,
+        connect,
+        &cat(&fixture.catalog, &repeated_id),
+        "catalog same version/new command",
+        observations,
+    )?;
+    if artifact_published(
+        &repeated,
+        &repeated_id,
+        "publish_catalog",
+        cluster,
+        principal,
+        1,
+    )?["outcome"]["digest"]
+        != catalog_receipt["outcome"]["digest"]
+    {
+        return Err("identical catalog bytes did not publish idempotently".into());
+    }
+    artifact_reject(
+        cli,
+        connect,
+        &cat(&fixture.changed_catalog, &catalog_id),
+        "catalog same-command changed bytes",
+        "command ID reused",
+        observations,
+    )?;
+    artifact_reject(
+        cli,
+        connect,
+        &cat(&fixture.changed_catalog, &id()),
+        "catalog same-version changed bytes",
+        "catalog version has different content",
+        observations,
+    )?;
+
+    let published = artifact_command(
+        cli,
+        connect,
+        &def(&fixture.definition, &definition_id),
+        "definition publish",
+        observations,
+    )?;
+    let definition_receipt = artifact_published(
+        &published,
+        &definition_id,
+        "publish_definition",
+        cluster,
+        principal,
+        1,
+    )?;
+    let retry = artifact_command(
+        cli,
+        connect,
+        &def(&fixture.definition, &definition_id),
+        "definition retry",
+        observations,
+    )?;
+    if artifact_published(
+        &retry,
+        &definition_id,
+        "publish_definition",
+        cluster,
+        principal,
+        1,
+    )? != definition_receipt
+        || artifact_command(
+            cli,
+            connect,
+            &query(&definition_id),
+            "definition committed lookup",
+            observations,
+        )? != definition_receipt
+    {
+        return Err("definition retry or committed lookup changed typed receipt".into());
+    }
+    let repeated_id = id();
+    let repeated = artifact_command(
+        cli,
+        connect,
+        &def(&fixture.definition, &repeated_id),
+        "definition same version/new command",
+        observations,
+    )?;
+    if artifact_published(
+        &repeated,
+        &repeated_id,
+        "publish_definition",
+        cluster,
+        principal,
+        1,
+    )?["outcome"]["digest"]
+        != definition_receipt["outcome"]["digest"]
+    {
+        return Err("identical definition bytes did not publish idempotently".into());
+    }
+    artifact_reject(
+        cli,
+        connect,
+        &def(&fixture.changed_definition, &definition_id),
+        "definition same-command changed bytes",
+        "command ID reused",
+        observations,
+    )?;
+    artifact_reject(
+        cli,
+        connect,
+        &def(&fixture.changed_definition, &id()),
+        "definition same-version changed bytes",
+        "workflow version has different content",
+        observations,
+    )?;
+
+    let response = artifact_command(
+        cli,
+        connect,
+        &start(&fixture.input, &start_id, "explicit-v1", Some(1)),
+        "start explicit v1",
+        observations,
+    )?;
+    let run = response["run"]
+        .as_str()
+        .ok_or_else(|| format!("start lacks run: {response}"))?
+        .to_owned();
+    graphrun::RunId::from_hex(&run).map_err(|err| format!("invalid start run: {err}"))?;
+    if response["command_id"] != start_id
+        || response["status"] != "succeeded"
+        || response["output"]["value"] != 4
+    {
+        return Err(format!("unexpected explicit v1 execution: {response}"));
+    }
+    let receipt = artifact_command(
+        cli,
+        connect,
+        &query(&start_id),
+        "start committed lookup",
+        observations,
+    )?;
+    artifact_receipt(
+        &receipt,
+        &start_id,
+        "start",
+        "artifact_proof/explicit-v1",
+        cluster,
+        principal,
+        1,
+        Some(&run),
+    )?;
+    let accepted_input: graphrun::Value =
+        serde_json::from_slice(&fs::read(&fixture.input).map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+    artifact_expect_request_digest(
+        &receipt,
+        &serde_json::json!({
+            "operation": "start",
+            "workflow": "artifact_proof",
+            "version": 1,
+            "start_key": "explicit-v1",
+            "input": accepted_input,
+        }),
+        "explicit v1 start",
+    )?;
+    let history = artifact_command(cli, connect, &page(&run), "committed history", observations)?;
+    artifact_history(&history, &receipt, &run, &start_id, principal)?;
+    let retry = artifact_command(
+        cli,
+        connect,
+        &start(&fixture.input, &start_id, "explicit-v1", Some(1)),
+        "start same logical ID retry",
+        observations,
+    )?;
+    if retry["run"] != run
+        || retry["output"]["value"] != 4
+        || artifact_command(
+            cli,
+            connect,
+            &query(&start_id),
+            "start receipt after retry",
+            observations,
+        )? != receipt
+        || artifact_command(
+            cli,
+            connect,
+            &page(&run),
+            "history after retry",
+            observations,
+        )? != history
+    {
+        return Err("same-command retry changed run, typed result or event range".into());
+    }
+    artifact_reject(
+        cli,
+        connect,
+        &start(&fixture.changed_input, &start_id, "explicit-v1", Some(1)),
+        "start same-command changed input",
+        "command ID reused",
+        observations,
+    )?;
+    artifact_reject(
+        cli,
+        connect,
+        &start(&fixture.changed_input, &id(), "explicit-v1", Some(1)),
+        "start same-key changed input",
+        "start key has different input",
+        observations,
+    )?;
+
+    let next_id = id();
+    let next = artifact_command(
+        cli,
+        connect,
+        &def(&fixture.next_definition, &next_id),
+        "definition v2 publish",
+        observations,
+    )?;
+    artifact_published(&next, &next_id, "publish_definition", cluster, principal, 2)?;
+    let latest_id = id();
+    let latest = artifact_command(
+        cli,
+        connect,
+        &start(&fixture.input, &latest_id, "latest-v2", None),
+        "start latest v2",
+        observations,
+    )?;
+    let latest_run = latest["run"]
+        .as_str()
+        .ok_or_else(|| format!("latest lacks run: {latest}"))?
+        .to_owned();
+    if latest_run == run || latest["output"]["value"] != 4 {
+        return Err(format!("latest did not make a distinct run: {latest}"));
+    }
+    let latest_receipt = artifact_command(
+        cli,
+        connect,
+        &query(&latest_id),
+        "latest committed lookup",
+        observations,
+    )?;
+    artifact_receipt(
+        &latest_receipt,
+        &latest_id,
+        "start",
+        "artifact_proof/latest-v2",
+        cluster,
+        principal,
+        2,
+        Some(&latest_run),
+    )?;
+    let pinned_id = id();
+    let pinned = artifact_command(
+        cli,
+        connect,
+        &start(&fixture.input, &pinned_id, "explicit-v1", None),
+        "latest aliases pinned key",
+        observations,
+    )?;
+    let pinned_receipt = artifact_command(
+        cli,
+        connect,
+        &query(&pinned_id),
+        "pinned alias lookup",
+        observations,
+    )?;
+    if pinned["run"] != run
+        || pinned_receipt["outcome"]["version"] != 1
+        || pinned_receipt["outcome"]["run"] != run
+        || !pinned_receipt["event_range"].is_null()
+    {
+        return Err(format!(
+            "latest changed the already-pinned start key: {pinned}"
+        ));
+    }
+    let latest_history = artifact_command(
+        cli,
+        connect,
+        &page(&latest_run),
+        "latest history",
+        observations,
+    )?;
+    artifact_history(
+        &latest_history,
+        &latest_receipt,
+        &latest_run,
+        &latest_id,
+        principal,
+    )?;
+    Ok(ArtifactOutcome {
+        run,
+        latest_run,
+        receipt,
+        history,
+        latest_receipt,
+        latest_history,
+    })
+}
+
+fn artifact_history(
+    history: &serde_json::Value,
+    receipt: &serde_json::Value,
+    run: &str,
+    command: &str,
+    principal: &str,
+) -> Result<(), String> {
+    let events = history["events"]
+        .as_array()
+        .ok_or_else(|| format!("history lacks events: {history}"))?;
+    let range = &receipt["event_range"];
+    let last = range["last"].as_u64().ok_or("receipt lacks final event")?;
+    let causal_prefix = events
+        .iter()
+        .take_while(|event| event["command_id"] == command)
+        .count();
+    if history["run"] != run
+        || history["unavailable"] != false
+        || history["retained_from"] != 1
+        || history["retained_through"]
+            .as_u64()
+            .is_none_or(|end| end < last)
+        || events.len() < last as usize
+        || causal_prefix != last as usize
+        || events
+            .first()
+            .is_none_or(|event| event["event"]["kind"] != "run_admitted")
+        || events.first().is_none_or(|event| {
+            event["command_id"] != command || event["principal_id"] != principal
+        })
+    {
+        return Err(format!(
+            "receipt range does not match committed history: receipt={receipt} page={history}"
+        ));
+    }
+    for (index, event) in events.iter().take(last as usize).enumerate() {
+        if event["format"] != "graphrun.run-event/v1"
+            || event["run"] != run
+            || event["sequence"] != (index + 1) as u64
+            || event["command_id"] != command
+            || event["principal_id"] != principal
+            || event["payload"]["format"] != "graphrun-artifact/v1"
+        {
+            return Err(format!(
+                "noncontiguous or untyped event {}: {event}",
+                index + 1
+            ));
+        }
+    }
+    if !events.iter().any(|event| {
+        event["event"]["kind"] == "run_succeeded" && event["event"]["output"]["value"] == 4
+    }) {
+        return Err(format!("run output absent from event range: {history}"));
+    }
+    Ok(())
+}
+
+fn artifact_identity(path: &Path) -> Result<String, String> {
+    let identity: serde_json::Value =
+        serde_json::from_slice(&fs::read(path).map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+    identity["cluster_id"]
+        .as_str()
+        .filter(|cluster| !cluster.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("no committed cluster identity in {}", path.display()))
+}
+
+fn artifact_retry_read(
+    cli: &Path,
+    connection: &[String],
+    args: &[String],
+    label: &str,
+    observations: &mut Vec<String>,
+) -> Result<serde_json::Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        match artifact_command(cli, connection, args, label, observations) {
+            Ok(result) => return Ok(result),
+            Err(err) if Instant::now() >= deadline => return Err(err),
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+}
+
+fn artifact_local(cli: &Path, dir: &Path, observations: &mut Vec<String>) -> Result<(), String> {
+    let fixture = artifact_fixture(dir)?;
+    let server_log = fs::File::create(dir.join("serve.log")).map_err(|err| err.to_string())?;
+    let mut server = ChildProc::new(
+        Command::new(cli)
+            .args([
+                "serve",
+                "--local-dir",
+                dir.to_str().ok_or("local dir is not UTF-8")?,
+            ])
+            .stdout(Stdio::from(
+                server_log.try_clone().map_err(|err| err.to_string())?,
+            ))
+            .stderr(Stdio::from(server_log))
+            .spawn()
+            .map_err(|err| format!("local serve: {err}"))?,
+    );
+    if !wait_path(&dir.join("control.sock"), Duration::from_secs(10)) {
+        return Err("local control socket not ready within 10 seconds".into());
+    }
+    let connection = vec!["--local-dir".into(), dir.display().to_string()];
+    let cluster = artifact_identity(&dir.join("identity.json"))?;
+    let proof = artifact_commands(
+        cli,
+        &connection,
+        &fixture,
+        &cluster,
+        "local-owner",
+        observations,
+    )?;
+    terminate(&mut server.0);
+    drop(server);
+    let gone = Instant::now() + Duration::from_secs(5);
+    while dir.join("control.sock").exists() && Instant::now() < gone {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if dir.join("control.sock").exists() {
+        return Err("local control socket was not removed on shutdown".into());
+    }
+    let server_log = fs::File::create(dir.join("restart.log")).map_err(|err| err.to_string())?;
+    let mut server = ChildProc::new(
+        Command::new(cli)
+            .args([
+                "serve",
+                "--local-dir",
+                dir.to_str().ok_or("local dir is not UTF-8")?,
+            ])
+            .stdout(Stdio::from(
+                server_log.try_clone().map_err(|err| err.to_string())?,
+            ))
+            .stderr(Stdio::from(server_log))
+            .spawn()
+            .map_err(|err| format!("local restart: {err}"))?,
+    );
+    if !wait_path(&dir.join("control.sock"), Duration::from_secs(10)) {
+        return Err("local control socket not ready after restart".into());
+    }
+    let lookup = vec![
+        "command-result".into(),
+        "--command-id".into(),
+        proof.receipt["key"]["command_id"]
+            .as_str()
+            .ok_or("missing command ID")?
+            .into(),
+    ];
+    if artifact_retry_read(
+        cli,
+        &connection,
+        &lookup,
+        "local receipt after restart",
+        observations,
+    )? != proof.receipt
+    {
+        return Err("local restart did not retain typed command result".into());
+    }
+    let page = vec!["history".into(), "--run".into(), proof.run.clone()];
+    if artifact_command(
+        cli,
+        &connection,
+        &page,
+        "local history after restart",
+        observations,
+    )? != proof.history
+    {
+        return Err("local restart changed the recorded event range".into());
+    }
+    terminate(&mut server.0);
+    drop(server);
+    artifact_export(cli, dir, &cluster, &proof, observations)
+}
+
+fn artifact_cluster(
+    cli: &Path,
+    artifacts: &Path,
+    row: &MatrixRow,
+    observations: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut cluster = boot_three(artifacts, row, 1)?;
+    let fixture = artifact_fixture(&cluster.dir.join("fixture"))?;
+    let cluster_id = graphrun::tls::cluster_id_from_ca(&cluster.ca.pem)
+        .map_err(|err| err.to_string())?
+        .as_str()
+        .to_owned();
+    let leader = cluster_connect(&cluster, 0, &[]);
+    let ready = vec!["cluster".into(), "health".into()];
+    artifact_retry_read(cli, &leader, &ready, "cluster ready", observations)?;
+    let proof = artifact_commands(cli, &leader, &fixture, &cluster_id, "1", observations)?;
+    let lookup = vec![
+        "command-result".into(),
+        "--command-id".into(),
+        proof.receipt["key"]["command_id"]
+            .as_str()
+            .ok_or("missing command ID")?
+            .into(),
+    ];
+    let page = vec!["history".into(), "--run".into(), proof.run.clone()];
+    artifact_wait_member_catchup(cli, &cluster, observations)?;
+    for node in [1usize, 2] {
+        let connection = cluster_connect(&cluster, node, &[]);
+        if artifact_retry_read(
+            cli,
+            &connection,
+            &lookup,
+            &format!("member {} routed receipt", node + 1),
+            observations,
+        )? != proof.receipt
+            || artifact_retry_read(
+                cli,
+                &connection,
+                &page,
+                &format!("member {} routed history", node + 1),
+                observations,
+            )? != proof.history
+        {
+            return Err(format!(
+                "member {} routed client read disagrees with committed receipt and history",
+                node + 1
+            ));
+        }
+    }
+    artifact_stop_member(&mut cluster, 0, 2)?;
+    artifact_verify_member_store(
+        &cluster.dir.join("m2"),
+        &proof,
+        "member 2 before restart",
+        observations,
+    )?;
+    fs::remove_file(cluster.dir.join("shutdown-2.request")).map_err(|err| err.to_string())?;
+    cluster
+        .members
+        .push(spawn_fixture_member(&cluster, 2, false)?);
+    let follower = cluster_connect(&cluster, 1, &[]);
+    if artifact_retry_read(
+        cli,
+        &follower,
+        &lookup,
+        "restarted follower receipt",
+        observations,
+    )? != proof.receipt
+        || artifact_retry_read(
+            cli,
+            &follower,
+            &page,
+            "restarted follower history",
+            observations,
+        )? != proof.history
+    {
+        return Err("restarted follower lost committed receipt/event range".into());
+    }
+    artifact_wait_member_catchup(cli, &cluster, observations)?;
+    observations.push(format!(
+        "cluster also retained latest run {}",
+        proof.latest_run
+    ));
+    for (index, node) in [(2, 1), (1, 3), (3, 2)] {
+        artifact_stop_member(&mut cluster, index, node)?;
+        artifact_verify_member_store(
+            &cluster.dir.join(format!("m{node}")),
+            &proof,
+            &format!("member {node} after shutdown"),
+            observations,
+        )?;
+    }
+    drop(cluster.members.drain(..));
+    artifact_export(
+        cli,
+        &cluster.dir.join("m1"),
+        &cluster_id,
+        &proof,
+        observations,
+    )
+}
+
+fn artifact_wait_member_catchup(
+    cli: &Path,
+    cluster: &LiveCluster,
+    observations: &mut Vec<String>,
+) -> Result<(), String> {
+    let health_args = |node: usize| {
+        vec![
+            "cluster".to_owned(),
+            "health".to_owned(),
+            "--local-dir".to_owned(),
+            cluster.dir.join(format!("m{node}")).display().to_string(),
+        ]
+    };
+    let leader = artifact_command(
+        cli,
+        &[],
+        &health_args(1),
+        "leader committed position",
+        observations,
+    )?;
+    let target = leader["last_applied"]
+        .as_u64()
+        .ok_or_else(|| format!("leader has no committed applied position: {leader}"))?;
+    for node in [2usize, 3] {
+        let args = health_args(node);
+        let parts: Vec<&str> = args.iter().map(String::as_str).collect();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            let (ok, out, err) = run_cli_timeout(cli, &parts, Duration::from_secs(3));
+            let health = serde_json::from_str::<serde_json::Value>(&out).ok();
+            if ok
+                && health.as_ref().is_some_and(|health| {
+                    health["last_applied"]
+                        .as_u64()
+                        .is_some_and(|index| index >= target)
+                        && health["voters"] == serde_json::json!([1, 2, 3])
+                })
+            {
+                observations.push(format!(
+                    "member {node} applied leader position {target} locally: {}",
+                    health.unwrap()
+                ));
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "member {node} did not apply leader position {target} and roster: success={ok} stdout={out} stderr={err}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Ok(())
+}
+
+fn artifact_stop_member(
+    cluster: &mut LiveCluster,
+    index: usize,
+    node: usize,
+) -> Result<(), String> {
+    fs::write(cluster.dir.join(format!("shutdown-{node}.request")), "stop")
+        .map_err(|err| err.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let member = cluster
+            .members
+            .get_mut(index)
+            .ok_or_else(|| format!("member {node} has no owned child"))?;
+        match member.0.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(format!("member {node} exited unsuccessfully: {status}"));
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                return Err(format!("member {node} did not shut down gracefully"));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => return Err(format!("member {node} status: {err}")),
+        }
+    }
+}
+
+fn artifact_verify_member_store(
+    dir: &Path,
+    proof: &ArtifactOutcome,
+    label: &str,
+    observations: &mut Vec<String>,
+) -> Result<(), String> {
+    let state = graphrun::storage::load_domain_readonly(dir.join("member.redb"))
+        .map_err(|err| format!("{label}: cannot open own committed store: {err}"))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|err| err.to_string())?
+        .as_millis() as u64;
+    for (run, receipt, history) in [
+        (&proof.run, &proof.receipt, &proof.history),
+        (
+            &proof.latest_run,
+            &proof.latest_receipt,
+            &proof.latest_history,
+        ),
+    ] {
+        let key: graphrun::publication::CommandKey = serde_json::from_value(receipt["key"].clone())
+            .map_err(|err| format!("{label}: invalid receipt key: {err}"))?;
+        let stored = state
+            .command_results
+            .get(&key.storage_key())
+            .ok_or_else(|| format!("{label}: own store lacks receipt for {run}"))?;
+        if serde_json::to_value(stored).map_err(|err| err.to_string())? != *receipt {
+            return Err(format!("{label}: own receipt differs for run {run}"));
+        }
+        let run_id = graphrun::RunId::from_hex(run)
+            .map_err(|err| format!("{label}: invalid retained run ID: {err}"))?;
+        let page = graphrun::history::page(
+            &state,
+            run_id,
+            0,
+            graphrun::history::MAX_PAGE_LIMIT,
+            graphrun::time::EngineTime::from_millis(now_ms),
+        )
+        .map_err(|err| format!("{label}: own history unavailable for {run}: {err}"))?;
+        if serde_json::to_value(page).map_err(|err| err.to_string())? != *history {
+            return Err(format!("{label}: own history differs for run {run}"));
+        }
+    }
+    observations.push(format!(
+        "{label}: own stopped member store retains both receipts and histories"
+    ));
+    Ok(())
+}
+
+fn artifact_export(
+    cli: &Path,
+    dir: &Path,
+    cluster: &str,
+    proof: &ArtifactOutcome,
+    observations: &mut Vec<String>,
+) -> Result<(), String> {
+    let before = hash_file(&dir.join("member.redb"))?;
+    for run in [&proof.run, &proof.latest_run] {
+        let replay = vec![
+            "replay".into(),
+            "--local-dir".into(),
+            dir.display().to_string(),
+            "--run".into(),
+            run.clone(),
+        ];
+        let replayed = artifact_command(
+            cli,
+            &[],
+            &replay,
+            &format!("read-only replay {run}"),
+            observations,
+        )?;
+        if replayed["run"] != *run
+            || replayed["status"] != "succeeded"
+            || replayed["output"]["value"] != 4
+        {
+            return Err(format!(
+                "read-only replay omitted retained output for {run}: {replayed}"
+            ));
+        }
+    }
+    let export_dir = dir
+        .parent()
+        .ok_or("missing artifact evidence parent")?
+        .join(format!(
+            "{}-export",
+            dir.file_name().ok_or("member dir name")?.to_string_lossy()
+        ));
+    let backup = vec![
+        "backup".into(),
+        "--local-dir".into(),
+        dir.display().to_string(),
+        "--out".into(),
+        export_dir.display().to_string(),
+    ];
+    artifact_command(
+        cli,
+        &[],
+        &backup,
+        "supported committed-state backup",
+        observations,
+    )?;
+    if hash_file(&dir.join("member.redb"))? != before {
+        return Err("backup/replay wrote the source redb".into());
+    }
+    let exported: serde_json::Value = serde_json::from_slice(
+        &fs::read(export_dir.join("domain.json")).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| format!("backup domain JSON: {err}"))?;
+    let original_catalog =
+        graphrun::Catalog::from_json(&fs::read(catalog()).map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+    let original_catalog = serde_json::to_value(original_catalog).map_err(|err| err.to_string())?;
+    let expected_digest = artifact_canonical_sha256(&original_catalog)?;
+    let retained_catalog = &exported["published_catalogs"]["1"];
+    if retained_catalog["catalog"] != original_catalog
+        || retained_catalog["digest"] != expected_digest
+    {
+        return Err(format!(
+            "rejected catalog overwrite changed the original catalog bytes or digest: expected {expected_digest}, got {retained_catalog}"
+        ));
+    }
+    let mut errors = Vec::new();
+    for (run, receipt, history, version) in [
+        (&proof.run, &proof.receipt, &proof.history, 1),
+        (
+            &proof.latest_run,
+            &proof.latest_receipt,
+            &proof.latest_history,
+            2,
+        ),
+    ] {
+        match artifact_verify_export(&exported, cluster, run, receipt, history, version) {
+            Ok(details) => observations.extend(details),
+            Err(err) => errors.push(format!("run {run}: {err}")),
+        }
+    }
+    let restore =
+        artifact_reject_corrupt_restore(cli, &export_dir, &proof.run, cluster, observations);
+    if let Err(err) = restore {
+        errors.push(format!("supported restore check: {err}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn artifact_reference(
+    reference: &serde_json::Value,
+    schema: &str,
+    payload: &serde_json::Value,
+    cluster: &str,
+    label: &str,
+    observations: &mut Vec<String>,
+    missing: &mut Vec<String>,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec(payload).map_err(|err| format!("{label}: {err}"))?;
+    let mut sha = Sha256::new();
+    sha.update(b"graphrun-artifact/v1\0");
+    sha.update(schema.as_bytes());
+    sha.update([0]);
+    sha.update(&bytes);
+    let expected = hex::encode(sha.finalize());
+    if reference["format"] != "graphrun-artifact/v1"
+        || reference["schema"] != schema
+        || reference["byte_len"] != bytes.len() as u64
+        || reference["sha256"] != expected
+    {
+        return Err(format!(
+            "{label}: independent domain-separated SHA-256 / format / schema / byte length mismatch: expected {schema}, {} bytes, {expected}; got {reference}",
+            bytes.len()
+        ));
+    }
+    if reference["cluster_id"] != cluster
+        && !missing
+            .iter()
+            .any(|item| item.starts_with("artifact references"))
+    {
+        missing.push(format!(
+            "artifact references lack matching cluster_id ({cluster})"
+        ));
+    }
+    observations.push(format!(
+        "{label}: {schema} bytes={} sha256={expected} cluster_id={}",
+        bytes.len(),
+        reference["cluster_id"]
+    ));
+    Ok(())
+}
+
+fn artifact_verify_export(
+    export: &serde_json::Value,
+    cluster: &str,
+    run: &str,
+    receipt: &serde_json::Value,
+    history: &serde_json::Value,
+    version: u64,
+) -> Result<Vec<String>, String> {
+    let mut observations = Vec::new();
+    let mut missing = Vec::new();
+    let state = export["runs"]
+        .get(run)
+        .ok_or_else(|| format!("export lacks committed run {run}"))?;
+    let dependencies = export["history_dependencies"]
+        .get(run)
+        .ok_or_else(|| format!("export lacks retained dependencies for run {run}"))?;
+    let definition = &state["definition"];
+    let catalog = &state["catalog"];
+    let policy = &state["policy"];
+    if definition["id"] != "artifact_proof"
+        || definition["version"] != version
+        || state["published"]["catalog_version"] != 1
+        || state["published"]["definition_digest"] != receipt["outcome"]["digest"]
+        || state["published"]["policy_format"] != "graphrun.run-policy/v1"
+        || state["input"]["value"] != 3
+        || state["status"]["Succeeded"]["output"]["value"] != 4
+    {
+        return Err(format!(
+            "export does not pin accepted definition/catalog/policy/input/output: {state}"
+        ));
+    }
+    let published = &export["published_definitions"]["artifact_proof"][version.to_string()];
+    let published_catalog = &export["published_catalogs"]["1"];
+    if published["format"] != "graphrun.definition-publication/v1"
+        || published["normalized_format_version"] != definition["format_version"]
+        || published["digest"] != receipt["outcome"]["digest"]
+        || published["definition"] != *definition
+        || published_catalog["format"] != "graphrun.catalog-publication/v1"
+        || published_catalog["catalog"] != *catalog
+        || state["published"]["catalog_digest"] != published_catalog["digest"]
+    {
+        return Err("published identity/bytes differ from pinned committed run and receipt".into());
+    }
+    artifact_reference(
+        &dependencies["definition"],
+        "graphrun.definition/v1",
+        definition,
+        cluster,
+        "definition",
+        &mut observations,
+        &mut missing,
+    )?;
+    artifact_reference(
+        &dependencies["catalog"],
+        "graphrun.catalog/v1",
+        catalog,
+        cluster,
+        "catalog",
+        &mut observations,
+        &mut missing,
+    )?;
+    artifact_reference(
+        &dependencies["policy"],
+        "graphrun.run-policy/v1",
+        policy,
+        cluster,
+        "policy",
+        &mut observations,
+        &mut missing,
+    )?;
+    let schemas = dependencies["schemas"]
+        .as_object()
+        .ok_or("retained schemas absent")?;
+    if schemas.is_empty() || !schemas.contains_key("counter/v1") {
+        return Err("retained input/output schemas absent".into());
+    }
+    for (name, reference) in schemas {
+        let value = catalog["schemas"]
+            .get(name)
+            .ok_or_else(|| format!("schema {name} lacks retained bytes"))?;
+        artifact_reference(
+            reference,
+            &format!("graphrun.schema/{name}"),
+            value,
+            cluster,
+            &format!("schema {name}"),
+            &mut observations,
+            &mut missing,
+        )?;
+    }
+    let contracts = dependencies["contracts"]
+        .as_object()
+        .ok_or("retained contracts absent")?;
+    if !contracts.contains_key("activity/counter.increment/v1") {
+        return Err("retained activity contract counter.increment/v1 absent".into());
+    }
+    for (name, reference) in contracts {
+        let value = if let Some(activity) = name.strip_prefix("activity/") {
+            catalog["activities"].get(activity)
+        } else if let Some(reconciler) = name.strip_prefix("reconciler/") {
+            catalog["reconcilers"].get(reconciler)
+        } else {
+            None
+        }
+        .ok_or_else(|| format!("contract {name} lacks retained bytes"))?;
+        artifact_reference(
+            reference,
+            &format!("graphrun.contract/{name}"),
+            value,
+            cluster,
+            &format!("contract {name}"),
+            &mut observations,
+            &mut missing,
+        )?;
+    }
+    let events = export["history"]
+        .get(run)
+        .and_then(serde_json::Value::as_array)
+        .ok_or("export lacks events")?;
+    let records = export["history_records"]
+        .get(run)
+        .and_then(serde_json::Value::as_array)
+        .ok_or("export lacks typed event records")?;
+    let page = history["events"]
+        .as_array()
+        .ok_or("no committed history page")?;
+    if events.len() != records.len() || events.len() != page.len() || events.is_empty() {
+        return Err(
+            "export history, event records and linearizable page disagree in length".into(),
+        );
+    }
+    for (i, (event, record)) in events.iter().zip(records).enumerate() {
+        if page[i]["event"] != *event
+            || page[i]["sequence"] != record["sequence"]
+            || page[i]["payload"] != record["payload"]
+            || record["run"] != *run
+            || record["sequence"] != (i + 1) as u64
+            || record["format"] != "graphrun.run-event/v1"
+        {
+            return Err(format!(
+                "event {} differs between export and committed history",
+                i + 1
+            ));
+        }
+        artifact_reference(
+            &record["payload"],
+            "graphrun.domain-event/v1",
+            event,
+            cluster,
+            &format!("event {}", i + 1),
+            &mut observations,
+            &mut missing,
+        )?;
+    }
+    if events
+        .first()
+        .is_none_or(|event| event["kind"] != "run_admitted" || event["input"] != state["input"])
+        || !events
+            .iter()
+            .any(|event| event["kind"] == "run_succeeded" && event["output"]["value"] == 4)
+    {
+        return Err("retained input/output event payloads differ from run".into());
+    }
+    for (label, reference, schema, value) in [
+        (
+            "accepted input",
+            &state["input_artifact"],
+            "graphrun.input/v1",
+            &state["input"],
+        ),
+        (
+            "accepted output",
+            &state["output_artifact"],
+            "graphrun.output/v1",
+            &events
+                .iter()
+                .find(|event| event["kind"] == "run_succeeded")
+                .ok_or("no output event")?["output"],
+        ),
+    ] {
+        if reference.is_null() {
+            missing.push(format!("{label}: no retained payload artifact reference"));
+        } else {
+            artifact_reference(
+                reference,
+                schema,
+                value,
+                cluster,
+                label,
+                &mut observations,
+                &mut missing,
+            )?;
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "runtime prerequisite missing: {}; verified {} independent artifact hashes",
+            missing.join("; "),
+            observations.len()
+        ));
+    }
+    Ok(observations)
+}
+
+fn artifact_reject_corrupt_restore(
+    cli: &Path,
+    export: &Path,
+    run: &str,
+    original_cluster: &str,
+    observations: &mut Vec<String>,
+) -> Result<(), String> {
+    let parent = export.parent().ok_or("export parent")?;
+    let healthy_dest = parent.join("restored-control");
+    let healthy_restore = vec![
+        "restore".into(),
+        "--from".into(),
+        export.display().to_string(),
+        "--local-dir".into(),
+        healthy_dest.display().to_string(),
+        "--confirm".into(),
+        "--reason".into(),
+        "artifact-integrity-control".into(),
+    ];
+    let restored = artifact_command(
+        cli,
+        &[],
+        &healthy_restore,
+        "untouched backup restore",
+        observations,
+    )?;
+    if restored["status"] != "ok" {
+        return Err(format!("untouched backup did not restore: {restored}"));
+    }
+    let restored_cluster = artifact_identity(&healthy_dest.join("identity.json"))?;
+    if restored_cluster == original_cluster {
+        return Err("restore did not establish new cluster authority".to_owned());
+    }
+    let run_id = graphrun::RunId::from_hex(run).map_err(|err| err.to_string())?;
+    let rt = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
+    let (page, view) = rt.block_on(async {
+        let engine = graphrun::Engine::local(&healthy_dest)
+            .await
+            .map_err(|err| format!("open untouched restore: {err}"))?;
+        let read = async {
+            let page = engine
+                .history_page(run_id, 0, 100)
+                .await
+                .map_err(|err| format!("restored history: {err}"))?;
+            let view = engine
+                .inspect_json(run_id)
+                .await
+                .map_err(|err| format!("restored run: {err}"))?;
+            Ok::<_, String>((page, view))
+        }
+        .await;
+        engine
+            .shutdown()
+            .await
+            .map_err(|err| format!("close untouched restore: {err}"))?;
+        read
+    })?;
+    if page.unavailable
+        || page.events.is_empty()
+        || view["status"] != "succeeded"
+        || view["output"]["value"] != 4
+    {
+        return Err(format!(
+            "untouched backup lost accepted run/history: view={view} page={page:?}"
+        ));
+    }
+    observations.push(format!(
+        "untouched backup restored run {run} under new cluster {restored_cluster}"
+    ));
+
+    let mut domain: serde_json::Value = serde_json::from_slice(
+        &fs::read(export.join("domain.json")).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+    let corrupted = domain["history_dependencies"][run]["definition"]["sha256"]
+        .as_str()
+        .ok_or("export has no retained definition SHA-256")?
+        .to_owned();
+    domain["history_dependencies"][run]["definition"]["sha256"] = serde_json::Value::String(
+        if corrupted.starts_with('0') { "1" } else { "0" }.to_owned() + &corrupted[1..],
+    );
+    let corrupt_dir = parent.join("corrupt-export");
+    fs::create_dir_all(&corrupt_dir).map_err(|err| err.to_string())?;
+    fs::copy(
+        export.join("manifest.json"),
+        corrupt_dir.join("manifest.json"),
+    )
+    .map_err(|err| err.to_string())?;
+    fs::write(
+        corrupt_dir.join("domain.json"),
+        serde_json::to_vec(&domain).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+    let dest = parent.join("corrupt-restored");
+    let restore = vec![
+        "restore".into(),
+        "--from".into(),
+        corrupt_dir.display().to_string(),
+        "--local-dir".into(),
+        dest.display().to_string(),
+        "--confirm".into(),
+        "--reason".into(),
+        "artifact-integrity-probe".into(),
+    ];
+    let refs: Vec<&str> = restore.iter().map(String::as_str).collect();
+    let (ok, out, corrupt_error) = run_cli_timeout(cli, &refs, Duration::from_secs(12));
+    observations.push(format!(
+        "corrupt retained artifact restore: success={ok}; stdout={out:?}; stderr={corrupt_error:?}"
+    ));
+    let corrupt_accepted = ok;
+    let missing = parent.join("missing-export");
+    fs::create_dir_all(&missing).map_err(|err| err.to_string())?;
+    fs::copy(export.join("manifest.json"), missing.join("manifest.json"))
+        .map_err(|err| err.to_string())?;
+    let absent = vec![
+        "restore".into(),
+        "--from".into(),
+        missing.display().to_string(),
+        "--local-dir".into(),
+        parent.join("missing-restored").display().to_string(),
+        "--confirm".into(),
+        "--reason".into(),
+        "artifact-integrity-probe".into(),
+    ];
+    let refs: Vec<&str> = absent.iter().map(String::as_str).collect();
+    let (ok, out, err) = run_cli_timeout(cli, &refs, Duration::from_secs(12));
+    observations.push(format!(
+        "missing domain restore: success={ok}; stdout={out:?}; stderr={err:?}"
+    ));
+    if ok || !err.contains("No such file or directory") {
+        return Err(format!(
+            "restore did not reject missing export: {out} {err}"
+        ));
+    }
+    if corrupt_accepted {
+        return Err("restore accepted corrupt export (retained definition SHA-256 changed)".into());
+    }
+    if !artifact_retained_definition_rejection(&corrupt_error) {
+        return Err(format!(
+            "corrupt export was rejected for a reason other than retained artifact integrity: {corrupt_error}"
+        ));
+    }
+    if dest.exists()
+        && fs::read_dir(&dest)
+            .map_err(|err| err.to_string())?
+            .next()
+            .is_some()
+    {
+        return Err("corrupt restore wrote destination before artifact validation".into());
+    }
+    Ok(())
+}
+
+fn artifact_retained_definition_rejection(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("retained") && error.contains("definition")
+}
+
+fn contract_artifact_proof(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
+    let started = Instant::now();
+    let dir = artifacts.join("CONTRACT-001-data");
+    let _ = fs::remove_dir_all(&dir);
+    if let Err(err) = fs::create_dir_all(&dir) {
+        return fail(row, "fresh CONTRACT-001 artifacts", err.to_string());
+    }
+    let context = match RunContext::new(cli, artifacts) {
+        Ok(context) => context,
+        Err(err) => return fail(row, "fresh proof fingerprint", err),
+    };
+    let (ok, version, err) = run_cli_timeout(cli, &["--version"], Duration::from_secs(3));
+    if !ok || version.trim().is_empty() || context.cli_sha256.starts_with("UNAVAILABLE: ") {
+        return fail(
+            row,
+            "fresh proof binary identity",
+            format!("{version} {err}"),
+        );
+    }
+    let mut observations = vec![format!(
+        "case={} run_id={} source_sha256={} cli_sha256={} cli_version={} driver_sha256={} driver_version={}",
+        row.id,
+        context.run_id,
+        context.source_sha256,
+        context.cli_sha256,
+        version.trim(),
+        context.driver_sha256,
+        context.driver_version
+    )];
+    let local = artifact_local(cli, &dir.join("local"), &mut observations);
+    observations.push(format!("local result: {local:?}"));
+    let cluster = artifact_cluster(cli, &dir.join("cluster"), row, &mut observations);
+    observations.push(format!("cluster result: {cluster:?}"));
+    let log = dir.join("proof.log");
+    let wrote = fs::write(&log, observations.join("\n"));
+    let (status, actual) = match (local, cluster, wrote) {
+        (Ok(()), Ok(()), Ok(())) => ("PASS", "local and three-member committed typed receipts, retained artifacts and rejected corrupt restore".to_owned()),
+        (local, cluster, Ok(())) => ("FAIL", format!("local={local:?}; cluster={cluster:?}; see {}", log.display())),
+        (_, _, Err(err)) => ("FAIL", format!("cannot save current proof log: {err}")),
+    };
+    let mut case = finish(
+        row,
+        status,
+        "graphrun publish/start/command-result/history/replay/backup/restore on fresh local and three-member Raft",
+        actual,
+        vec![dir, log],
+    );
+    case.duration_ms = started.elapsed().as_millis();
+    case
 }
 
 fn contract_worker_proof(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
@@ -5466,6 +7188,7 @@ fn fixture_member(
     host_activities: bool,
     peer: Vec<String>,
     remove_voter_on_file: Option<PathBuf>,
+    shutdown_on_file: Option<PathBuf>,
 ) -> ExitCode {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -5516,6 +7239,15 @@ fn fixture_member(
                 let mut remove_voter_on_file = remove_voter_on_file;
                 loop {
                     tokio::time::sleep(Duration::from_millis(100)).await;
+                    if shutdown_on_file.as_ref().is_some_and(|path| path.exists()) {
+                        return match engine.shutdown().await {
+                            Ok(()) => ExitCode::SUCCESS,
+                            Err(err) => {
+                                eprintln!("fixture member shutdown: {err}");
+                                ExitCode::from(2)
+                            }
+                        };
+                    }
                     if let Some(request) = remove_voter_on_file.as_ref()
                         && request.exists()
                     {
@@ -5599,6 +7331,166 @@ fn fixture_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contract_artifact_reference_is_independently_domain_separated_and_strict() {
+        let payload = serde_json::json!({"value": 3});
+        let reference = serde_json::json!({
+            "format": "graphrun-artifact/v1",
+            "schema": "graphrun.input/v1",
+            "cluster_id": "cluster-a",
+            "byte_len": 11,
+            "sha256": "ad3e891a91fa766fed3118c3d158b8b3afa1a66dda0bf5ab5102c01fc686a7ec",
+        });
+        let check = |reference: &serde_json::Value, schema: &str, payload: &serde_json::Value| {
+            let mut observed = Vec::new();
+            let mut missing = Vec::new();
+            let result = artifact_reference(
+                reference,
+                schema,
+                payload,
+                "cluster-a",
+                "accepted input",
+                &mut observed,
+                &mut missing,
+            );
+            (result, missing)
+        };
+        let (ok, missing) = check(&reference, "graphrun.input/v1", &payload);
+        assert!(ok.is_ok());
+        assert!(missing.is_empty());
+        for (field, wrong) in [
+            ("format", serde_json::json!("graphrun-artifact/v2")),
+            ("schema", serde_json::json!("graphrun.other/v1")),
+            ("byte_len", serde_json::json!(12)),
+            ("sha256", serde_json::json!("f".repeat(64))),
+        ] {
+            let mut changed = reference.clone();
+            changed[field] = wrong;
+            assert!(
+                check(&changed, "graphrun.input/v1", &payload).0.is_err(),
+                "{field}"
+            );
+        }
+        assert!(check(&reference, "graphrun.other/v1", &payload).0.is_err());
+        assert!(
+            check(
+                &reference,
+                "graphrun.input/v1",
+                &serde_json::json!({"value": 4})
+            )
+            .0
+            .is_err()
+        );
+        let mut unscoped = reference.clone();
+        unscoped.as_object_mut().unwrap().remove("cluster_id");
+        let (_, missing) = check(&unscoped, "graphrun.input/v1", &payload);
+        assert_eq!(missing.len(), 1, "unscoped references cannot yield PASS");
+    }
+
+    #[test]
+    fn contract_artifact_corrupt_restore_requires_retained_definition_failure() {
+        assert!(artifact_retained_definition_rejection(
+            "FailedPrecondition: retained definition digest mismatch"
+        ));
+        assert!(!artifact_retained_definition_rejection(
+            "FailedPrecondition: snapshot footer digest mismatch"
+        ));
+        assert!(!artifact_retained_definition_rejection(
+            "FailedPrecondition: backup manifest checksum mismatch"
+        ));
+    }
+
+    #[test]
+    fn contract_artifact_receipt_and_event_range_reject_missing_or_forged_fields() {
+        let receipt = serde_json::json!({
+            "format": "graphrun.command-result/v1",
+            "key": {"cluster_id":"cluster-a","principal_id":"owner","command_id":"command"},
+            "operation":"start", "target":"artifact_proof/explicit-v1", "request_digest":"a".repeat(64),
+            "outcome":{"disposition":"applied","version":1,"run":"run"},
+            "event_range":{"run":"run","first":1,"last":2},
+        });
+        let check = |receipt: &serde_json::Value| {
+            artifact_receipt(
+                receipt,
+                "command",
+                "start",
+                "artifact_proof/explicit-v1",
+                "cluster-a",
+                "owner",
+                1,
+                Some("run"),
+            )
+        };
+        assert!(check(&receipt).is_ok());
+        let start_request = serde_json::json!({
+            "operation": "start",
+            "workflow": "artifact_proof",
+            "version": 1,
+            "start_key": "explicit-v1",
+            "input": {"value": 3},
+        });
+        let known_digest = "a019d5fe33564de91a4a37459fc52c47a0b4a22b1dd4c2e27eebdcfba6f0a713";
+        assert_eq!(
+            artifact_canonical_sha256(&start_request).unwrap(),
+            known_digest
+        );
+        let mut matching_digest = receipt.clone();
+        matching_digest["request_digest"] = serde_json::json!(known_digest);
+        assert!(artifact_expect_request_digest(&matching_digest, &start_request, "start").is_ok());
+        assert!(artifact_expect_request_digest(&receipt, &start_request, "start").is_err());
+        for (field, wrong) in [
+            ("/format", serde_json::json!("v0")),
+            ("/key/cluster_id", serde_json::json!("other")),
+            ("/key/command_id", serde_json::json!("other")),
+            ("/key/principal_id", serde_json::json!("other")),
+            ("/target", serde_json::json!("other")),
+            ("/request_digest", serde_json::json!("")),
+            ("/outcome/disposition", serde_json::json!("rejected")),
+            ("/outcome/version", serde_json::json!(2)),
+            ("/event_range/first", serde_json::json!(2)),
+            ("/event_range/last", serde_json::json!(0)),
+            ("/event_range/run", serde_json::json!("other")),
+        ] {
+            let mut altered = receipt.clone();
+            *altered.pointer_mut(field).unwrap() = wrong;
+            assert!(check(&altered).is_err(), "{field}");
+        }
+        let page = serde_json::json!({
+            "run":"run","unavailable":false,"retained_from":1,"retained_through":2,
+            "events":[
+                {"run":"run","sequence":1,"format":"graphrun.run-event/v1",
+                 "command_id":"command","principal_id":"owner",
+                 "payload":{"format":"graphrun-artifact/v1"},
+                 "event":{"kind":"run_admitted"}},
+                {"run":"run","sequence":2,"format":"graphrun.run-event/v1",
+                 "command_id":"command","principal_id":"owner",
+                 "payload":{"format":"graphrun-artifact/v1"},
+                 "event":{"kind":"run_succeeded","output":{"value":4}}},
+            ],
+        });
+        let history = |page: &serde_json::Value, receipt: &serde_json::Value| {
+            artifact_history(page, receipt, "run", "command", "owner")
+        };
+        assert!(history(&page, &receipt).is_ok());
+        let mut missing_actor = page.clone();
+        missing_actor["events"][1]["principal_id"] = serde_json::Value::Null;
+        assert!(history(&missing_actor, &receipt).is_err());
+        let mut shortened = receipt.clone();
+        shortened["event_range"]["last"] = serde_json::json!(3);
+        assert!(history(&page, &shortened).is_err());
+        shortened["event_range"]["last"] = serde_json::json!(1);
+        assert!(history(&page, &shortened).is_err());
+        let mut wrong_sequence = page.clone();
+        wrong_sequence["events"][1]["sequence"] = serde_json::json!(3);
+        assert!(history(&wrong_sequence, &receipt).is_err());
+        let mut missing_output = page.clone();
+        missing_output["events"][1]["event"]["kind"] = serde_json::json!("run_failed");
+        assert!(history(&missing_output, &receipt).is_err());
+        let mut unavailable = page;
+        unavailable["unavailable"] = serde_json::json!(true);
+        assert!(history(&unavailable, &receipt).is_err());
+    }
 
     #[test]
     fn contract_worker_proof_rejects_accepted_negatives_and_unpinned_assignments() {
