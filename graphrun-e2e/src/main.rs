@@ -36,6 +36,12 @@ enum Commands {
         #[arg(long)]
         artifacts: PathBuf,
     },
+    ContractWorkerProof {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
     Verify {
         #[arg(long)]
         cli: PathBuf,
@@ -68,6 +74,8 @@ enum Commands {
         host_activities: bool,
         #[arg(long = "peer")]
         peer: Vec<String>,
+        #[arg(long)]
+        remove_voter_on_file: Option<PathBuf>,
     },
     #[command(name = "fixture-worker")]
     FixtureWorker {
@@ -124,6 +132,9 @@ struct PerformanceEvidence {
 fn main() -> ExitCode {
     match Cli::parse().command {
         Commands::SmokeCluster { cli, artifacts } => smoke_cluster(&cli, &artifacts),
+        Commands::ContractWorkerProof { cli, artifacts } => {
+            focused_contract_worker_proof(&cli, &artifacts)
+        }
         Commands::Verify {
             cli,
             matrix,
@@ -141,6 +152,7 @@ fn main() -> ExitCode {
             initialize,
             host_activities,
             peer,
+            remove_voter_on_file,
         } => fixture_member(
             data_dir,
             bind,
@@ -152,6 +164,7 @@ fn main() -> ExitCode {
             initialize,
             host_activities,
             peer,
+            remove_voter_on_file,
         ),
         Commands::FixtureWorker {
             endpoint,
@@ -169,6 +182,7 @@ fn smoke_cluster(cli: &Path, artifacts: &Path) -> ExitCode {
         eprintln!("cannot create cluster smoke artifacts: {error}");
         return ExitCode::from(2);
     }
+
     let matrix = match parse_matrix(include_str!("../../docs/specs/v1/verification-matrix.tsv")) {
         Ok(matrix) => matrix,
         Err(error) => {
@@ -195,6 +209,61 @@ fn smoke_cluster(cli: &Path, artifacts: &Path) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+fn focused_contract_worker_proof(cli: &Path, artifacts: &Path) -> ExitCode {
+    let result = (|| -> Result<CaseResult, String> {
+        fs::create_dir_all(artifacts).map_err(|err| err.to_string())?;
+        let run_dir = tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(artifacts)
+            .map_err(|err| err.to_string())?
+            .keep();
+        let row = parse_matrix(include_str!("../../docs/specs/v1/verification-matrix.tsv"))?
+            .into_iter()
+            .find(|row| row.id == "CONTRACT-003")
+            .ok_or("CONTRACT-003 missing from canonical matrix")?;
+        let mut context = RunContext::new(cli, &run_dir)?;
+        let (ok, version, error) = run_cli_timeout(cli, &["--version"], Duration::from_secs(3));
+        if !ok {
+            return Err(format!("CLI preflight: {error}"));
+        }
+        context.cli_version = version.trim().to_owned();
+        if context.cli_version.is_empty() || context.cli_sha256.starts_with("UNAVAILABLE: ") {
+            return Err("CLI preflight lacks binary hash/version".to_owned());
+        }
+        let mut case = enforce_case(&row, contract_worker_proof(cli, &run_dir, &row), &run_dir);
+        if case.status == "PASS" {
+            let current_driver = std::env::current_exe().map_err(|err| err.to_string())?;
+            if source_fingerprint(&run_dir)? != context.source_sha256
+                || hash_file(cli)? != context.cli_sha256
+                || hash_file(&current_driver)? != context.driver_sha256
+            {
+                case.status = "FAIL".to_owned();
+                case.actual = "source, CLI, or driver changed during proof".to_owned();
+            }
+        }
+        let case = context.bind(case);
+        write_case(&run_dir, &case)?;
+        Ok(case)
+    })();
+    match result {
+        Ok(case) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&case).unwrap_or_default()
+            );
+            if case.status == "PASS" {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(err) => {
+            eprintln!("CONTRACT-003 focused proof: {err}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -1326,7 +1395,8 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             &evidence.driver,
             &["tests::status_and_certification_gate"],
         ),
-        "CONTRACT-001" | "CONTRACT-002" | "CONTRACT-003" => fail(
+        "CONTRACT-003" => contract_worker_proof(cli, artifacts, row),
+        "CONTRACT-001" | "CONTRACT-002" => fail(
             row,
             "contract acceptance",
             "normative contract defined; runtime acceptance not implemented yet",
@@ -2643,8 +2713,18 @@ fn spawn_fixture_member(
             ));
         }
     }
-    cmd.stdout(Stdio::null())
-        .stderr(fs::File::create(log).map_err(|err| err.to_string())?);
+    if cluster
+        .dir
+        .file_name()
+        .is_some_and(|name| name == "CONTRACT-003-data")
+        && node == 1
+    {
+        cmd.arg("--remove-voter-on-file")
+            .arg(cluster.dir.join("remove-voter.request"));
+    }
+    let log = fs::File::create(log).map_err(|err| err.to_string())?;
+    cmd.stdout(Stdio::from(log.try_clone().map_err(|err| err.to_string())?))
+        .stderr(Stdio::from(log));
     cmd.spawn()
         .map(ChildProc::new)
         .map_err(|err| err.to_string())
@@ -2885,6 +2965,849 @@ fn cluster_three_and_workers(cli: &Path, artifacts: &Path, row: &MatrixRow) -> C
         ),
         Ok(body) | Err(body) => fail(row, "cluster inspect", body),
     }
+}
+
+fn contract_reject<T>(
+    label: &str,
+    response: Result<tonic::Response<T>, tonic::Status>,
+    code: tonic::Code,
+    observations: &mut Vec<String>,
+) -> Result<(), String> {
+    match response {
+        Err(status) if status.code() == code => {
+            observations.push(format!(
+                "{label}: {:?}: {}",
+                status.code(),
+                status.message()
+            ));
+            Ok(())
+        }
+        Err(status) => Err(format!(
+            "{label}: expected {code:?}, got {:?}: {status}",
+            status.code()
+        )),
+        Ok(_) => Err(format!("{label}: unauthorized request was accepted")),
+    }
+}
+
+fn contract_reject_ack(
+    label: &str,
+    response: Result<tonic::Response<graphrun::generated::Ack>, tonic::Status>,
+    observations: &mut Vec<String>,
+) -> Result<(), String> {
+    match response {
+        Ok(reply) if !reply.get_ref().error.is_empty() => {
+            observations.push(format!("{label}: {}", reply.get_ref().error));
+            Ok(())
+        }
+        Err(status)
+            if matches!(
+                status.code(),
+                tonic::Code::FailedPrecondition
+                    | tonic::Code::AlreadyExists
+                    | tonic::Code::PermissionDenied
+                    | tonic::Code::Unauthenticated
+                    | tonic::Code::InvalidArgument
+            ) =>
+        {
+            observations.push(format!("{label}: {status}"));
+            Ok(())
+        }
+        other => Err(format!("{label}: expected a denial, got {other:?}")),
+    }
+}
+
+async fn contract_reject_unknown_claim(
+    worker: &mut graphrun::generated::worker_client::WorkerClient<tonic::transport::Channel>,
+    request: graphrun::generated::ClaimRequest,
+    label: &str,
+    observations: &mut Vec<String>,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        match worker.claim(request.clone()).await {
+            Err(status)
+                if status.code() == tonic::Code::Unavailable
+                    && status.message().contains("worker session apply is pending")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            response => {
+                return contract_reject(
+                    label,
+                    response,
+                    tonic::Code::Unauthenticated,
+                    observations,
+                );
+            }
+        }
+    }
+}
+
+async fn contract_reject_unknown_report(
+    worker: &mut graphrun::generated::worker_client::WorkerClient<tonic::transport::Channel>,
+    request: graphrun::generated::ReportRequest,
+    label: &str,
+    observations: &mut Vec<String>,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        match worker.report(request.clone()).await {
+            Err(status)
+                if status.code() == tonic::Code::Unavailable
+                    && status.message().contains("worker session apply is pending")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            response => {
+                return contract_reject(
+                    label,
+                    response,
+                    tonic::Code::Unauthenticated,
+                    observations,
+                );
+            }
+        }
+    }
+}
+
+fn contract_assignment_matches(
+    assignment: &graphrun::generated::Assignment,
+    capability: &graphrun::worker_contract::WorkerCapability,
+    session: &str,
+    run: &str,
+) -> Result<(), String> {
+    if assignment.run_id != run
+        || assignment.session_id != session
+        || assignment.activity_name != capability.activity_name
+        || assignment.activity_version != capability.activity_version
+        || assignment.role != graphrun::worker_contract::role_name(capability.role)
+        || assignment.codec_version != capability.codec_version
+        || assignment.input_schema_digest != capability.input_schema_digest
+        || assignment.output_schema_digest != capability.output_schema_digest
+        || assignment.contract_digest != capability.contract_digest
+        || assignment.generation == 0
+        || assignment.revision == 0
+        || assignment.effect_key.is_empty()
+    {
+        return Err(format!(
+            "assignment does not carry the exact signed session and pinned capability: {assignment:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn contract_identity(
+    ca: &graphrun::CertificateAuthority,
+    principal: &str,
+    roles: &[graphrun::tls::PeerRole],
+    server_name: &str,
+) -> Result<graphrun::TlsMaterial, String> {
+    let identity = graphrun::tls::PrincipalIdentity::new(
+        graphrun::tls::cluster_id_from_ca(&ca.pem).map_err(|err| err.to_string())?,
+        graphrun::tls::PrincipalId::parse(principal).map_err(|err| err.to_string())?,
+        roles.iter().copied(),
+    )
+    .map_err(|err| err.to_string())?;
+    let mut tls =
+        graphrun::tls::issue_principal(ca, &identity, &format!("{principal}.graphrun.local"))
+            .map_err(|err| err.to_string())?;
+    tls.server_name = server_name.to_owned();
+    Ok(tls)
+}
+
+async fn contract_worker_client(
+    cluster: &LiveCluster,
+    tls: &graphrun::TlsMaterial,
+) -> Result<graphrun::generated::worker_client::WorkerClient<tonic::transport::Channel>, String> {
+    graphrun::tls::install_provider();
+    let channel = tonic::transport::Channel::from_shared(format!("https://{}", cluster.addrs[0]))
+        .map_err(|err| err.to_string())?
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(3))
+        .tls_config(graphrun::rpc::client_tls(tls).map_err(|err| err.to_string())?)
+        .map_err(|err| err.to_string())?
+        .connect()
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(graphrun::generated::worker_client::WorkerClient::new(
+        channel,
+    ))
+}
+
+async fn contract_worker_rpc_probes(
+    cluster: &LiveCluster,
+    run: &str,
+    provider_url: &str,
+    observations: &mut Vec<String>,
+) -> Result<String, String> {
+    use graphrun::generated::{ClaimRequest, RegisterRequest, ReportRequest};
+    use graphrun::ids::{ActivityKey, CommandId, ExecutionRole, WorkerSessionId};
+    use graphrun::tls::PeerRole;
+    use tonic::Code;
+
+    let catalog = graphrun::Catalog::from_json(include_bytes!(
+        "../../docs/specs/v1/examples/activity-catalog.json"
+    ))
+    .map_err(|err| err.to_string())?;
+    let required = graphrun::worker_contract::capability_for(
+        &catalog,
+        &ActivityKey::new("inventory.reserve", 1),
+        ExecutionRole::Forward,
+    )
+    .map_err(|err| err.to_string())?;
+    let server_name = &cluster.certs[0].2;
+    let signed = contract_identity(&cluster.ca, "app-1", &[PeerRole::Worker], server_name)?;
+    let other = contract_identity(&cluster.ca, "app-2", &[PeerRole::Worker], server_name)?;
+    let client_only = contract_identity(&cluster.ca, "client-1", &[PeerRole::Client], server_name)?;
+    let mut worker = contract_worker_client(cluster, &signed).await?;
+    let mut wrong_principal = contract_worker_client(cluster, &other).await?;
+    let mut wrong_role = contract_worker_client(cluster, &client_only).await?;
+    let register = |session: WorkerSessionId, capability: graphrun::generated::WorkerCapability| {
+        RegisterRequest {
+            session_id: session.to_hex(),
+            capacity: 1,
+            capabilities: vec![capability],
+            principal_id: "app-1".to_owned(),
+            protocol_min: graphrun::worker_contract::PROTOCOL_VERSION,
+            protocol_max: graphrun::worker_contract::PROTOCOL_VERSION,
+            command_id: CommandId::generate().to_hex(),
+        }
+    };
+
+    let valid_session = WorkerSessionId::generate();
+    let valid_registration = register(valid_session, required.to_wire());
+    contract_reject(
+        "signed wrong role registration",
+        wrong_role.register(valid_registration.clone()).await,
+        Code::PermissionDenied,
+        observations,
+    )?;
+    contract_reject(
+        "signed wrong principal registration",
+        wrong_principal.register(valid_registration.clone()).await,
+        Code::PermissionDenied,
+        observations,
+    )?;
+    let foreign_ca = graphrun::generate_ca().map_err(|err| err.to_string())?;
+    let mut alien = contract_identity(&foreign_ca, "app-1", &[PeerRole::Worker], server_name)?;
+    alien.ca_pem.clone_from(&cluster.ca.pem);
+    match contract_worker_client(cluster, &alien).await {
+        Err(err) => observations.push(format!("wrong CA TLS denied: {err}")),
+        Ok(mut client) => match client.register(valid_registration.clone()).await {
+            Err(status)
+                if matches!(status.code(), Code::Unavailable | Code::Unauthenticated)
+                    || status.code() == Code::Unknown
+                        && format!("{status:?}").contains("hyper::Error(Io") =>
+            {
+                observations.push(format!("wrong CA request denied: {status}"));
+            }
+            other => {
+                return Err(format!(
+                    "wrong CA unexpectedly reached registration: {other:?}"
+                ));
+            }
+        },
+    }
+    let foreign = graphrun::tls::PrincipalIdentity::new(
+        graphrun::tls::ClusterId::parse("other-cluster").map_err(|err| err.to_string())?,
+        graphrun::tls::PrincipalId::parse("app-1").map_err(|err| err.to_string())?,
+        [PeerRole::Worker],
+    )
+    .map_err(|err| err.to_string())?;
+    let mut foreign_tls =
+        graphrun::tls::issue_principal(&cluster.ca, &foreign, "foreign.graphrun.local")
+            .map_err(|err| err.to_string())?;
+    foreign_tls.server_name.clone_from(server_name);
+    let mut foreign_client = contract_worker_client(cluster, &foreign_tls).await?;
+    contract_reject(
+        "signed foreign cluster",
+        foreign_client.register(valid_registration.clone()).await,
+        Code::Unauthenticated,
+        observations,
+    )?;
+
+    let mut unsupported_codec = required.to_wire();
+    unsupported_codec.codec_version += 1;
+    contract_reject(
+        "codec registration",
+        worker
+            .register(register(WorkerSessionId::generate(), unsupported_codec))
+            .await,
+        Code::InvalidArgument,
+        observations,
+    )?;
+    let mut unsupported_role = required.to_wire();
+    unsupported_role.role = "invented".to_owned();
+    contract_reject(
+        "unknown execution role registration",
+        worker
+            .register(register(WorkerSessionId::generate(), unsupported_role))
+            .await,
+        Code::InvalidArgument,
+        observations,
+    )?;
+    let mut unsupported_protocol = register(WorkerSessionId::generate(), required.to_wire());
+    unsupported_protocol.protocol_min = graphrun::worker_contract::PROTOCOL_VERSION + 1;
+    unsupported_protocol.protocol_max = unsupported_protocol.protocol_min;
+    contract_reject(
+        "protocol version registration",
+        worker.register(unsupported_protocol).await,
+        Code::InvalidArgument,
+        observations,
+    )?;
+
+    let mut wrong_version = required.to_wire();
+    wrong_version.activity_version += 1;
+    let mut wrong_execution_role = required.to_wire();
+    wrong_execution_role.role = "compensation".to_owned();
+    let mut wrong_input = required.to_wire();
+    wrong_input.input_schema_digest = "f".repeat(64);
+    let mut wrong_output = required.to_wire();
+    wrong_output.output_schema_digest = "f".repeat(64);
+    let mut wrong_contract = required.to_wire();
+    wrong_contract.contract_digest = "f".repeat(64);
+    for (label, capability) in [
+        ("activity version", wrong_version),
+        ("execution role", wrong_execution_role),
+        ("input schema digest", wrong_input),
+        ("output schema digest", wrong_output),
+        ("contract digest", wrong_contract),
+    ] {
+        let session = WorkerSessionId::generate();
+        let reply = worker
+            .register(register(session, capability))
+            .await
+            .map_err(|err| format!("{label} registration: {err}"))?
+            .into_inner();
+        if !reply.error.is_empty() || reply.revision == 0 {
+            return Err(format!(
+                "{label} registration could not test matching: {reply:?}"
+            ));
+        }
+        let claimed = worker
+            .claim(ClaimRequest {
+                command_id: CommandId::generate().to_hex(),
+                session_id: session.to_hex(),
+                capacity: 1,
+            })
+            .await
+            .map_err(|err| format!("{label} claim: {err}"))?
+            .into_inner();
+        if !claimed.error.is_empty() || !claimed.assignments.is_empty() {
+            return Err(format!(
+                "{label} admitted an incompatible assignment: {claimed:?}"
+            ));
+        }
+        observations.push(format!("{label}: registered but no assignment"));
+    }
+
+    let registration = worker
+        .register(valid_registration.clone())
+        .await
+        .map_err(|err| format!("exact registration: {err}"))?
+        .into_inner();
+    if !registration.error.is_empty() || registration.revision != 1 {
+        return Err(format!("exact registration rejected: {registration:?}"));
+    }
+    contract_reject(
+        "wrong role on cached registration",
+        wrong_role.register(valid_registration.clone()).await,
+        Code::PermissionDenied,
+        observations,
+    )?;
+    contract_reject(
+        "wrong principal on cached registration",
+        wrong_principal.register(valid_registration.clone()).await,
+        Code::PermissionDenied,
+        observations,
+    )?;
+    let claim = ClaimRequest {
+        command_id: CommandId::generate().to_hex(),
+        session_id: valid_session.to_hex(),
+        capacity: 1,
+    };
+    contract_reject(
+        "wrong role on registered session",
+        wrong_role.claim(claim.clone()).await,
+        Code::PermissionDenied,
+        observations,
+    )?;
+    contract_reject(
+        "wrong signed session principal",
+        wrong_principal.claim(claim.clone()).await,
+        Code::PermissionDenied,
+        observations,
+    )?;
+    let mut unknown_session = claim.clone();
+    unknown_session.session_id = WorkerSessionId::generate().to_hex();
+    contract_reject_unknown_claim(
+        &mut worker,
+        unknown_session,
+        "unknown session with valid command ID",
+        observations,
+    )
+    .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let assignment = loop {
+        let response = worker
+            .claim(claim.clone())
+            .await
+            .map_err(|err| format!("compatible claim: {err}"))?
+            .into_inner();
+        if !response.error.is_empty() {
+            return Err(format!("compatible claim failed: {}", response.error));
+        }
+        if let Some(assignment) = response.assignments.first() {
+            break assignment.clone();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("compatible worker never received an assignment".to_owned());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    contract_assignment_matches(&assignment, &required, &valid_session.to_hex(), run)?;
+    observations.push(format!(
+        "pinned assignment: name={} version={} role={} codec={} input={} output={} contract={}",
+        assignment.activity_name,
+        assignment.activity_version,
+        assignment.role,
+        assignment.codec_version,
+        assignment.input_schema_digest,
+        assignment.output_schema_digest,
+        assignment.contract_digest
+    ));
+    let replay = worker
+        .claim(claim.clone())
+        .await
+        .map_err(|err| format!("identical claim replay: {err}"))?
+        .into_inner();
+    if replay.assignments != vec![assignment.clone()] {
+        return Err("identical claim replay changed its cached assignment".to_owned());
+    }
+    contract_reject(
+        "wrong principal on cached claim",
+        wrong_principal.claim(claim.clone()).await,
+        Code::PermissionDenied,
+        observations,
+    )?;
+    contract_reject(
+        "wrong role on cached claim",
+        wrong_role.claim(claim.clone()).await,
+        Code::PermissionDenied,
+        observations,
+    )?;
+    let mut unknown_cached_claim = claim.clone();
+    unknown_cached_claim.session_id = WorkerSessionId::generate().to_hex();
+    contract_reject_unknown_claim(
+        &mut worker,
+        unknown_cached_claim,
+        "unknown session on cached claim",
+        observations,
+    )
+    .await?;
+    let mut changed_claim = claim.clone();
+    changed_claim.capacity = 2;
+    contract_reject(
+        "same command ID changed claim body",
+        worker.claim(changed_claim).await,
+        Code::AlreadyExists,
+        observations,
+    )?;
+
+    let input: graphrun::Value = serde_json::from_slice(&assignment.input_json)
+        .map_err(|err| format!("assignment input: {err}"))?;
+    let output = graphrun::engine::builtin_handler(&assignment.activity_name, &input)
+        .map_err(|err| format!("fixture inventory handler: {err}"))?;
+    let report = ReportRequest {
+        command_id: CommandId::generate().to_hex(),
+        session_id: valid_session.to_hex(),
+        run_id: assignment.run_id.clone(),
+        activation_id: assignment.activation_id.clone(),
+        generation: assignment.generation,
+        revision: assignment.revision,
+        output_json: serde_json::to_vec(&output).map_err(|err| err.to_string())?,
+        output_schema_digest: assignment.output_schema_digest.clone(),
+        ..Default::default()
+    };
+    let mut stale = report.clone();
+    stale.command_id = CommandId::generate().to_hex();
+    stale.generation += 1;
+    contract_reject_ack("stale generation", worker.report(stale).await, observations)?;
+    let mut wrong_digest = report.clone();
+    wrong_digest.command_id = CommandId::generate().to_hex();
+    wrong_digest.output_schema_digest = "f".repeat(64);
+    contract_reject_ack(
+        "report schema digest",
+        worker.report(wrong_digest).await,
+        observations,
+    )?;
+    contract_reject(
+        "wrong role on report",
+        wrong_role.report(report.clone()).await,
+        Code::PermissionDenied,
+        observations,
+    )?;
+    contract_reject(
+        "wrong principal on report",
+        wrong_principal.report(report.clone()).await,
+        Code::PermissionDenied,
+        observations,
+    )?;
+    let effect =
+        graphrun::provider::apply_effect(provider_url, &assignment.effect_key, "forward", &output)
+            .map_err(|err| format!("inventory provider effect: {err}"))?;
+    if effect.status != graphrun::provider::EffectStatus::Applied
+        || effect.logical != 1
+        || effect.output.as_ref() != Some(&output)
+    {
+        return Err(format!("inventory provider did not apply: {effect:?}"));
+    }
+    let accepted = worker
+        .report(report.clone())
+        .await
+        .map_err(|err| format!("valid inventory report: {err}"))?
+        .into_inner();
+    if !accepted.error.is_empty() {
+        return Err(format!("valid inventory report denied: {}", accepted.error));
+    }
+    let duplicate = worker
+        .report(report.clone())
+        .await
+        .map_err(|err| format!("valid report replay: {err}"))?
+        .into_inner();
+    if !duplicate.error.is_empty() {
+        return Err(format!(
+            "identical report replay denied: {}",
+            duplicate.error
+        ));
+    }
+    observations.push("matching signed report and identical cached replay accepted".to_owned());
+    match contract_worker_client(cluster, &alien).await {
+        Err(err) => observations.push(format!("wrong CA cached report TLS denied: {err}")),
+        Ok(mut client) => match client.report(report.clone()).await {
+            Err(status)
+                if matches!(status.code(), Code::Unavailable | Code::Unauthenticated)
+                    || status.code() == Code::Unknown
+                        && format!("{status:?}").contains("hyper::Error(Io") =>
+            {
+                observations.push(format!("wrong CA cached report TLS denied: {status}"));
+            }
+            other => {
+                return Err(format!(
+                    "wrong CA reached the cached report despite TLS: {other:?}"
+                ));
+            }
+        },
+    }
+    contract_reject(
+        "foreign cluster on cached report",
+        foreign_client.report(report.clone()).await,
+        Code::Unauthenticated,
+        observations,
+    )?;
+    contract_reject(
+        "wrong principal on cached report",
+        wrong_principal.report(report.clone()).await,
+        Code::PermissionDenied,
+        observations,
+    )?;
+    contract_reject(
+        "wrong role on cached report",
+        wrong_role.report(report.clone()).await,
+        Code::PermissionDenied,
+        observations,
+    )?;
+    let mut unknown_cached_report = report.clone();
+    unknown_cached_report.session_id = WorkerSessionId::generate().to_hex();
+    contract_reject_unknown_report(
+        &mut worker,
+        unknown_cached_report,
+        "unknown session on cached report",
+        observations,
+    )
+    .await?;
+    let mut changed_body = report.clone();
+    changed_body.output_json = serde_json::to_vec(&graphrun::Value::Null).unwrap_or_default();
+    contract_reject(
+        "cached command ID with changed result body",
+        worker.report(changed_body).await,
+        Code::AlreadyExists,
+        observations,
+    )?;
+    let mut changed_digest = report.clone();
+    changed_digest.output_schema_digest = "f".repeat(64);
+    contract_reject(
+        "cached command ID with changed digest",
+        worker.report(changed_digest).await,
+        Code::AlreadyExists,
+        observations,
+    )?;
+    let mut stale_replay = report;
+    stale_replay.command_id = CommandId::generate().to_hex();
+    stale_replay.generation += 1;
+    contract_reject_ack(
+        "new command ID with stale result after cache",
+        worker.report(stale_replay).await,
+        observations,
+    )?;
+    Ok(assignment.effect_key)
+}
+
+fn contract_worker_proof(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
+    let started = Instant::now();
+    let mut observations = Vec::new();
+    let dir = artifacts.join(format!("{}-data", row.id));
+    let result = (|| -> Result<(String, serde_json::Value), String> {
+        let mut cluster = boot_three(artifacts, row, 0)?;
+        let provider_addr = format!("127.0.0.1:{}", unused_port());
+        let provider_url = format!("http://{provider_addr}");
+        let provider_log = cluster.dir.join("provider.log");
+        let provider_log = fs::File::create(&provider_log).map_err(|err| err.to_string())?;
+        let _provider = ChildProc::new(
+            Command::new(&cluster.e2e)
+                .args([
+                    "fixture-provider",
+                    "--bind",
+                    &provider_addr,
+                    "--data-dir",
+                    cluster
+                        .dir
+                        .join("provider")
+                        .to_str()
+                        .ok_or("provider path")?,
+                ])
+                .stdout(Stdio::from(
+                    provider_log.try_clone().map_err(|err| err.to_string())?,
+                ))
+                .stderr(Stdio::from(provider_log))
+                .spawn()
+                .map_err(|err| format!("fixture-provider: {err}"))?,
+        );
+        let provider_deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if graphrun::provider::dump_ledger(&provider_url).is_ok() {
+                break;
+            }
+            if Instant::now() >= provider_deadline {
+                return Err("fixture-provider never became responsive".to_owned());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let run = cluster_start(
+            cli,
+            &cluster,
+            "sequence.yaml",
+            r#"{"order_id":"o1","amount":1000}"#,
+            false,
+        )?;
+        let rt = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
+        let inventory_effect = rt.block_on(contract_worker_rpc_probes(
+            &cluster,
+            &run,
+            &provider_url,
+            &mut observations,
+        ))?;
+
+        use graphrun::tls::PeerRole;
+        let app_tls = contract_identity(
+            &cluster.ca,
+            "app-live",
+            &[PeerRole::Worker],
+            &cluster.certs[0].2,
+        )?;
+        let worker_cert = cluster.dir.join("app-live.cert.pem");
+        let worker_key = cluster.dir.join("app-live.key.pem");
+        fs::write(&worker_cert, &app_tls.cert_pem).map_err(|err| err.to_string())?;
+        fs::write(&worker_key, &app_tls.key_pem).map_err(|err| err.to_string())?;
+        let worker_log = cluster.dir.join("app-live.log");
+        let mut child = Command::new(&cluster.e2e);
+        let worker_log = fs::File::create(&worker_log).map_err(|err| err.to_string())?;
+        child
+            .args([
+                "fixture-worker",
+                "--endpoint",
+                &format!("https://{}", cluster.addrs[0]),
+                "--ca",
+                cluster.ca_path.to_str().ok_or("CA path")?,
+                "--cert",
+                worker_cert.to_str().ok_or("worker cert path")?,
+                "--key",
+                worker_key.to_str().ok_or("worker key path")?,
+                "--server-name",
+                &app_tls.server_name,
+            ])
+            .env("GRAPHUN_PROVIDER_URL", &provider_url)
+            .stdout(Stdio::from(
+                worker_log.try_clone().map_err(|err| err.to_string())?,
+            ))
+            .stderr(Stdio::from(worker_log));
+        cluster.workers.push(ChildProc::new(
+            child
+                .spawn()
+                .map_err(|err| format!("application worker: {err}"))?,
+        ));
+        let body =
+            wait_nodes_succeeded(cli, &cluster, &run, [0, 1, 2], 2, Duration::from_secs(25))?;
+        if cluster.workers[0]
+            .0
+            .try_wait()
+            .map_err(|err| err.to_string())?
+            .is_some()
+        {
+            return Err("application worker exited before output assertion".to_owned());
+        }
+        let view: serde_json::Value =
+            serde_json::from_str(&body).map_err(|err| format!("inspect JSON: {err}"))?;
+        if view["run"] != run
+            || view["status"] != "succeeded"
+            || view["output"]["order_id"] != "o1"
+            || view["output"]["amount"] != 1000
+            || view["output"]["payment_id"] != "pay-1"
+        {
+            return Err(format!("unexpected application worker output: {body}"));
+        }
+        let ledger = graphrun::provider::dump_ledger(&provider_url)
+            .map_err(|err| format!("provider ledger: {err}"))?;
+        let entries = ledger["entries"]
+            .as_object()
+            .ok_or_else(|| format!("invalid provider ledger: {ledger}"))?;
+        if entries.len() != 2
+            || entries.get(&inventory_effect).is_none_or(|entry| {
+                entry["status"] != "applied"
+                    || entry["logical"] != 1
+                    || entry["physical"] != 1
+                    || entry["output"]["reservation_id"] != "res-1"
+            })
+            || !entries.iter().any(|(key, entry)| {
+                key != &inventory_effect
+                    && entry["status"] == "applied"
+                    && entry["kind"] == "forward"
+                    && entry["logical"] == 1
+                    && entry["physical"] == 1
+                    && entry["output"]["payment_id"] == "pay-1"
+            })
+        {
+            return Err(format!(
+                "provider did not record both real effects: {ledger}"
+            ));
+        }
+        observations.push(format!(
+            "application worker output={}; provider={ledger}",
+            view["output"]
+        ));
+
+        let removed = rt.block_on(async {
+            use graphrun::generated::{ClockHealthRequest, raft_client::RaftClient};
+            use tonic::Code;
+            let node3 = graphrun::TlsMaterial {
+                ca_pem: cluster.ca.pem.clone(),
+                cert_pem: fs::read_to_string(&cluster.certs[2].0).map_err(|err| err.to_string())?,
+                key_pem: fs::read_to_string(&cluster.certs[2].1).map_err(|err| err.to_string())?,
+                server_name: cluster.certs[0].2.clone(),
+            };
+            let channel =
+                tonic::transport::Channel::from_shared(format!("https://{}", cluster.addrs[0]))
+                    .map_err(|err| err.to_string())?
+                    .connect_timeout(Duration::from_secs(3))
+                    .timeout(Duration::from_secs(3))
+                    .tls_config(graphrun::rpc::client_tls(&node3).map_err(|err| err.to_string())?)
+                    .map_err(|err| err.to_string())?
+                    .connect()
+                    .await
+                    .map_err(|err| err.to_string())?;
+            let mut member = RaftClient::new(channel);
+            let before = member
+                .clock_health(ClockHealthRequest { sender_id: 3 })
+                .await
+                .map_err(|err| format!("rostered member precondition: {err}"))?
+                .into_inner();
+            if before.member_id != 1 {
+                return Err(format!(
+                    "roster precondition returned wrong member: {before:?}"
+                ));
+            }
+            observations.push("signed member 3 admitted while rostered".to_owned());
+            let mut forged = node3.clone();
+            forged.cert_pem =
+                fs::read_to_string(&cluster.certs[1].0).map_err(|err| err.to_string())?;
+            forged.key_pem =
+                fs::read_to_string(&cluster.certs[1].1).map_err(|err| err.to_string())?;
+            let forged_channel =
+                tonic::transport::Channel::from_shared(format!("https://{}", cluster.addrs[0]))
+                    .map_err(|err| err.to_string())?
+                    .connect_timeout(Duration::from_secs(3))
+                    .timeout(Duration::from_secs(3))
+                    .tls_config(graphrun::rpc::client_tls(&forged).map_err(|err| err.to_string())?)
+                    .map_err(|err| err.to_string())?
+                    .connect()
+                    .await
+                    .map_err(|err| err.to_string())?;
+            contract_reject(
+                "roster sender differs from signed member",
+                RaftClient::new(forged_channel)
+                    .clock_health(ClockHealthRequest { sender_id: 3 })
+                    .await,
+                Code::PermissionDenied,
+                &mut observations,
+            )?;
+            fs::write(cluster.dir.join("remove-voter.request"), "3")
+                .map_err(|err| err.to_string())?;
+            let outcome = cluster.dir.join("remove-voter.result");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+            while !outcome.is_file() {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("member did not commit roster removal".to_owned());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let result = fs::read_to_string(outcome).map_err(|err| err.to_string())?;
+            if result != "OK" {
+                return Err(format!("roster removal failed: {result}"));
+            }
+            contract_reject(
+                "signed removed member",
+                member
+                    .clock_health(ClockHealthRequest { sender_id: 3 })
+                    .await,
+                Code::PermissionDenied,
+                &mut observations,
+            )?;
+            Ok::<(), String>(())
+        });
+        removed?;
+        fs::write(
+            cluster.dir.join("provider-ledger.json"),
+            serde_json::to_vec_pretty(&ledger).map_err(|err| err.to_string())?,
+        )
+        .map_err(|err| err.to_string())?;
+        Ok((body, ledger))
+    })();
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(
+        dir.join("probes.log"),
+        format!("{}\nresult={result:?}\n", observations.join("\n")),
+    );
+    let mut case = match result {
+        Ok((body, ledger)) => finish(
+            row,
+            "PASS",
+            "fresh 3-member mTLS process, signed worker and provider ledger",
+            format!("run={body}\nledger={ledger}\n{}", observations.join("\n")),
+            vec![dir],
+        ),
+        Err(err) => finish(
+            row,
+            "FAIL",
+            "fresh 3-member mTLS process, signed worker and provider ledger",
+            format!("{err}; evidence: {}", dir.display()),
+            vec![dir],
+        ),
+    };
+    case.duration_ms = started.elapsed().as_millis();
+    case
 }
 
 fn cluster_leader_kill_keeps_result(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
@@ -4542,6 +5465,7 @@ fn fixture_member(
     initialize: bool,
     host_activities: bool,
     peer: Vec<String>,
+    remove_voter_on_file: Option<PathBuf>,
 ) -> ExitCode {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -4588,10 +5512,32 @@ fn fixture_member(
         })
         .await
         {
-            Ok(engine) => loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                let _ = &engine;
-            },
+            Ok(engine) => {
+                let mut remove_voter_on_file = remove_voter_on_file;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if let Some(request) = remove_voter_on_file.as_ref()
+                        && request.exists()
+                    {
+                        let outcome = match fs::read_to_string(request)
+                            .map_err(|err| err.to_string())
+                            .and_then(|id| id.trim().parse::<u64>().map_err(|err| err.to_string()))
+                        {
+                            Ok(id) => engine.remove_voter(id).await.map_err(|err| err.to_string()),
+                            Err(err) => Err(err),
+                        };
+                        let response = match outcome {
+                            Ok(()) => "OK".to_owned(),
+                            Err(err) => format!("ERROR: {err}"),
+                        };
+                        if let Err(err) = fs::write(request.with_extension("result"), response) {
+                            eprintln!("cannot persist roster outcome: {err}");
+                            return ExitCode::from(2);
+                        }
+                        remove_voter_on_file = None;
+                    }
+                }
+            }
             Err(err) => {
                 eprintln!("{err}");
                 ExitCode::from(2)
@@ -4653,6 +5599,89 @@ fn fixture_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contract_worker_proof_rejects_accepted_negatives_and_unpinned_assignments() {
+        use graphrun::ids::{ActivityKey, ExecutionRole};
+        let mut observations = Vec::new();
+        assert!(
+            contract_reject::<()>(
+                "wrong role",
+                Ok(tonic::Response::new(())),
+                tonic::Code::PermissionDenied,
+                &mut observations
+            )
+            .is_err()
+        );
+        assert!(
+            contract_reject_ack(
+                "stale",
+                Ok(tonic::Response::new(graphrun::generated::Ack {
+                    error: String::new()
+                })),
+                &mut observations
+            )
+            .is_err()
+        );
+        let catalog = graphrun::Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let capability = graphrun::worker_contract::capability_for(
+            &catalog,
+            &ActivityKey::new("inventory.reserve", 1),
+            ExecutionRole::Forward,
+        )
+        .unwrap();
+        let assignment = graphrun::generated::Assignment {
+            run_id: "run".to_owned(),
+            session_id: "session".to_owned(),
+            activity_name: capability.activity_name.clone(),
+            activity_version: capability.activity_version,
+            role: "forward".to_owned(),
+            codec_version: capability.codec_version,
+            input_schema_digest: capability.input_schema_digest.clone(),
+            output_schema_digest: capability.output_schema_digest.clone(),
+            contract_digest: capability.contract_digest.clone(),
+            generation: 1,
+            revision: 1,
+            effect_key: "effect".to_owned(),
+            ..Default::default()
+        };
+        assert!(contract_assignment_matches(&assignment, &capability, "session", "run").is_ok());
+        for changed in [
+            graphrun::generated::Assignment {
+                activity_version: 2,
+                ..assignment.clone()
+            },
+            graphrun::generated::Assignment {
+                role: "compensation".to_owned(),
+                ..assignment.clone()
+            },
+            graphrun::generated::Assignment {
+                codec_version: 2,
+                ..assignment.clone()
+            },
+            graphrun::generated::Assignment {
+                input_schema_digest: "f".repeat(64),
+                ..assignment.clone()
+            },
+            graphrun::generated::Assignment {
+                output_schema_digest: "f".repeat(64),
+                ..assignment.clone()
+            },
+            graphrun::generated::Assignment {
+                contract_digest: "f".repeat(64),
+                ..assignment.clone()
+            },
+            graphrun::generated::Assignment {
+                session_id: "other".to_owned(),
+                ..assignment
+            },
+        ] {
+            assert!(contract_assignment_matches(&changed, &capability, "session", "run").is_err());
+        }
+    }
 
     #[test]
     fn fixture_node_cert_uses_numeric_member_id_and_node_dns() {
