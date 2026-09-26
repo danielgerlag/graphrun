@@ -36,6 +36,48 @@ enum Commands {
         #[arg(long)]
         artifacts: PathBuf,
     },
+    SmokeProvider {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
+    SmokeReconciliation {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
+    SmokeSagaSettlement {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
+    SmokeRelease {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
+    SmokeSecurity {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
+    SmokePerformance {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
+    SmokeResourceCost {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
     ContractWorkerProof {
         #[arg(long)]
         cli: PathBuf,
@@ -97,6 +139,8 @@ enum Commands {
         key: PathBuf,
         #[arg(long)]
         server_name: String,
+        #[arg(long)]
+        catalog: Option<PathBuf>,
     },
     #[command(name = "fixture-provider")]
     FixtureProvider {
@@ -127,6 +171,20 @@ struct CaseResult {
     driver_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     performance: Option<PerformanceEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    related_binaries: Vec<RelatedBinary>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct RelatedBinary {
+    role: String,
+    path: String,
+    version: String,
+    source_revision: String,
+    sha256_before: String,
+    sha256_after: String,
+    build_log: String,
+    run_id: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -139,7 +197,30 @@ struct PerformanceEvidence {
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Commands::SmokeCluster { cli, artifacts } => smoke_cluster(&cli, &artifacts),
+        Commands::SmokeCluster { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "CLUSTER-001", cluster_three_and_workers)
+        }
+        Commands::SmokeProvider { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "ACT-006", provider_idempotent_effect)
+        }
+        Commands::SmokeReconciliation { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "ACT-005", provider_recon_outcomes)
+        }
+        Commands::SmokeSagaSettlement { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "SAGA-007", provider_delayed_forward)
+        }
+        Commands::SmokeRelease { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "GATE-003", release_artifact_and_workers)
+        }
+        Commands::SmokeSecurity { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "SEC-001", contract_worker_proof)
+        }
+        Commands::SmokePerformance { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "PERF-001", perf_command_compile)
+        }
+        Commands::SmokeResourceCost { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "PERF-002", perf_history_snapshot)
+        }
         Commands::ContractWorkerProof { cli, artifacts } => {
             focused_contract_worker_proof(&cli, &artifacts)
         }
@@ -185,12 +266,18 @@ fn main() -> ExitCode {
             cert,
             key,
             server_name,
-        } => fixture_worker(endpoint, ca, cert, key, server_name),
+            catalog,
+        } => fixture_worker(endpoint, ca, cert, key, server_name, catalog),
         Commands::FixtureProvider { bind, data_dir } => fixture_provider(bind, data_dir),
     }
 }
 
-fn smoke_cluster(cli: &Path, artifacts: &Path) -> ExitCode {
+fn smoke_case(
+    cli: &Path,
+    artifacts: &Path,
+    id: &str,
+    proof: fn(&Path, &Path, &MatrixRow) -> CaseResult,
+) -> ExitCode {
     if let Err(error) = fs::create_dir_all(artifacts) {
         eprintln!("cannot create cluster smoke artifacts: {error}");
         return ExitCode::from(2);
@@ -203,11 +290,11 @@ fn smoke_cluster(cli: &Path, artifacts: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Some(row) = matrix.into_iter().find(|row| row.id == "CLUSTER-001") else {
-        eprintln!("CLUSTER-001 case missing from verification matrix");
+    let Some(row) = matrix.into_iter().find(|row| row.id == id) else {
+        eprintln!("{id} case missing from verification matrix");
         return ExitCode::from(2);
     };
-    let result = cluster_three_and_workers(cli, artifacts, &row);
+    let result = proof(cli, artifacts, &row);
     println!(
         "{}",
         serde_json::json!({
@@ -522,6 +609,7 @@ fn verify(cli: &Path, matrix: &Path, artifacts: &Path, strict: bool) -> ExitCode
 
 struct RunContext {
     run_id: String,
+    cli_path: PathBuf,
     source_sha256: String,
     cli_sha256: String,
     cli_version: String,
@@ -539,6 +627,7 @@ impl RunContext {
         let driver = std::env::current_exe().map_err(|err| err.to_string())?;
         Ok(Self {
             run_id,
+            cli_path: cli.to_path_buf(),
             source_sha256: source_fingerprint(run_dir)?,
             cli_sha256: hash_file(cli).unwrap_or_else(|err| format!("UNAVAILABLE: {err}")),
             cli_version: "UNAVAILABLE".to_owned(),
@@ -666,6 +755,103 @@ fn enforce_case(row: &MatrixRow, result: CaseResult, run_dir: &Path) -> CaseResu
     }
 }
 
+fn validate_related_binaries(
+    result: &CaseResult,
+    run_dir: &Path,
+    context: &RunContext,
+) -> Result<(), String> {
+    if result.related_binaries.len() != 2 {
+        return Err(
+            "CONTRACT-002 requires both old_reader and current_release binaries".to_owned(),
+        );
+    }
+    let old = result
+        .related_binaries
+        .iter()
+        .find(|binary| binary.role == "old_reader")
+        .ok_or("CONTRACT-002 lacks old_reader")?;
+    let current = result
+        .related_binaries
+        .iter()
+        .find(|binary| binary.role == "current_release")
+        .ok_or("CONTRACT-002 lacks current_release")?;
+    let root = fs::canonicalize(run_dir).map_err(|err| err.to_string())?;
+    let cli = fs::canonicalize(&context.cli_path).map_err(|err| err.to_string())?;
+    let old_path = fs::canonicalize(&old.path).map_err(|err| err.to_string())?;
+    let current_path = fs::canonicalize(&current.path).map_err(|err| err.to_string())?;
+    if !old_path.starts_with(&root)
+        || current_path != cli
+        || old_path == current_path
+        || !result
+            .artifacts
+            .iter()
+            .any(|artifact| fs::canonicalize(artifact).is_ok_and(|saved| saved == old_path))
+    {
+        return Err(
+            "CONTRACT-002 binaries must be separate, with the old binary built in this run"
+                .to_owned(),
+        );
+    }
+    if current.source_revision != context.source_sha256
+        || old.source_revision == current.source_revision
+        || current.sha256_before != context.cli_sha256
+        || old.sha256_before == current.sha256_before
+    {
+        return Err(
+            "CONTRACT-002 old/current source or binary identity is not distinct and current"
+                .to_owned(),
+        );
+    }
+    for binary in &result.related_binaries {
+        let path = fs::canonicalize(&binary.path).map_err(|err| err.to_string())?;
+        let build_log = fs::canonicalize(&binary.build_log).map_err(|err| err.to_string())?;
+        let hash = hash_file(&path)?;
+        let sha256 = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        let revision = &binary.source_revision;
+        if binary.run_id != context.run_id
+            || !matches!(revision.len(), 40 | 64)
+            || !revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !sha256(&binary.sha256_before)
+            || binary.sha256_before != binary.sha256_after
+            || hash != binary.sha256_after
+            || !build_log.starts_with(&root)
+            || !result
+                .artifacts
+                .iter()
+                .any(|artifact| fs::canonicalize(artifact).is_ok_and(|saved| saved == build_log))
+            || binary.version.is_empty()
+        {
+            return Err(format!(
+                "CONTRACT-002 {} binary has stale or incomplete in-run evidence",
+                binary.role
+            ));
+        }
+        let version = Command::new(&path)
+            .arg("--version")
+            .output()
+            .map_err(|err| format!("cannot execute {} --version: {err}", binary.role))?;
+        if !version.status.success()
+            || String::from_utf8(version.stdout)
+                .map_err(|err| err.to_string())?
+                .trim()
+                != binary.version
+        {
+            return Err(format!(
+                "CONTRACT-002 {} binary version does not match executable",
+                binary.role
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_coverage(
     rows: &[MatrixRow],
     results: &[CaseResult],
@@ -713,6 +899,16 @@ fn validate_coverage(
             ));
         }
         check_case_artifacts(result, run_dir)?;
+        if result.id == "CONTRACT-002" {
+            if result.status == "PASS" {
+                validate_related_binaries(result, run_dir, context)?;
+            }
+        } else if !result.related_binaries.is_empty() {
+            return Err(format!(
+                "{} has unexpected related binary records",
+                result.id
+            ));
+        }
         let path = run_dir.join(format!("{}.json", result.id));
         let bytes = fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))?;
         let saved: CaseResult =
@@ -902,12 +1098,17 @@ fn parse_test_results(text: &str) -> (HashSet<String>, bool) {
                 .map(str::to_owned)
         })
         .collect();
-    let summary = text
+    let summaries: Vec<_> = text
         .lines()
         .filter_map(|line| line.trim().strip_prefix("test result: ok. "))
-        .filter_map(|line| line.split_whitespace().next()?.parse::<usize>().ok())
-        .next();
-    let complete = summary.is_some_and(|count| count > 0 && count == passed.len());
+        .collect();
+    let complete = summaries.len() == 1
+        && summaries[0]
+            .split_whitespace()
+            .next()
+            .and_then(|count| count.parse::<usize>().ok())
+            .is_some_and(|count| count > 0 && count == passed.len())
+        && summaries[0].contains("; 0 failed; 0 ignored; 0 measured; 0 filtered out");
     (passed, complete)
 }
 
@@ -916,7 +1117,6 @@ struct Evidence {
     api: TestSuite,
     ui: TestSuite,
     crash: TestSuite,
-    snapshot: TestSuite,
     driver: TestSuite,
 }
 
@@ -926,7 +1126,15 @@ fn collect_evidence(run_dir: &Path) -> Result<Evidence, String> {
             run_dir,
             "lib",
             &[
-                "test", "-p", "graphrun", "--lib", "--locked", "--color", "never",
+                "test",
+                "-p",
+                "graphrun",
+                "--lib",
+                "--locked",
+                "--color",
+                "never",
+                "--",
+                "--show-output",
             ],
         )?,
         api: TestSuite::run(
@@ -957,23 +1165,6 @@ fn collect_evidence(run_dir: &Path) -> Result<Evidence, String> {
                 "--locked",
                 "--color",
                 "never",
-            ],
-        )?,
-        snapshot: TestSuite::run(
-            run_dir,
-            "snapshot",
-            &[
-                "test",
-                "-p",
-                "graphrun",
-                "--lib",
-                "snapshot_controller_fires_at_20000_entries",
-                "--locked",
-                "--color",
-                "never",
-                "--",
-                "--ignored",
-                "--show-output",
             ],
         )?,
         driver: TestSuite::run(
@@ -1297,10 +1488,10 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
                     row,
                     "cluster::tests::remote_recon_and_idempotent_effect",
                 ),
-                provider_recon_outcomes(artifacts, row),
+                provider_recon_outcomes(cli, artifacts, row),
             ],
         ),
-        "ACT-006" => provider_idempotent_effect(artifacts, row),
+        "ACT-006" => provider_idempotent_effect(cli, artifacts, row),
         "POLICY-001" => from_test(
             evidence,
             row,
@@ -1403,7 +1594,13 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             row,
             "domain::tests::expired_claim_rejects_renewal",
         ),
-        "SEC-001" => from_test(evidence, row, "cluster::tests::wrong_ca_is_rejected"),
+        "SEC-001" => all_of(
+            row,
+            vec![
+                from_test(evidence, row, "cluster::tests::wrong_ca_is_rejected"),
+                contract_worker_proof(cli, artifacts, row),
+            ],
+        ),
         "LOCAL-001" => local_start(
             cli,
             artifacts,
@@ -1428,10 +1625,10 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             row,
             vec![
                 from_test(evidence, row, "engine::tests::snapshot_writes_file"),
-                from_suite(
+                from_test(
+                    evidence,
                     row,
-                    &evidence.snapshot,
-                    &["engine::tests::snapshot_controller_fires_at_20000_entries"],
+                    "engine::tests::snapshot_controller_fires_at_20000_entries",
                 ),
             ],
         ),
@@ -1449,7 +1646,7 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
         ),
         "E2E-002" => e2e_no_ready_scan(cli, artifacts, row),
         "PERF-001" => perf_command_compile(cli, artifacts, row),
-        "PERF-002" => perf_history_snapshot(cli, artifacts, evidence, row),
+        "PERF-002" => perf_history_snapshot(cli, artifacts, row),
         "GATE-001" => from_suite(
             row,
             &evidence.driver,
@@ -1463,6 +1660,7 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             &evidence.driver,
             &["tests::status_and_certification_gate"],
         ),
+        "GATE-003" => release_artifact_and_workers(cli, artifacts, row),
         "CONTRACT-003" => contract_worker_proof(cli, artifacts, row),
         "CONTRACT-001" => contract_artifact_proof(cli, artifacts, row),
         "CONTRACT-002" => fail(
@@ -1854,6 +2052,7 @@ fn finish(
         driver_sha256: String::new(),
         driver_version: String::new(),
         performance: None,
+        related_binaries: Vec::new(),
     }
 }
 
@@ -2418,7 +2617,7 @@ fn e2e_no_ready_scan(_cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResu
 }
 
 fn perf_command_compile(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
-    let catalog = catalog();
+    let catalog_path = catalog();
     let yaml = examples().join("sequence.yaml");
     let started = Instant::now();
     let (ok, stdout, stderr) = run_cli(
@@ -2428,7 +2627,7 @@ fn perf_command_compile(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseRe
             "--definition",
             yaml.to_str().unwrap(),
             "--catalog",
-            catalog.to_str().unwrap(),
+            catalog_path.to_str().unwrap(),
         ],
     );
     let compile_ms = started.elapsed().as_millis();
@@ -2475,19 +2674,35 @@ fn perf_command_compile(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseRe
             "--definition",
             yaml512.to_str().unwrap(),
             "--catalog",
-            catalog.to_str().unwrap(),
+            catalog_path.to_str().unwrap(),
         ],
     );
-    let compile512_ms = compile512_started.elapsed().as_millis();
+    let validate512_ms = compile512_started.elapsed().as_millis();
     if !ok512 {
         return fail(row, "512-node validation", "validation failed");
     }
-    let (cmds, p95_us, wall_ms) = match measure_progress_rate(artifacts) {
+    let catalog = match fs::read(&catalog_path)
+        .map_err(|err| err.to_string())
+        .and_then(|bytes| graphrun::Catalog::from_json(&bytes).map_err(|err| err.to_string()))
+    {
+        Ok(catalog) => catalog,
+        Err(err) => return fail(row, "512-node catalog", err),
+    };
+    let yaml512_text = match fs::read_to_string(&yaml512) {
+        Ok(text) => text,
+        Err(err) => return fail(row, "512-node fixture read", err.to_string()),
+    };
+    let pure_compile = Instant::now();
+    if let Err(err) = graphrun::compiler::compile_yaml(&yaml512_text, &catalog) {
+        return fail(row, "512-node compilation", err.to_string());
+    }
+    let compile512_us = pure_compile.elapsed().as_micros();
+    let (cmds, p95_us, wall_ms, ready_ms) = match measure_progress_rate(artifacts) {
         Ok(rate) => rate,
         Err(err) => return fail(row, "progress-rate measurement", err),
     };
     let body = format!(
-        "validate_cli_wall_ms={compile_ms} validate_512_cli_wall_ms={compile512_ms} local_start_wall_ms={local_ms} progress_commands=1000 progress_commands_per_s={cmds:.1} progress_p95_us={p95_us} progress_wall_ms={wall_ms}"
+        "validate_cli_wall_ms={compile_ms} validate_512_cli_wall_ms={validate512_ms} compile_512_pure_us={compile512_us} local_start_wall_ms={local_ms} existing_store_ready_ms={ready_ms} committed_start_commands=1000 input_bytes=1024 local_commands_per_s={cmds:.1} local_p95_receipt_us={p95_us} local_wall_ms={wall_ms}"
     );
     perf_blocked(
         row,
@@ -2496,50 +2711,57 @@ fn perf_command_compile(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseRe
         &body,
         vec![
             format!("validate_cli_wall_ms={compile_ms}"),
-            format!("validate_512_cli_wall_ms={compile512_ms}"),
+            format!("validate_512_cli_wall_ms={validate512_ms}"),
+            format!("compile_512_pure_us={compile512_us}"),
             format!("local_start_wall_ms={local_ms}"),
-            format!("progress_commands_per_s={cmds:.1}"),
-            format!("progress_p95_us={p95_us}"),
-            format!("progress_wall_ms={wall_ms}"),
+            format!("existing_store_ready_ms={ready_ms}"),
+            format!("local_commands_per_s={cmds:.1}"),
+            format!("local_p95_receipt_us={p95_us}"),
+            format!("local_wall_ms={wall_ms}"),
         ],
     )
 }
 
-fn measure_progress_rate(artifacts: &Path) -> Result<(f64, u128, u128), String> {
+fn measure_progress_rate(artifacts: &Path) -> Result<(f64, u128, u128, u128), String> {
     let dir = artifacts.join("PERF-001-rate");
-    let _ = fs::create_dir_all(&dir);
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
     let rt = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
     rt.block_on(async {
         let engine = graphrun::Engine::local(&dir)
             .await
             .map_err(|err| err.to_string())?;
-        let catalog =
-            graphrun::Catalog::from_json(&fs::read(catalog()).map_err(|err| err.to_string())?)
+        let mut catalog_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(catalog()).map_err(|err| err.to_string())?)
                 .map_err(|err| err.to_string())?;
-        let yaml =
-            fs::read_to_string(examples().join("events.yaml")).map_err(|err| err.to_string())?;
-        let input = graphrun::Value::Object(
-            [("key".to_owned(), graphrun::Value::String("k1".to_owned()))]
-                .into_iter()
-                .collect(),
-        );
-        let run = engine
-            .start_yaml(&yaml, &catalog, input)
-            .await
-            .map_err(|err| err.to_string())?;
+        catalog_json["schemas"]["perf_text/v1"] =
+            serde_json::json!({"type":"string","minLength":1024,"maxLength":1024});
+        let catalog = graphrun::Catalog::from_json(
+            &serde_json::to_vec(&catalog_json).map_err(|err| err.to_string())?,
+        )
+        .map_err(|err| err.to_string())?;
+        let yaml = "dsl: graphrun/v1\nid: perf_input\nversion: 1\ninput_schema: perf_text/v1\noutput_schema: perf_text/v1\nstart: finish\nnodes:\n  finish:\n    kind: complete\n    output: {from: workflow.input}\n";
+        let definition =
+            graphrun::compiler::compile_yaml(yaml, &catalog).map_err(|err| err.to_string())?;
+        let input = graphrun::Value::String("x".repeat(1024));
         const N: usize = 1_000;
         let mut samples = Vec::with_capacity(N);
         let wall = Instant::now();
         for _ in 0..N {
             let one = Instant::now();
             engine
-                .commit_progress(run)
+                .start(definition.clone(), catalog.clone(), input.clone())
                 .await
                 .map_err(|err| err.to_string())?;
             samples.push(one.elapsed().as_micros());
         }
         let wall_ms = wall.elapsed().as_millis();
-        let _ = engine.shutdown().await;
+        engine.shutdown().await.map_err(|err| err.to_string())?;
+        let reopening = Instant::now();
+        let reopened = graphrun::Engine::local(&dir)
+            .await
+            .map_err(|err| err.to_string())?;
+        let ready_ms = reopening.elapsed().as_millis();
+        reopened.shutdown().await.map_err(|err| err.to_string())?;
         samples.sort_unstable();
         let p95 = samples[(N * 95 / 100).min(N - 1)];
         let cmds_per_s = if wall_ms == 0 {
@@ -2547,16 +2769,11 @@ fn measure_progress_rate(artifacts: &Path) -> Result<(f64, u128, u128), String> 
         } else {
             (N as f64) / (wall_ms as f64 / 1000.0)
         };
-        Ok((cmds_per_s, p95, wall_ms))
+        Ok((cmds_per_s, p95, wall_ms, ready_ms))
     })
 }
 
-fn perf_history_snapshot(
-    cli: &Path,
-    artifacts: &Path,
-    evidence: &Evidence,
-    row: &MatrixRow,
-) -> CaseResult {
+fn perf_history_snapshot(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
     let nested_started = Instant::now();
     let nested = local_start_in(
         cli,
@@ -2570,6 +2787,20 @@ fn perf_history_snapshot(
     let nested_ms = nested_started.elapsed().as_millis();
     if nested.status != "PASS" {
         return fail(row, "nested timing", nested.actual);
+    }
+    let parallel_started = Instant::now();
+    let parallel = local_start_in(
+        cli,
+        artifacts,
+        row,
+        "parallel",
+        "parallel.yaml",
+        r#"{"order_id":"o1","amount":1000}"#,
+        "100",
+    );
+    let parallel_ms = parallel_started.elapsed().as_millis();
+    if parallel.status != "PASS" {
+        return fail(row, "parallel timing", parallel.actual);
     }
     let run = match serde_json::from_str::<serde_json::Value>(&nested.actual)
         .ok()
@@ -2592,46 +2823,154 @@ fn perf_history_snapshot(
         ],
     );
     let history_ms = started.elapsed().as_millis();
-    if !history_ok || serde_json::from_str::<serde_json::Value>(&history).is_err() {
+    let history_page = serde_json::from_str::<serde_json::Value>(&history);
+    if !history_ok || history_page.is_err() {
         return fail(row, "history timing", format!("{history}\n{history_err}"));
     }
-    if !evidence
-        .snapshot
-        .passed("engine::tests::snapshot_controller_fires_at_20000_entries")
-    {
-        return fail(
-            row,
-            "snapshot measurement",
-            "snapshot test did not execute and pass",
-        );
-    }
-    let snapshot_note = match fs::read_to_string(&evidence.snapshot.log) {
-        Ok(note) => note,
-        Err(err) => return fail(row, "snapshot measurement", err.to_string()),
+    let page = history_page.unwrap();
+    let events = match page["events"].as_array() {
+        Some(events) if !events.is_empty() => events.len(),
+        _ => {
+            return fail(
+                row,
+                "retained history measurement",
+                format!("empty or invalid page: {page}"),
+            );
+        }
     };
-    let snapshot_line = match snapshot_note
-        .lines()
-        .find(|line| line.contains("snapshot fill writes="))
-    {
-        Some(line) => line,
-        None => return fail(row, "snapshot measurement", "snapshot progress is missing"),
-    };
+    let (snapshot_ms, snapshot_bytes, snapshot_sha256, replay_ms, replay_events, store_bytes) =
+        match measure_snapshot_history(&artifacts.join("PERF-002-snapshot")) {
+            Ok(measured) => measured,
+            Err(err) => return fail(row, "snapshot/history measurement", err),
+        };
     let body = format!(
-        "nested_cli_wall_ms={nested_ms} history_cli_wall_ms={history_ms} snapshot_test_wall_ms={} {snapshot_line}",
-        evidence.snapshot.duration_ms
+        "nested_cli_wall_ms={nested_ms} parallel_cli_wall_ms={parallel_ms} history_cli_wall_ms={history_ms} history_events={events} snapshot_published_ms={snapshot_ms} snapshot_bytes={snapshot_bytes} snapshot_sha256={snapshot_sha256} replay_ms={replay_ms} replay_events={replay_events} store_bytes={store_bytes}"
     );
     perf_blocked(
         row,
         artifacts,
-        "measured nested/history/snapshot test on this host",
+        "measured nested/history/snapshot on this host",
         &body,
         vec![
             format!("nested_cli_wall_ms={nested_ms}"),
+            format!("parallel_cli_wall_ms={parallel_ms}"),
             format!("history_cli_wall_ms={history_ms}"),
-            format!("snapshot_test_wall_ms={}", evidence.snapshot.duration_ms),
-            snapshot_line.to_owned(),
+            format!("history_events={events}"),
+            format!("snapshot_published_ms={snapshot_ms}"),
+            format!("snapshot_bytes={snapshot_bytes}"),
+            format!("snapshot_sha256={snapshot_sha256}"),
+            format!("replay_ms={replay_ms}"),
+            format!("replay_events={replay_events}"),
+            format!("store_bytes={store_bytes}"),
         ],
     )
+}
+
+fn measure_snapshot_history(dir: &Path) -> Result<(u128, u64, String, u128, usize, u64), String> {
+    fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+    let rt = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
+    let (run, snapshot_ms, snapshot_bytes, snapshot_sha256) = rt.block_on(async {
+        let engine = graphrun::Engine::local(dir)
+            .await
+            .map_err(|err| err.to_string())?;
+        let catalog =
+            graphrun::Catalog::from_json(&fs::read(catalog()).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())?;
+        let run = engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/events.yaml"),
+                &catalog,
+                graphrun::Value::Object(
+                    [("key".to_owned(), graphrun::Value::String("k1".to_owned()))]
+                        .into_iter()
+                        .collect(),
+                ),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        for i in 0..256 {
+            engine
+                .signal(
+                    run,
+                    graphrun::EventId::generate(),
+                    "approval",
+                    &format!("unused-{i}"),
+                    graphrun::Value::Object(
+                        [("approved".to_owned(), graphrun::Value::Bool(true))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+        let before = engine
+            .history_page(run, 0, 1000)
+            .await
+            .map_err(|err| err.to_string())?;
+        if before.unavailable || before.events.len() < 257 {
+            return Err(format!(
+                "snapshot setup retained only {} events, unavailable={}",
+                before.events.len(),
+                before.unavailable
+            ));
+        }
+        let started = Instant::now();
+        engine.snapshot().await.map_err(|err| err.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (snapshot_bytes, snapshot_sha256) = 'snapshot: loop {
+            let snapshots = dir.join("snapshots");
+            match fs::read_dir(&snapshots) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let path = entry.map_err(|err| err.to_string())?.path();
+                        if path
+                            .extension()
+                            .is_some_and(|extension| extension == "snap")
+                        {
+                            let size = fs::metadata(&path).map_err(|err| err.to_string())?.len();
+                            if size > 0 {
+                                break 'snapshot (size, hash_file(&path)?);
+                            }
+                        }
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("snapshot directory unreadable: {err}")),
+            }
+            if Instant::now() >= deadline {
+                return Err("snapshot was not published within 30 seconds".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let snapshot_ms = started.elapsed().as_millis();
+        engine.shutdown().await.map_err(|err| err.to_string())?;
+        Ok::<_, String>((run, snapshot_ms, snapshot_bytes, snapshot_sha256))
+    })?;
+    let started = Instant::now();
+    let state = graphrun::engine::replay(dir).map_err(|err| err.to_string())?;
+    let replay_ms = started.elapsed().as_millis();
+    let replay_events = state
+        .history
+        .get(&run)
+        .ok_or("snapshot replay lost the measured run")?
+        .len();
+    if replay_events < 257 {
+        return Err(format!(
+            "snapshot replay retained only {replay_events} events"
+        ));
+    }
+    let store_bytes = fs::metadata(dir.join("member.redb"))
+        .map_err(|err| err.to_string())?
+        .len();
+    Ok((
+        snapshot_ms,
+        snapshot_bytes,
+        snapshot_sha256,
+        replay_ms,
+        replay_events,
+        store_bytes,
+    ))
 }
 
 fn perf_blocked(
@@ -2642,15 +2981,11 @@ fn perf_blocked(
     measurements: Vec<String>,
 ) -> CaseResult {
     let measure_path = artifacts.join(format!("{}-measure.txt", row.id));
-    let hardware = format!(
-        "os={} arch={} logical_cpus={} observed_members=1 memory=unmeasured storage=unmeasured",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        std::thread::available_parallelism()
-            .map(|cpus| cpus.get().to_string())
-            .unwrap_or_else(|err| format!("unavailable ({err})"))
-    );
-    let reason = "reference three same-region 4-vCPU/8-GiB SSD members unavailable; local measurement is not a reference benchmark";
+    let hardware = match local_hardware(artifacts) {
+        Ok(hardware) => hardware,
+        Err(err) => return fail(row, command, format!("hardware inventory failed: {err}")),
+    };
+    let reason = "this verifier launched no reference cluster on three distinct same-region 4-vCPU/8-GiB SSD hosts; these one-host measurements cannot certify the reference target";
     if let Err(err) = fs::write(&measure_path, format!("{body}\n{hardware}\n{reason}\n")) {
         return fail(row, command, format!("measurement write failed: {err}"));
     }
@@ -2670,6 +3005,59 @@ fn perf_blocked(
     result
 }
 
+fn local_hardware(artifacts: &Path) -> Result<String, String> {
+    let cpus = std::thread::available_parallelism()
+        .map_err(|err| err.to_string())?
+        .get();
+    let memory_bytes = if cfg!(target_os = "linux") {
+        let meminfo = fs::read_to_string("/proc/meminfo").map_err(|err| err.to_string())?;
+        let kb = meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))
+            .and_then(|line| line.split_whitespace().next())
+            .ok_or("MemTotal absent from /proc/meminfo")?
+            .parse::<u64>()
+            .map_err(|err| err.to_string())?;
+        kb * 1024
+    } else if cfg!(target_os = "macos") {
+        let output = Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .map_err(|err| err.to_string())?;
+        if !output.status.success() {
+            return Err(format!("sysctl hw.memsize exited {}", output.status));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|err| err.to_string())?
+            .trim()
+            .parse::<u64>()
+            .map_err(|err| err.to_string())?
+    } else {
+        return Err("hardware inventory requires Linux or macOS".to_owned());
+    };
+    let df = Command::new("df")
+        .args([
+            "-Pk",
+            artifacts.to_str().ok_or("artifact path is not UTF-8")?,
+        ])
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !df.status.success() {
+        return Err(format!("df exited {}", df.status));
+    }
+    let disk = String::from_utf8(df.stdout)
+        .map_err(|err| err.to_string())?
+        .lines()
+        .nth(1)
+        .ok_or("df returned no filesystem")?
+        .to_owned();
+    Ok(format!(
+        "os={} arch={} logical_cpus={cpus} memory_bytes={memory_bytes} filesystem={disk:?} storage_media=unverified observed_hosts=1 distinct_reference_members=0",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    ))
+}
+
 struct LiveCluster {
     dir: PathBuf,
     ca: graphrun::CertificateAuthority,
@@ -2679,6 +3067,9 @@ struct LiveCluster {
     members: Vec<ChildProc>,
     workers: Vec<ChildProc>,
     e2e: PathBuf,
+    provider_url: Option<String>,
+    lost_result_marker: Option<PathBuf>,
+    catalog_path: Option<PathBuf>,
 }
 
 fn boot_three(artifacts: &Path, row: &MatrixRow, workers: usize) -> Result<LiveCluster, String> {
@@ -2714,6 +3105,9 @@ fn boot_three(artifacts: &Path, row: &MatrixRow, workers: usize) -> Result<LiveC
         members: Vec::new(),
         workers: Vec::new(),
         e2e,
+        provider_url: None,
+        lost_result_marker: None,
+        catalog_path: None,
     };
     for node in [2usize, 3] {
         cluster
@@ -2785,7 +3179,7 @@ fn spawn_fixture_member(
     if cluster
         .dir
         .file_name()
-        .is_some_and(|name| name == "CONTRACT-003-data")
+        .is_some_and(|name| name == "CONTRACT-003-data" || name == "SEC-001-data")
         && node == 1
     {
         cmd.arg("--remove-voter-on-file")
@@ -2872,6 +3266,15 @@ fn spawn_worker_on(
         "--server-name",
         &cert.2,
     ]);
+    if let Some(url) = &cluster.provider_url {
+        cmd.env("GRAPHUN_PROVIDER_URL", url);
+    }
+    if let Some(marker) = &cluster.lost_result_marker {
+        cmd.env("GRAPHUN_FIXTURE_LOSE_RESULT_ONCE", marker);
+    }
+    if let Some(path) = &cluster.catalog_path {
+        cmd.arg("--catalog").arg(path);
+    }
     cmd.stdout(Stdio::null());
     if let Ok(file) = fs::File::create(log) {
         cmd.stderr(file);
@@ -2905,9 +3308,19 @@ fn cluster_start(
     input: &str,
     wait: bool,
 ) -> Result<String, String> {
+    cluster_start_definition(cli, cluster, &examples().join(yaml), input, wait)
+}
+
+fn cluster_start_definition(
+    cli: &Path,
+    cluster: &LiveCluster,
+    definition: &Path,
+    input: &str,
+    wait: bool,
+) -> Result<String, String> {
     let input_path = cluster.dir.join("input.json");
     fs::write(&input_path, input).map_err(|err| err.to_string())?;
-    let definition = examples().join(yaml);
+    let catalog_path = cluster.catalog_path.clone().unwrap_or_else(catalog);
     let mut last = String::new();
     let command_id = graphrun::ids::CommandId::generate().to_hex();
     let deadline = Instant::now() + Duration::from_secs(25);
@@ -2918,7 +3331,7 @@ fn cluster_start(
                 "--definition".to_owned(),
                 definition.display().to_string(),
                 "--catalog".to_owned(),
-                catalog().display().to_string(),
+                catalog_path.display().to_string(),
                 "--input".to_owned(),
                 input_path.display().to_string(),
                 "--command-id".to_owned(),
@@ -3021,11 +3434,174 @@ fn wait_inspect(
     Err(last)
 }
 
+fn release_artifact_isolation(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
+    let dir = artifacts.join(format!("{}-release", row.id));
+    if let Err(err) = fs::create_dir_all(&dir) {
+        return fail(row, "release artifact directory", err.to_string());
+    }
+    let build = Command::new("cargo")
+        .args(["build", "--release", "--locked", "-p", "graphrun-cli"])
+        .output();
+    let build = match build {
+        Ok(build) => build,
+        Err(err) => return fail(row, "isolated release build", err.to_string()),
+    };
+    let build_log = dir.join("release-build.log");
+    if let Err(err) = fs::write(
+        &build_log,
+        [build.stdout.as_slice(), build.stderr.as_slice()].concat(),
+    ) {
+        return fail(row, "isolated release build log", err.to_string());
+    }
+    if !build.status.success() {
+        return fail(
+            row,
+            "isolated release build",
+            format!("build exited {}; see {}", build.status, build_log.display()),
+        );
+    }
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"))
+        .join("release")
+        .join(format!("graphrun{}", std::env::consts::EXE_SUFFIX));
+    let (supplied_hash, built_hash) = match (hash_file(cli), hash_file(&target)) {
+        (Ok(supplied), Ok(built)) => (supplied, built),
+        (left, right) => return fail(row, "release binary hashes", format!("{left:?}, {right:?}")),
+    };
+    if supplied_hash != built_hash {
+        return fail(
+            row,
+            "release binary identity",
+            format!(
+                "supplied {} differs from isolated build {}",
+                cli.display(),
+                target.display()
+            ),
+        );
+    }
+    let tree = match Command::new("cargo")
+        .args(["tree", "--locked", "-p", "graphrun-cli", "-e", "features"])
+        .output()
+    {
+        Ok(tree) => tree,
+        Err(err) => return fail(row, "release feature graph", err.to_string()),
+    };
+    let features = String::from_utf8_lossy(&tree.stdout);
+    let feature_log = dir.join("release-features.log");
+    if let Err(err) = fs::write(&feature_log, &tree.stdout) {
+        return fail(row, "release feature graph log", err.to_string());
+    }
+    if !tree.status.success()
+        || features.contains("feature \"fault-injection\"")
+        || features.contains("feature \"fixture-worker\"")
+    {
+        return fail(
+            row,
+            "release feature graph",
+            format!(
+                "feature graph exited {}; see {}",
+                tree.status,
+                feature_log.display()
+            ),
+        );
+    }
+    let input = dir.join("input.json");
+    if let Err(err) = fs::write(&input, r#"{"order_id":"o1","amount":1000}"#) {
+        return fail(row, "release fault probe input", err.to_string());
+    }
+    let data = dir.join("store");
+    let output = Command::new(cli)
+        .args([
+            "start",
+            "--definition",
+            examples().join("sequence.yaml").to_str().unwrap(),
+            "--catalog",
+            catalog().to_str().unwrap(),
+            "--input",
+            input.to_str().unwrap(),
+            "--local-dir",
+            data.to_str().unwrap(),
+            "--wait-ms",
+            "20000",
+        ])
+        .env("GRAPHUN_FAULT", "after-apply")
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(err) => return fail(row, "release fault probe", err.to_string()),
+    };
+    let probe_log = dir.join("fault-probe.log");
+    if let Err(err) = fs::write(
+        &probe_log,
+        [output.stdout.as_slice(), output.stderr.as_slice()].concat(),
+    ) {
+        return fail(row, "release fault probe log", err.to_string());
+    }
+    let body = serde_json::from_slice::<serde_json::Value>(&output.stdout);
+    if !output.status.success()
+        || !body.as_ref().is_ok_and(|body| {
+            body["status"] == "succeeded" && body["output"]["payment_id"] == "pay-1"
+        })
+    {
+        return fail(
+            row,
+            "release fault probe",
+            format!(
+                "CLI exited {}; body={body:?}; see {}",
+                output.status,
+                probe_log.display()
+            ),
+        );
+    }
+    finish(
+        row,
+        "PASS",
+        "cargo build --release --locked -p graphrun-cli; cargo tree -p graphrun-cli -e features; GRAPHUN_FAULT=after-apply graphrun start",
+        format!(
+            "verified release SHA-256 {built_hash}; fault variable did not activate a storage cut"
+        ),
+        vec![build_log, feature_log, probe_log],
+    )
+}
+
+fn release_artifact_and_workers(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
+    all_of(
+        row,
+        vec![
+            release_artifact_isolation(cli, artifacts, row),
+            cluster_three_and_workers(cli, artifacts, row),
+        ],
+    )
+}
+
 fn cluster_three_and_workers(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
-    let cluster = match boot_three(artifacts, row, 2) {
+    let mut cluster = match boot_three(artifacts, row, 2) {
         Ok(cluster) => cluster,
         Err(err) => return fail(row, "boot cluster", err),
     };
+    let member_pids: HashSet<_> = cluster.members.iter().map(|member| member.0.id()).collect();
+    let worker_pids: HashSet<_> = cluster.workers.iter().map(|worker| worker.0.id()).collect();
+    if member_pids.len() != 3
+        || worker_pids.len() != 2
+        || worker_pids.contains(&std::process::id())
+        || !member_pids.is_disjoint(&worker_pids)
+    {
+        return fail(
+            row,
+            "independent worker processes",
+            "member/worker PID identity is not independent",
+        );
+    }
+    for worker in &mut cluster.workers {
+        match worker.0.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                return fail(row, "worker readiness", format!("worker exited {status}"));
+            }
+            Err(err) => return fail(row, "worker readiness", err.to_string()),
+        }
+    }
     let run = match cluster_start(
         cli,
         &cluster,
@@ -3037,11 +3613,13 @@ fn cluster_three_and_workers(cli: &Path, artifacts: &Path, row: &MatrixRow) -> C
         Err(err) => return fail(row, "cluster start", err),
     };
     match wait_inspect(cli, &cluster, &run, "pay-1", Duration::from_secs(20)) {
-        Ok(body) if body.contains("succeeded") => finish(
+        Ok(body) if inspect_succeeded(&body) => finish(
             row,
             "PASS",
             "3 fixture-member + 2 fixture-worker + production CLI",
-            body,
+            format!(
+                "member_pids={member_pids:?} worker_pids={worker_pids:?} run={run} inspect={body}"
+            ),
             vec![cluster.dir.clone()],
         ),
         Ok(body) | Err(body) => fail(row, "cluster inspect", body),
@@ -3810,16 +4388,29 @@ fn artifact_expect_request_digest(
     Ok(())
 }
 
+struct ReceiptExpectation<'a> {
+    command: &'a str,
+    operation: &'a str,
+    target: &'a str,
+    cluster: &'a str,
+    principal: &'a str,
+    version: u64,
+    run: Option<&'a str>,
+}
+
 fn artifact_receipt(
     receipt: &serde_json::Value,
-    command: &str,
-    operation: &str,
-    target: &str,
-    cluster: &str,
-    principal: &str,
-    version: u64,
-    run: Option<&str>,
+    expected: ReceiptExpectation<'_>,
 ) -> Result<(), String> {
+    let ReceiptExpectation {
+        command,
+        operation,
+        target,
+        cluster,
+        principal,
+        version,
+        run,
+    } = expected;
     let outcome = &receipt["outcome"];
     if receipt["format"] != "graphrun.command-result/v1"
         || receipt["key"]["cluster_id"] != cluster
@@ -3879,13 +4470,15 @@ fn artifact_published(
     };
     artifact_receipt(
         &receipts[0],
-        command,
-        operation,
-        &target,
-        cluster,
-        principal,
-        version,
-        None,
+        ReceiptExpectation {
+            command,
+            operation,
+            target: &target,
+            cluster,
+            principal,
+            version,
+            run: None,
+        },
     )?;
     Ok(receipts[0].clone())
 }
@@ -4157,13 +4750,15 @@ fn artifact_commands(
     )?;
     artifact_receipt(
         &receipt,
-        &start_id,
-        "start",
-        "artifact_proof/explicit-v1",
-        cluster,
-        principal,
-        1,
-        Some(&run),
+        ReceiptExpectation {
+            command: &start_id,
+            operation: "start",
+            target: "artifact_proof/explicit-v1",
+            cluster,
+            principal,
+            version: 1,
+            run: Some(&run),
+        },
     )?;
     let accepted_input: graphrun::Value =
         serde_json::from_slice(&fs::read(&fixture.input).map_err(|err| err.to_string())?)
@@ -4257,13 +4852,15 @@ fn artifact_commands(
     )?;
     artifact_receipt(
         &latest_receipt,
-        &latest_id,
-        "start",
-        "artifact_proof/latest-v2",
-        cluster,
-        principal,
-        2,
-        Some(&latest_run),
+        ReceiptExpectation {
+            command: &latest_id,
+            operation: "start",
+            target: "artifact_proof/latest-v2",
+            cluster,
+            principal,
+            version: 2,
+            run: Some(&latest_run),
+        },
     )?;
     let pinned_id = id();
     let pinned = artifact_command(
@@ -5163,7 +5760,7 @@ fn artifact_reject_corrupt_restore(
     )
     .map_err(|err| err.to_string())?;
     let dest = parent.join("corrupt-restored");
-    let restore = vec![
+    let restore = [
         "restore".into(),
         "--from".into(),
         corrupt_dir.display().to_string(),
@@ -5183,7 +5780,7 @@ fn artifact_reject_corrupt_restore(
     fs::create_dir_all(&missing).map_err(|err| err.to_string())?;
     fs::copy(export.join("manifest.json"), missing.join("manifest.json"))
         .map_err(|err| err.to_string())?;
-    let absent = vec![
+    let absent = [
         "restore".into(),
         "--from".into(),
         missing.display().to_string(),
@@ -6602,129 +7199,389 @@ fn spawn_provider(dir: &Path) -> Result<(ChildProc, String), String> {
     Ok((ChildProc::new(provider), url))
 }
 
-fn provider_idempotent_effect(artifacts: &Path, row: &MatrixRow) -> CaseResult {
-    let dir = artifacts.join(format!("{}-data", row.id));
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::create_dir_all(&dir);
-    let (_provider, url) = match spawn_provider(&dir) {
-        Ok(pair) => pair,
-        Err(err) => return fail(row, "fixture-provider", err),
-    };
-    let output = graphrun::Value::Object(
-        [(
-            "payment_id".to_owned(),
-            graphrun::Value::String("pay-1".to_owned()),
-        )]
-        .into_iter()
-        .collect(),
-    );
-    let first = match graphrun::provider::apply_effect(&url, "pay-key", "forward", &output) {
-        Ok(resp) => resp,
-        Err(err) => return fail(row, "provider apply", err.to_string()),
-    };
-    let second = match graphrun::provider::apply_effect(&url, "pay-key", "forward", &output) {
-        Ok(resp) => resp,
-        Err(err) => return fail(row, "provider retry", err.to_string()),
-    };
-    if first.logical != 1 || second.logical != 1 || second.physical != 2 {
-        return fail(
+fn provider_idempotent_effect(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
+    let result = (|| -> Result<(serde_json::Value, serde_json::Value, serde_json::Value, PathBuf), String> {
+        let provider_dir = artifacts.join("ACT-006-provider");
+        let (_provider, url) = spawn_provider(&provider_dir)?;
+        let mut cluster = boot_three(artifacts, row, 0)?;
+        let marker = cluster.dir.join("lost-first-inventory-result");
+        cluster.provider_url = Some(url.clone());
+        cluster.lost_result_marker = Some(marker.clone());
+        for i in 0..2 {
+            let worker = spawn_fixture_worker(&cluster, i)?;
+            cluster.workers.push(worker);
+        }
+        let run = cluster_start(
+            cli,
+            &cluster,
+            "sequence.yaml",
+            r#"{"order_id":"o1","amount":1000}"#,
+            false,
+        )?;
+        let view_text =
+            wait_nodes_succeeded(cli, &cluster, &run, [0, 1, 2], 2, Duration::from_secs(30))?;
+        let view: serde_json::Value =
+            serde_json::from_str(&view_text).map_err(|err| err.to_string())?;
+        if view["run"] != run
+            || view["status"] != "succeeded"
+            || view["output"]["order_id"] != "o1"
+            || view["output"]["amount"] != 1000
+            || view["output"]["payment_id"] != "pay-1"
+            || !marker.is_file()
+        {
+            return Err(format!("lost-result workflow did not finish correctly: {view}"));
+        }
+        let ledger = graphrun::provider::dump_ledger(&url).map_err(|err| err.to_string())?;
+        let entries = ledger["entries"]
+            .as_object()
+            .ok_or_else(|| format!("provider ledger is invalid: {ledger}"))?;
+        if entries.len() != 2
+            || !entries.values().any(|effect| {
+                effect["kind"] == "forward"
+                    && effect["physical"] == 2
+                    && effect["logical"] == 1
+                    && effect["status"] == "applied"
+                    && effect["output"]["reservation_id"] == "res-1"
+            })
+            || !entries.values().any(|effect| {
+                effect["kind"] == "forward"
+                    && effect["physical"] == 1
+                    && effect["logical"] == 1
+                    && effect["output"]["payment_id"] == "pay-1"
+            })
+        {
+            return Err(format!("worker retries did not preserve one logical effect: {ledger}"));
+        }
+        let args = cluster_connect(&cluster, 0, &["history", "--run", &run]);
+        let parts: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (ok, history_text, err) = run_cli(cli, &parts);
+        if !ok {
+            return Err(format!("cannot read committed history: {err}"));
+        }
+        let history: serde_json::Value =
+            serde_json::from_str(&history_text).map_err(|err| err.to_string())?;
+        if history["events"].as_array().is_none_or(Vec::is_empty) {
+            return Err(format!("workflow has no committed history: {history}"));
+        }
+        let observation = cluster.dir.join("provider-observation.json");
+        let worker_pids: Vec<u32> = cluster.workers.iter().map(|worker| worker.0.id()).collect();
+        fs::write(
+            &observation,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "run": run, "view": view, "history": history, "ledger": ledger,
+                "worker_pids": worker_pids, "lost_result_marker": marker,
+            }))
+            .map_err(|err| err.to_string())?,
+        )
+        .map_err(|err| err.to_string())?;
+        Ok((view, history, ledger, observation))
+    })();
+    match result {
+        Ok((view, history, ledger, observation)) => finish(
             row,
-            "provider ledger",
-            format!("first={first:?} second={second:?}"),
-        );
-    }
-    let undo = match graphrun::provider::apply_effect(
-        &url,
-        "pay-key:undo",
-        "compensate",
-        &graphrun::Value::Null,
-    ) {
-        Ok(resp) => resp,
-        Err(err) => return fail(row, "provider compensate", err.to_string()),
-    };
-    if undo.logical != 1 || undo.physical != 1 {
-        return fail(row, "provider compensate", format!("{undo:?}"));
-    }
-    finish(
-        row,
-        "PASS",
-        "fixture-provider HTTP ledger",
-        format!(
-            "physical={} logical={} undo_physical={}",
-            second.physical, second.logical, undo.physical
+            "PASS",
+            "release CLI three-voter run; independent fixture workers lose one provider acknowledgement and retry the same effect key",
+            format!(
+                "run={} committed_events={} provider={ledger}",
+                view["run"],
+                history["events"].as_array().map_or(0, Vec::len)
+            ),
+            vec![
+                observation.parent().unwrap().to_path_buf(),
+                artifacts
+                    .join("ACT-006-provider")
+                    .join("provider")
+                    .join("ledger.json"),
+                observation,
+            ],
         ),
-        vec![dir],
-    )
+        Err(err) => fail(row, "workflow-driven provider effect and retry", err),
+    }
 }
 
-fn provider_recon_outcomes(artifacts: &Path, row: &MatrixRow) -> CaseResult {
-    let dir = artifacts.join(format!("{}-recon", row.id));
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::create_dir_all(&dir);
-    let (_provider, url) = match spawn_provider(&dir) {
-        Ok(pair) => pair,
-        Err(err) => return fail(row, "fixture-provider", err),
-    };
-    let output = graphrun::Value::Object(
-        [("value".to_owned(), graphrun::Value::Int(2))]
-            .into_iter()
-            .collect(),
-    );
-    if let Err(err) = graphrun::provider::apply_effect(&url, "applied-key", "forward", &output) {
-        return fail(row, "apply applied-key", err.to_string());
-    }
-    if let Err(err) = graphrun::provider::set_effect(
-        &url,
-        "not-applied-key",
-        graphrun::provider::EffectStatus::NotApplied,
-    ) {
-        return fail(row, "set not_applied", err.to_string());
-    }
-    if let Err(err) = graphrun::provider::set_effect(
-        &url,
-        "unknown-key",
-        graphrun::provider::EffectStatus::Unknown,
-    ) {
-        return fail(row, "set unknown", err.to_string());
-    }
-    let applied = match graphrun::provider::probe_effect(&url, "applied-key") {
-        Ok(resp) => resp,
-        Err(err) => return fail(row, "probe applied", err.to_string()),
-    };
-    let not_applied = match graphrun::provider::probe_effect(&url, "not-applied-key") {
-        Ok(resp) => resp,
-        Err(err) => return fail(row, "probe not_applied", err.to_string()),
-    };
-    let unknown = match graphrun::provider::probe_effect(&url, "unknown-key") {
-        Ok(resp) => resp,
-        Err(err) => return fail(row, "probe unknown", err.to_string()),
-    };
-    if applied.status != graphrun::provider::EffectStatus::Applied
-        || not_applied.status != graphrun::provider::EffectStatus::NotApplied
-        || unknown.status != graphrun::provider::EffectStatus::Unknown
-    {
-        return fail(
+fn provider_recon_outcomes(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
+    const DEFINITION: &str = "dsl: graphrun/v1\nid: provider_reconciliation\nversion: 1\ninput_schema: order/v1\noutput_schema: reserved_order/v1\nstart: reserve\nnodes:\n  reserve:\n    kind: activity\n    activity: {name: inventory.reserve, version: 1}\n    input: {from: workflow.input}\n    next: finish\n  finish:\n    kind: complete\n    output: {from: nodes.reserve.output}\n";
+    let proof = (|| -> Result<(serde_json::Value, PathBuf), String> {
+        use graphrun::generated::{ClaimRequest, RegisterRequest};
+        use graphrun::ids::{ActivityKey, CommandId, ExecutionRole, WorkerSessionId};
+        use graphrun::tls::PeerRole;
+
+        let provider_dir = artifacts.join("ACT-005-provider");
+        let (_provider, url) = spawn_provider(&provider_dir)?;
+        let mut cluster = boot_three(artifacts, row, 0)?;
+        cluster.provider_url = Some(url.clone());
+        let mut catalog_json: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .map_err(|err| err.to_string())?;
+        let inventory = catalog_json["activities"]
+            .as_array_mut()
+            .ok_or("fixture catalog lacks activities")?
+            .iter_mut()
+            .find(|activity| activity["name"] == "inventory.reserve")
+            .ok_or("fixture catalog lacks inventory.reserve")?;
+        if inventory["recovery"] != "RetrySafe" {
+            return Err("fixture inventory recovery mode changed".to_owned());
+        }
+        inventory["recovery"] = serde_json::json!("Manual");
+        let fixture_catalog = cluster.dir.join("reconciliation-catalog.json");
+        fs::write(
+            &fixture_catalog,
+            serde_json::to_vec_pretty(&catalog_json).map_err(|err| err.to_string())?,
+        )
+        .map_err(|err| err.to_string())?;
+        cluster.catalog_path = Some(fixture_catalog);
+        let definition = cluster.dir.join("provider-reconciliation.yaml");
+        fs::write(&definition, DEFINITION).map_err(|err| err.to_string())?;
+        let mut runs = HashMap::new();
+        for label in ["applied", "not_applied", "unknown"] {
+            let input = format!(r#"{{"order_id":"{label}","amount":1000}}"#);
+            let run = cluster_start_definition(cli, &cluster, &definition, &input, false)?;
+            runs.insert(label, run);
+        }
+        let catalog = graphrun::Catalog::from_json(
+            &serde_json::to_vec(&catalog_json).map_err(|err| err.to_string())?,
+        )
+        .map_err(|err| err.to_string())?;
+        let tls = contract_identity(
+            &cluster.ca,
+            "reconciliation-fixture",
+            &[PeerRole::Worker],
+            &cluster.certs[0].2,
+        )?;
+        let rt = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
+        let claimed = rt.block_on(async {
+            let mut worker = contract_worker_client(&cluster, &tls).await?;
+            let session = WorkerSessionId::generate();
+            let capability = graphrun::worker_contract::capability_for(
+                &catalog,
+                &ActivityKey::new("inventory.reserve", 1),
+                ExecutionRole::Forward,
+            )
+            .map_err(|err| err.to_string())?;
+            let registered = worker
+                .register(RegisterRequest {
+                    session_id: session.to_hex(),
+                    capacity: 3,
+                    capabilities: vec![capability.to_wire()],
+                    principal_id: "reconciliation-fixture".to_owned(),
+                    protocol_min: graphrun::worker_contract::PROTOCOL_VERSION,
+                    protocol_max: graphrun::worker_contract::PROTOCOL_VERSION,
+                    command_id: CommandId::generate().to_hex(),
+                })
+                .await
+                .map_err(|err| err.to_string())?
+                .into_inner();
+            if !registered.error.is_empty() || registered.revision == 0 {
+                return Err(format!("signed worker registration failed: {registered:?}"));
+            }
+            let mut claims = HashMap::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+            while claims.len() < runs.len() && tokio::time::Instant::now() < deadline {
+                let batch = worker
+                    .claim(ClaimRequest {
+                        command_id: CommandId::generate().to_hex(),
+                        session_id: session.to_hex(),
+                        capacity: 3,
+                    })
+                    .await
+                    .map_err(|err| err.to_string())?
+                    .into_inner();
+                if !batch.error.is_empty() {
+                    return Err(format!("initial claim failed: {}", batch.error));
+                }
+                for assignment in batch.assignments {
+                    if assignment.role != "forward"
+                        || assignment.activity_name != "inventory.reserve"
+                        || !runs.values().any(|run| *run == assignment.run_id)
+                        || claims
+                            .insert(assignment.run_id.clone(), assignment)
+                            .is_some()
+                    {
+                        return Err(
+                            "initial claims are duplicated or not pinned to the three runs"
+                                .to_owned(),
+                        );
+                    }
+                }
+                if claims.len() < runs.len() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            if claims.len() != runs.len() {
+                return Err(format!(
+                    "claimed {} of {} forward effects",
+                    claims.len(),
+                    runs.len()
+                ));
+            }
+            Ok::<_, String>(claims)
+        })?;
+        let applied = claimed
+            .get(runs["applied"].as_str())
+            .ok_or("applied claim absent")?;
+        let unknown = claimed
+            .get(runs["unknown"].as_str())
+            .ok_or("unknown claim absent")?;
+        let effect = graphrun::provider::apply_effect(
+            &url,
+            &applied.effect_key,
+            "forward",
+            &graphrun::Value::Object(
+                [
+                    (
+                        "order_id".to_owned(),
+                        graphrun::Value::String("applied".to_owned()),
+                    ),
+                    ("amount".to_owned(), graphrun::Value::Int(1000)),
+                    (
+                        "reservation_id".to_owned(),
+                        graphrun::Value::String("res-1".to_owned()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+        if effect.status != graphrun::provider::EffectStatus::Applied
+            || effect.physical != 1
+            || effect.logical != 1
+        {
+            return Err(format!("applied effect was not durable: {effect:?}"));
+        }
+        graphrun::provider::hold_effect(&url, &unknown.effect_key)
+            .map_err(|err| err.to_string())?;
+        let worker = spawn_fixture_worker(&cluster, 0)?;
+        let worker_pid = worker.0.id();
+        cluster.workers.push(worker);
+        let mut histories = serde_json::Map::new();
+        let deadline = Instant::now() + Duration::from_secs(55);
+        loop {
+            histories.clear();
+            for (label, run) in &runs {
+                let args = cluster_connect(&cluster, 0, &["history", "--run", run]);
+                let parts: Vec<&str> = args.iter().map(String::as_str).collect();
+                let (ok, body, _) = run_cli_timeout(cli, &parts, Duration::from_secs(3));
+                if ok {
+                    let history: serde_json::Value =
+                        serde_json::from_str(&body).map_err(|err| err.to_string())?;
+                    if history["events"].as_array().is_some_and(|events| {
+                        events.iter().any(|event| {
+                            event["event"]["kind"] == "reconciliation_recorded"
+                                && event["event"]["outcome"] == *label
+                        })
+                    }) {
+                        histories.insert((*label).to_owned(), history);
+                    }
+                }
+            }
+            if histories.len() == runs.len() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out awaiting real provider reconciliation: {histories:?}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let mut views = serde_json::Map::new();
+        for label in ["applied", "not_applied"] {
+            let run = &runs[label];
+            let body =
+                wait_nodes_succeeded(cli, &cluster, run, [0, 1, 2], 2, Duration::from_secs(15))?;
+            let view: serde_json::Value =
+                serde_json::from_str(&body).map_err(|err| err.to_string())?;
+            if view["run"] != *run
+                || view["output"]["order_id"] != label
+                || view["output"]["reservation_id"] != "res-1"
+            {
+                return Err(format!(
+                    "{label} continuation differs from provider result: {view}"
+                ));
+            }
+            views.insert(label.to_owned(), view);
+        }
+        let blocked: serde_json::Value =
+            serde_json::from_str(&cluster_inspect(cli, &cluster, 0, &runs["unknown"]))
+                .map_err(|err| err.to_string())?;
+        if blocked["run"] != runs["unknown"] || blocked["status"] != "active" {
+            return Err(format!(
+                "Unknown reconciliation invented a terminal outcome: {blocked}"
+            ));
+        }
+        views.insert("unknown".to_owned(), blocked);
+        let ledger = graphrun::provider::dump_ledger(&url).map_err(|err| err.to_string())?;
+        let entries = ledger["entries"]
+            .as_object()
+            .ok_or_else(|| format!("invalid provider ledger: {ledger}"))?;
+        let not_applied = claimed
+            .get(runs["not_applied"].as_str())
+            .ok_or("not-applied claim absent")?;
+        if entries.len() != 2
+            || entries.get(&applied.effect_key).is_none_or(|entry| {
+                entry["physical"] != 1
+                    || entry["logical"] != 1
+                    || entry["output"]["order_id"] != "applied"
+            })
+            || entries.get(&not_applied.effect_key).is_none_or(|entry| {
+                entry["physical"] != 1
+                    || entry["logical"] != 1
+                    || entry["output"]["order_id"] != "not_applied"
+            })
+            || entries.contains_key(&unknown.effect_key)
+            || !ledger["holds"]
+                .as_array()
+                .is_some_and(|holds| holds.iter().any(|held| held == &unknown.effect_key))
+        {
+            return Err(format!(
+                "reconciliation produced unsupported provider effects: {ledger}"
+            ));
+        }
+        let observed = serde_json::json!({
+            "runs": runs, "views": views, "histories": histories,
+            "ledger": ledger,
+            "initial_claims": claimed.iter().map(|(run, claim)| (run.clone(), serde_json::json!({
+                "activation_id": claim.activation_id,
+                "effect_key": claim.effect_key,
+                "generation": claim.generation,
+                "role": claim.role,
+            }))).collect::<serde_json::Map<String, serde_json::Value>>(),
+            "worker_pid": worker_pid,
+        });
+        let path = cluster.dir.join("provider-reconciliation.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&observed).map_err(|err| err.to_string())?,
+        )
+        .map_err(|err| err.to_string())?;
+        Ok((observed, path))
+    })();
+    match proof {
+        Ok((observed, path)) => finish(
             row,
-            "provider recon statuses",
-            format!("applied={applied:?} not={not_applied:?} unknown={unknown:?}"),
-        );
-    }
-    finish(
-        row,
-        "PASS",
-        "fixture-provider Applied/NotApplied/Unknown probes",
-        format!(
-            "applied={:?} not_applied={:?} unknown={:?}",
-            applied.status, not_applied.status, unknown.status
+            "PASS",
+            "three real member processes, signed abandoned worker claims, independent worker reconciliation and provider ledger",
+            format!(
+                "Applied and NotApplied finished; Unknown stayed active; provider ledger={}",
+                observed["ledger"]
+            ),
+            vec![path],
         ),
-        vec![dir],
-    )
+        Err(err) => fail(
+            row,
+            "workflow-driven Applied/NotApplied/Unknown reconciliation",
+            err,
+        ),
+    }
 }
 
 fn provider_delayed_forward(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
     let dir = artifacts.join(format!("{}-delay", row.id));
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::create_dir_all(&dir);
+    if let Err(err) = fs::create_dir_all(&dir) {
+        return fail(row, "provider settlement directory", err.to_string());
+    }
     let (_provider, url) = match spawn_provider(&dir) {
         Ok(pair) => pair,
         Err(err) => return fail(row, "fixture-provider", err),
@@ -6733,12 +7590,22 @@ fn provider_delayed_forward(cli: &Path, artifacts: &Path, row: &MatrixRow) -> Ca
         return fail(row, "hold *", err.to_string());
     }
     let local = dir.join("local");
-    let _ = fs::create_dir_all(&local);
-    let mut serve = match Command::new(cli)
+    if let Err(err) = fs::create_dir_all(&local) {
+        return fail(row, "local store", err.to_string());
+    }
+    let log = dir.join("serve.log");
+    let log_file = match fs::File::create(&log) {
+        Ok(file) => file,
+        Err(err) => return fail(row, "local server log", err.to_string()),
+    };
+    let serve = match Command::new(cli)
         .args(["serve", "--local-dir", local.to_str().unwrap()])
         .env("GRAPHUN_PROVIDER_URL", &url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(match log_file.try_clone() {
+            Ok(file) => file,
+            Err(err) => return fail(row, "local server log", err.to_string()),
+        }))
+        .stderr(Stdio::from(log_file))
         .spawn()
     {
         Ok(child) => ChildProc::new(child),
@@ -6747,72 +7614,146 @@ fn provider_delayed_forward(cli: &Path, artifacts: &Path, row: &MatrixRow) -> Ca
     if !wait_path(&local.join("control.sock"), Duration::from_secs(10)) {
         return fail(row, "graphrun serve", "control socket missing");
     }
-    let input = dir.join("input.json");
-    let _ = fs::write(
-        &input,
-        r#"{"order_id":"o1","amount":1000,"fail_after_payment":true}"#,
-    );
-    let (ok, stdout, stderr) = run_cli(
-        cli,
-        &[
-            "start",
-            "--definition",
-            examples().join("saga.yaml").to_str().unwrap(),
-            "--catalog",
-            catalog().to_str().unwrap(),
-            "--input",
-            input.to_str().unwrap(),
-            "--local-dir",
-            local.to_str().unwrap(),
-            "--no-wait",
-        ],
-    );
-    if !ok {
-        terminate(&mut serve.0);
-        return fail(row, "start saga", format!("{stdout}\n{stderr}"));
-    }
-    std::thread::sleep(Duration::from_millis(1500));
-    let run = stdout
-        .split('"')
-        .skip_while(|part| *part != "run")
-        .nth(2)
-        .unwrap_or("")
-        .to_owned();
-    let (_, body, _) = run_cli(
-        cli,
-        &[
-            "inspect",
-            "--run",
-            &run,
-            "--local-dir",
-            local.to_str().unwrap(),
-        ],
-    );
-    let ledger = match graphrun::provider::dump_ledger(&url) {
-        Ok(value) => value,
-        Err(err) => {
-            terminate(&mut serve.0);
-            return fail(row, "dump ledger", err.to_string());
-        }
-    };
-    terminate(&mut serve.0);
-    let pending = body.contains("\"status\":\"active\"")
-        && !body.contains("\"status\":\"succeeded\"")
-        && ledger.to_string().contains("pending");
-    if !pending {
-        return fail(
-            row,
-            "delayed forward",
-            format!("inspect={body}\nledger={ledger}"),
+    let proof = (|| -> Result<(serde_json::Value, PathBuf), String> {
+        let input = dir.join("input.json");
+        fs::write(
+            &input,
+            r#"{"order_id":"o1","amount":1000,"fail_after_payment":true}"#,
+        )
+        .map_err(|err| err.to_string())?;
+        let (ok, stdout, stderr) = run_cli(
+            cli,
+            &[
+                "start",
+                "--definition",
+                examples().join("saga.yaml").to_str().unwrap(),
+                "--catalog",
+                catalog().to_str().unwrap(),
+                "--input",
+                input.to_str().unwrap(),
+                "--local-dir",
+                local.to_str().unwrap(),
+                "--no-wait",
+            ],
         );
+        if !ok {
+            return Err(format!("start saga: {stdout}\n{stderr}"));
+        }
+        let start: serde_json::Value =
+            serde_json::from_str(&stdout).map_err(|err| err.to_string())?;
+        let run = start["run"].as_str().ok_or("start did not return run ID")?;
+        graphrun::RunId::from_hex(run).map_err(|err| err.to_string())?;
+        let inspect = || -> Result<serde_json::Value, String> {
+            let (ok, body, err) = run_cli_timeout(
+                cli,
+                &[
+                    "inspect",
+                    "--run",
+                    run,
+                    "--local-dir",
+                    local.to_str().unwrap(),
+                ],
+                Duration::from_secs(3),
+            );
+            if !ok {
+                return Err(format!("inspect: {body}\n{err}"));
+            }
+            serde_json::from_str(&body).map_err(|err| err.to_string())
+        };
+        let pending_deadline = Instant::now() + Duration::from_secs(4);
+        let (before, pending) = loop {
+            let ledger = graphrun::provider::dump_ledger(&url).map_err(|err| err.to_string())?;
+            if ledger["entries"].as_object().is_some_and(|entries| {
+                entries.len() == 1
+                    && entries.values().any(|entry| {
+                        entry["status"] == "pending"
+                            && entry["physical"] == 1
+                            && entry["logical"] == 0
+                    })
+            }) {
+                let view = inspect()?;
+                if view["run"] != run
+                    || view["status"] != "active"
+                    || view["obligations"]
+                        .as_array()
+                        .is_none_or(|items| !items.is_empty())
+                {
+                    return Err(format!(
+                        "forward is unsettled but saga advanced: view={view} ledger={ledger}"
+                    ));
+                }
+                break (view, ledger);
+            }
+            if Instant::now() >= pending_deadline {
+                return Err(format!("forward never reached provider barrier: {ledger}"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        graphrun::provider::release_effect(&url, "*").map_err(|err| err.to_string())?;
+        let terminal_deadline = Instant::now() + Duration::from_secs(25);
+        let after = loop {
+            let view = inspect()?;
+            if view["status"] == "failed" && view["open_scopes"] == 0 {
+                break view;
+            }
+            if Instant::now() >= terminal_deadline {
+                return Err(format!("released provider never settled saga: {view}"));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let ledger = graphrun::provider::dump_ledger(&url).map_err(|err| err.to_string())?;
+        let entries = ledger["entries"]
+            .as_object()
+            .ok_or_else(|| format!("invalid settled ledger: {ledger}"))?;
+        let forward = entries
+            .values()
+            .filter(|entry| {
+                entry["kind"] == "forward" && entry["status"] == "applied" && entry["logical"] == 1
+            })
+            .count();
+        let undo = entries
+            .values()
+            .filter(|entry| {
+                entry["kind"] == "compensate"
+                    && entry["status"] == "applied"
+                    && entry["logical"] == 1
+            })
+            .count();
+        if forward != 2
+            || undo != 2
+            || entries.len() != 4
+            || after["error"]["code"] != "fixture.failed"
+        {
+            return Err(format!(
+                "released saga did not apply then undo both effects: view={after} ledger={ledger}"
+            ));
+        }
+        let observed = serde_json::json!({
+            "run": run, "before": before, "pending_ledger": pending,
+            "after": after, "settled_ledger": ledger,
+        });
+        let path = dir.join("settlement-observation.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&observed).map_err(|err| err.to_string())?,
+        )
+        .map_err(|err| err.to_string())?;
+        Ok((observed, path))
+    })();
+    drop(serve);
+    match proof {
+        Ok((observed, path)) => finish(
+            row,
+            "PASS",
+            "release CLI saga with a held provider request, barrier release, and independent durable effect ledger",
+            format!(
+                "no undo while pending; two forward effects and two compensations after release: {}",
+                observed["after"]
+            ),
+            vec![dir, path],
+        ),
+        Err(err) => fail(row, "pending provider forward and causal compensation", err),
     }
-    finish(
-        row,
-        "PASS",
-        "held provider blocks saga forward and undo",
-        format!("inspect={body} ledger={ledger}"),
-        vec![dir],
-    )
 }
 
 fn rust_builder_sequence(artifacts: &Path, row: &MatrixRow) -> CaseResult {
@@ -7284,6 +8225,7 @@ fn fixture_worker(
     cert: PathBuf,
     key: PathBuf,
     server_name: String,
+    catalog_path: Option<PathBuf>,
 ) -> ExitCode {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -7300,9 +8242,17 @@ fn fixture_worker(
                 return ExitCode::from(2);
             }
         };
-        let result = graphrun::Catalog::from_json(include_bytes!(
-            "../../docs/specs/v1/examples/activity-catalog.json"
-        ));
+        let bytes = match catalog_path {
+            Some(path) => match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    eprintln!("fixture worker catalog {}: {err}", path.display());
+                    return ExitCode::from(2);
+                }
+            },
+            None => include_bytes!("../../docs/specs/v1/examples/activity-catalog.json").to_vec(),
+        };
+        let result = graphrun::Catalog::from_json(&bytes);
         let result = match result {
             Ok(catalog) => {
                 graphrun::Worker::builder(endpoint, tls, catalog)
@@ -7413,13 +8363,15 @@ mod tests {
         let check = |receipt: &serde_json::Value| {
             artifact_receipt(
                 receipt,
-                "command",
-                "start",
-                "artifact_proof/explicit-v1",
-                "cluster-a",
-                "owner",
-                1,
-                Some("run"),
+                ReceiptExpectation {
+                    command: "command",
+                    operation: "start",
+                    target: "artifact_proof/explicit-v1",
+                    cluster: "cluster-a",
+                    principal: "owner",
+                    version: 1,
+                    run: Some("run"),
+                },
             )
         };
         assert!(check(&receipt).is_ok());
@@ -7616,6 +8568,7 @@ mod tests {
     fn context(run_dir: &Path) -> RunContext {
         RunContext {
             run_id: run_dir.file_name().unwrap().to_string_lossy().into_owned(),
+            cli_path: run_dir.join("cli"),
             source_sha256: "source-1".to_owned(),
             cli_sha256: "cli-1".to_owned(),
             cli_version: "0.1.test".to_owned(),
@@ -7671,6 +8624,98 @@ mod tests {
         assert_eq!(enforce_case(&rows[1], missing, &run_dir).status, "FAIL");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn contract_two_requires_two_fresh_executable_identities() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let run_dir = parent.path().join("run-current");
+        fs::create_dir(&run_dir).unwrap();
+        let current_path = parent.path().join("release-cli");
+        let old_path = run_dir.join("old-reader");
+        for (path, version) in [(&current_path, "new-v2"), (&old_path, "old-v1")] {
+            fs::write(path, format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n")).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let row = row("CONTRACT-002");
+        let mut context = context(&run_dir);
+        context.cli_path = current_path.clone();
+        context.cli_sha256 = hash_file(&current_path).unwrap();
+        context.source_sha256 = "c".repeat(64);
+        let mut case = passing_case(&row, &run_dir, &context);
+        let check = |case: &CaseResult| {
+            write_case(&run_dir, case).unwrap();
+            validate_coverage(
+                std::slice::from_ref(&row),
+                std::slice::from_ref(case),
+                &run_dir,
+                &context,
+            )
+        };
+        assert!(check(&case).unwrap_err().contains("requires both"));
+        let current_revision = context.source_sha256.clone();
+        let old_revision = if current_revision == "a".repeat(40) {
+            "b".repeat(40)
+        } else {
+            "a".repeat(40)
+        };
+        let old_build = run_dir.join("old-build.log");
+        let current_build = run_dir.join("current-build.log");
+        fs::write(&old_build, "built old reader from pinned commit").unwrap();
+        fs::write(&current_build, "built current CLI").unwrap();
+        case.artifacts.extend([
+            old_path.display().to_string(),
+            old_build.display().to_string(),
+            current_build.display().to_string(),
+        ]);
+        case.related_binaries = [
+            ("old_reader", &old_path, "old-v1", old_revision),
+            ("current_release", &current_path, "new-v2", current_revision),
+        ]
+        .into_iter()
+        .map(|(role, path, version, source_revision)| RelatedBinary {
+            role: role.to_owned(),
+            path: path.display().to_string(),
+            version: version.to_owned(),
+            source_revision,
+            sha256_before: hash_file(path).unwrap(),
+            sha256_after: hash_file(path).unwrap(),
+            build_log: if role == "old_reader" {
+                old_build.display().to_string()
+            } else {
+                current_build.display().to_string()
+            },
+            run_id: context.run_id.clone(),
+        })
+        .collect();
+        check(&case).unwrap();
+
+        let mut same_binary = case.clone();
+        same_binary.related_binaries[0].sha256_before = context.cli_sha256.clone();
+        same_binary.related_binaries[0].sha256_after = context.cli_sha256.clone();
+        assert!(check(&same_binary).unwrap_err().contains("not distinct"));
+        let mut stale_run = case.clone();
+        stale_run.related_binaries[0].run_id = "run-old".to_owned();
+        assert!(check(&stale_run).unwrap_err().contains("stale"));
+        let mut outside = case.clone();
+        outside.related_binaries[0].path = current_path.display().to_string();
+        assert!(check(&outside).unwrap_err().contains("built in this run"));
+        let mut wrong_version = case.clone();
+        wrong_version.related_binaries[0].version = "forged-v9".to_owned();
+        assert!(check(&wrong_version).unwrap_err().contains("version"));
+        let mut missing_build = case.clone();
+        missing_build
+            .artifacts
+            .retain(|artifact| artifact != &old_build.display().to_string());
+        assert!(check(&missing_build).unwrap_err().contains("stale"));
+        let mut wrong_revision = case.clone();
+        wrong_revision.related_binaries[0].source_revision = "z".repeat(40);
+        assert!(check(&wrong_revision).unwrap_err().contains("stale"));
+        fs::write(&old_path, "tampered after proof").unwrap();
+        assert!(check(&case).unwrap_err().contains("stale"));
+    }
+
     #[test]
     fn test_evidence_requires_executed_pass_and_successful_exit() {
         let log = PathBuf::from("current-suite.log");
@@ -7682,6 +8727,16 @@ mod tests {
         let failed_exit =
             TestSuite::from_output("cargo test".to_owned(), log.clone(), good, false, 1);
         assert!(!failed_exit.passed("domain::tests::required"));
+        let hidden_ignored = TestSuite::from_output(
+            "cargo test".to_owned(),
+            log.clone(),
+            "running 2 tests\ntest domain::tests::required ... ok\n\
+             test domain::tests::other ... ignored\n\
+             test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\n",
+            true,
+            1,
+        );
+        assert!(!hidden_ignored.success);
         let ignored = TestSuite::from_output(
             "cargo test".to_owned(),
             log.clone(),

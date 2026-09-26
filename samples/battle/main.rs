@@ -634,7 +634,7 @@ fn build_cases(catalog: &Catalog) -> Vec<Case> {
     // Fill remaining slots with sequence variants so we have 500.
     let mut extra = 0;
     while out.len() < 500 {
-        let start = (extra % 17) as i64;
+        let start = extra % 17;
         let len = 1 + (extra % 9);
         let id = format!("pad-seq-{extra}");
         let mut w = workflow::<Counter>(id.clone());

@@ -3063,7 +3063,6 @@ nodes:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "applies 20_000 raft entries (~4 min)"]
     async fn snapshot_controller_fires_at_20000_entries() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::local(dir.path()).await.unwrap();

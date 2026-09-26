@@ -87,5 +87,6 @@ CONTRACT-002	REQ-DURABILITY	storage	Format compatibility and indexed history	Rea
 CONTRACT-003	REQ-CLUSTER	protocol	Authenticated worker capability and signed principal	Only signed same-cluster principal/role and pinned capability/roster admit authorized assignments and results, including dedup/cache paths
 GATE-001	REQ-E2E	unit	Fresh case evidence and complete report	Every expected ID occurs once with matching invocation/source/binary, existing in-run artifacts, and passing executed tests
 GATE-002	REQ-E2E	unit	Verification status and certification	Functional failure/blocked/ignored/stale evidence exits nonzero; only measured PERF hardware blocker passes normal mode with release_certified false, strict mode fails
+GATE-003	REQ-E2E	e2e	Release CLI excludes fault controls and executes with independent workers	A separately built release CLI matches the verified binary, ignores verification fault injection, and executes with separately identified worker processes
 PERF-001	REQ-E2E	performance	Command/compile/local-ready targets	Reference workload measurements are recorded and targets pass or are explicitly blocked
 PERF-002	REQ-E2E	performance	History, nesting, concurrency, and snapshot cost	Resource growth and configured limits are measured on representative retained state
