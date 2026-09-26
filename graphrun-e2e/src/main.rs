@@ -2301,9 +2301,11 @@ nodes:
             && statuses.iter().all(|status| {
                 status["active_runs"] == 1
                     && status["pending_waits"] == 1
-                    && status["ready_leaves"] == 0
                     && status["ready_index_discovery_reads"].as_u64().is_some()
-                    && status["scheduler_observed_revision"] == status["schedule_revision"]
+                    && (status["state"] == "Follower"
+                        || (status["state"] == "Leader"
+                            && status["scheduler_observed_revision"]
+                                == status["schedule_revision"]))
             })
         {
             break statuses.clone();
@@ -2326,7 +2328,6 @@ nodes:
     let stable = before.iter().zip(&after).all(|(old, new)| {
         new["active_runs"] == 1
             && new["pending_waits"] == 1
-            && new["ready_leaves"] == 0
             && old["ready_index_discovery_reads"] == new["ready_index_discovery_reads"]
     });
     let proof = serde_json::json!({

@@ -3,7 +3,7 @@ use crate::catalog::{Catalog, ExecutionKind};
 use crate::error::{Error, ErrorKind, Result};
 use crate::generated::{
     Assignment, ClaimRequest, ReconcileRequest, RegisterRequest, RenewRequest, RenewSessionRequest,
-    ReportRequest, WatchReadyRequest, worker_client::WorkerClient,
+    ReportRequest, WatchReadyRequest, WatchReadyResponse, worker_client::WorkerClient,
 };
 use crate::ids::{
     ActivationId, ActivityKey, CommandId, ExecutionRole, RunId, ScopeId, WorkerSessionId,
@@ -22,12 +22,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tonic::transport::{Channel, Endpoint};
 
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<Outcome>> + Send>>;
 type Handler = Arc<dyn Fn(Value, HandlerContext) -> HandlerFuture + Send + Sync>;
 type HandlerKey = (String, u32, &'static str);
+
+struct ReadyWatch(JoinHandle<std::result::Result<WatchReadyResponse, tonic::Status>>);
+
+impl Drop for ReadyWatch {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActivityError {
@@ -916,6 +924,7 @@ impl Worker {
     /// Run until the shutdown future completes, then stop claiming and drain running handlers.
     pub async fn run_until<F: Future<Output = ()>>(mut self, shutdown: F) -> Result<()> {
         let mut watcher = self.client.clone();
+        let mut ready_watch: Option<ReadyWatch> = None;
         let mut active: BTreeMap<String, Active> = BTreeMap::new();
         let mut tasks: JoinSet<(String, Result<Outcome>)> = JoinSet::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
@@ -932,6 +941,24 @@ impl Worker {
             if draining && active.is_empty() {
                 return Ok(());
             }
+            if !draining
+                && pending_claim.is_none()
+                && active.len() < self.capacity as usize
+                && ready_watch.is_none()
+            {
+                let mut client = watcher.clone();
+                let request = WatchReadyRequest {
+                    session_id: self.session.to_hex(),
+                    generation,
+                    cursor,
+                };
+                ready_watch = Some(ReadyWatch(tokio::spawn(async move {
+                    client
+                        .watch_ready(request)
+                        .await
+                        .map(|response| response.into_inner())
+                })));
+            }
             tokio::select! {
                 _ = clock_tick.tick() => {
                     if let Err(err) = self.clock.check() {
@@ -943,6 +970,7 @@ impl Worker {
                 }
                 _ = &mut shutdown, if !draining => {
                     draining = true;
+                    ready_watch = None;
                     for claim in active.values() {
                         claim.cancelled.store(true, Ordering::SeqCst);
                     }
@@ -971,6 +999,7 @@ impl Worker {
                             }
                             self.rotate_endpoint(&err)?;
                             watcher = self.client.clone();
+                            ready_watch = None;
                             generation = 0;
                             cursor = 0;
                             continue;
@@ -1016,6 +1045,7 @@ impl Worker {
                                 tracing::warn!(activation = %claim.assignment.activation_id, "claim renewal uncertain; retrying same command");
                                 self.rotate_endpoint(&err)?;
                                 watcher = self.client.clone();
+                                ready_watch = None;
                                 generation = 0;
                                 cursor = 0;
                             }
@@ -1023,7 +1053,13 @@ impl Worker {
                         }
                     }
                     let completed: Vec<_> = active.iter().filter(|(_,claim)| claim.outcome.is_some() && claim.renew_id.is_none()).map(|(id,_)| id.clone()).collect();
-                    for id in completed { self.report(&id, &mut active).await?; }
+                    if !completed.is_empty() {
+                        for id in completed { self.report(&id, &mut active).await?; }
+                        watcher = self.client.clone();
+                        ready_watch = None;
+                        generation = 0;
+                        cursor = 0;
+                    }
                 }
                 result = tasks.join_next(), if !tasks.is_empty() => {
                     let (id, result) = result.expect("join set nonempty").map_err(|err| Error::invalid(format!("worker handler task panicked: {err}")))?;
@@ -1032,7 +1068,13 @@ impl Worker {
                         Ok(outcome) => outcome,
                         Err(err) => Outcome::Failure(ActivityError::new("worker.handler_error", err.to_string())),
                     });
-                    if claim.renew_id.is_none() { self.report(&id, &mut active).await?; }
+                    if claim.renew_id.is_none() {
+                        self.report(&id, &mut active).await?;
+                        watcher = self.client.clone();
+                        ready_watch = None;
+                        generation = 0;
+                        cursor = 0;
+                    }
                 }
                 claim = async {
                     let (id, capacity) = pending_claim.expect("enabled claim branch");
@@ -1058,6 +1100,7 @@ impl Worker {
                         Err(err) if uncertain_rpc(&err) => {
                             self.rotate_endpoint(&err)?;
                             watcher = self.client.clone();
+                            ready_watch = None;
                             generation = 0;
                             cursor = 0;
                             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1065,12 +1108,15 @@ impl Worker {
                         Err(err) => return Err(rpc_error(err)),
                     }
                 }
-                watch = watcher.watch_ready(WatchReadyRequest {
-                    session_id: self.session.to_hex(), generation, cursor,
-                }), if !draining && pending_claim.is_none() && active.len() < self.capacity as usize => {
+                watch = async {
+                    (&mut ready_watch.as_mut().expect("enabled ready watch").0).await
+                }, if ready_watch.is_some() && !draining && pending_claim.is_none() && active.len() < self.capacity as usize => {
+                    let watch = watch.map_err(|err| {
+                        Error::new(ErrorKind::Unavailable, format!("ready watch task stopped: {err}"))
+                    })?;
+                    ready_watch = None;
                     match watch {
                         Ok(response) => {
-                            let response = response.into_inner();
                             generation = response.generation;
                             cursor = response.cursor;
                             if !response.ready { continue; }
