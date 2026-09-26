@@ -1,23 +1,15 @@
-error[E0277]: the trait bound `ValueRef<Order>: IntoInput<ReservedOrder>` is not satisfied
-  --> tests/ui/fail/wrong_activity_input.rs:45:46
+error[E0308]: mismatched types
+  --> tests/ui/fail/wrong_activity_input.rs:44:74
    |
-45 |     let _ = root.activity("charge", &charge, root.input());
-   |                  --------                    ^^^^^^^^^^^^ the trait `IntoInput<ReservedOrder>` is not implemented for `ValueRef<Order>`
-   |                  |
-   |                  required by a bound introduced by this call
+44 |     let _ = workflow::<Order>("wrong_activity_input").activity("charge", &charge);
+   |                                                       --------           ^^^^^^^ expected `&ActivityRef<Order, _>`, found `&ActivityRef<ReservedOrder, Receipt>`
+   |                                                       |
+   |                                                       arguments to this method are incorrect
    |
-help: the trait `IntoInput<ReservedOrder>` is not implemented for `ValueRef<Order>`
-      but trait `IntoInput<Order>` is implemented for it
-  --> src/builder.rs
+   = note: expected reference `&ActivityRef<Order, _>`
+              found reference `&ActivityRef<ReservedOrder, Receipt>`
+note: method defined here
+  --> src/flow.rs
    |
-   | impl<T> IntoInput<T> for ValueRef<T> {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = help: for that trait implementation, expected `Order`, found `ReservedOrder`
-note: required by a bound in `RegionBuilder::<I>::activity`
-  --> src/builder.rs
-   |
-   |     pub fn activity<A, B>(
-   |            -------- required by a bound in this associated function
-...
-   |         input: impl IntoInput<A>,
-   |                     ^^^^^^^^^^^^ required by this bound in `RegionBuilder::<I>::activity`
+   |     pub fn activity<O: DurablePayload>(
+   |            ^^^^^^^^

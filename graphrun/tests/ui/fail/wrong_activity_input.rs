@@ -1,6 +1,6 @@
-use graphrun::builder::RegionBuilder;
 use graphrun::catalog::Catalog;
 use graphrun::schema::{DurablePayload, SchemaRef};
+use graphrun::workflow;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -41,6 +41,5 @@ impl DurablePayload for Receipt {
 fn main() {
     let catalog = Catalog::from_json(include_bytes!("../../../../docs/specs/v1/examples/activity-catalog.json")).unwrap();
     let charge = catalog.activity_ref::<ReservedOrder, Receipt>("payment.charge", 1).unwrap();
-    let mut root = RegionBuilder::<Order>::new();
-    let _ = root.activity("charge", &charge, root.input());
+    let _ = workflow::<Order>("wrong_activity_input").activity("charge", &charge);
 }

@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/fail/wrong_compensation_input.rs:9:28
+  |
+9 |     root.compensate(&node, undo).unwrap();
+  |          ----------        ^^^^ expected `&ActivityRef<i64, _>`, found `&ActivityRef<String, String>`
+  |          |
+  |          arguments to this method are incorrect
+  |
+  = note: expected reference `&ActivityRef<i64, _>`
+             found reference `&ActivityRef<std::string::String, std::string::String>`
+note: method defined here
+ --> src/builder.rs
+  |
+  |     pub fn compensate<O, U>(
+  |            ^^^^^^^^^^
