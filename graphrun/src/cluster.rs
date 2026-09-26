@@ -2202,10 +2202,20 @@ nodes:
         let _ = client
             .reconcile(send_recon(not_a, &session.to_hex(), "not_applied", None))
             .await;
-        for _ in 0..3 {
-            let _ = client
+        let accepted = client
+            .reconcile(send_recon(unk_a, &session.to_hex(), "unknown", None))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(accepted.error.is_empty());
+        for _ in 0..2 {
+            match client
                 .reconcile(send_recon(unk_a, &session.to_hex(), "unknown", None))
-                .await;
+                .await
+            {
+                Ok(response) => assert!(!response.into_inner().error.is_empty()),
+                Err(status) => assert_eq!(status.code(), tonic::Code::FailedPrecondition),
+            }
         }
         let worker = tokio::spawn(Engine::run_worker(format!("https://{addr}"), tls));
         let applied_out = engine
@@ -2222,7 +2232,25 @@ nodes:
             Some("pay-1")
         );
         let state = engine.inspect(unknown).await.unwrap();
-        assert!(!state.interventions.is_empty());
+        assert_eq!(
+            state.history[&unknown]
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    crate::domain::DomainEvent::ReconciliationRecorded {
+                        outcome: crate::domain::ReconcileOutcome::Unknown,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(!state.interventions.iter().any(|(id, _)| {
+            state
+                .activations
+                .get(id)
+                .is_some_and(|act| act.run == unknown)
+        }));
         let not_out = engine
             .wait_terminal(not_applied, Duration::from_secs(15))
             .await
