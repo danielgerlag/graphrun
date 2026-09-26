@@ -26,13 +26,13 @@ use crate::write::{
     admit_unapplied, inspect_view, linearizable_read, now, write_raft, write_raft_response,
 };
 use openraft::raft::AppendEntriesRequest;
-use openraft::{Raft, ServerState};
+use openraft::{Raft, RaftLogId, ServerState};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 #[cfg(any(test, feature = "fault-injection"))]
 use std::sync::{LazyLock, Mutex};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
@@ -97,6 +97,8 @@ pub struct GraphServices {
     genesis_members: BTreeMap<u64, SocketAddr>,
     network: ClusterNetwork,
     node_id: u64,
+    decode_slots: Arc<Semaphore>,
+    control_decode_slots: Arc<Semaphore>,
 }
 
 impl GraphServices {
@@ -119,6 +121,8 @@ impl GraphServices {
             genesis_members,
             network,
             node_id,
+            decode_slots: Arc::new(Semaphore::new(8)),
+            control_decode_slots: Arc::new(Semaphore::new(4)),
         }
     }
 
@@ -313,6 +317,20 @@ impl RaftSvc for GraphServices {
     async fn append_entries(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
         self.member_context(&request, request.get_ref().sender_id)
             .await?;
+        let slots = if request.get_ref().json.len() <= 4 * 1024 {
+            self.control_decode_slots.clone()
+        } else {
+            self.decode_slots.clone()
+        };
+        let _decode = slots
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("Raft decode admission stopped"))?;
+        if request.get_ref().json.len() > 8 * 1024 * 1024 {
+            return Err(Status::resource_exhausted(
+                "Raft append exceeds the 8 MiB envelope",
+            ));
+        }
         let rpc: AppendEntriesRequest<TypeConfig> = serde_json::from_slice(&request.get_ref().json)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         if rpc.vote.leader_id.voted_for() != Some(request.get_ref().sender_id) {
@@ -321,27 +339,26 @@ impl RaftSvc for GraphServices {
             ));
         }
         if !rpc.entries.is_empty() {
-            let metrics = self.raft.metrics().borrow().clone();
-            let last_log = metrics.last_log_index.unwrap_or(0);
-            let applied = metrics.last_applied.map(|id| id.index).unwrap_or(0);
-            let incoming = rpc.entries.len() as u64;
-            let incoming_bytes: u64 = rpc
+            if rpc.entries.len() > 4 {
+                return Err(Status::resource_exhausted(
+                    "Raft replication batch exceeds four entries",
+                ));
+            }
+            let entries = rpc
                 .entries
                 .iter()
                 .map(|entry| {
                     serde_json::to_vec(entry)
-                        .map(|bytes| bytes.len() as u64)
-                        .unwrap_or(0)
+                        .map(|bytes| (entry.get_log_id().index, bytes.len() as u64))
+                        .map_err(|err| Status::internal(format!("Raft entry encoding: {err}")))
                 })
-                .sum();
-            let pending = last_log.saturating_sub(applied);
-            admit_unapplied(
-                pending.saturating_add(incoming),
-                pending
-                    .saturating_add(1)
-                    .saturating_mul(incoming_bytes.max(1)),
-            )
-            .map_err(|err| Status::resource_exhausted(err.to_string()))?;
+                .collect::<Result<Vec<_>, _>>()?;
+            let (entries, bytes) = self
+                .storage
+                .projected_append_usage(entries)
+                .await
+                .map_err(status_error)?;
+            admit_unapplied(u64::from(entries), bytes).map_err(status_error)?;
         }
         let resp = self
             .raft
@@ -357,6 +374,12 @@ impl RaftSvc for GraphServices {
     async fn vote(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
         self.member_context(&request, request.get_ref().sender_id)
             .await?;
+        let _decode = self
+            .control_decode_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("Raft decode admission stopped"))?;
         let rpc: openraft::raft::VoteRequest<u64> = serde_json::from_slice(&request.get_ref().json)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         if rpc.vote.leader_id.voted_for() != Some(request.get_ref().sender_id) {
@@ -378,6 +401,17 @@ impl RaftSvc for GraphServices {
     async fn install_snapshot(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
         self.member_context(&request, request.get_ref().sender_id)
             .await?;
+        if request.get_ref().json.len() > 8 * 1024 * 1024 {
+            return Err(Status::resource_exhausted(
+                "Raft snapshot chunk exceeds the 8 MiB envelope",
+            ));
+        }
+        let _decode = self
+            .decode_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("Raft decode admission stopped"))?;
         let rpc: openraft::raft::InstallSnapshotRequest<TypeConfig> =
             serde_json::from_slice(&request.get_ref().json)
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -861,13 +895,20 @@ impl WorkerSvc for GraphServices {
         self.worker_session(&request, session).await?;
         let req = request.into_inner();
         let mut metrics = self.raft.metrics();
+        let mut changes = self.storage.subscribe_schedule();
         let previous = (req.generation, req.cursor);
         loop {
+            self.require_leader()?;
             let observed = metrics.borrow().clone();
             let generation = observed.current_term;
-            let cursor = observed.last_applied.map(|id| id.index).unwrap_or(0);
-            let state = self.storage.query_state().await;
-            let ready = worker_has_ready(&state, session, now()).map_err(status_error)?;
+            let view = self.storage.schedule_view().await.map_err(status_error)?;
+            let cursor = view.revision;
+            let ready = if view.runs.iter().any(|(_, row)| row.ready) {
+                let state = self.storage.query_state().await;
+                worker_has_ready(&state, session, now()).map_err(status_error)?
+            } else {
+                false
+            };
             let resync =
                 req.generation != 0 && (generation != req.generation || cursor != req.cursor);
             if ready || resync || (generation, cursor) != previous {
@@ -878,16 +919,26 @@ impl WorkerSvc for GraphServices {
                     resync,
                 }));
             }
-            if tokio::time::timeout(std::time::Duration::from_secs(15), metrics.changed())
-                .await
-                .is_err()
-            {
-                return Ok(Response::new(WatchReadyResponse {
-                    generation,
-                    cursor,
-                    ready: false,
-                    resync: false,
-                }));
+            loop {
+                if *changes.borrow() != cursor {
+                    break;
+                }
+                tokio::select! {
+                    change = changes.changed() => {
+                        change.map_err(|_| Status::unavailable("storage schedule stopped"))?;
+                        self.storage.record_schedule_wake(crate::storage::ScheduleWake::Worker);
+                        break;
+                    }
+                    change = metrics.changed() => {
+                        change.map_err(|_| Status::unavailable("Raft metrics stopped"))?;
+                        let current = metrics.borrow();
+                        if current.current_term != generation
+                            || current.state != openraft::ServerState::Leader
+                        {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1240,7 +1291,11 @@ pub async fn serve_grpc(
     Server::builder()
         .tls_config(tls_config)
         .map_err(|err| crate::error::Error::invalid(err.to_string()))?
-        .add_service(RaftServer::new(svc.clone()))
+        .add_service(
+            RaftServer::new(svc.clone())
+                .max_decoding_message_size(8 * 1024 * 1024)
+                .max_encoding_message_size(8 * 1024 * 1024),
+        )
         .add_service(ClientServer::new(svc.clone()))
         .add_service(WorkerServer::new(svc))
         .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener))

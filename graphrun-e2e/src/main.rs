@@ -36,6 +36,12 @@ enum Commands {
         #[arg(long)]
         artifacts: PathBuf,
     },
+    SmokeQuiescence {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
     Verify {
         #[arg(long)]
         cli: PathBuf,
@@ -123,7 +129,12 @@ struct PerformanceEvidence {
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Commands::SmokeCluster { cli, artifacts } => smoke_cluster(&cli, &artifacts),
+        Commands::SmokeCluster { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "CLUSTER-001", cluster_three_and_workers)
+        }
+        Commands::SmokeQuiescence { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "E2E-002", e2e_no_ready_scan)
+        }
         Commands::Verify {
             cli,
             matrix,
@@ -164,23 +175,28 @@ fn main() -> ExitCode {
     }
 }
 
-fn smoke_cluster(cli: &Path, artifacts: &Path) -> ExitCode {
+fn smoke_case(
+    cli: &Path,
+    artifacts: &Path,
+    case_id: &str,
+    run: fn(&Path, &Path, &MatrixRow) -> CaseResult,
+) -> ExitCode {
     if let Err(error) = fs::create_dir_all(artifacts) {
-        eprintln!("cannot create cluster smoke artifacts: {error}");
+        eprintln!("cannot create smoke artifacts: {error}");
         return ExitCode::from(2);
     }
     let matrix = match parse_matrix(include_str!("../../docs/specs/v1/verification-matrix.tsv")) {
         Ok(matrix) => matrix,
         Err(error) => {
-            eprintln!("cannot load cluster smoke case: {error}");
+            eprintln!("cannot load smoke case: {error}");
             return ExitCode::from(2);
         }
     };
-    let Some(row) = matrix.into_iter().find(|row| row.id == "CLUSTER-001") else {
-        eprintln!("CLUSTER-001 case missing from verification matrix");
+    let Some(row) = matrix.into_iter().find(|row| row.id == case_id) else {
+        eprintln!("{case_id} case missing from verification matrix");
         return ExitCode::from(2);
     };
-    let result = cluster_three_and_workers(cli, artifacts, &row);
+    let result = run(cli, artifacts, &row);
     println!(
         "{}",
         serde_json::json!({
@@ -1201,7 +1217,7 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             row,
             &[
                 "storage::tests::unapplied_credits_bound_append_without_truncating_reads",
-                "write::tests::unapplied_credits_reject_at_limit",
+                "write::tests::unapplied_credits_reject_above_limit",
             ],
         ),
         "STORE-007" => all_of(
@@ -2214,68 +2230,125 @@ fn e2e_report_complete(
     )
 }
 
-fn e2e_no_ready_scan(_cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
-    let dir = artifacts.join(format!("{}-data", row.id));
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::create_dir_all(&dir);
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(err) => return fail(row, "tokio runtime", err.to_string()),
+fn cluster_local_health(
+    cli: &Path,
+    cluster: &LiveCluster,
+    node: usize,
+) -> Result<serde_json::Value, String> {
+    let member_dir = cluster.dir.join(format!("m{}", node + 1));
+    let (ok, body, error) = run_cli_timeout(
+        cli,
+        &[
+            "cluster",
+            "health",
+            "--local-dir",
+            member_dir
+                .to_str()
+                .ok_or_else(|| "member directory is not UTF-8".to_owned())?,
+        ],
+        Duration::from_secs(5),
+    );
+    if !ok {
+        return Err(format!(
+            "member {} health failed: {body}\n{error}",
+            node + 1
+        ));
+    }
+    serde_json::from_str(&body).map_err(|err| format!("member {} health: {err}", node + 1))
+}
+
+fn e2e_no_ready_scan(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
+    let cluster = match boot_three(artifacts, row, 2) {
+        Ok(cluster) => cluster,
+        Err(error) => return fail(row, "boot three voting members", error),
     };
-    rt.block_on(async {
-        let engine = match graphrun::Engine::local(&dir).await {
-            Ok(engine) => engine,
-            Err(err) => return fail(row, "Engine::local", err.to_string()),
-        };
-        let catalog = match graphrun::Catalog::from_json(include_bytes!(
-            "../../docs/specs/v1/examples/activity-catalog.json"
-        )) {
-            Ok(catalog) => catalog,
-            Err(err) => return fail(row, "catalog", err.to_string()),
-        };
-        let yaml = include_str!("../../docs/specs/v1/examples/sequence.yaml");
-        let input = graphrun::Value::Object(
-            [
-                (
-                    "order_id".to_owned(),
-                    graphrun::Value::String("o1".to_owned()),
-                ),
-                ("amount".to_owned(), graphrun::Value::Int(1000)),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        match engine.start_yaml(yaml, &catalog, input).await {
-            Ok(run) => {
-                if let Err(err) = engine.wait_terminal(run, Duration::from_secs(20)).await {
-                    let _ = engine.shutdown().await;
-                    return fail(row, "wait_terminal", err.to_string());
-                }
-            }
-            Err(err) => {
-                let _ = engine.shutdown().await;
-                return fail(row, "start_yaml", err.to_string());
-            }
+    let definition = cluster.dir.join("quiescent-wait.yaml");
+    if let Err(error) = fs::write(
+        &definition,
+        "\
+dsl: graphrun/v1
+id: quiescent_wait
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+signals:
+  continue: {schema: unit/v1}
+start: pause
+nodes:
+  pause:
+    kind: wait_signal
+    signal: continue
+    key: {literal: k1}
+    timeout: null
+    next: finish
+  finish:
+    kind: complete
+    output: {literal: null}
+",
+    ) {
+        return fail(row, "write wait definition", error.to_string());
+    }
+    let run = match cluster_start(cli, &cluster, &definition.to_string_lossy(), "null", false) {
+        Ok(run) => run,
+        Err(error) => return fail(row, "start indefinite wait", error),
+    };
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let before = loop {
+        let statuses: Result<Vec<_>, _> = (0..3)
+            .map(|node| cluster_local_health(cli, &cluster, node))
+            .collect();
+        if let Ok(statuses) = &statuses
+            && statuses.iter().all(|status| {
+                status["active_runs"] == 1
+                    && status["pending_waits"] == 1
+                    && status["ready_leaves"] == 0
+                    && status["ready_index_discovery_reads"].as_u64().is_some()
+                    && status["scheduler_observed_revision"] == status["schedule_revision"]
+            })
+        {
+            break statuses.clone();
         }
-        let before = graphrun::domain::READY_SCANS.load(std::sync::atomic::Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        let after = graphrun::domain::READY_SCANS.load(std::sync::atomic::Ordering::Relaxed);
-        let _ = engine.shutdown().await;
-        if after != before {
-            return fail(
-                row,
-                "60s quiescent ready-index",
-                format!("READY_SCANS grew from {before} to {after}"),
-            );
+        if Instant::now() >= deadline {
+            return fail(row, "three-member active wait", format!("{statuses:?}"));
         }
-        finish(
-            row,
-            "PASS",
-            "60s quiescent observation after Engine::local sequence",
-            format!("READY_SCANS stayed {after}"),
-            vec![dir],
-        )
-    })
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let started = Instant::now();
+    std::thread::sleep(Duration::from_secs(60));
+    let after: Vec<_> = match (0..3)
+        .map(|node| cluster_local_health(cli, &cluster, node))
+        .collect::<Result<_, _>>()
+    {
+        Ok(after) => after,
+        Err(error) => return fail(row, "three-member final health", error),
+    };
+    let elapsed = started.elapsed();
+    let stable = before.iter().zip(&after).all(|(old, new)| {
+        new["active_runs"] == 1
+            && new["pending_waits"] == 1
+            && new["ready_leaves"] == 0
+            && old["ready_index_discovery_reads"] == new["ready_index_discovery_reads"]
+    });
+    let proof = serde_json::json!({
+        "run": run,
+        "elapsed_ms": elapsed.as_millis(),
+        "before": before,
+        "after": after,
+    });
+    let path = cluster.dir.join("quiescent-read-counts.json");
+    if let Err(error) = fs::write(&path, proof.to_string()) {
+        return fail(row, "write read-count evidence", error.to_string());
+    }
+    if !stable || elapsed < Duration::from_secs(60) {
+        return fail(row, "60s three-voter active wait", proof.to_string());
+    }
+    finish(
+        row,
+        "PASS",
+        "60s active quiescent three-voter cluster with two independent workers",
+        proof.to_string(),
+        vec![cluster.dir.clone(), path],
+    )
 }
 
 fn perf_command_compile(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
@@ -2746,7 +2819,11 @@ fn cluster_start(
 ) -> Result<String, String> {
     let input_path = cluster.dir.join("input.json");
     fs::write(&input_path, input).map_err(|err| err.to_string())?;
-    let definition = examples().join(yaml);
+    let definition = if Path::new(yaml).is_absolute() {
+        PathBuf::from(yaml)
+    } else {
+        examples().join(yaml)
+    };
     let mut last = String::new();
     let command_id = graphrun::ids::CommandId::generate().to_hex();
     let deadline = Instant::now() + Duration::from_secs(25);

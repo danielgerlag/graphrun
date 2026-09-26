@@ -1,14 +1,14 @@
 use crate::catalog::{Catalog, ExecutionKind};
 use crate::cluster::{ClusterNetwork, MemberConfig};
 use crate::compiler::compile_yaml;
-use crate::domain::{Command, CommandBody, RunStatus, State, active_runs, run_output};
+use crate::domain::{Command, CommandBody, RunStatus, State, run_output};
 use crate::error::{Error, ErrorKind, Result};
 use crate::handlers::Handlers;
 use crate::ids::{CommandId, EventId, RunId};
 use crate::ir::Definition;
 use crate::limits;
 use crate::rpc::serve_grpc;
-use crate::storage::{LocalNetwork, StorageHandle, TypeConfig, load_domain_readonly};
+use crate::storage::{LocalNetwork, ScheduleWake, StorageHandle, TypeConfig, load_domain_readonly};
 use crate::value::Value;
 use crate::write::{
     health_view, inspect_view, linearizable_read, now, write_raft, write_raft_response,
@@ -326,6 +326,7 @@ impl LocalBuilder {
             election_timeout_min: 1000,
             election_timeout_max: 2000,
             max_payload_entries: 4,
+            snapshot_max_chunk_size: 1024 * 1024,
             snapshot_policy: SnapshotPolicy::Never,
             max_in_snapshot_log_to_keep: 1024,
             ..Config::default()
@@ -440,6 +441,7 @@ impl Engine {
             election_timeout_min: 1000,
             election_timeout_max: 2000,
             max_payload_entries: 4,
+            snapshot_max_chunk_size: 1024 * 1024,
             snapshot_policy: SnapshotPolicy::Never,
             max_in_snapshot_log_to_keep: 1024,
             ..Config::default()
@@ -839,6 +841,7 @@ impl Engine {
             clock_safe,
             self.storage.clock().fault_reason().await,
             quorum_safe,
+            self.storage.scheduler_stats(),
         )
     }
 
@@ -1575,6 +1578,7 @@ async fn dispatch_control(
                 clock_safe,
                 storage.clock().fault_reason().await,
                 quorum_safe,
+                storage.scheduler_stats(),
             ))
         }
         ControlRequest::List => {
@@ -1914,11 +1918,12 @@ async fn publication_via_raft(
 async fn wait_via_raft(
     raft: &Raft<TypeConfig>,
     storage: &StorageHandle,
-    notify: &Notify,
+    _notify: &Notify,
     run: RunId,
     timeout: Duration,
 ) -> Result<Value> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut changes = storage.subscribe_schedule();
     loop {
         let state = storage.query_state().await;
         if let Some(output) = run_output(&state, run) {
@@ -1940,18 +1945,14 @@ async fn wait_via_raft(
                 "timed out waiting for run",
             ));
         }
-        let _ = write_raft(
-            raft,
-            storage,
-            Command {
-                id: CommandId::generate(),
-                time: now(),
-                body: CommandBody::Progress { run },
-            },
-        )
-        .await;
-        wake(notify);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::select! {
+            result = changes.changed() => result.map_err(|_| {
+                Error::new(ErrorKind::Unavailable, "storage schedule notifications stopped")
+            })?,
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(Error::new(ErrorKind::DeadlineExceeded, "timed out waiting for run"));
+            }
+        }
     }
 }
 
@@ -1990,15 +1991,42 @@ async fn clock_watchdog_loop(storage: StorageHandle) {
     }
 }
 
-async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc<Notify>) {
-    let mut last_cleanup = tokio::time::Instant::now() - Duration::from_secs(5);
+async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, _notify: Arc<Notify>) {
+    let mut changes = storage.subscribe_schedule();
+    let mut metrics = raft.metrics();
+    let mut leader_term = None;
     loop {
-        tokio::select! {
-            _ = notify.notified() => {}
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        let observed = metrics.borrow().clone();
+        if observed.state != ServerState::Leader {
+            leader_term = None;
+            if metrics.changed().await.is_err() {
+                return;
+            }
+            continue;
         }
-        if last_cleanup.elapsed() >= Duration::from_secs(5) {
-            if write_raft(
+        if leader_term != Some(observed.current_term) {
+            storage.record_schedule_wake(ScheduleWake::Leadership);
+            leader_term = Some(observed.current_term);
+        }
+        let view = match storage.schedule_view().await {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::error!(%error, "scheduler index unavailable");
+                return;
+            }
+        };
+        storage.observe_scheduler(view.revision);
+        let now_ms = match crate::time::wall_millis() {
+            Ok(now_ms) => now_ms,
+            Err(error) => {
+                tracing::error!(%error, "scheduler wall clock unavailable");
+                return;
+            }
+        };
+        let mut next_due = view.retention_ms;
+        if view.retention_ms.is_some_and(|at| at <= now_ms) {
+            storage.record_schedule_wake(ScheduleWake::Retention);
+            if let Err(error) = write_raft(
                 &raft,
                 &storage,
                 Command {
@@ -2008,23 +2036,79 @@ async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: 
                 },
             )
             .await
-            .is_ok()
             {
-                last_cleanup = tokio::time::Instant::now();
+                tracing::warn!(%error, "retention proposal deferred");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            continue;
+        }
+        let mut progressed = false;
+        for (run, row) in &view.runs {
+            if row.progress || row.deadline_ms.is_some_and(|at| at <= now_ms) {
+                if let Err(error) = write_raft(
+                    &raft,
+                    &storage,
+                    Command {
+                        id: CommandId::generate(),
+                        time: now(),
+                        body: CommandBody::Progress { run: *run },
+                    },
+                )
+                .await
+                {
+                    tracing::warn!(%run, %error, "run progression deferred");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                progressed = true;
+                break;
+            }
+            if let Some(at) = row.deadline_ms {
+                next_due = Some(next_due.map_or(at, |previous| previous.min(at)));
             }
         }
-        let state = storage.query_state().await;
-        for run in active_runs(&state) {
-            let _ = write_raft(
-                &raft,
-                &storage,
-                Command {
-                    id: CommandId::generate(),
-                    time: now(),
-                    body: CommandBody::Progress { run },
+        if progressed {
+            continue;
+        }
+        let mut deadline = next_due.map(|at| {
+            Box::pin(tokio::time::sleep(Duration::from_millis(
+                at.saturating_sub(now_ms),
+            )))
+        });
+        loop {
+            if *changes.borrow() != view.revision {
+                break;
+            }
+            tokio::select! {
+                change = changes.changed() => {
+                    if change.is_err() {
+                        return;
+                    }
+                    storage.record_schedule_wake(ScheduleWake::Applied);
+                    break;
+                }
+                change = metrics.changed() => {
+                    if change.is_err() {
+                        return;
+                    }
+                    let latest = metrics.borrow();
+                    if latest.state != ServerState::Leader
+                        || latest.current_term != observed.current_term
+                    {
+                        storage.record_schedule_wake(ScheduleWake::Leadership);
+                        break;
+                    }
+                }
+                _ = async {
+                    if let Some(timer) = deadline.as_mut() {
+                        timer.as_mut().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    storage.record_schedule_wake(ScheduleWake::Deadline);
+                    break;
                 },
-            )
-            .await;
+            }
         }
     }
 }
@@ -2059,6 +2143,10 @@ async fn worker_loop(
 ) {
     let session = crate::ids::WorkerSessionId::generate();
     let blocking_slots = Arc::new(Semaphore::new(limits::BLOCKING_POOL_DEFAULT as usize));
+    let mut changes = storage.subscribe_schedule();
+    let mut leadership = raft.metrics();
+    let mut renewal = tokio::time::interval(Duration::from_secs(5));
+    renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let _ = write_raft(
         &raft,
         &storage,
@@ -2074,9 +2162,116 @@ async fn worker_loop(
     )
     .await;
     loop {
-        tokio::select! {
-            _ = notify.notified() => {}
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        let observed = leadership.borrow().clone();
+        if observed.state != ServerState::Leader {
+            if leadership.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let view = match storage.schedule_view().await {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::error!(%error, "local worker schedule index unavailable");
+                return;
+            }
+        };
+        storage.observe_local_worker(view.revision);
+        let ready = if view.runs.iter().any(|(_, row)| row.ready) {
+            let state = storage.query_state().await;
+            if state
+                .sessions
+                .get(&session)
+                .is_none_or(|worker| now().as_millis() >= worker.expires_ms)
+            {
+                if let Err(error) = write_raft(
+                    &raft,
+                    &storage,
+                    Command {
+                        id: CommandId::generate(),
+                        time: now(),
+                        body: CommandBody::RegisterSession {
+                            session,
+                            activities: vec!["*".to_owned()],
+                            capacity: crate::limits::CLAIM_BATCH,
+                        },
+                    },
+                )
+                .await
+                {
+                    tracing::warn!(%error, "local worker registration deferred");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                continue;
+            } else {
+                match crate::domain::worker_has_ready(&state, session, now()) {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        tracing::error!(%error, "local worker readiness failed");
+                        return;
+                    }
+                }
+            }
+        } else {
+            false
+        };
+        if !ready {
+            loop {
+                if *changes.borrow() != view.revision {
+                    break;
+                }
+                tokio::select! {
+                    changed = changes.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        storage.record_schedule_wake(ScheduleWake::Worker);
+                        break;
+                    }
+                    changed = leadership.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        let latest = leadership.borrow();
+                        if latest.state != ServerState::Leader
+                            || latest.current_term != observed.current_term
+                        {
+                            storage.record_schedule_wake(ScheduleWake::Leadership);
+                            break;
+                        }
+                    }
+                    _ = renewal.tick() => {
+                        if let Err(error) = write_raft(
+                            &raft,
+                            &storage,
+                            Command {
+                                id: CommandId::generate(),
+                                time: now(),
+                                body: CommandBody::RenewLocalSession { session },
+                            },
+                        ).await {
+                            tracing::warn!(%error, "local worker renewal failed");
+                            match write_raft(
+                                &raft,
+                                &storage,
+                                Command {
+                                    id: CommandId::generate(),
+                                    time: now(),
+                                    body: CommandBody::RegisterSession {
+                                        session,
+                                        activities: vec!["*".to_owned()],
+                                        capacity: crate::limits::CLAIM_BATCH,
+                                    },
+                                },
+                            ).await {
+                                Ok(()) => break,
+                                Err(error) => tracing::warn!(%error, "local worker re-registration failed"),
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
         }
         let claim = Command {
             id: CommandId::generate(),
@@ -2101,6 +2296,7 @@ async fn worker_loop(
                 },
             )
             .await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
         let mut did_work = false;
@@ -2709,6 +2905,77 @@ nodes:
             .await
             .unwrap();
         assert_eq!(output.pointer("/approved").unwrap(), &Value::Bool(true));
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_wait_does_not_rescan_ready_index_on_local_renewal() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                r#"
+dsl: graphrun/v1
+id: waiting_without_deadline
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+signals:
+  continue: {schema: unit/v1}
+start: pause
+nodes:
+  pause:
+    kind: wait_signal
+    signal: continue
+    key: {literal: k1}
+    timeout: null
+    next: finish
+  finish:
+    kind: complete
+    output: {literal: null}
+"#,
+                &catalog(),
+                Value::Null,
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = engine.storage.query_state().await;
+            let view = engine.storage.schedule_view().await.unwrap();
+            if state.waits.values().any(|wait| wait.pending)
+                && view.runs.iter().any(|(id, row)| {
+                    *id == run && !row.progress && !row.ready && row.deadline_ms.is_none()
+                })
+                && engine.storage.scheduler_observed_revision() >= view.revision
+                && engine.storage.local_worker_observed_revision() >= view.revision
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "wait did not settle"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let before = engine.storage.schedule_discovery_reads();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(matches!(
+            engine.storage.query_state().await.runs[&run].status,
+            RunStatus::Active
+        ));
+        assert_eq!(engine.storage.schedule_discovery_reads(), before);
+        engine
+            .signal(run, EventId::generate(), "continue", "k1", Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .wait_terminal(run, Duration::from_secs(10))
+                .await
+                .unwrap(),
+            Value::Null
+        );
         engine.shutdown().await.unwrap();
     }
 

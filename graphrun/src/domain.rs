@@ -319,6 +319,9 @@ pub enum CommandBody {
         activities: Vec<String>,
         capacity: u32,
     },
+    RenewLocalSession {
+        session: WorkerSessionId,
+    },
     RegisterWorker {
         session: WorkerSessionId,
         principal_id: String,
@@ -760,6 +763,31 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             activities,
             capacity,
         } => decide_register(state, *session, activities, *capacity, command.time),
+        CommandBody::RenewLocalSession { session } => {
+            let worker = state.sessions.get(session).ok_or_else(|| {
+                Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "unknown local session",
+                )
+            })?;
+            if !worker.principal_id.is_empty() || command.time.as_millis() >= worker.expires_ms {
+                return Err(Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "local worker session expired or is not local",
+                ));
+            }
+            Ok(Decision {
+                events: vec![DomainEvent::SessionRegistered {
+                    session: *session,
+                    activities: worker.activities.clone(),
+                    capacity: worker.capacity,
+                    expires_ms: command
+                        .time
+                        .as_millis()
+                        .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64),
+                }],
+            })
+        }
         CommandBody::RegisterWorker {
             session,
             principal_id,
@@ -1569,7 +1597,7 @@ pub fn worker_has_ready(state: &State, session: WorkerSessionId, time: EngineTim
         .sessions
         .get(&session)
         .ok_or_else(|| Error::invalid("unknown worker session"))?;
-    if worker.principal_id.is_empty() || time.as_millis() >= worker.expires_ms {
+    if time.as_millis() >= worker.expires_ms {
         return Err(Error::new(
             crate::error::ErrorKind::FailedPrecondition,
             "worker session expired",
@@ -2485,6 +2513,13 @@ fn next_progress(
                 }]));
             }
             Node::WaitUntil { at, next } => {
+                if state
+                    .waits
+                    .values()
+                    .any(|wait| wait.activation == act.id && wait.pending)
+                {
+                    continue;
+                }
                 let scope = state.scopes.get(&act.scope).unwrap();
                 let at = match eval_binding(at, &eval_ctx(state, scope))? {
                     Value::Int(v) if v >= 0 => v as u64,
@@ -2497,6 +2532,15 @@ fn next_progress(
                 if time.as_millis() >= at {
                     return Ok(Some(open_node(state, act.scope, next, ids)?));
                 }
+                return Ok(Some(vec![DomainEvent::WaitOpened {
+                    run,
+                    wait: ids.wait(),
+                    activation: act.id,
+                    signal: "__timer".to_owned(),
+                    key: act.id.to_hex(),
+                    deadline_ms: Some(at),
+                    consume_from: ConsumeFrom::AfterActivation,
+                }]));
             }
             Node::WaitSignal { .. } => {
                 if state
@@ -2674,8 +2718,9 @@ fn due_wait(
     let act = state.activations.get(&wait.activation).unwrap();
     if wait.signal == "__timer" {
         let region = region_for_scope(state, act.scope).unwrap();
-        let Node::Delay { next, .. } = region.nodes.get(act.node.as_str()).unwrap() else {
-            return Err(Error::invalid("timer wait is not a delay"));
+        let next = match region.nodes.get(act.node.as_str()) {
+            Some(Node::Delay { next, .. } | Node::WaitUntil { next, .. }) => next,
+            _ => return Err(Error::invalid("timer wait is not a delay or wait_until")),
         };
         let mut events = vec![DomainEvent::WaitTimedOut { run, wait: wait.id }];
         events.extend(open_node(state, act.scope, next, ids)?);
@@ -3720,7 +3765,7 @@ pub fn apply_events_with_cause(
     Ok(())
 }
 
-fn event_owner(state: &State, event: &DomainEvent) -> Result<Option<RunId>> {
+pub(crate) fn event_owner(state: &State, event: &DomainEvent) -> Result<Option<RunId>> {
     let owner = match event {
         DomainEvent::RunAdmitted { run, .. }
         | DomainEvent::ScopeOpened { run, .. }
@@ -5276,6 +5321,72 @@ mod tests {
             panic!("nested");
         };
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn wait_until_records_deadline_across_restart() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: absolute_wait
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: absolute
+nodes:
+  absolute:
+    kind: wait_until
+    at: {literal: 1010000}
+    next: finish
+  finish:
+    kind: complete
+    output: {literal: null}
+"#;
+        let catalog = catalog();
+        let definition = compile_yaml(yaml, &catalog).unwrap();
+        let run = RunId::generate();
+        let mut state = State::default();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1_000_000),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Null,
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        let progress = |state: &mut State, at| {
+            apply_command(
+                state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(at),
+                    body: CommandBody::Progress { run },
+                },
+            )
+            .unwrap();
+        };
+        progress(&mut state, 1_000_000);
+        let wait = state.waits.values().find(|wait| wait.pending).unwrap();
+        assert_eq!(wait.deadline_ms, Some(1_010_000));
+        progress(&mut state, 1_000_500);
+        assert_eq!(state.waits.len(), 1);
+        let mut restored: State =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        progress(&mut restored, 1_010_000);
+        assert!(matches!(
+            restored.runs[&run].status,
+            RunStatus::Succeeded {
+                output: Value::Null
+            }
+        ));
+        assert!(restored.waits.values().all(|wait| !wait.pending));
     }
 
     #[test]

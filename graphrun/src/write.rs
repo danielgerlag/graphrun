@@ -46,14 +46,21 @@ pub(crate) async fn write_raft_response(
         ));
     }
     storage.clock().authorize(storage, raft).await?;
-    let metrics = raft.metrics().borrow().clone();
-    let last_log = metrics.last_log_index.unwrap_or(0);
-    let applied = metrics.last_applied.map(|id| id.index).unwrap_or(0);
-    let pending = last_log.saturating_sub(applied);
-    let encoded = serde_json::to_vec(&command)
-        .map(|bytes| bytes.len() as u64)
-        .unwrap_or(0);
-    admit_unapplied(pending, pending.saturating_add(1).saturating_mul(encoded))?;
+    let encoded = serde_json::to_vec(&RaftRequest {
+        command: command.clone(),
+    })
+    .map_err(|err| Error::invalid(format!("command encoding failed: {err}")))?;
+    if encoded.len() > crate::limits::PUBLIC_COMMAND_ENVELOPE {
+        return Err(Error::new(
+            ErrorKind::ResourceExhausted,
+            "public command exceeds the 1 MiB envelope",
+        ));
+    }
+    let (pending, pending_bytes) = storage.unapplied_usage().await?;
+    admit_unapplied(
+        u64::from(pending).saturating_add(1),
+        pending_bytes.saturating_add(encoded.len() as u64),
+    )?;
     let identity = match &command.body {
         crate::domain::CommandBody::Publication { key, .. } => format!(
             "cluster={} principal={} command={}",
@@ -253,6 +260,7 @@ pub(crate) fn health_view(
     clock_safe: bool,
     clock_fault: Option<String>,
     quorum_safe: bool,
+    scheduler: crate::storage::SchedulerStats,
 ) -> serde_json::Value {
     let applied = last_applied.unwrap_or(0);
     let log = last_log.unwrap_or(0);
@@ -261,6 +269,17 @@ pub(crate) fn health_view(
         "clock_safe": clock_safe,
         "clock_fault": clock_fault,
         "quorum_safe": quorum_safe,
+        "ready_index_discovery_reads": scheduler.ready_index_discovery_reads,
+        "schedule_revision": scheduler.revision,
+        "scheduler_observed_revision": scheduler.scheduler_observed_revision,
+        "local_worker_observed_revision": scheduler.local_worker_observed_revision,
+        "scheduler_wake_causes": {
+            "applied": scheduler.applied_wakes,
+            "leadership": scheduler.leadership_wakes,
+            "deadline": scheduler.deadline_wakes,
+            "retention": scheduler.retention_wakes,
+            "worker": scheduler.worker_wakes,
+        },
         "engine_time_watermark_ms": state.engine_time_watermark_ms,
         "state": raft_state,
         "last_applied": last_applied,
@@ -270,6 +289,7 @@ pub(crate) fn health_view(
         "voters": voters,
         "active_runs": state.runs.values().filter(|run| matches!(run.status, crate::domain::RunStatus::Active)).count(),
         "ready_leaves": state.activations.values().filter(|act| act.status == crate::domain::ActivationStatus::Ready).count(),
+        "pending_waits": state.waits.values().filter(|wait| wait.pending).count(),
         "inbox_depth": state.inbox.iter().filter(|entry| !entry.consumed).count(),
         "open_scopes": state.scopes.values().filter(|scope| matches!(scope.status, crate::domain::ScopeStatus::Open)).count(),
         "recovery": state.recovery.as_ref().map(|hold| {
@@ -283,13 +303,13 @@ pub(crate) fn health_view(
 }
 
 pub(crate) fn admit_unapplied(unapplied_entries: u64, unapplied_bytes: u64) -> Result<()> {
-    if unapplied_entries >= crate::limits::UNAPPLIED_ENTRIES as u64 {
+    if unapplied_entries > crate::limits::UNAPPLIED_ENTRIES as u64 {
         return Err(Error::new(
             ErrorKind::ResourceExhausted,
             "unapplied entry credit exhausted",
         ));
     }
-    if unapplied_bytes >= crate::limits::UNAPPLIED_BYTES {
+    if unapplied_bytes > crate::limits::UNAPPLIED_BYTES {
         return Err(Error::new(
             ErrorKind::ResourceExhausted,
             "unapplied byte credit exhausted",
@@ -303,8 +323,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unapplied_credits_reject_at_limit() {
+    fn unapplied_credits_reject_above_limit() {
         assert!(admit_unapplied(0, 0).is_ok());
+        assert!(
+            admit_unapplied(
+                u64::from(crate::limits::UNAPPLIED_ENTRIES),
+                crate::limits::UNAPPLIED_BYTES,
+            )
+            .is_ok()
+        );
         assert!(
             admit_unapplied(
                 u64::from(crate::limits::UNAPPLIED_ENTRIES) - 1,
@@ -312,10 +339,11 @@ mod tests {
             )
             .is_ok()
         );
-        let entries = admit_unapplied(u64::from(crate::limits::UNAPPLIED_ENTRIES), 0).unwrap_err();
+        let entries =
+            admit_unapplied(u64::from(crate::limits::UNAPPLIED_ENTRIES) + 1, 0).unwrap_err();
         assert_eq!(entries.kind, ErrorKind::ResourceExhausted);
         assert!(entries.to_string().contains("unapplied entry credit"));
-        let bytes = admit_unapplied(0, crate::limits::UNAPPLIED_BYTES).unwrap_err();
+        let bytes = admit_unapplied(0, crate::limits::UNAPPLIED_BYTES + 1).unwrap_err();
         assert_eq!(bytes.kind, ErrorKind::ResourceExhausted);
         assert!(bytes.to_string().contains("unapplied byte credit"));
     }

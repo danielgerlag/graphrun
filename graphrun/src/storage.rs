@@ -2,6 +2,7 @@
 
 use crate::domain::{self, Command, State};
 use crate::error::{Error, Result};
+use crate::schedule::{RunSchedule, retention_deadline};
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -28,9 +29,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot, watch};
 
 openraft::declare_raft_types!(
     pub TypeConfig:
@@ -59,6 +60,41 @@ pub struct RaftResponse {
 
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
 const LOG: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("log");
+const SCHEDULE: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("schedule");
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+struct PendingCredits {
+    entries: u32,
+    bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScheduleView {
+    pub revision: u64,
+    pub runs: Vec<(crate::ids::RunId, RunSchedule)>,
+    pub retention_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct SchedulerStats {
+    pub ready_index_discovery_reads: u64,
+    pub revision: u64,
+    pub scheduler_observed_revision: u64,
+    pub local_worker_observed_revision: u64,
+    pub applied_wakes: u64,
+    pub leadership_wakes: u64,
+    pub deadline_wakes: u64,
+    pub retention_wakes: u64,
+    pub worker_wakes: u64,
+}
+
+pub(crate) enum ScheduleWake {
+    Applied,
+    Leadership,
+    Deadline,
+    Retention,
+    Worker,
+}
 
 type LogIdT = LogId<u64>;
 type VoteT = Vote<u64>;
@@ -79,6 +115,14 @@ static CUT: Mutex<Option<Cut>> = Mutex::new(None);
 
 thread_local! {
     static LOCAL_CUT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    static COMMIT_UNCERTAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn commit_immediate(txn: redb::WriteTransaction) -> std::result::Result<(), StoErr> {
+    txn.commit().map_err(|err| {
+        COMMIT_UNCERTAIN.with(|uncertain| uncertain.set(true));
+        sto_err(ErrorVerb::Write, err)
+    })
 }
 
 #[cfg(any(test, feature = "fault-injection"))]
@@ -120,6 +164,7 @@ fn after_persist(point: &'static str) -> std::result::Result<(), StoErr> {
     if cut || env_hit {
         LOCAL_CUT.with(|cell| cell.set(None));
         *CUT.lock().unwrap() = None;
+        COMMIT_UNCERTAIN.with(|uncertain| uncertain.set(true));
         return Err(sto_err(ErrorVerb::Write, format!("fault cut {point}")));
     }
     Ok(())
@@ -141,6 +186,11 @@ enum Req {
         oneshot::Sender<std::result::Result<Vec<EntryT>, StoErr>>,
     ),
     AppliedState(oneshot::Sender<std::result::Result<(Option<LogIdT>, MembershipT), StoErr>>),
+    UnappliedUsage(oneshot::Sender<std::result::Result<(u32, u64), StoErr>>),
+    PreflightAppend(
+        Vec<(u64, u64)>,
+        oneshot::Sender<std::result::Result<(u32, u64), StoErr>>,
+    ),
     Apply(
         Vec<EntryT>,
         oneshot::Sender<std::result::Result<Vec<RaftResponse>, StoErr>>,
@@ -153,6 +203,7 @@ enum Req {
     ),
     CurrentSnapshot(oneshot::Sender<std::result::Result<Option<Snapshot<TypeConfig>>, StoErr>>),
     QueryState(oneshot::Sender<State>),
+    ScheduleView(oneshot::Sender<std::result::Result<ScheduleView, StoErr>>),
     QueryWatermark(oneshot::Sender<u64>),
     SetClockFault(bool, oneshot::Sender<std::result::Result<(), StoErr>>),
     InstallDomain(Box<State>, oneshot::Sender<std::result::Result<(), StoErr>>),
@@ -164,6 +215,11 @@ pub struct StorageHandle {
     tx: mpsc::Sender<Req>,
     clock: Arc<crate::clock::ClockAuthority>,
     watermark: Arc<AtomicU64>,
+    schedule_watch: watch::Sender<u64>,
+    schedule_reads: Arc<AtomicU64>,
+    scheduler_observed: Arc<AtomicU64>,
+    local_worker_observed: Arc<AtomicU64>,
+    schedule_wakes: Arc<[AtomicU64; 5]>,
 }
 
 impl StorageHandle {
@@ -219,13 +275,29 @@ impl StorageHandle {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| Error::invalid(err.to_string()))?;
         }
-        let (tx, rx) = mpsc::channel();
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel(crate::limits::MAX_QUEUED_COMMANDS as usize);
+        let (ready_tx, ready_rx) = std_mpsc::channel();
+        let (schedule_watch, _) = watch::channel(0);
+        let schedule_reads = Arc::new(AtomicU64::new(0));
+        let scheduler_observed = Arc::new(AtomicU64::new(0));
+        let local_worker_observed = Arc::new(AtomicU64::new(0));
+        let schedule_wakes = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
         let watermark = Arc::new(AtomicU64::new(initial_watermark));
         let stored_watermark = watermark.clone();
+        let stored_schedule_watch = schedule_watch.clone();
+        let stored_schedule_reads = schedule_reads.clone();
         let handle = std::thread::Builder::new()
             .name("graphrun-storage".into())
-            .spawn(move || storage_thread(path, rx, ready_tx, stored_watermark))
+            .spawn(move || {
+                storage_thread(
+                    path,
+                    rx,
+                    ready_tx,
+                    stored_watermark,
+                    stored_schedule_watch,
+                    stored_schedule_reads,
+                )
+            })
             .map_err(|err| Error::invalid(err.to_string()))?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok((
@@ -233,6 +305,11 @@ impl StorageHandle {
                     tx,
                     clock: Arc::new(crate::clock::ClockAuthority::new(clock_faulted)),
                     watermark,
+                    schedule_watch,
+                    schedule_reads,
+                    scheduler_observed,
+                    local_worker_observed,
+                    schedule_wakes,
                 },
                 handle,
             )),
@@ -257,13 +334,79 @@ impl StorageHandle {
         &self.clock
     }
 
+    pub(crate) fn subscribe_schedule(&self) -> watch::Receiver<u64> {
+        self.schedule_watch.subscribe()
+    }
+
+    pub(crate) async fn schedule_view(&self) -> Result<ScheduleView> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Req::ScheduleView(tx))
+            .await
+            .map_err(|_| Error::new(crate::error::ErrorKind::Unavailable, "storage stopped"))?;
+        rx.await
+            .map_err(|_| Error::new(crate::error::ErrorKind::Unavailable, "storage dropped"))?
+            .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))
+    }
+
+    pub fn schedule_discovery_reads(&self) -> u64 {
+        self.schedule_reads.load(Ordering::Relaxed)
+    }
+
+    pub fn scheduler_stats(&self) -> SchedulerStats {
+        SchedulerStats {
+            ready_index_discovery_reads: self.schedule_discovery_reads(),
+            revision: self.schedule_revision(),
+            scheduler_observed_revision: self.scheduler_observed_revision(),
+            local_worker_observed_revision: self.local_worker_observed_revision(),
+            applied_wakes: self.schedule_wakes[0].load(Ordering::Relaxed),
+            leadership_wakes: self.schedule_wakes[1].load(Ordering::Relaxed),
+            deadline_wakes: self.schedule_wakes[2].load(Ordering::Relaxed),
+            retention_wakes: self.schedule_wakes[3].load(Ordering::Relaxed),
+            worker_wakes: self.schedule_wakes[4].load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn record_schedule_wake(&self, cause: ScheduleWake) {
+        let index = match cause {
+            ScheduleWake::Applied => 0,
+            ScheduleWake::Leadership => 1,
+            ScheduleWake::Deadline => 2,
+            ScheduleWake::Retention => 3,
+            ScheduleWake::Worker => 4,
+        };
+        self.schedule_wakes[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn schedule_revision(&self) -> u64 {
+        *self.schedule_watch.borrow()
+    }
+
+    pub fn scheduler_observed_revision(&self) -> u64 {
+        self.scheduler_observed.load(Ordering::Acquire)
+    }
+
+    pub fn local_worker_observed_revision(&self) -> u64 {
+        self.local_worker_observed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn observe_scheduler(&self, revision: u64) {
+        self.scheduler_observed
+            .fetch_max(revision, Ordering::Release);
+    }
+
+    pub(crate) fn observe_local_worker(&self, revision: u64) {
+        self.local_worker_observed
+            .fetch_max(revision, Ordering::Release);
+    }
+
     pub fn engine_watermark_cached(&self) -> u64 {
         self.watermark.load(Ordering::SeqCst)
     }
 
     pub async fn engine_watermark(&self) -> Result<u64> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(Req::QueryWatermark(tx)).map_err(|_| {
+        self.tx.send(Req::QueryWatermark(tx)).await.map_err(|_| {
             Error::new(
                 crate::error::ErrorKind::Unavailable,
                 "storage thread stopped",
@@ -279,12 +422,15 @@ impl StorageHandle {
 
     pub async fn persist_clock_fault(&self, faulted: bool) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(Req::SetClockFault(faulted, tx)).map_err(|_| {
-            Error::new(
-                crate::error::ErrorKind::Unavailable,
-                "storage thread stopped",
-            )
-        })?;
+        self.tx
+            .send(Req::SetClockFault(faulted, tx))
+            .await
+            .map_err(|_| {
+                Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "storage thread stopped",
+                )
+            })?;
         rx.await
             .map_err(|_| {
                 Error::new(
@@ -297,8 +443,11 @@ impl StorageHandle {
 
     pub async fn query_state(&self) -> State {
         let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(Req::QueryState(tx));
-        rx.await.unwrap_or_default()
+        self.tx
+            .send(Req::QueryState(tx))
+            .await
+            .expect("storage thread stopped during state query");
+        rx.await.expect("storage thread dropped state query")
     }
 
     pub async fn install_domain(&self, state: State) -> Result<()> {
@@ -306,6 +455,7 @@ impl StorageHandle {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Req::InstallDomain(Box::new(state), tx))
+            .await
             .map_err(|_| Error::invalid("storage thread stopped"))?;
         rx.await
             .map_err(|_| Error::invalid("storage thread dropped"))?
@@ -314,16 +464,21 @@ impl StorageHandle {
 
     pub async fn last_applied_index(&self) -> u64 {
         let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(Req::AppliedState(tx));
+        self.tx
+            .send(Req::AppliedState(tx))
+            .await
+            .expect("storage thread stopped during applied-position query");
         match rx.await {
             Ok(Ok((Some(id), _))) => id.index,
-            _ => 0,
+            Ok(Ok((None, _))) => 0,
+            Ok(Err(err)) => panic!("applied-position query failed: {err}"),
+            Err(err) => panic!("storage thread dropped applied-position query: {err}"),
         }
     }
 
     pub async fn applied_membership(&self) -> Result<StoredMembership<u64, BasicNode>> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(Req::AppliedState(tx)).map_err(|_| {
+        self.tx.send(Req::AppliedState(tx)).await.map_err(|_| {
             Error::new(
                 crate::error::ErrorKind::Unavailable,
                 "storage thread stopped",
@@ -341,6 +496,28 @@ impl StorageHandle {
         Ok(membership)
     }
 
+    pub async fn unapplied_usage(&self) -> Result<(u32, u64)> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Req::UnappliedUsage(tx))
+            .await
+            .map_err(|_| Error::new(crate::error::ErrorKind::Unavailable, "storage stopped"))?;
+        rx.await
+            .map_err(|_| Error::new(crate::error::ErrorKind::Unavailable, "storage dropped"))?
+            .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))
+    }
+
+    pub async fn projected_append_usage(&self, entries: Vec<(u64, u64)>) -> Result<(u32, u64)> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Req::PreflightAppend(entries, tx))
+            .await
+            .map_err(|_| Error::new(crate::error::ErrorKind::Unavailable, "storage stopped"))?;
+        rx.await
+            .map_err(|_| Error::new(crate::error::ErrorKind::Unavailable, "storage dropped"))?
+            .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))
+    }
+
     pub async fn applied_members(&self) -> Result<BTreeMap<u64, String>> {
         Ok(self
             .applied_membership()
@@ -351,7 +528,20 @@ impl StorageHandle {
     }
 
     pub fn shutdown(&self) {
-        let _ = self.tx.send(Req::Shutdown);
+        match self.tx.try_send(Req::Shutdown) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(request)) => {
+                let sender = self.tx.clone();
+                std::thread::spawn(move || {
+                    if let Err(error) = sender.blocking_send(request) {
+                        tracing::error!(%error, "storage shutdown queue stopped");
+                    }
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!("storage shutdown requested after thread stopped");
+            }
+        }
     }
 }
 
@@ -422,9 +612,11 @@ fn validate_history_store(state: &State) -> Result<()> {
 
 fn storage_thread(
     path: PathBuf,
-    rx: mpsc::Receiver<Req>,
-    ready: mpsc::Sender<std::result::Result<(), String>>,
+    mut rx: mpsc::Receiver<Req>,
+    ready: std_mpsc::Sender<std::result::Result<(), String>>,
     watermark: Arc<AtomicU64>,
+    schedule_watch: watch::Sender<u64>,
+    schedule_reads: Arc<AtomicU64>,
 ) {
     let db = match Database::create(&path) {
         Ok(db) => db,
@@ -439,12 +631,17 @@ fn storage_thread(
             return;
         }
     }
-    let _ = ready.send(Ok(()));
     let mut last_purged: Option<LogIdT> = load_json(&db, "last_purged");
     let mut last_applied: Option<LogIdT> = load_json(&db, "last_applied");
     let mut last_membership: MembershipT = load_json(&db, "membership")
         .unwrap_or_else(|| StoredMembership::new(None, Membership::new(vec![], None)));
     let mut domain: State = load_json(&db, "domain").unwrap_or_default();
+    let Some(mut schedule_revision): Option<u64> = load_json(&db, "schedule_revision") else {
+        let _ = ready.send(Err("schedule index is missing or corrupt".to_owned()));
+        return;
+    };
+    schedule_watch.send_replace(schedule_revision);
+    let _ = ready.send(Ok(()));
     let snapshot_dir = path
         .parent()
         .map(|parent| parent.join("snapshots"))
@@ -456,7 +653,7 @@ fn storage_thread(
         (Some(meta), Some(data)) => Some((meta, data)),
         _ => None,
     };
-    while let Ok(req) = rx.recv() {
+    while let Some(req) = rx.blocking_recv() {
         match req {
             Req::Shutdown => break,
             Req::SaveVote(vote, tx) => {
@@ -472,8 +669,10 @@ fn storage_thread(
                 let _ = tx.send(truncate_logs(&db, log_id.index));
             }
             Req::Purge(log_id, tx) => {
-                last_purged = Some(log_id);
                 let res = purge_logs(&db, log_id.index, &log_id);
+                if res.is_ok() {
+                    last_purged = Some(log_id);
+                }
                 let _ = tx.send(res);
             }
             Req::LogState(tx) => {
@@ -485,16 +684,31 @@ fn storage_thread(
             Req::AppliedState(tx) => {
                 let _ = tx.send(Ok((last_applied, last_membership.clone())));
             }
+            Req::UnappliedUsage(tx) => {
+                let _ =
+                    tx.send(persisted_credits(&db).map(|credits| (credits.entries, credits.bytes)));
+            }
+            Req::PreflightAppend(entries, tx) => {
+                let _ = tx.send(
+                    projected_append_usage(&db, last_applied, &entries)
+                        .map(|credits| (credits.entries, credits.bytes)),
+                );
+            }
             Req::Apply(entries, tx) => {
+                let previous_revision = schedule_revision;
                 let res = apply_entries(
                     &db,
                     &mut last_applied,
                     &mut last_membership,
                     &mut domain,
+                    &mut schedule_revision,
                     entries,
                 );
                 if res.is_ok() {
                     watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
+                    if schedule_revision != previous_revision {
+                        schedule_watch.send_replace(schedule_revision);
+                    }
                 }
                 let _ = tx.send(res);
             }
@@ -534,11 +748,13 @@ fn storage_thread(
                     &mut last_membership,
                     &mut domain,
                     &mut snapshot,
+                    &mut schedule_revision,
                     meta,
                     data,
                 );
                 if res.is_ok() {
                     watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
+                    schedule_watch.send_replace(schedule_revision);
                 }
                 let _ = tx.send(res);
             }
@@ -551,6 +767,10 @@ fn storage_thread(
             }
             Req::QueryState(tx) => {
                 let _ = tx.send(domain.clone());
+            }
+            Req::ScheduleView(tx) => {
+                schedule_reads.fetch_add(1, Ordering::Relaxed);
+                let _ = tx.send(load_schedule_view(&db));
             }
             Req::QueryWatermark(tx) => {
                 let _ = tx.send(domain.engine_time_watermark_ms);
@@ -565,13 +785,42 @@ fn storage_thread(
                     .max(domain.engine_time_watermark_ms);
                 let res = validate_history_store(&next)
                     .map_err(|err| sto_err(ErrorVerb::Write, err))
-                    .and_then(|()| put_json(&db, "domain", &next));
+                    .and_then(|()| {
+                        let mut txn = db
+                            .begin_write()
+                            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+                        txn.set_durability(Durability::Immediate)
+                            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+                        {
+                            let mut meta = txn
+                                .open_table(META)
+                                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+                            let bytes = serde_json::to_vec(&next)
+                                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+                            meta.insert("domain", bytes.as_slice())
+                                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+                        }
+                        let revision = replace_schedule(
+                            &txn,
+                            &next,
+                            schedule_revision,
+                            last_applied.map_or(0, |id| id.index),
+                        )?;
+                        commit_immediate(txn)?;
+                        schedule_revision = revision;
+                        Ok(())
+                    });
                 if res.is_ok() {
                     domain = next;
                     watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
+                    schedule_watch.send_replace(schedule_revision);
                 }
                 let _ = tx.send(res);
             }
+        }
+        if COMMIT_UNCERTAIN.with(|uncertain| uncertain.get()) {
+            tracing::error!("storage commit outcome uncertain; member must reopen before writing");
+            break;
         }
     }
 }
@@ -594,10 +843,26 @@ fn initialize_publication_store(db: &Database) -> std::result::Result<(), StoErr
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         meta.insert("domain", domain.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert(
+            "schedule_revision",
+            serde_json::to_vec(&0u64).unwrap().as_slice(),
+        )
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert(
+            "schedule_retention",
+            serde_json::to_vec(&Option::<u64>::None).unwrap().as_slice(),
+        )
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let credits = serde_json::to_vec(&PendingCredits::default())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("unapplied_credits", credits.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     }
     txn.open_table(LOG)
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))
+    txn.open_table(SCHEDULE)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    commit_immediate(txn)
 }
 
 fn load_json<D, T>(db: &D, key: &str) -> Option<T>
@@ -637,14 +902,342 @@ fn put_bytes(db: &Database, key: &str, bytes: &[u8]) -> std::result::Result<(), 
             .insert(key, bytes)
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     }
-    txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    commit_immediate(txn)?;
     Ok(())
 }
 
-fn encoded_entry_len(entry: &EntryT) -> u64 {
-    serde_json::to_vec(entry)
-        .map(|bytes| bytes.len() as u64)
-        .unwrap_or(0)
+fn load_schedule_view(db: &Database) -> std::result::Result<ScheduleView, StoErr> {
+    let txn = db
+        .begin_read()
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let table = txn
+        .open_table(SCHEDULE)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let mut runs = Vec::new();
+    for record in table.iter().map_err(|err| sto_err(ErrorVerb::Read, err))? {
+        let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        let run = crate::ids::RunId::from_hex(key.value())
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        let schedule: RunSchedule =
+            serde_json::from_slice(value.value()).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        if schedule.format != 1 {
+            return Err(sto_err(
+                ErrorVerb::Read,
+                "unsupported persisted schedule index format",
+            ));
+        }
+        runs.push((run, schedule));
+    }
+    let meta = txn
+        .open_table(META)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let read = |key| -> std::result::Result<Vec<u8>, StoErr> {
+        let value = meta
+            .get(key)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+            .ok_or_else(|| sto_err(ErrorVerb::Read, format!("missing {key}")))?;
+        Ok(value.value().to_vec())
+    };
+    let revision = serde_json::from_slice(&read("schedule_revision")?)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let retention_ms = serde_json::from_slice(&read("schedule_retention")?)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    Ok(ScheduleView {
+        revision,
+        runs,
+        retention_ms,
+    })
+}
+
+fn update_schedule(
+    txn: &redb::WriteTransaction,
+    state: &State,
+    affected: &BTreeMap<crate::ids::RunId, Option<bool>>,
+    current_revision: u64,
+    applied_index: u64,
+    now_ms: u64,
+) -> std::result::Result<Option<u64>, StoErr> {
+    let mut changed = false;
+    {
+        let mut table = txn
+            .open_table(SCHEDULE)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        for (run, progress) in affected {
+            let key = run.to_hex();
+            let previous = table
+                .get(key.as_str())
+                .map_err(|err| sto_err(ErrorVerb::Read, err))?
+                .map(|value| serde_json::from_slice::<RunSchedule>(value.value()))
+                .transpose()
+                .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+            if previous.as_ref().is_some_and(|row| row.format != 1) {
+                return Err(sto_err(
+                    ErrorVerb::Read,
+                    "unsupported persisted schedule index format",
+                ));
+            }
+            let next = RunSchedule::from_state(
+                state,
+                *run,
+                progress.unwrap_or(previous.as_ref().is_some_and(|row| row.progress)),
+                now_ms,
+                applied_index,
+            );
+            if match (&previous, &next) {
+                (Some(old), Some(new)) => new.changed_from(old),
+                (None, None) => false,
+                _ => true,
+            } {
+                changed = true;
+                if let Some(next) = next {
+                    let bytes =
+                        serde_json::to_vec(&next).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+                    table
+                        .insert(key.as_str(), bytes.as_slice())
+                        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+                } else {
+                    table
+                        .remove(key.as_str())
+                        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+                }
+            }
+        }
+    }
+    let mut meta = txn
+        .open_table(META)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let previous_retention: Option<u64> = {
+        let value = meta
+            .get("schedule_retention")
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+            .ok_or_else(|| sto_err(ErrorVerb::Read, "missing schedule retention"))?;
+        serde_json::from_slice(value.value()).map_err(|err| sto_err(ErrorVerb::Read, err))?
+    };
+    let retention = retention_deadline(state);
+    if retention != previous_retention {
+        changed = true;
+        let bytes = serde_json::to_vec(&retention).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("schedule_retention", bytes.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    }
+    if changed {
+        let revision = current_revision
+            .checked_add(1)
+            .ok_or_else(|| sto_err(ErrorVerb::Write, "schedule revision exhausted"))?;
+        let bytes = serde_json::to_vec(&revision).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("schedule_revision", bytes.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        Ok(Some(revision))
+    } else {
+        Ok(None)
+    }
+}
+
+fn replace_schedule(
+    txn: &redb::WriteTransaction,
+    state: &State,
+    current_revision: u64,
+    applied_index: u64,
+) -> std::result::Result<u64, StoErr> {
+    {
+        let mut table = txn
+            .open_table(SCHEDULE)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let keys: Vec<String> = table
+            .iter()
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+            .map(|record| {
+                record
+                    .map(|(key, _)| key.value().to_owned())
+                    .map_err(|err| sto_err(ErrorVerb::Read, err))
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        for key in keys {
+            table
+                .remove(key.as_str())
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        }
+    }
+    let affected = domain::active_runs(state)
+        .into_iter()
+        .map(|run| (run, Some(true)))
+        .collect();
+    let revision = update_schedule(
+        txn,
+        state,
+        &affected,
+        current_revision,
+        applied_index,
+        state.engine_time_watermark_ms,
+    )?;
+    if revision.is_none() {
+        let revision = current_revision
+            .checked_add(1)
+            .ok_or_else(|| sto_err(ErrorVerb::Write, "schedule revision exhausted"))?;
+        let bytes = serde_json::to_vec(&revision).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        txn.open_table(META)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?
+            .insert("schedule_revision", bytes.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        return Ok(revision);
+    }
+    Ok(revision.expect("schedule revision present"))
+}
+
+fn read_credits(txn: &redb::WriteTransaction) -> std::result::Result<PendingCredits, StoErr> {
+    let meta = txn
+        .open_table(META)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let value = meta
+        .get("unapplied_credits")
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        .ok_or_else(|| sto_err(ErrorVerb::Read, "missing unapplied credit ledger"))?;
+    serde_json::from_slice(value.value()).map_err(|err| sto_err(ErrorVerb::Read, err))
+}
+
+fn persisted_credits(db: &Database) -> std::result::Result<PendingCredits, StoErr> {
+    let txn = db
+        .begin_read()
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let meta = txn
+        .open_table(META)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let value = meta
+        .get("unapplied_credits")
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        .ok_or_else(|| sto_err(ErrorVerb::Read, "missing unapplied credit ledger"))?;
+    serde_json::from_slice(value.value()).map_err(|err| sto_err(ErrorVerb::Read, err))
+}
+
+fn projected_append_usage(
+    db: &Database,
+    applied: Option<LogIdT>,
+    entries: &[(u64, u64)],
+) -> std::result::Result<PendingCredits, StoErr> {
+    let txn = db
+        .begin_read()
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let mut projected = persisted_credits(db)?;
+    let log = txn
+        .open_table(LOG)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let applied = applied.map_or(0, |id| id.index);
+    let mut overwritten = BTreeMap::new();
+    for &(index, length) in entries {
+        if index <= applied {
+            continue;
+        }
+        let previous = match overwritten.insert(index, length) {
+            Some(previous) => Some(previous),
+            None => log
+                .get(&index)
+                .map_err(|err| sto_err(ErrorVerb::Read, err))?
+                .map(|value| value.value().len() as u64),
+        };
+        if let Some(previous) = previous {
+            projected.bytes = projected
+                .bytes
+                .checked_sub(previous)
+                .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied ledger mismatch"))?;
+        } else {
+            projected.entries = projected
+                .entries
+                .checked_add(1)
+                .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied entry overflow"))?;
+        }
+        projected.bytes = projected
+            .bytes
+            .checked_add(length)
+            .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied byte overflow"))?;
+    }
+    Ok(projected)
+}
+
+fn write_credits(
+    txn: &redb::WriteTransaction,
+    credits: PendingCredits,
+) -> std::result::Result<(), StoErr> {
+    let bytes = serde_json::to_vec(&credits).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    txn.open_table(META)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?
+        .insert("unapplied_credits", bytes.as_slice())
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    Ok(())
+}
+
+fn remove_pending_credit(
+    credits: &mut PendingCredits,
+    bytes: usize,
+) -> std::result::Result<(), StoErr> {
+    credits.entries = credits
+        .entries
+        .checked_sub(1)
+        .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied entry ledger mismatch"))?;
+    credits.bytes = credits
+        .bytes
+        .checked_sub(bytes as u64)
+        .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied byte ledger mismatch"))?;
+    Ok(())
+}
+
+fn release_applied_credits(
+    txn: &redb::WriteTransaction,
+    from: Option<LogIdT>,
+    through: Option<LogIdT>,
+) -> std::result::Result<(), StoErr> {
+    let start = from.map_or(0, |id| id.index).saturating_add(1);
+    let end = through.map_or(0, |id| id.index);
+    if start > end {
+        return Ok(());
+    }
+    let mut credits = read_credits(txn)?;
+    let log = txn
+        .open_table(LOG)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    for record in log
+        .range(start..=end)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+    {
+        let (_, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        remove_pending_credit(&mut credits, value.value().len())?;
+    }
+    drop(log);
+    write_credits(txn, credits)
+}
+
+fn recount_unapplied_credits(
+    txn: &redb::WriteTransaction,
+    applied: Option<LogIdT>,
+) -> std::result::Result<(), StoErr> {
+    let start = applied.map_or(0, |id| id.index).saturating_add(1);
+    let log = txn
+        .open_table(LOG)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let mut credits = PendingCredits::default();
+    for record in log
+        .range(start..)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+    {
+        let (_, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        credits.entries = credits
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied count overflow"))?;
+        credits.bytes = credits
+            .bytes
+            .checked_add(value.value().len() as u64)
+            .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied byte overflow"))?;
+        if credits.entries > crate::limits::UNAPPLIED_ENTRIES
+            || credits.bytes > crate::limits::UNAPPLIED_BYTES
+        {
+            return Err(sto_err(
+                ErrorVerb::Read,
+                "snapshot leaves an over-limit unapplied log",
+            ));
+        }
+    }
+    drop(log);
+    write_credits(txn, credits)
 }
 
 fn admit_and_append(
@@ -652,45 +1245,63 @@ fn admit_and_append(
     last_applied: Option<LogIdT>,
     entries: &[EntryT],
 ) -> std::result::Result<(), StoErr> {
-    let applied = last_applied.map(|id| id.index).unwrap_or(0);
-    let pending = get_logs(db, applied.saturating_add(1), u64::MAX)?;
-    let mut sizes = BTreeMap::new();
-    for entry in pending.iter().chain(entries.iter()) {
-        sizes.insert(entry.get_log_id().index, encoded_entry_len(entry));
-    }
-    if sizes.len() > crate::limits::UNAPPLIED_ENTRIES as usize {
-        return Err(sto_err(
-            ErrorVerb::Write,
-            "unapplied entry credit exhausted",
-        ));
-    }
-    let bytes: u64 = sizes.values().copied().sum();
-    if bytes > crate::limits::UNAPPLIED_BYTES {
-        return Err(sto_err(ErrorVerb::Write, "unapplied byte credit exhausted"));
-    }
-    append_logs(db, entries)
-}
-
-fn append_logs(db: &Database, entries: &[EntryT]) -> std::result::Result<(), StoErr> {
+    let applied = last_applied.map_or(0, |id| id.index);
     let mut txn = db
         .begin_write()
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     txn.set_durability(Durability::Immediate)
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let mut credits = read_credits(&txn)?;
     {
         let mut table = txn
             .open_table(LOG)
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         for entry in entries {
             let bytes = serde_json::to_vec(entry).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            let index = entry.get_log_id().index;
+            if index > applied {
+                if let Some(previous) = table
+                    .get(&index)
+                    .map_err(|err| sto_err(ErrorVerb::Read, err))?
+                {
+                    credits.bytes = credits
+                        .bytes
+                        .checked_sub(previous.value().len() as u64)
+                        .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied ledger mismatch"))?;
+                } else {
+                    credits.entries = credits
+                        .entries
+                        .checked_add(1)
+                        .ok_or_else(|| sto_err(ErrorVerb::Write, "unapplied entry overflow"))?;
+                }
+                credits.bytes = credits
+                    .bytes
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| sto_err(ErrorVerb::Write, "unapplied byte overflow"))?;
+                if credits.entries > crate::limits::UNAPPLIED_ENTRIES {
+                    return Err(sto_err(
+                        ErrorVerb::Write,
+                        "unapplied entry credit exhausted",
+                    ));
+                }
+                if credits.bytes > crate::limits::UNAPPLIED_BYTES {
+                    return Err(sto_err(ErrorVerb::Write, "unapplied byte credit exhausted"));
+                }
+            }
             table
-                .insert(&entry.get_log_id().index, bytes.as_slice())
+                .insert(&index, bytes.as_slice())
                 .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         }
     }
-    txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    write_credits(&txn, credits)?;
+    commit_immediate(txn)?;
     after_persist("after-log")?;
     Ok(())
+}
+
+#[cfg(test)]
+fn append_logs(db: &Database, entries: &[EntryT]) -> std::result::Result<(), StoErr> {
+    admit_and_append(db, load_json(db, "last_applied"), entries)
 }
 
 fn write_snapshot_file(dir: &Path, meta: &SnapMeta, data: &[u8]) -> std::io::Result<()> {
@@ -710,22 +1321,33 @@ fn truncate_logs(db: &Database, from: u64) -> std::result::Result<(), StoErr> {
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     txn.set_durability(Durability::Immediate)
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let applied = load_json::<_, Option<LogIdT>>(db, "last_applied")
+        .flatten()
+        .map_or(0, |id| id.index);
+    let mut credits = read_credits(&txn)?;
     {
         let mut table = txn
             .open_table(LOG)
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        let keys: Vec<u64> = table
+        let keys: Vec<(u64, usize)> = table
             .range(from..)
             .map_err(|err| sto_err(ErrorVerb::Write, err))?
-            .filter_map(|row| row.ok().map(|(k, _)| k.value()))
-            .collect();
-        for key in keys {
+            .map(|row| {
+                row.map(|(key, value)| (key.value(), value.value().len()))
+                    .map_err(|err| sto_err(ErrorVerb::Read, err))
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        for (key, bytes) in keys {
+            if key > applied {
+                remove_pending_credit(&mut credits, bytes)?;
+            }
             table
                 .remove(&key)
                 .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         }
     }
-    txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    write_credits(&txn, credits)?;
+    commit_immediate(txn)?;
     Ok(())
 }
 
@@ -739,16 +1361,26 @@ fn purge_logs(
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     txn.set_durability(Durability::Immediate)
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let applied = load_json::<_, Option<LogIdT>>(db, "last_applied")
+        .flatten()
+        .map_or(0, |id| id.index);
+    let mut credits = read_credits(&txn)?;
     {
         let mut logs = txn
             .open_table(LOG)
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        let keys: Vec<u64> = logs
+        let keys: Vec<(u64, usize)> = logs
             .range(..=through)
             .map_err(|err| sto_err(ErrorVerb::Write, err))?
-            .filter_map(|row| row.ok().map(|(k, _)| k.value()))
-            .collect();
-        for key in keys {
+            .map(|row| {
+                row.map(|(key, value)| (key.value(), value.value().len()))
+                    .map_err(|err| sto_err(ErrorVerb::Read, err))
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        for (key, bytes) in keys {
+            if key > applied {
+                remove_pending_credit(&mut credits, bytes)?;
+            }
             logs.remove(&key)
                 .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         }
@@ -760,7 +1392,8 @@ fn purge_logs(
         meta.insert("last_purged", bytes.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     }
-    txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    write_credits(&txn, credits)?;
+    commit_immediate(txn)?;
     Ok(())
 }
 
@@ -813,14 +1446,17 @@ fn apply_entries(
     last_applied: &mut Option<LogIdT>,
     last_membership: &mut MembershipT,
     domain: &mut State,
+    schedule_revision: &mut u64,
     entries: Vec<EntryT>,
 ) -> std::result::Result<Vec<RaftResponse>, StoErr> {
     let mut replies = Vec::new();
-    let mut next_applied = *last_applied;
+    let previous_applied = *last_applied;
+    let mut next_applied = previous_applied;
     let mut next_membership = last_membership.clone();
     let mut next_domain = domain.clone();
     let mut domain_changed = false;
     let mut membership_changed = false;
+    let mut affected = BTreeMap::<crate::ids::RunId, Option<bool>>::new();
     for entry in entries {
         next_applied = Some(*entry.get_log_id());
         if let Some(membership) = openraft::entry::RaftPayload::get_membership(&entry.payload) {
@@ -848,6 +1484,9 @@ fn apply_entries(
                     }
                     let receipt =
                         crate::publication::apply(&mut next_domain, &command, key, operation);
+                    if let Ok(run) = receipt.applied_run() {
+                        affected.insert(run, Some(true));
+                    }
                     if let Err(err) = receipt.ensure_applied() {
                         reply.error = Some(err.to_string());
                     }
@@ -857,6 +1496,36 @@ fn apply_entries(
                 let mut candidate = next_domain.clone();
                 match domain::commit_command(&mut candidate, req.command.clone()) {
                     Ok(events) => {
+                        if let domain::CommandBody::Progress { run } = &req.command.body {
+                            affected.insert(*run, Some(!events.is_empty()));
+                        }
+                        for event in &events {
+                            if let Some(run) = domain::event_owner(&candidate, event)
+                                .map_err(|err| sto_err(ErrorVerb::Read, err))?
+                            {
+                                let progress = !matches!(
+                                    event,
+                                    domain::DomainEvent::ClaimGranted { .. }
+                                        | domain::DomainEvent::ClaimRenewed { .. }
+                                );
+                                affected
+                                    .entry(run)
+                                    .and_modify(|existing| {
+                                        if progress {
+                                            *existing = Some(true);
+                                        }
+                                    })
+                                    .or_insert(progress.then_some(true));
+                            }
+                        }
+                        if matches!(
+                            &req.command.body,
+                            domain::CommandBody::AcknowledgeRecovery { .. }
+                        ) {
+                            for run in domain::active_runs(&candidate) {
+                                affected.insert(run, Some(true));
+                            }
+                        }
                         next_domain = candidate;
                         domain_changed = true;
                         reply.run_id = events.iter().find_map(|event| match event {
@@ -896,10 +1565,22 @@ fn apply_entries(
                 .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         }
     }
-    txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    release_applied_credits(&txn, previous_applied, next_applied)?;
+    let next_revision = update_schedule(
+        &txn,
+        &next_domain,
+        &affected,
+        *schedule_revision,
+        next_applied.map_or(0, |id| id.index),
+        next_domain.engine_time_watermark_ms,
+    )?;
+    commit_immediate(txn)?;
     *last_applied = next_applied;
     *last_membership = next_membership;
     *domain = next_domain;
+    if let Some(revision) = next_revision {
+        *schedule_revision = revision;
+    }
     after_persist("after-apply")?;
     Ok(replies)
 }
@@ -928,6 +1609,7 @@ fn install_snapshot(
     last_membership: &mut MembershipT,
     domain: &mut State,
     snapshot: &mut Option<(SnapMeta, Vec<u8>)>,
+    schedule_revision: &mut u64,
     meta: SnapMeta,
     data: Vec<u8>,
 ) -> std::result::Result<(), StoErr> {
@@ -969,11 +1651,19 @@ fn install_snapshot(
             .insert("snapshot_data", data.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     }
-    txn.commit().map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let new_revision = replace_schedule(
+        &txn,
+        &restored,
+        *schedule_revision,
+        applied.map_or(0, |id| id.index),
+    )?;
+    recount_unapplied_credits(&txn, applied)?;
+    commit_immediate(txn)?;
     *last_applied = applied;
     *last_membership = membership;
     *domain = restored;
     *snapshot = Some((meta, data));
+    *schedule_revision = new_revision;
     after_persist("after-snapshot")?;
     Ok(())
 }
@@ -997,6 +1687,7 @@ impl LogStore {
         self.handle
             .tx
             .send(req(tx))
+            .await
             .map_err(|_| sto_err(ErrorVerb::Write, "storage thread stopped"))?;
         rx.await
             .map_err(|_| sto_err(ErrorVerb::Read, "storage thread dropped"))?
@@ -1012,6 +1703,7 @@ impl StateMachineStore {
         self.handle
             .tx
             .send(req(tx))
+            .await
             .map_err(|_| sto_err(ErrorVerb::Write, "storage thread stopped"))?;
         rx.await
             .map_err(|_| sto_err(ErrorVerb::Read, "storage thread dropped"))?
@@ -1240,12 +1932,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("member.redb");
         let db = redb::Database::create(&path).unwrap();
-        {
-            let txn = db.begin_write().unwrap();
-            let _ = txn.open_table(LOG);
-            let _ = txn.open_table(META);
-            txn.commit().unwrap();
-        }
+        initialize_publication_store(&db).unwrap();
         let entry = Entry::<TypeConfig> {
             log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
             payload: EntryPayload::Blank,
@@ -1346,15 +2033,11 @@ nodes:
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("member.redb");
         let db = redb::Database::create(&path).unwrap();
-        {
-            let txn = db.begin_write().unwrap();
-            let _ = txn.open_table(LOG);
-            let _ = txn.open_table(META);
-            txn.commit().unwrap();
-        }
+        initialize_publication_store(&db).unwrap();
         let mut last_applied = None;
         let mut last_membership = StoredMembership::new(None, Membership::new(vec![], None));
         let mut domain = State::default();
+        let mut schedule_revision = 0;
         inject_cut("after-apply");
         let entry = Entry::<TypeConfig> {
             log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
@@ -1365,6 +2048,7 @@ nodes:
             &mut last_applied,
             &mut last_membership,
             &mut domain,
+            &mut schedule_revision,
             vec![entry],
         )
         .unwrap_err();
@@ -1380,12 +2064,7 @@ nodes:
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("member.redb");
         let db = redb::Database::create(&path).unwrap();
-        {
-            let txn = db.begin_write().unwrap();
-            let _ = txn.open_table(LOG);
-            let _ = txn.open_table(META);
-            txn.commit().unwrap();
-        }
+        initialize_publication_store(&db).unwrap();
         let old_applied = Some(LogId::new(openraft::CommittedLeaderId::new(1, 1), 1));
         let old_membership = StoredMembership::new(None, Membership::new(vec![], None));
         let old_domain = State::default();
@@ -1405,6 +2084,7 @@ nodes:
         let mut last_membership = old_membership.clone();
         let mut domain = old_domain.clone();
         let mut snapshot = None;
+        let mut schedule_revision = 0;
         inject_cut("after-snapshot");
         let err = install_snapshot(
             &db,
@@ -1412,6 +2092,7 @@ nodes:
             &mut last_membership,
             &mut domain,
             &mut snapshot,
+            &mut schedule_revision,
             meta,
             data,
         )
@@ -1435,12 +2116,7 @@ nodes:
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("member.redb");
         let db = redb::Database::create(&path).unwrap();
-        {
-            let txn = db.begin_write().unwrap();
-            let _ = txn.open_table(LOG);
-            let _ = txn.open_table(META);
-            txn.commit().unwrap();
-        }
+        initialize_publication_store(&db).unwrap();
         let entries: Vec<EntryT> = (1..=3)
             .map(|index| Entry::<TypeConfig> {
                 log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
@@ -1538,11 +2214,13 @@ nodes:
         let mut applied = None;
         let mut membership = StoredMembership::new(None, Membership::new(vec![], None));
         let mut state = State::default();
+        let mut schedule_revision = 0;
         let responses = apply_entries(
             &db,
             &mut applied,
             &mut membership,
             &mut state,
+            &mut schedule_revision,
             vec![start, progress],
         )
         .unwrap();
@@ -1572,8 +2250,15 @@ nodes:
             2 + 30 * 24 * 60 * 60 * 1000,
             CommandBody::PruneHistory { limit: 128 },
         );
-        let response =
-            apply_entries(&db, &mut applied, &mut membership, &mut state, vec![expiry]).unwrap();
+        let response = apply_entries(
+            &db,
+            &mut applied,
+            &mut membership,
+            &mut state,
+            &mut schedule_revision,
+            vec![expiry],
+        )
+        .unwrap();
         assert!(response[0].error.is_none());
         assert!(!state.runs.contains_key(&run));
         drop(db);
@@ -1599,12 +2284,7 @@ nodes:
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("member.redb");
         let db = redb::Database::create(&path).unwrap();
-        {
-            let txn = db.begin_write().unwrap();
-            let _ = txn.open_table(LOG);
-            let _ = txn.open_table(META);
-            txn.commit().unwrap();
-        }
+        initialize_publication_store(&db).unwrap();
         let batch: Vec<EntryT> = (1..=crate::limits::UNAPPLIED_ENTRIES)
             .map(|index| Entry::<TypeConfig> {
                 log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), u64::from(index)),
@@ -1627,5 +2307,49 @@ nodes:
             loaded.last().unwrap().get_log_id().index,
             u64::from(crate::limits::UNAPPLIED_ENTRIES)
         );
+    }
+
+    #[test]
+    fn unapplied_credits_follow_overwrite_apply_and_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("member.redb")).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let entry = |index, term| Entry::<TypeConfig> {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(term, 1), index),
+            payload: EntryPayload::Blank,
+        };
+        let first = entry(1, 1);
+        let second = entry(2, 1);
+        admit_and_append(&db, None, &[first.clone(), second]).unwrap();
+        let bytes = persisted_credits(&db).unwrap().bytes;
+        assert_eq!(persisted_credits(&db).unwrap().entries, 2);
+        let replacement = entry(2, 2);
+        let size = serde_json::to_vec(&replacement).unwrap().len() as u64;
+        let projected = projected_append_usage(&db, None, &[(2, size)]).unwrap();
+        assert_eq!(projected.entries, 2);
+        admit_and_append(&db, None, std::slice::from_ref(&replacement)).unwrap();
+        assert_eq!(persisted_credits(&db).unwrap().bytes, projected.bytes);
+        assert_eq!(persisted_credits(&db).unwrap().entries, 2);
+        assert!(bytes > 0);
+
+        let mut applied = None;
+        let mut membership = StoredMembership::new(None, Membership::new(vec![], None));
+        let mut domain = State::default();
+        let mut schedule_revision = 0;
+        apply_entries(
+            &db,
+            &mut applied,
+            &mut membership,
+            &mut domain,
+            &mut schedule_revision,
+            vec![first],
+        )
+        .unwrap();
+        let remaining = persisted_credits(&db).unwrap();
+        assert_eq!(remaining.entries, 1);
+        assert_eq!(remaining.bytes, size);
+        truncate_logs(&db, 2).unwrap();
+        assert_eq!(persisted_credits(&db).unwrap().entries, 0);
+        assert_eq!(persisted_credits(&db).unwrap().bytes, 0);
     }
 }

@@ -34,7 +34,9 @@ pub mod provider;
 pub mod publication;
 #[doc(hidden)]
 pub mod rpc;
+mod schedule;
 pub mod schema;
+
 #[doc(hidden)]
 pub mod storage;
 pub mod time;
