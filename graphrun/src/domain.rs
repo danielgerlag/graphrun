@@ -3714,6 +3714,9 @@ pub fn start_run(
     let CommandBody::Start { run, .. } = &command.body else {
         return Err(Error::invalid("start_run requires Start"));
     };
+    if let Some(events) = state.commands.get(&command.id) {
+        return Ok(events.clone());
+    }
     state.runs.insert(
         *run,
         RunState {
@@ -3758,6 +3761,9 @@ pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEv
 }
 
 pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainEvent>> {
+    if let Some(events) = state.commands.get(&command.id) {
+        return Ok(events.clone());
+    }
     if let CommandBody::Start {
         run,
         definition,
@@ -4093,6 +4099,83 @@ mod tests {
         )
         .unwrap();
         (state, run)
+    }
+
+    #[test]
+    fn retrying_start_command_with_different_run_preserves_state() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let id = CommandId::generate();
+        let original_run = RunId::generate();
+        let retry_run = RunId::generate();
+        let events = commit_command(
+            &mut state,
+            Command {
+                id,
+                time: EngineTime::from_millis(10),
+                body: CommandBody::Start {
+                    run: original_run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::String("original".to_owned()),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+        )
+        .unwrap();
+        let Some(DomainEvent::RunAdmitted { run, root, .. }) = events.first() else {
+            panic!("initial start did not admit a run");
+        };
+        assert_eq!(*run, original_run);
+        assert_eq!(state.runs[&original_run].root, *root);
+        assert_eq!(state.scopes[root].run, original_run);
+        assert_eq!(state.history[&original_run], events);
+        assert_eq!(state.commands[&id], events);
+        let before_retry = serde_json::to_value(&state).unwrap();
+
+        let replayed = commit_command(
+            &mut state,
+            Command {
+                id,
+                time: EngineTime::from_millis(20),
+                body: CommandBody::Start {
+                    run: retry_run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::String("different".to_owned()),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(replayed, events);
+        assert_eq!(state.commands[&id], events);
+        assert!(!state.runs.contains_key(&retry_run));
+        assert_eq!(serde_json::to_value(&state).unwrap(), before_retry);
+
+        let other_run = RunId::generate();
+        let replayed = start_run(
+            &mut state,
+            Command {
+                id,
+                time: EngineTime::from_millis(30),
+                body: CommandBody::Start {
+                    run: other_run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Null,
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        assert_eq!(replayed, events);
+        assert!(!state.runs.contains_key(&other_run));
+        assert_eq!(serde_json::to_value(&state).unwrap(), before_retry);
     }
 
     fn handler(name: &str, input: &Value) -> Value {
