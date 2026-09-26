@@ -573,6 +573,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mismatched_member_private_key_rejects_before_storage_open() {
+        let ca = generate_ca().unwrap();
+        let mut invalid = issue_node(&ca, 1).unwrap();
+        invalid.key_pem = issue_node(&ca, 2).unwrap().key_pem;
+        let dir = tempfile::tempdir().unwrap();
+        let error = Engine::member(MemberConfig {
+            data_dir: dir.path().to_path_buf(),
+            node_id: 1,
+            bind: unused_addr(),
+            peers: BTreeMap::new(),
+            tls: invalid,
+            host_activities: false,
+            initialize: true,
+        })
+        .await
+        .err()
+        .expect("the member's TLS key must match its signed certificate");
+        assert_eq!(error.kind, crate::error::ErrorKind::InvalidArgument);
+        assert!(!dir.path().join("identity.json").exists());
+        assert!(!dir.path().join("member.redb").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn outbound_member_checks_the_presented_certificate_not_only_dns() {
         let ca = generate_ca().unwrap();
         let local = issue_node(&ca, 1).unwrap();

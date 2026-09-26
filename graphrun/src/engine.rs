@@ -411,6 +411,7 @@ impl Engine {
             &expected_cluster,
             &crate::tls::PrincipalId::parse(config.node_id.to_string())?,
         )?;
+        crate::tls::server_config(&config.tls)?;
         let listener = tokio::net::TcpListener::bind(config.bind)
             .await
             .map_err(|err| {
