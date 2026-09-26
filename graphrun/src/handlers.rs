@@ -5,10 +5,10 @@
 
 use crate::domain::ReconcileOutcome;
 use crate::error::{Error, Result};
-use crate::ids::ActivityKey;
+use crate::ids::{ActivityKey, ExecutionRole, valid_ascii_name};
 use crate::schema::DurablePayload;
 use crate::value::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -80,6 +80,7 @@ impl Handlers {
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O>> + Send + 'static,
     {
+        validate_handler_key(name, version)?;
         let handler = Arc::new(handler);
         let wrapped: AsyncFn = Arc::new(move |value: Value| {
             let handler = handler.clone();
@@ -103,6 +104,16 @@ impl Handlers {
         O: DurablePayload,
         F: Fn(I) -> Result<O> + Send + Sync + 'static,
     {
+        self.blocking_version(name, 1, handler)
+    }
+
+    pub fn blocking_version<I, O, F>(&self, name: &str, version: u32, handler: F) -> Result<()>
+    where
+        I: DurablePayload,
+        O: DurablePayload,
+        F: Fn(I) -> Result<O> + Send + Sync + 'static,
+    {
+        validate_handler_key(name, version)?;
         let handler = Arc::new(handler);
         let wrapped: BlockingFn = Arc::new(move |value: Value| {
             let input: I = decode(&value)?;
@@ -112,7 +123,7 @@ impl Handlers {
             .write()
             .expect("handlers")
             .blocking
-            .insert((name.to_owned(), 1), wrapped);
+            .insert((name.to_owned(), version), wrapped);
         Ok(())
     }
 
@@ -120,19 +131,83 @@ impl Handlers {
     where
         F: Fn(&Value, Option<&str>) -> (ReconcileOutcome, Option<Value>) + Send + Sync + 'static,
     {
+        self.reconciler_version(name, 1, handler)
+            .expect("valid version-1 reconciler name");
+    }
+
+    pub fn reconciler_version<F>(&self, name: &str, version: u32, handler: F) -> Result<()>
+    where
+        F: Fn(&Value, Option<&str>) -> (ReconcileOutcome, Option<Value>) + Send + Sync + 'static,
+    {
+        validate_handler_key(name, version)?;
         self.inner
             .write()
             .expect("handlers")
             .reconcilers
-            .insert((name.to_owned(), 1), Arc::new(handler));
+            .insert((name.to_owned(), version), Arc::new(handler));
+        Ok(())
     }
 
+    /// Whether a runnable activity is registered for the legacy local-engine path.
     pub fn provides(&self, key: &ActivityKey) -> bool {
+        self.provides_role(key, ExecutionRole::Forward)
+    }
+
+    /// Compensation uses the same activity implementation as forward execution.
+    /// Reconcilers must be registered independently.
+    pub fn provides_role(&self, key: &ActivityKey, role: ExecutionRole) -> bool {
         let inner = self.inner.read().expect("handlers");
         let k = (key.name.clone(), key.version);
-        inner.async_handlers.contains_key(&k)
-            || inner.blocking.contains_key(&k)
-            || (inner.fixtures && is_fixture(&key.name))
+        match role {
+            ExecutionRole::Forward | ExecutionRole::Compensation => {
+                inner.async_handlers.contains_key(&k)
+                    || inner.blocking.contains_key(&k)
+                    || (inner.fixtures && key.version == 1 && is_fixture_activity(&key.name))
+            }
+            ExecutionRole::Reconciliation => {
+                inner.reconcilers.contains_key(&k)
+                    || (inner.fixtures && key.version == 1 && is_fixture_reconciler(&key.name))
+            }
+        }
+    }
+
+    /// Enumerate exact runnable (role, name/version) pairs; never advertise a wildcard.
+    pub fn capabilities(&self) -> Vec<(ExecutionRole, ActivityKey)> {
+        let inner = self.inner.read().expect("handlers");
+        let mut activities: BTreeSet<_> = inner
+            .async_handlers
+            .keys()
+            .chain(inner.blocking.keys())
+            .map(|(name, version)| ActivityKey::new(name.clone(), *version))
+            .collect();
+        let mut reconcilers: BTreeSet<_> = inner
+            .reconcilers
+            .keys()
+            .map(|(name, version)| ActivityKey::new(name.clone(), *version))
+            .collect();
+        if inner.fixtures {
+            activities.extend(
+                FIXTURE_ACTIVITIES
+                    .iter()
+                    .map(|name| ActivityKey::new(*name, 1)),
+            );
+            reconcilers.extend(
+                FIXTURE_RECONCILERS
+                    .iter()
+                    .map(|name| ActivityKey::new(*name, 1)),
+            );
+        }
+        let mut result = Vec::new();
+        for key in activities {
+            result.push((ExecutionRole::Forward, key.clone()));
+            result.push((ExecutionRole::Compensation, key));
+        }
+        result.extend(
+            reconcilers
+                .into_iter()
+                .map(|key| (ExecutionRole::Reconciliation, key)),
+        );
+        result
     }
 
     pub fn require_all(&self, keys: &[ActivityKey]) -> Result<()> {
@@ -162,7 +237,7 @@ impl Handlers {
         }
         let fixtures = inner.fixtures;
         drop(inner);
-        if fixtures {
+        if fixtures && version == 1 && is_fixture_activity(name) {
             return crate::engine::dispatch_handler(name, &input, effect_key);
         }
         Err(Error::invalid(format!(
@@ -196,7 +271,7 @@ impl Handlers {
         } else if let Some(handler) = blocking_h {
             return handler(input);
         }
-        if fixtures {
+        if fixtures && version == 1 && is_fixture_activity(name) {
             return crate::engine::dispatch_handler(name, &input, effect_key);
         }
         Err(Error::invalid(format!(
@@ -210,39 +285,66 @@ impl Handlers {
         input: &Value,
         effect_key: Option<&str>,
     ) -> (ReconcileOutcome, Option<Value>) {
+        self.reconcile_version(name, 1, input, effect_key)
+    }
+
+    pub fn reconcile_version(
+        &self,
+        name: &str,
+        version: u32,
+        input: &Value,
+        effect_key: Option<&str>,
+    ) -> (ReconcileOutcome, Option<Value>) {
         let inner = self.inner.read().expect("handlers");
-        if let Some(handler) = inner.reconcilers.get(&(name.to_owned(), 1)).cloned() {
+        if let Some(handler) = inner.reconcilers.get(&(name.to_owned(), version)).cloned() {
             drop(inner);
             return handler(input, effect_key);
         }
         let fixtures = inner.fixtures;
         drop(inner);
-        if fixtures {
+        if fixtures && version == 1 && is_fixture_reconciler(name) {
             return crate::engine::builtin_reconcile(name, input, effect_key);
         }
         (ReconcileOutcome::Unknown, None)
     }
 }
 
+fn validate_handler_key(name: &str, version: u32) -> Result<()> {
+    if !valid_ascii_name(name) {
+        return Err(Error::invalid(format!("invalid handler name {name}")));
+    }
+    if version == 0 {
+        return Err(Error::invalid("handler version must be positive"));
+    }
+    Ok(())
+}
+
+const FIXTURE_ACTIVITIES: &[&str] = &[
+    "counter.increment",
+    "inventory.reserve",
+    "inventory.release",
+    "payment.charge",
+    "payment.refund",
+    "tax.quote",
+    "shipping.quote",
+    "remote.echo",
+    "test.gate",
+    "test.manual",
+    "test.block",
+];
+
+const FIXTURE_RECONCILERS: &[&str] = &["test.lookup", "inventory.lookup", "payment.lookup"];
+
+fn is_fixture_activity(name: &str) -> bool {
+    FIXTURE_ACTIVITIES.contains(&name)
+}
+
+fn is_fixture_reconciler(name: &str) -> bool {
+    FIXTURE_RECONCILERS.contains(&name)
+}
+
 pub fn is_fixture(name: &str) -> bool {
-    matches!(
-        name,
-        "counter.increment"
-            | "inventory.reserve"
-            | "inventory.release"
-            | "payment.charge"
-            | "payment.refund"
-            | "tax.quote"
-            | "shipping.quote"
-            | "remote.echo"
-            | "test.gate"
-            | "test.manual"
-            | "test.flaky"
-            | "test.block"
-            | "test.lookup"
-            | "inventory.lookup"
-            | "payment.lookup"
-    )
+    is_fixture_activity(name) || is_fixture_reconciler(name) || name == "test.flaky"
 }
 
 fn decode<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T> {
@@ -253,4 +355,222 @@ fn decode<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T> {
 fn encode<T: serde::Serialize>(value: &T) -> Result<Value> {
     let json = serde_json::to_value(value).map_err(|err| Error::invalid(err.to_string()))?;
     Value::from_json(json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_are_exact_and_role_specific() {
+        let handlers = Handlers::empty();
+        assert!(handlers.capabilities().is_empty());
+
+        handlers
+            .activity_version("shared", 1, |input: i64| async move { Ok(input + 1) })
+            .unwrap();
+        handlers
+            .blocking_version("shared", 1, |input: i64| Ok(input + 10))
+            .unwrap();
+        handlers
+            .blocking_version("shared", 2, |input: i64| Ok(input + 20))
+            .unwrap();
+        handlers
+            .reconciler_version("shared", 2, |_, _| (ReconcileOutcome::NotApplied, None))
+            .unwrap();
+
+        let v1 = ActivityKey::new("shared", 1);
+        let v2 = ActivityKey::new("shared", 2);
+        let v3 = ActivityKey::new("shared", 3);
+        assert_eq!(
+            handlers.capabilities(),
+            vec![
+                (ExecutionRole::Forward, v1.clone()),
+                (ExecutionRole::Compensation, v1.clone()),
+                (ExecutionRole::Forward, v2.clone()),
+                (ExecutionRole::Compensation, v2.clone()),
+                (ExecutionRole::Reconciliation, v2.clone()),
+            ]
+        );
+        assert!(handlers.provides(&v1));
+        assert!(handlers.provides_role(&v2, ExecutionRole::Compensation));
+        assert!(handlers.provides_role(&v2, ExecutionRole::Reconciliation));
+        assert!(!handlers.provides_role(&v1, ExecutionRole::Reconciliation));
+        for role in [
+            ExecutionRole::Forward,
+            ExecutionRole::Compensation,
+            ExecutionRole::Reconciliation,
+        ] {
+            assert!(!handlers.provides_role(&v3, role));
+        }
+        assert!(!handlers.provides(&ActivityKey::new("*", 1)));
+    }
+
+    #[test]
+    fn invalid_handler_identities_are_not_registered() {
+        let handlers = Handlers::empty();
+        assert!(
+            handlers
+                .activity_version("", 1, |input: i64| async move { Ok(input) })
+                .is_err()
+        );
+        assert!(
+            handlers
+                .blocking_version("bad name", 1, |input: i64| Ok(input))
+                .is_err()
+        );
+        assert!(
+            handlers
+                .activity_version("valid", 0, |input: i64| async move { Ok(input) })
+                .is_err()
+        );
+        assert!(
+            handlers
+                .blocking_version("valid", 0, |input: i64| Ok(input))
+                .is_err()
+        );
+        assert!(
+            handlers
+                .reconciler_version("recon", 0, |_, _| (ReconcileOutcome::Unknown, None))
+                .is_err()
+        );
+        assert!(
+            handlers
+                .reconciler_version("bad/name", 2, |_, _| (ReconcileOutcome::Unknown, None))
+                .is_err()
+        );
+        assert!(handlers.capabilities().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_respects_versions_and_existing_v1_wrappers() {
+        let handlers = Handlers::empty();
+        handlers
+            .activity("async", |input: i64| async move { Ok(input + 1) })
+            .unwrap();
+        handlers
+            .activity_version("async", 2, |input: i64| async move { Ok(input + 2) })
+            .unwrap();
+        handlers
+            .blocking("blocking", |input: i64| Ok(input + 10))
+            .unwrap();
+        handlers
+            .blocking_version("blocking", 2, |input: i64| Ok(input + 20))
+            .unwrap();
+
+        for (name, version, expected) in [
+            ("async", 1, 4),
+            ("async", 2, 5),
+            ("blocking", 1, 13),
+            ("blocking", 2, 23),
+        ] {
+            assert_eq!(
+                handlers
+                    .run(name, version, Value::Int(3), None, false)
+                    .await
+                    .unwrap(),
+                Value::Int(expected)
+            );
+        }
+        assert_eq!(
+            handlers
+                .run_blocking("blocking", 2, Value::Int(3), None)
+                .unwrap(),
+            Value::Int(23)
+        );
+        assert!(
+            handlers
+                .run("async", 3, Value::Int(3), None, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            handlers
+                .run_blocking("blocking", 3, Value::Int(3), None)
+                .is_err()
+        );
+        assert!(
+            handlers
+                .run_blocking("async", 1, Value::Int(3), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reconciliation_dispatch_uses_its_own_versioned_registry() {
+        let handlers = Handlers::empty();
+        handlers.reconciler("recon", |_, _| (ReconcileOutcome::NotApplied, None));
+        handlers
+            .reconciler_version("recon", 2, |input, effect_key| {
+                assert_eq!(effect_key, Some("effect"));
+                (ReconcileOutcome::Applied, Some(input.clone()))
+            })
+            .unwrap();
+
+        let input = Value::Int(7);
+        assert_eq!(
+            handlers.reconcile("recon", &input, None),
+            (ReconcileOutcome::NotApplied, None)
+        );
+        assert_eq!(
+            handlers.reconcile_version("recon", 2, &input, Some("effect")),
+            (ReconcileOutcome::Applied, Some(input.clone()))
+        );
+        assert_eq!(
+            handlers.reconcile_version("recon", 3, &input, None),
+            (ReconcileOutcome::Unknown, None)
+        );
+        assert!(!handlers.provides(&ActivityKey::new("recon", 2)));
+        assert!(
+            handlers.provides_role(&ActivityKey::new("recon", 2), ExecutionRole::Reconciliation)
+        );
+    }
+
+    #[tokio::test]
+    async fn fixtures_are_only_advertised_at_v1_for_runnable_roles() {
+        let handlers = Handlers::fixtures();
+        let forward = ActivityKey::new("remote.echo", 1);
+        let lookup = ActivityKey::new("test.lookup", 1);
+        assert!(handlers.provides_role(&forward, ExecutionRole::Forward));
+        assert!(handlers.provides_role(&forward, ExecutionRole::Compensation));
+        assert!(!handlers.provides_role(&forward, ExecutionRole::Reconciliation));
+        assert!(handlers.provides_role(&lookup, ExecutionRole::Reconciliation));
+        assert!(!handlers.provides(&lookup));
+        assert!(!handlers.provides(&ActivityKey::new("remote.echo", 2)));
+        assert!(!handlers.provides_role(
+            &ActivityKey::new("test.lookup", 2),
+            ExecutionRole::Reconciliation
+        ));
+        assert!(
+            !handlers
+                .capabilities()
+                .contains(&(ExecutionRole::Forward, ActivityKey::new("test.flaky", 1)))
+        );
+        assert!(
+            handlers
+                .capabilities()
+                .contains(&(ExecutionRole::Reconciliation, lookup))
+        );
+        assert_eq!(
+            handlers
+                .run("remote.echo", 1, Value::Int(8), None, false)
+                .await
+                .unwrap(),
+            Value::Int(8)
+        );
+        assert!(
+            handlers
+                .run("remote.echo", 2, Value::Int(8), None, false)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            handlers.reconcile_version("test.lookup", 1, &Value::Int(8), None),
+            (ReconcileOutcome::Applied, Some(Value::Int(8)))
+        );
+        assert_eq!(
+            handlers.reconcile_version("test.lookup", 2, &Value::Int(8), None),
+            (ReconcileOutcome::Unknown, None)
+        );
+    }
 }
