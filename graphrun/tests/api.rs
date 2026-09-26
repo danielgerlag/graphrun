@@ -185,6 +185,93 @@ fn repeat_builder_compiles() {
 }
 
 #[test]
+fn do_while_builder_compiles() {
+    let catalog = catalog();
+    let increment = catalog
+        .activity_ref::<Counter, Counter>("counter.increment", 1)
+        .unwrap();
+    let mut body = RegionBuilder::<Counter>::new();
+    let bumped = body
+        .activity("increment", &increment, body.input())
+        .unwrap();
+    let body = body.complete("iteration_done", bumped.output()).unwrap();
+    let mut root = RegionBuilder::<Counter>::new();
+    let looped = root
+        .do_while(
+            "do_while",
+            root.input(),
+            Condition::lt_loop("/value", 3),
+            body,
+            10,
+        )
+        .unwrap();
+    let root = root.complete("finish", looped.output()).unwrap();
+    WorkflowBuilder::new("do_while_counter", 1, root)
+        .build(&catalog)
+        .unwrap();
+}
+
+#[test]
+fn foreach_builder_compiles() {
+    let catalog = catalog();
+    let increment = catalog
+        .activity_ref::<Counter, Counter>("counter.increment", 1)
+        .unwrap();
+    let mut body = RegionBuilder::<Counter>::new();
+    let bumped = body
+        .activity("increment", &increment, body.input())
+        .unwrap();
+    let body = body.complete("iteration_done", bumped.output()).unwrap();
+    let mut root = RegionBuilder::<Vec<Counter>>::new();
+    let foreach = root.foreach("each", root.input(), body, 100, 4).unwrap();
+    let root = root.complete("finish", foreach.output()).unwrap();
+    WorkflowBuilder::new("foreach_counter", 1, root)
+        .build(&catalog)
+        .unwrap();
+}
+
+#[test]
+fn saga_builder_compiles() {
+    let catalog = catalog();
+    let reserve = catalog
+        .activity_ref::<Order, ReservedOrder>("inventory.reserve", 1)
+        .unwrap();
+    let release = catalog
+        .activity_ref::<ReservedOrder, ()>("inventory.release", 1)
+        .unwrap();
+    let mut body = RegionBuilder::<Order>::new();
+    let reserved = body.activity("reserve", &reserve, body.input()).unwrap();
+    body.compensate(&reserved, &release).unwrap();
+    let body = body.complete("done", reserved.output()).unwrap();
+    let mut root = RegionBuilder::<Order>::new();
+    let saga = root.saga("saga", root.input(), body).unwrap();
+    let root = root.complete("finish", saga.output()).unwrap();
+    WorkflowBuilder::new("saga_order", 1, root)
+        .build(&catalog)
+        .unwrap();
+}
+
+#[test]
+fn delay_wait_and_fail_builder_compiles() {
+    let catalog = catalog();
+    let mut root = RegionBuilder::<Counter>::new();
+    root.delay("delay", Duration::from_millis(1)).unwrap();
+    root.wait_until("deadline", 42).unwrap();
+    let input = root.workflow_input();
+    let root = root.complete("finish", input).unwrap();
+    WorkflowBuilder::new("delayed_counter", 1, root)
+        .build(&catalog)
+        .unwrap();
+
+    let fail = RegionBuilder::<Counter>::new()
+        .fail::<Counter>("abort", "fixture.failed", "expected")
+        .unwrap();
+    WorkflowBuilder::new("failed_counter", 1, fail)
+        .build(&catalog)
+        .unwrap();
+}
+
+#[test]
 fn timed_wait_shared_tail_compiles() {
     let catalog = catalog();
     let increment = catalog
@@ -885,9 +972,8 @@ async fn parallel_outputs_follow_declaration_not_name_order() {
         .unwrap()
         .finish(&catalog)
         .unwrap();
-    let data_dir = std::path::PathBuf::from(format!("p{}", std::process::id()));
-    std::fs::create_dir(&data_dir).unwrap();
-    let engine = graphrun::Engine::local(&data_dir).await.unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let engine = graphrun::Engine::local(data_dir.path()).await.unwrap();
     let input = graphrun::Value::from_json(serde_json::json!({
         "order_id": "o1", "amount": 1000
     }))
@@ -922,5 +1008,4 @@ async fn parallel_outputs_follow_declaration_not_name_order() {
         assert_eq!(output.to_json(), expected);
     }
     engine.shutdown().await.unwrap();
-    std::fs::remove_dir_all(data_dir).unwrap();
 }
