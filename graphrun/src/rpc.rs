@@ -30,9 +30,62 @@ use openraft::{Raft, ServerState};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+#[cfg(any(test, feature = "fault-injection"))]
+use std::sync::{LazyLock, Mutex};
 use tokio::sync::Notify;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
+
+#[cfg(any(test, feature = "fault-injection"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerResponseFault {
+    DropReportAck,
+    HangReportAck,
+    DropReconcileAck,
+    HangReconcileAck,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+static WORKER_RESPONSE_FAULTS: LazyLock<
+    Mutex<std::collections::HashMap<ActivationId, WorkerResponseFault>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn inject_worker_response_fault(activation: ActivationId, fault: WorkerResponseFault) {
+    WORKER_RESPONSE_FAULTS
+        .lock()
+        .expect("worker fault registry")
+        .insert(activation, fault);
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+async fn after_worker_result(activation: ActivationId, reconciliation: bool) -> Result<(), Status> {
+    let fault = {
+        let mut faults = WORKER_RESPONSE_FAULTS
+            .lock()
+            .expect("worker fault registry");
+        if faults.get(&activation).is_some_and(|fault| {
+            matches!(
+                fault,
+                WorkerResponseFault::DropReconcileAck | WorkerResponseFault::HangReconcileAck
+            ) == reconciliation
+        }) {
+            faults.remove(&activation)
+        } else {
+            None
+        }
+    };
+    match fault {
+        Some(WorkerResponseFault::DropReportAck | WorkerResponseFault::DropReconcileAck) => Err(
+            Status::unavailable("injected lost committed worker receipt"),
+        ),
+        Some(WorkerResponseFault::HangReportAck | WorkerResponseFault::HangReconcileAck) => {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
 
 #[derive(Clone)]
 pub struct GraphServices {
@@ -1051,7 +1104,7 @@ impl WorkerSvc for GraphServices {
         if req.output_schema_digest != capability.output_schema_digest {
             return Err(Status::failed_precondition("output schema digest mismatch"));
         }
-        ack(write_raft(
+        let result = write_raft(
             &self.raft,
             &self.storage,
             Command {
@@ -1060,8 +1113,13 @@ impl WorkerSvc for GraphServices {
                 body,
             },
         )
-        .await
-        .map(|_| self.notify.notify_one()))
+        .await;
+        if result.is_ok() {
+            self.notify.notify_one();
+            #[cfg(any(test, feature = "fault-injection"))]
+            after_worker_result(activation, false).await?;
+        }
+        ack(result)
     }
 
     async fn reconcile(&self, request: Request<ReconcileRequest>) -> Result<Response<Ack>, Status> {
@@ -1137,7 +1195,7 @@ impl WorkerSvc for GraphServices {
         if req.output_schema_digest != capability.output_schema_digest {
             return Err(Status::failed_precondition("output schema digest mismatch"));
         }
-        ack(write_raft(
+        let result = write_raft(
             &self.raft,
             &self.storage,
             Command {
@@ -1146,8 +1204,13 @@ impl WorkerSvc for GraphServices {
                 body,
             },
         )
-        .await
-        .map(|_| self.notify.notify_one()))
+        .await;
+        if result.is_ok() {
+            self.notify.notify_one();
+            #[cfg(any(test, feature = "fault-injection"))]
+            after_worker_result(activation, true).await?;
+        }
+        ack(result)
     }
 }
 
@@ -1228,5 +1291,24 @@ fn ack(result: Result<(), crate::error::Error>) -> Result<Response<Ack>, Status>
         Err(err) => Ok(Response::new(Ack {
             error: err.to_string(),
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_worker_write_is_a_transport_error() {
+        let outcome = ack(Err(crate::error::Error::new(
+            ErrorKind::Unavailable,
+            "unknown outcome for command abc",
+        )));
+        assert_eq!(outcome.unwrap_err().code(), tonic::Code::Unavailable);
+        let terminal = ack(Err(crate::error::Error::new(
+            ErrorKind::FailedPrecondition,
+            "stale claim",
+        )));
+        assert!(terminal.unwrap().into_inner().error.contains("stale claim"));
     }
 }

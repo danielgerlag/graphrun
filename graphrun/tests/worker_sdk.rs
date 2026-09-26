@@ -114,29 +114,37 @@ fn unused_addr() -> std::net::SocketAddr {
 
 async fn member() -> (Engine, tempfile::TempDir, TlsMaterial, String) {
     let ca = generate_ca().unwrap();
-    let addr = unused_addr();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::member(MemberConfig {
-        data_dir: dir.path().to_path_buf(),
-        node_id: 1,
-        bind: addr,
-        peers: BTreeMap::new(),
-        tls: signed(
-            &ca,
-            "node-1",
-            &[PeerRole::Member, PeerRole::Client, PeerRole::Admin],
-        ),
-        host_activities: false,
-        initialize: true,
-    })
-    .await
-    .unwrap();
-    (
-        engine,
-        dir,
-        signed(&ca, "app-worker", &[PeerRole::Worker]),
-        format!("https://{addr}"),
-    )
+    for _ in 0..5 {
+        let addr = unused_addr();
+        let dir = tempfile::tempdir().unwrap();
+        match Engine::member(MemberConfig {
+            data_dir: dir.path().to_path_buf(),
+            node_id: 1,
+            bind: addr,
+            peers: BTreeMap::new(),
+            tls: signed(
+                &ca,
+                "node-1",
+                &[PeerRole::Member, PeerRole::Client, PeerRole::Admin],
+            ),
+            host_activities: false,
+            initialize: true,
+        })
+        .await
+        {
+            Ok(engine) => {
+                return (
+                    engine,
+                    dir,
+                    signed(&ca, "app-worker", &[PeerRole::Worker]),
+                    format!("https://{addr}"),
+                );
+            }
+            Err(err) if err.message.starts_with("member gRPC bind:") => continue,
+            Err(err) => panic!("member startup: {err}"),
+        }
+    }
+    panic!("no available member test port");
 }
 
 async fn provider() -> (
@@ -153,31 +161,12 @@ async fn provider() -> (
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn independent_worker_matches_pinned_contract_and_calls_provider() {
-    let ca = generate_ca().unwrap();
-    let addr = unused_addr();
-    let member_dir = tempfile::tempdir().unwrap();
-    let member = Engine::member(MemberConfig {
-        data_dir: member_dir.path().to_path_buf(),
-        node_id: 1,
-        bind: addr,
-        peers: BTreeMap::new(),
-        tls: signed(
-            &ca,
-            "node-1",
-            &[PeerRole::Member, PeerRole::Client, PeerRole::Admin],
-        ),
-        host_activities: false,
-        initialize: true,
-    })
-    .await
-    .unwrap();
+    let (member, _member_dir, tls, endpoint) = member().await;
     let provider_dir = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let probe_url = url.clone();
     let provider_task = tokio::spawn(provider::serve(listener, provider_dir.path().to_path_buf()));
-    let tls = signed(&ca, "app-worker", &[PeerRole::Worker]);
-    let endpoint = format!("https://{addr}");
     let incompatible = Worker::builder(endpoint.clone(), tls.clone(), catalog("string/v1"))
         .blocking("sdk.effect", 1, |input: i64, _| {
             Ok::<_, ActivityError>(input.to_string())
@@ -649,6 +638,31 @@ async fn remote_reconciler_records_all_three_outcomes() {
     first_task.abort();
     let _ = first_task.await;
     release.store(true, Ordering::SeqCst);
+    #[cfg(feature = "fault-injection")]
+    {
+        let applied = engine.inspect(runs[0]).await.unwrap();
+        let absent = engine.inspect(runs[1]).await.unwrap();
+        let applied_activation = applied
+            .activations
+            .values()
+            .find(|act| act.run == runs[0])
+            .unwrap()
+            .id;
+        let absent_activation = absent
+            .activations
+            .values()
+            .find(|act| act.run == runs[1])
+            .unwrap()
+            .id;
+        graphrun::rpc::inject_worker_response_fault(
+            applied_activation,
+            graphrun::rpc::WorkerResponseFault::DropReconcileAck,
+        );
+        graphrun::rpc::inject_worker_response_fault(
+            absent_activation,
+            graphrun::rpc::WorkerResponseFault::HangReconcileAck,
+        );
+    }
     let probe_url = url.clone();
     let recon = Worker::builder(endpoint, tls, manual_catalog())
         .capacity(4)
@@ -740,6 +754,13 @@ async fn remote_reconciler_records_all_three_outcomes() {
     let ledger = provider::dump_ledger(&url).unwrap();
     assert_eq!(ledger["entries"][&applied_key]["logical"], 1);
     stop.send(()).unwrap();
+    #[cfg(feature = "fault-injection")]
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    #[cfg(not(feature = "fault-injection"))]
     task.await.unwrap().unwrap();
     provider_task.abort();
     engine.shutdown().await.unwrap();
@@ -867,4 +888,183 @@ async fn worker_keeps_assignment_across_leader_change() {
     provider_task.abort();
     second.shutdown().await.unwrap();
     third.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "fault-injection")]
+async fn committed_result_receipt_fault(fault: graphrun::rpc::WorkerResponseFault) {
+    let (engine, _dir, tls, endpoint) = member().await;
+    let (provider_task, _provider_dir, url) = provider().await;
+    let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = applied.clone();
+    let worker = Worker::builder(endpoint, tls, catalog("integer/v1"))
+        .capacity(1)
+        .unwrap()
+        .blocking("sdk.effect", 1, move |input: i64, ctx| {
+            let response =
+                provider::apply_effect(&url, &ctx.effect_key, "forward", &Value::Int(input + 1))
+                    .map_err(|err| ActivityError::new("provider.unavailable", err.to_string()))?;
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(response.output.unwrap().as_i64().unwrap())
+        })
+        .unwrap()
+        .open()
+        .await
+        .unwrap();
+    let run = engine
+        .start_yaml(YAML, &catalog("integer/v1"), Value::Int(21))
+        .await
+        .unwrap();
+    let activation = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = engine.inspect(run).await.unwrap();
+            if let Some(activation) = state.activations.values().find(|act| {
+                act.run == run && act.status == graphrun::domain::ActivationStatus::Ready
+            }) {
+                break activation.id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    graphrun::rpc::inject_worker_response_fault(activation, fault);
+    let (stop, rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(worker.run_until(async move {
+        let _ = rx.await;
+    }));
+    assert_eq!(
+        engine
+            .wait_terminal(run, Duration::from_secs(15))
+            .await
+            .unwrap(),
+        Value::Int(22)
+    );
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(9), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(applied.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        engine
+            .history(run)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, graphrun::domain::DomainEvent::LeafSucceeded { .. }))
+            .count(),
+        1
+    );
+    provider_task.abort();
+    engine.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_ack_after_committed_report_retries_exact_result() {
+    committed_result_receipt_fault(graphrun::rpc::WorkerResponseFault::DropReportAck).await;
+}
+
+#[cfg(feature = "fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hanging_report_response_does_not_block_renewal() {
+    committed_result_receipt_fault(graphrun::rpc::WorkerResponseFault::HangReportAck).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_registration_waits_for_member_startup() {
+    let ca = generate_ca().unwrap();
+    let address = unused_addr();
+    let directory = tempfile::tempdir().unwrap();
+    let worker = Worker::builder(
+        format!("https://{address}"),
+        signed(&ca, "app-worker", &[PeerRole::Worker]),
+        catalog("integer/v1"),
+    )
+    .blocking("sdk.effect", 1, |input: i64, _ctx| {
+        Ok::<_, ActivityError>(input + 1)
+    })
+    .unwrap();
+    let opening = tokio::spawn(worker.open());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let engine = Engine::member(MemberConfig {
+        data_dir: directory.path().to_path_buf(),
+        node_id: 1,
+        bind: address,
+        peers: BTreeMap::new(),
+        tls: signed(
+            &ca,
+            "node-1",
+            &[PeerRole::Member, PeerRole::Client, PeerRole::Admin],
+        ),
+        host_activities: false,
+        initialize: true,
+    })
+    .await
+    .unwrap();
+    let worker = tokio::time::timeout(Duration::from_secs(15), opening)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let (stop, rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(worker.run_until(async move {
+        let _ = rx.await;
+    }));
+    let run = engine
+        .start_yaml(YAML, &catalog("integer/v1"), Value::Int(4))
+        .await
+        .unwrap();
+    assert_eq!(
+        engine
+            .wait_terminal(run, Duration::from_secs(15))
+            .await
+            .unwrap(),
+        Value::Int(5)
+    );
+    let state = engine.inspect(run).await.unwrap();
+    assert_eq!(
+        state
+            .sessions
+            .values()
+            .filter(|session| session.principal_id == "app-worker")
+            .count(),
+        1
+    );
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn occupied_member_port_rejects_startup_without_persisting_identity() {
+    let ca = generate_ca().unwrap();
+    let tls = signed(
+        &ca,
+        "node-1",
+        &[PeerRole::Member, PeerRole::Client, PeerRole::Admin],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bind = occupied.local_addr().unwrap();
+    let config = MemberConfig {
+        data_dir: dir.path().to_path_buf(),
+        node_id: 1,
+        bind,
+        peers: BTreeMap::new(),
+        tls,
+        host_activities: false,
+        initialize: true,
+    };
+    let error = Engine::member(config.clone())
+        .await
+        .err()
+        .expect("port is occupied");
+    assert_eq!(error.kind, graphrun::ErrorKind::Unavailable);
+    assert!(error.message.contains("member gRPC bind"));
+    assert!(!dir.path().join("identity.json").exists());
+    drop(occupied);
+    let engine = Engine::member(config).await.unwrap();
+    engine.shutdown().await.unwrap();
 }

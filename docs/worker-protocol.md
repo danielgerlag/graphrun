@@ -84,6 +84,19 @@ for a duplicate. If the old claim expires before a result is committed,
 reconcile it or retry according to its pinned recovery policy. The provider
 must deduplicate the assignment's stable `effect_key`.
 
+When the first result request leaves the worker, freeze its command ID,
+serialized body, claim generation, and revision. If the response is lost,
+renew the session but do not renew that claim while resolving the result.
+Retry the same request even if the original claim's stop margin has since
+passed; an uncommitted result still fails the member's lease guard. Report
+and reconciliation RPCs each have a two-second client deadline.
+
+If registration cannot reach a leader, the Rust worker retries its original
+session and registration command for at most five minutes, rotating seed
+endpoints with 250 ms to five-second jittered backoff. A confirmed expired
+registration is fenced before the worker creates a new session and command
+identity.
+
 ## Contract digests
 
 For each digest, hash the UTF-8 domain string, one NUL byte, and canonical

@@ -104,6 +104,17 @@ impl ClockGuard {
     }
 }
 
+async fn monitor_clock<F: Future>(clock: &ClockGuard, operation: F) -> Result<F::Output> {
+    tokio::pin!(operation);
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            result = &mut operation => return Ok(result),
+            _ = tick.tick() => clock.check()?,
+        }
+    }
+}
+
 fn clock_fault(previous: ClockSample, current: ClockSample) -> Option<&'static str> {
     let Some(elapsed) = current.boot_ms.checked_sub(previous.boot_ms) else {
         return Some("worker boot clock reversed");
@@ -633,8 +644,8 @@ impl WorkerBuilder {
             .map_err(|err| Error::invalid(err.to_string()))?;
         let peer = verify_peer_identity(&self.tls.ca_pem, &cluster, &chain)?;
         peer.require_role(PeerRole::Worker)?;
-        let session = WorkerSessionId::generate();
-        let request = RegisterRequest {
+        let mut session = WorkerSessionId::generate();
+        let mut request = RegisterRequest {
             session_id: session.to_hex(),
             capacity: self.capacity,
             capabilities: capabilities.iter().map(WorkerCapability::to_wire).collect(),
@@ -644,30 +655,104 @@ impl WorkerBuilder {
             command_id: CommandId::generate().to_hex(),
         };
         let mut last_error = Error::new(ErrorKind::Unavailable, "no worker endpoint is available");
-        let mut registered_client = None;
         let mut endpoints = self.endpoints;
         let mut tried = BTreeSet::new();
         let mut index = 0usize;
-        while index < endpoints.len() {
-            let endpoint = &endpoints[index];
-            if !tried.insert((endpoint.url.clone(), endpoint.server_name.clone())) {
-                index += 1;
+        let mut backoff = Duration::from_millis(250);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5 * 60);
+        loop {
+            clock.check()?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::new(
+                    ErrorKind::DeadlineExceeded,
+                    format!(
+                        "worker registration unknown (session={} command={}): {last_error}",
+                        request.session_id, request.command_id,
+                    ),
+                ));
+            }
+            if index >= endpoints.len() {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                monitor_clock(
+                    &clock,
+                    tokio::time::sleep(retry_delay(backoff)?.min(remaining)),
+                )
+                .await?;
+                backoff = backoff.saturating_mul(2).min(Duration::from_secs(5));
+                tried.clear();
+                index = 0;
                 continue;
             }
-            match connect(&endpoint.url, &tls_for(&self.tls, endpoint)).await {
-                Ok(channel) => {
+            let endpoint = &endpoints[index];
+            let current_index = index;
+            index += 1;
+            if !tried.insert((endpoint.url.clone(), endpoint.server_name.clone())) {
+                continue;
+            }
+            match monitor_clock(
+                &clock,
+                tokio::time::timeout(
+                    Duration::from_secs(5)
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    connect(&endpoint.url, &tls_for(&self.tls, endpoint)),
+                ),
+            )
+            .await?
+            {
+                Ok(Ok(channel)) => {
                     let mut client = WorkerClient::new(channel);
-                    match client.register(request.clone()).await {
-                        Ok(response) => {
-                            registered_client = Some((index, client, response.into_inner()));
-                            break;
+                    let mut rpc = tonic::Request::new(request.clone());
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let rpc_limit = Duration::from_secs(2).min(remaining);
+                    rpc.set_timeout(rpc_limit);
+                    match monitor_clock(
+                        &clock,
+                        tokio::time::timeout(rpc_limit, client.register(rpc)),
+                    )
+                    .await?
+                    {
+                        Ok(Ok(response)) => {
+                            let registered = response.into_inner();
+                            if !registered.error.is_empty() {
+                                return Err(Error::invalid(registered.error));
+                            }
+                            if registered.revision == 0 {
+                                return Err(Error::invalid("invalid worker session revision"));
+                            }
+                            if registered.lease_expiry_ms <= wall_ms()? {
+                                session = WorkerSessionId::generate();
+                                request.session_id = session.to_hex();
+                                request.command_id = CommandId::generate().to_hex();
+                                tried.clear();
+                                index = 0;
+                                backoff = Duration::from_millis(250);
+                                continue;
+                            }
+                            return Ok(Worker {
+                                client,
+                                endpoints,
+                                endpoint_index: current_index,
+                                tls: self.tls,
+                                session,
+                                session_revision: registered.revision,
+                                session_expiry_ms: registered.lease_expiry_ms,
+                                capacity: self.capacity,
+                                catalog: self.catalog,
+                                capabilities,
+                                handlers: self.handlers,
+                                clock,
+                            });
                         }
-                        Err(err)
-                            if matches!(
-                                err.code(),
-                                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
-                            ) =>
-                        {
+                        Err(_) => {
+                            last_error = Error::new(
+                                ErrorKind::Unavailable,
+                                format!(
+                                    "worker registration response unresolved for {}",
+                                    request.command_id
+                                ),
+                            );
+                        }
+                        Ok(Err(err)) if uncertain_rpc(&err) => {
                             if let Some(redirect) = leader_redirect(&err)? {
                                 if !endpoints.iter().any(|item| {
                                     item.url == redirect.url
@@ -684,34 +769,18 @@ impl WorkerBuilder {
                             }
                             last_error = rpc_error(err);
                         }
-                        Err(err) => return Err(rpc_error(err)),
+                        Ok(Err(err)) => return Err(rpc_error(err)),
                     }
                 }
-                Err(err) => last_error = err,
+                Ok(Err(err)) => last_error = err,
+                Err(_) => {
+                    last_error = Error::new(
+                        ErrorKind::Unavailable,
+                        format!("worker endpoint {} did not connect", endpoint.url),
+                    );
+                }
             }
-            index += 1;
         }
-        let (endpoint_index, client, registered) = registered_client.ok_or(last_error)?;
-        if !registered.error.is_empty() {
-            return Err(Error::invalid(registered.error));
-        }
-        if registered.revision == 0 || registered.lease_expiry_ms <= wall_ms()? {
-            return Err(Error::invalid("invalid worker session grant"));
-        }
-        Ok(Worker {
-            client,
-            endpoints,
-            endpoint_index,
-            tls: self.tls,
-            session,
-            session_revision: registered.revision,
-            session_expiry_ms: registered.lease_expiry_ms,
-            capacity: self.capacity,
-            catalog: self.catalog,
-            capabilities,
-            handlers: self.handlers,
-            clock,
-        })
     }
 }
 
@@ -752,6 +821,23 @@ fn rpc_error(error: tonic::Status) -> Error {
     Error::new(kind, error.to_string())
 }
 
+fn uncertain_rpc(error: &tonic::Status) -> bool {
+    matches!(
+        error.code(),
+        tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Cancelled
+            | tonic::Code::Unknown
+    )
+}
+
+fn retry_delay(base: Duration) -> Result<Duration> {
+    let mut random = [0u8; 2];
+    getrandom::fill(&mut random).map_err(|err| Error::invalid(err.to_string()))?;
+    let jitter_ms = u64::from(u16::from_le_bytes(random)) % ((base.as_millis() / 4) as u64 + 1);
+    Ok((base + Duration::from_millis(jitter_ms)).min(Duration::from_secs(5)))
+}
+
 async fn connect(endpoint: &str, tls: &TlsMaterial) -> Result<Channel> {
     Endpoint::from_shared(endpoint.to_owned())
         .map_err(|err| Error::invalid(err.to_string()))?
@@ -774,8 +860,24 @@ struct Active {
     permission: Arc<Mutex<Permission>>,
     cancelled: Arc<AtomicBool>,
     outcome: Option<Outcome>,
-    report_id: Option<CommandId>,
+    pending_result: Option<PendingResult>,
+    submitted: bool,
     renew_id: Option<CommandId>,
+}
+
+#[derive(Clone)]
+enum PendingResult {
+    Report(ReportRequest),
+    Reconcile(ReconcileRequest),
+}
+
+impl PendingResult {
+    fn command_id(&self) -> &str {
+        match self {
+            Self::Report(request) => &request.command_id,
+            Self::Reconcile(request) => &request.command_id,
+        }
+    }
 }
 
 impl Worker {
@@ -862,7 +964,7 @@ impl Worker {
                             self.session_expiry_ms = response.lease_expiry_ms;
                             session_renew_id = None;
                         }
-                        Err(err) if matches!(err.code(), tonic::Code::Unavailable | tonic::Code::DeadlineExceeded) => {
+                        Err(err) if uncertain_rpc(&err) => {
                             if wall_ms()? >= self.session_expiry_ms.saturating_sub(5_000) {
                                 for claim in active.values() { claim.cancelled.store(true, Ordering::SeqCst); }
                                 return Err(rpc_error(err));
@@ -877,6 +979,9 @@ impl Worker {
                     }
                     for claim in active.values_mut() {
                         claim.permission.lock().expect("worker permission").session_expiry_ms = self.session_expiry_ms;
+                        if claim.pending_result.is_some() || (claim.outcome.is_some() && claim.renew_id.is_none()) {
+                            continue;
+                        }
                         if wall_ms()? >= claim.assignment.attempt_deadline_ms {
                             claim.cancelled.store(true, Ordering::SeqCst);
                             return Err(Error::new(ErrorKind::FailedPrecondition,
@@ -903,7 +1008,7 @@ impl Worker {
                                 claim.permission.lock().expect("worker permission").claim_expiry_ms = response.lease_expiry_ms;
                                 claim.renew_id = None;
                             }
-                            Err(err) if matches!(err.code(), tonic::Code::Unavailable | tonic::Code::DeadlineExceeded) => {
+                            Err(err) if uncertain_rpc(&err) => {
                                 if wall_ms()? >= claim.assignment.lease_expiry_ms.saturating_sub(5_000) {
                                     claim.cancelled.store(true, Ordering::SeqCst);
                                     return Err(rpc_error(err));
@@ -927,7 +1032,6 @@ impl Worker {
                         Ok(outcome) => outcome,
                         Err(err) => Outcome::Failure(ActivityError::new("worker.handler_error", err.to_string())),
                     });
-                    claim.report_id = Some(CommandId::generate());
                     if claim.renew_id.is_none() { self.report(&id, &mut active).await?; }
                 }
                 claim = async {
@@ -947,11 +1051,11 @@ impl Worker {
                                 let (id, input, context, handler) = self.prepare(&assignment)?;
                                 let permission = context.permission.clone();
                                 let cancelled = context.cancelled.clone();
-                                active.insert(id.clone(), Active { assignment, permission, cancelled, outcome: None, report_id: None, renew_id: None });
+                                active.insert(id.clone(), Active { assignment, permission, cancelled, outcome: None, pending_result: None, submitted: false, renew_id: None });
                                 tasks.spawn(async move { (id, handler(input, context).await) });
                             }
                         }
-                        Err(err) if matches!(err.code(), tonic::Code::Unavailable | tonic::Code::DeadlineExceeded) => {
+                        Err(err) if uncertain_rpc(&err) => {
                             self.rotate_endpoint(&err)?;
                             watcher = self.client.clone();
                             generation = 0;
@@ -975,7 +1079,7 @@ impl Worker {
                                 (self.capacity as usize - active.len()).min(crate::limits::CLAIM_BATCH as usize) as u32,
                             ));
                         }
-                        Err(err) if matches!(err.code(), tonic::Code::Unavailable | tonic::Code::DeadlineExceeded) => {
+                        Err(err) if uncertain_rpc(&err) => {
                             generation = 0;
                             cursor = 0;
                             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1065,35 +1169,13 @@ impl Worker {
         Ok((assignment.activation_id.clone(), input, context, handler))
     }
 
-    async fn report(&mut self, id: &str, active: &mut BTreeMap<String, Active>) -> Result<()> {
-        self.clock.check()?;
-        let claim = active
-            .get(id)
-            .ok_or_else(|| Error::invalid("claim unavailable for reporting"))?;
-        if claim.renew_id.is_some() {
-            return Ok(());
-        }
+    fn prepare_result(&self, claim: &Active) -> Result<PendingResult> {
         let outcome = claim
             .outcome
             .as_ref()
             .ok_or_else(|| Error::invalid("handler not completed"))?;
-        let permission = *claim.permission.lock().expect("worker permission");
-        let now = wall_ms()?;
-        if now >= permission.session_expiry_ms.saturating_sub(5_000)
-            || now >= permission.claim_expiry_ms.saturating_sub(5_000)
-            || now >= permission.attempt_deadline_ms
-        {
-            claim.cancelled.store(true, Ordering::SeqCst);
-            return Err(Error::new(
-                ErrorKind::FailedPrecondition,
-                "handler completed without live reporting permission",
-            ));
-        }
         let a = &claim.assignment;
-        let command_id = claim
-            .report_id
-            .ok_or_else(|| Error::invalid("result command identity missing"))?
-            .to_hex();
+        let command_id = CommandId::generate().to_hex();
         let role = parse_role(&a.role)?;
         let key = ActivityKey::new(&a.activity_name, a.activity_version);
         let (_, output_schema) = contract_schemas(&self.catalog, &key, role)?;
@@ -1172,39 +1254,19 @@ impl Worker {
                     ));
                 }
             };
-            let response = match self
-                .client
-                .reconcile(ReconcileRequest {
-                    command_id: command_id.clone(),
-                    session_id: self.session.to_hex(),
-                    run_id: a.run_id.clone(),
-                    activation_id: a.activation_id.clone(),
-                    outcome: outcome.to_owned(),
-                    output_json,
-                    generation: a.generation,
-                    revision: a.revision,
-                    output_schema_digest: a.output_schema_digest.clone(),
-                    error_code,
-                    error_message,
-                })
-                .await
-            {
-                Ok(response) => response.into_inner(),
-                Err(err)
-                    if matches!(
-                        err.code(),
-                        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
-                    ) =>
-                {
-                    tracing::warn!(activation = %a.activation_id, command = %command_id, "reconciliation result uncertain; retrying same command");
-                    self.rotate_endpoint(&err)?;
-                    return Ok(());
-                }
-                Err(err) => return Err(rpc_error(err)),
-            };
-            if !response.error.is_empty() {
-                return Err(Error::new(ErrorKind::FailedPrecondition, response.error));
-            }
+            Ok(PendingResult::Reconcile(ReconcileRequest {
+                command_id,
+                session_id: self.session.to_hex(),
+                run_id: a.run_id.clone(),
+                activation_id: a.activation_id.clone(),
+                outcome: outcome.to_owned(),
+                output_json,
+                generation: a.generation,
+                revision: a.revision,
+                output_schema_digest: a.output_schema_digest.clone(),
+                error_code,
+                error_message,
+            }))
         } else {
             let (output_json, code, message) = match outcome {
                 Outcome::Success(value) => (
@@ -1219,38 +1281,127 @@ impl Worker {
                     ));
                 }
             };
-            let response = match self
-                .client
-                .report(ReportRequest {
-                    command_id: command_id.clone(),
-                    session_id: self.session.to_hex(),
-                    run_id: a.run_id.clone(),
-                    activation_id: a.activation_id.clone(),
-                    generation: a.generation,
-                    revision: a.revision,
-                    output_json,
-                    error_code: code,
-                    error_message: message,
-                    output_schema_digest: a.output_schema_digest.clone(),
-                })
-                .await
-            {
-                Ok(response) => response.into_inner(),
-                Err(err)
-                    if matches!(
-                        err.code(),
-                        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
-                    ) =>
-                {
-                    tracing::warn!(activation = %a.activation_id, command = %command_id, "activity result uncertain; retrying same command");
-                    self.rotate_endpoint(&err)?;
-                    return Ok(());
-                }
-                Err(err) => return Err(rpc_error(err)),
-            };
-            if !response.error.is_empty() {
-                return Err(Error::new(ErrorKind::FailedPrecondition, response.error));
+            Ok(PendingResult::Report(ReportRequest {
+                command_id,
+                session_id: self.session.to_hex(),
+                run_id: a.run_id.clone(),
+                activation_id: a.activation_id.clone(),
+                generation: a.generation,
+                revision: a.revision,
+                output_json,
+                error_code: code,
+                error_message: message,
+                output_schema_digest: a.output_schema_digest.clone(),
+            }))
+        }
+    }
+
+    async fn report(&mut self, id: &str, active: &mut BTreeMap<String, Active>) -> Result<()> {
+        self.clock.check()?;
+        let claim = active
+            .get(id)
+            .ok_or_else(|| Error::invalid("claim unavailable for reporting"))?;
+        if claim.pending_result.is_none() && claim.renew_id.is_some() {
+            return Ok(());
+        }
+        if claim.pending_result.is_none() {
+            let request = self.prepare_result(claim)?;
+            active
+                .get_mut(id)
+                .expect("claim still present")
+                .pending_result = Some(request);
+        }
+        let claim = active.get_mut(id).expect("claim still present");
+        let permission = *claim.permission.lock().expect("worker permission");
+        let now = wall_ms()?;
+        if now >= self.session_expiry_ms {
+            claim.cancelled.store(true, Ordering::SeqCst);
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                format!(
+                    "worker session expired with unknown result command {} for activation {id}",
+                    claim
+                        .pending_result
+                        .as_ref()
+                        .expect("prepared result")
+                        .command_id(),
+                ),
+            ));
+        }
+        if !claim.submitted
+            && (now >= permission.session_expiry_ms.saturating_sub(5_000)
+                || now >= permission.claim_expiry_ms.saturating_sub(5_000)
+                || now >= permission.attempt_deadline_ms)
+        {
+            claim.cancelled.store(true, Ordering::SeqCst);
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "handler completed without live reporting permission",
+            ));
+        }
+        let request = claim
+            .pending_result
+            .as_ref()
+            .expect("prepared result")
+            .clone();
+        claim.submitted = true;
+        let (command_id, response) = match request {
+            PendingResult::Report(body) => {
+                let command_id = body.command_id.clone();
+                let mut request = tonic::Request::new(body);
+                request.set_timeout(Duration::from_secs(2));
+                (
+                    command_id,
+                    monitor_clock(
+                        &self.clock,
+                        tokio::time::timeout(Duration::from_secs(2), self.client.report(request)),
+                    )
+                    .await?,
+                )
             }
+            PendingResult::Reconcile(body) => {
+                let command_id = body.command_id.clone();
+                let mut request = tonic::Request::new(body);
+                request.set_timeout(Duration::from_secs(2));
+                (
+                    command_id,
+                    monitor_clock(
+                        &self.clock,
+                        tokio::time::timeout(
+                            Duration::from_secs(2),
+                            self.client.reconcile(request),
+                        ),
+                    )
+                    .await?,
+                )
+            }
+        };
+        let reply = match response {
+            Ok(Ok(response)) => response.into_inner(),
+            Ok(Err(err)) if uncertain_rpc(&err) => {
+                tracing::warn!(activation = %id, command = %command_id, "worker result uncertain; retrying same command");
+                self.rotate_endpoint(&err)?;
+                return Ok(());
+            }
+            Ok(Err(err)) => {
+                let error = rpc_error(err);
+                return Err(Error::new(
+                    error.kind,
+                    format!("result command {command_id}: {}", error.message),
+                ));
+            }
+            Err(_) => {
+                let err = tonic::Status::deadline_exceeded("worker result response unresolved");
+                tracing::warn!(activation = %id, command = %command_id, "worker result timed out; retrying same command");
+                self.rotate_endpoint(&err)?;
+                return Ok(());
+            }
+        };
+        if !reply.error.is_empty() {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                format!("result command {command_id}: {}", reply.error),
+            ));
         }
         active.remove(id);
         Ok(())
@@ -1339,5 +1490,16 @@ mod tests {
             "http://127.0.0.1:7731".parse().unwrap(),
         );
         assert!(leader_redirect(&status).is_err());
+    }
+
+    #[test]
+    fn cancelled_result_timeout_has_unknown_commit_outcome() {
+        assert!(uncertain_rpc(&tonic::Status::cancelled("Timeout expired")));
+        assert!(uncertain_rpc(&tonic::Status::unknown(
+            "transport lost response"
+        )));
+        assert!(!uncertain_rpc(&tonic::Status::failed_precondition(
+            "stale claim"
+        )));
     }
 }
