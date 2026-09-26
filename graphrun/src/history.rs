@@ -481,6 +481,9 @@ pub fn checkpoint_after_command(state: &mut State, run: RunId, time: EngineTime)
     projection.terminal_summaries.clear();
     projection.signal_tombstones.clear();
     projection.commands.clear();
+    projection.command_actors.clear();
+    projection.command_external_ids.clear();
+    projection.authenticated_request_digests.clear();
     projection.command_results.clear();
     projection.legacy_start_digests.clear();
     projection.worker_command_digests.clear();
@@ -534,6 +537,9 @@ pub(crate) fn prune(
     for id in old_commands {
         state.command_times.remove(&id);
         state.commands.remove(&id);
+        state.command_actors.remove(&id);
+        state.command_external_ids.remove(&id);
+        state.authenticated_request_digests.remove(&id);
         state.legacy_start_digests.remove(&id);
         state.worker_command_digests.remove(&id);
         remaining -= 1;
@@ -732,6 +738,14 @@ mod tests {
             };
             state.command_times.insert(command_id, recorded_ms);
             state.commands.insert(command_id, Vec::new());
+            state.command_actors.insert(command_id, "worker-a".into());
+            state
+                .command_external_ids
+                .insert(command_id, id(1000 + index));
+            state.authenticated_request_digests.insert(
+                command_id,
+                format!("graphrun.authenticated-request/v1:digest-{index}"),
+            );
             state
                 .worker_command_digests
                 .insert(command_id, format!("digest-{index}"));
@@ -777,6 +791,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_authenticated_indexes_do_not_change_projection_bytes() {
+        let encoded = serde_json::to_value(State::default()).unwrap();
+        assert!(encoded.get("command_actors").is_none());
+        assert!(encoded.get("command_external_ids").is_none());
+        assert!(encoded.get("authenticated_request_digests").is_none());
+        let restored: State = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), encoded);
+    }
+
+    #[test]
     fn worker_digests_expire_with_commands_in_deterministic_batches() {
         let now = DAY_MS + 1_000;
         let mut forward = state_with_worker_commands(false, now);
@@ -804,6 +828,15 @@ mod tests {
                     let retained = index > ((batch + 1) * 3).min(10);
                     assert_eq!(state.command_times.contains_key(&id(index)), retained);
                     assert_eq!(state.commands.contains_key(&id(index)), retained);
+                    assert_eq!(state.command_actors.contains_key(&id(index)), retained);
+                    assert_eq!(
+                        state.command_external_ids.contains_key(&id(index)),
+                        retained
+                    );
+                    assert_eq!(
+                        state.authenticated_request_digests.contains_key(&id(index)),
+                        retained
+                    );
                     assert_eq!(
                         state.worker_command_digests.contains_key(&id(index)),
                         retained
@@ -816,6 +849,7 @@ mod tests {
                     state.worker_command_digests.get(&id(11)).unwrap(),
                     "digest-11"
                 );
+                assert_eq!(state.command_external_ids[&id(11)], id(1011));
                 assert_eq!(state.command_results.len(), 1);
                 assert_eq!(
                     state.command_results.values().next().unwrap().recorded_ms,

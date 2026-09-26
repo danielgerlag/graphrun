@@ -25,7 +25,10 @@ pub(crate) async fn write_raft(
 ) -> Result<()> {
     let resp = write_raft_response(raft, storage, command).await?;
     if let Some(err) = resp.error {
-        return Err(Error::invalid(err));
+        return Err(Error::new(
+            resp.error_kind.unwrap_or(ErrorKind::InvalidArgument),
+            err,
+        ));
     }
     Ok(())
 }

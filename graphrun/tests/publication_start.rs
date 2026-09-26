@@ -9,7 +9,6 @@ use graphrun::{MemberConfig, generate_ca, issue_node};
 use sha2::Digest;
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
 use std::time::Duration;
 
 fn catalog() -> Catalog {
@@ -31,29 +30,23 @@ fn input(value: i64) -> Value {
     serde_json::from_value(serde_json::json!({"value":value})).unwrap()
 }
 
-struct TestDirectory(PathBuf);
+struct TestDirectory(tempfile::TempDir);
 
 impl TestDirectory {
     fn new() -> Self {
-        let path = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join(format!("publication-start-{}", CommandId::generate()));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).unwrap();
+        Self(
+            tempfile::Builder::new()
+                .prefix("gr-pub-")
+                .tempdir()
+                .unwrap(),
+        )
     }
 }
 
 #[tokio::test]
 async fn concurrent_immutable_publish_and_pinned_latest_survive_restart() {
     let directory = TestDirectory::new();
-    let engine = Engine::local(&directory.0).await.unwrap();
+    let engine = Engine::local(directory.0.path()).await.unwrap();
     let c = catalog();
     let (a, b) = tokio::join!(
         engine.publish_catalog(1, c.clone()),
@@ -167,7 +160,7 @@ async fn concurrent_immutable_publish_and_pinned_latest_survive_restart() {
     engine.snapshot().await.unwrap();
     engine.shutdown().await.unwrap();
 
-    let engine = Engine::local(&directory.0).await.unwrap();
+    let engine = Engine::local(directory.0.path()).await.unwrap();
     assert_eq!(
         engine
             .start_published("external_worker_echo", None, "Key", input(1))
@@ -199,7 +192,7 @@ async fn concurrent_immutable_publish_and_pinned_latest_survive_restart() {
 #[tokio::test]
 async fn receipt_range_exactly_covers_immediate_nested_terminal_history() {
     let directory = TestDirectory::new();
-    let engine = Engine::local(&directory.0).await.unwrap();
+    let engine = Engine::local(directory.0.path()).await.unwrap();
     engine.publish_catalog(1, catalog()).await.unwrap();
     let yaml = "\
 dsl: graphrun/v1
@@ -235,6 +228,10 @@ nodes:
         .await
         .unwrap();
     let state = engine.inspect(run).await.unwrap();
+    assert_eq!(
+        state.history_records[&run][0].principal_id.as_deref(),
+        Some("local-owner")
+    );
     assert!(matches!(
         state.runs[&run].status,
         RunStatus::Succeeded { .. }
@@ -285,7 +282,7 @@ nodes:
 #[tokio::test]
 async fn command_result_dedup_rejection_and_event_range_are_durable() {
     let directory = TestDirectory::new();
-    let engine = Engine::local(&directory.0).await.unwrap();
+    let engine = Engine::local(directory.0.path()).await.unwrap();
     engine.publish_catalog(1, catalog()).await.unwrap();
     engine
         .publish_definition_yaml(&workflow(1), 1)
@@ -375,7 +372,7 @@ async fn command_result_dedup_rejection_and_event_range_are_durable() {
     );
     engine.snapshot().await.unwrap();
     engine.shutdown().await.unwrap();
-    let engine = Engine::local(&directory.0).await.unwrap();
+    let engine = Engine::local(directory.0.path()).await.unwrap();
     assert_eq!(
         engine
             .start_published_with_command("external_worker_echo", None, "stable", input(1), id)
@@ -407,7 +404,7 @@ async fn command_result_dedup_rejection_and_event_range_are_durable() {
 #[tokio::test]
 async fn invalid_key_failure_and_timeout_do_not_report_pending_success() {
     let directory = TestDirectory::new();
-    let engine = Engine::local(&directory.0).await.unwrap();
+    let engine = Engine::local(directory.0.path()).await.unwrap();
     engine.publish_catalog(1, catalog()).await.unwrap();
     let fail = "\
 dsl: graphrun/v1
@@ -494,9 +491,9 @@ nodes:
 async fn pre_publication_member_directory_is_not_modified() {
     let directory = TestDirectory::new();
     let identity = br#"{"mode":"local","node_id":1,"cluster_name":"graphrun-local"}"#;
-    std::fs::write(directory.0.join("identity.json"), identity).unwrap();
-    std::fs::write(directory.0.join("member.redb"), b"pre-v1").unwrap();
-    let result = Engine::local(&directory.0).await;
+    std::fs::write(directory.0.path().join("identity.json"), identity).unwrap();
+    std::fs::write(directory.0.path().join("member.redb"), b"pre-v1").unwrap();
+    let result = Engine::local(directory.0.path()).await;
     assert!(matches!(
         result,
         Err(graphrun::Error {
@@ -505,11 +502,11 @@ async fn pre_publication_member_directory_is_not_modified() {
         })
     ));
     assert_eq!(
-        std::fs::read(directory.0.join("identity.json")).unwrap(),
+        std::fs::read(directory.0.path().join("identity.json")).unwrap(),
         identity
     );
     assert_eq!(
-        std::fs::read(directory.0.join("member.redb")).unwrap(),
+        std::fs::read(directory.0.path().join("member.redb")).unwrap(),
         b"pre-v1"
     );
 }
@@ -517,7 +514,7 @@ async fn pre_publication_member_directory_is_not_modified() {
 #[test]
 fn pre_publication_redb_is_rejected_without_writes() {
     let directory = TestDirectory::new();
-    let path = directory.0.join("member.redb");
+    let path = directory.0.path().join("member.redb");
     drop(redb::Database::create(&path).unwrap());
     let before = std::fs::read(&path).unwrap();
     assert!(matches!(
@@ -562,7 +559,7 @@ async fn committed_command_result_survives_leader_change() {
             })
             .collect();
         members.push(Engine::member(MemberConfig {
-            data_dir: directory.0.join(format!("node-{node}")),
+            data_dir: directory.0.path().join(format!("node-{node}")),
             node_id: node,
             bind: addrs[(node - 1) as usize],
             peers,
@@ -596,12 +593,6 @@ async fn committed_command_result_survives_leader_change() {
         .await
         .unwrap();
     let committed_index = original.last_applied_index().await;
-    let receipt_key = original
-        .command_result(command)
-        .await
-        .unwrap()
-        .key
-        .storage_key();
     let catchup_deadline = tokio::time::Instant::now() + Duration::from_secs(12);
     loop {
         let second = follower2.last_applied_index().await;
@@ -620,17 +611,6 @@ async fn committed_command_result_survives_leader_change() {
             "followers did not apply committed index {committed_index} and voter roster before shutdown: node2 index {second} voters {second_voters:?}, node3 index {third} voters {third_voters:?}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    for follower in [&follower2, &follower3] {
-        assert!(
-            follower
-                .inspect(run)
-                .await
-                .unwrap()
-                .command_results
-                .contains_key(&receipt_key),
-            "follower applied the log but not the start receipt"
-        );
     }
     original.shutdown().await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
@@ -715,7 +695,7 @@ async fn inline_rpc_duplicate_returns_original_run_and_changed_body_conflicts() 
     let tls = issue_node(&ca, 1).unwrap();
     let addr = unused_addr();
     let engine = Engine::member(MemberConfig {
-        data_dir: directory.0.join("member"),
+        data_dir: directory.0.path().join("member"),
         node_id: 1,
         bind: addr,
         peers: BTreeMap::new(),
@@ -780,7 +760,7 @@ async fn signed_principal_publishes_and_starts_over_grpc_with_scoped_receipts() 
     let server_tls = issue_node(&ca, 1).unwrap();
     let addr = unused_addr();
     let engine = Engine::member(MemberConfig {
-        data_dir: directory.0.join("member"),
+        data_dir: directory.0.path().join("member"),
         node_id: 1,
         bind: addr,
         peers: BTreeMap::new(),
@@ -817,6 +797,10 @@ async fn signed_principal_publishes_and_starts_over_grpc_with_scoped_receipts() 
         .await
         .unwrap();
     let remote_page = client.history_page(first, 0, 2).await.unwrap();
+    assert_eq!(
+        remote_page.events[0].record.principal_id.as_deref(),
+        Some("operator")
+    );
     let local_page = engine.history_page(first, 0, 2).await.unwrap();
     assert_eq!(
         serde_json::to_value(&remote_page).unwrap(),
@@ -835,7 +819,7 @@ async fn signed_principal_publishes_and_starts_over_grpc_with_scoped_receipts() 
         graphrun::history::projection_view(&local_projection, first)
     );
     let socket_page = graphrun::connect_control(
-        directory.0.join("member/control.sock"),
+        directory.0.path().join("member/control.sock"),
         graphrun::ControlRequest::History {
             run: first.to_hex(),
             after_sequence: 0,

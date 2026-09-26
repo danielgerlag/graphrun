@@ -243,7 +243,7 @@ impl GraphServices {
         &self,
         request: &Request<T>,
         session: WorkerSessionId,
-    ) -> Result<(), Status> {
+    ) -> Result<crate::tls::VerifiedPeerIdentity, Status> {
         let peer = self.verified_peer(request)?;
         peer.require_role(crate::tls::PeerRole::Worker)
             .map_err(status_error)?;
@@ -267,7 +267,7 @@ impl GraphServices {
         if now().as_millis() >= current.expires_ms {
             return Err(Status::failed_precondition("worker session expired"));
         }
-        Ok(())
+        Ok(peer)
     }
 }
 
@@ -299,17 +299,11 @@ fn worker_duplicate(
     state: &crate::domain::State,
     id: CommandId,
     body: &CommandBody,
+    actor: &str,
 ) -> Result<bool, Status> {
-    if !state.commands.contains_key(&id) {
-        return Ok(false);
-    }
-    let actual = crate::domain::worker_request_digest(body).map_err(status_error)?;
-    if state.worker_command_digests.get(&id).map(String::as_str) != actual.as_deref() {
-        return Err(Status::already_exists(
-            "worker command ID reused with different request",
-        ));
-    }
-    Ok(true)
+    Ok(crate::domain::authenticated_receipt(state, id, actor, body)
+        .map_err(status_error)?
+        .is_some())
 }
 
 #[tonic::async_trait]
@@ -573,7 +567,8 @@ impl Client for GraphServices {
                     input,
                     catalog: Box::new(catalog),
                 },
-            },
+            }
+            .authenticated_context(&auth),
         )
         .await;
         self.notify.notify_one();
@@ -588,18 +583,17 @@ impl Client for GraphServices {
             })),
             Ok(reply) => {
                 let error = reply.error.unwrap_or_default();
-                if error.starts_with("AlreadyExists") {
-                    Err(Status::already_exists(error))
-                } else {
-                    Err(Status::failed_precondition(error))
-                }
+                Err(status_error(crate::error::Error::new(
+                    reply.error_kind.unwrap_or(ErrorKind::FailedPrecondition),
+                    error,
+                )))
             }
             Err(err) => Err(status_error(err)),
         }
     }
 
     async fn signal(&self, request: Request<SignalRequest>) -> Result<Response<Ack>, Status> {
-        self.query_context(&request)?;
+        let auth = self.query_context(&request)?;
         self.require_leader()?;
         let req = request.into_inner();
         let run = parse_run(&req.run_id)?;
@@ -619,14 +613,15 @@ impl Client for GraphServices {
                     key: req.key,
                     payload,
                 },
-            },
+            }
+            .authenticated_context(&auth),
         )
         .await
         .map(|_| self.notify.notify_one()))
     }
 
     async fn cancel(&self, request: Request<CancelRequest>) -> Result<Response<Ack>, Status> {
-        self.query_context(&request)?;
+        let auth = self.query_context(&request)?;
         self.require_leader()?;
         let req = request.into_inner();
         ack(write_raft(
@@ -639,7 +634,8 @@ impl Client for GraphServices {
                     run: parse_run(&req.run_id)?,
                     reason: req.reason,
                 },
-            },
+            }
+            .authenticated_context(&auth),
         )
         .await
         .map(|_| self.notify.notify_one()))
@@ -780,6 +776,8 @@ impl WorkerSvc for GraphServices {
         let session =
             WorkerSessionId::from_hex(&req.session_id).map_err(Status::invalid_argument)?;
         let id = parse_publication_command_id(&req.command_id)?;
+        let receipt_id = crate::domain::authenticated_command_id(peer.principal_id().as_str(), id)
+            .map_err(status_error)?;
         write_raft(
             &self.raft,
             &self.storage,
@@ -794,14 +792,15 @@ impl WorkerSvc for GraphServices {
                     protocol_min: req.protocol_min,
                     protocol_max: req.protocol_max,
                 },
-            },
+            }
+            .authenticated_peer(&peer),
         )
         .await
         .map_err(status_error)?;
         let state = self.storage.query_state().await;
         let events = state
             .commands
-            .get(&id)
+            .get(&receipt_id)
             .ok_or_else(|| Status::internal("registration receipt unavailable"))?;
         let expiry = events
             .iter()
@@ -831,9 +830,11 @@ impl WorkerSvc for GraphServices {
     ) -> Result<Response<RenewSessionResponse>, Status> {
         let session = WorkerSessionId::from_hex(&request.get_ref().session_id)
             .map_err(Status::invalid_argument)?;
-        self.worker_session(&request, session).await?;
+        let peer = self.worker_session(&request, session).await?;
         let req = request.into_inner();
         let id = parse_publication_command_id(&req.command_id)?;
+        let receipt_id = crate::domain::authenticated_command_id(peer.principal_id().as_str(), id)
+            .map_err(status_error)?;
         write_raft(
             &self.raft,
             &self.storage,
@@ -844,14 +845,15 @@ impl WorkerSvc for GraphServices {
                     session,
                     revision: LeaseRevision::new(req.revision),
                 },
-            },
+            }
+            .authenticated_peer(&peer),
         )
         .await
         .map_err(status_error)?;
         let state = self.storage.query_state().await;
         let events = state
             .commands
-            .get(&id)
+            .get(&receipt_id)
             .ok_or_else(|| Status::internal("session renewal receipt unavailable"))?;
         let (revision, lease_expiry_ms) = events
             .iter()
@@ -949,7 +951,7 @@ impl WorkerSvc for GraphServices {
     ) -> Result<Response<ClaimResponse>, Status> {
         let session = WorkerSessionId::from_hex(&request.get_ref().session_id)
             .map_err(Status::invalid_argument)?;
-        self.worker_session(&request, session).await?;
+        let peer = self.worker_session(&request, session).await?;
         let req = request.into_inner();
         let command = Command {
             id: parse_command_id(&req.command_id)?,
@@ -958,7 +960,11 @@ impl WorkerSvc for GraphServices {
                 session,
                 capacity: req.capacity,
             },
-        };
+        }
+        .authenticated_peer(&peer);
+        let receipt_id =
+            crate::domain::authenticated_command_id(peer.principal_id().as_str(), command.id)
+                .map_err(status_error)?;
         write_raft(&self.raft, &self.storage, command.clone())
             .await
             .map_err(status_error)?;
@@ -966,7 +972,7 @@ impl WorkerSvc for GraphServices {
         let state = self.storage.query_state().await;
         let events = state
             .commands
-            .get(&command.id)
+            .get(&receipt_id)
             .ok_or_else(|| Status::internal("claim receipt unavailable"))?;
         let assignments = assignments_from(&state, events)
             .map_err(status_error)?
@@ -1007,7 +1013,7 @@ impl WorkerSvc for GraphServices {
     ) -> Result<Response<RenewResponse>, Status> {
         let session = WorkerSessionId::from_hex(&request.get_ref().session_id)
             .map_err(Status::invalid_argument)?;
-        self.worker_session(&request, session).await?;
+        let peer = self.worker_session(&request, session).await?;
         let req = request.into_inner();
         let activation =
             ActivationId::from_hex(&req.activation_id).map_err(Status::invalid_argument)?;
@@ -1020,13 +1026,17 @@ impl WorkerSvc for GraphServices {
                 generation: OwnerGeneration::new(req.generation),
                 revision: LeaseRevision::new(req.revision),
             },
-        };
+        }
+        .authenticated_peer(&peer);
+        let receipt_id =
+            crate::domain::authenticated_command_id(peer.principal_id().as_str(), command.id)
+                .map_err(status_error)?;
         match write_raft(&self.raft, &self.storage, command.clone()).await {
             Ok(()) => {
                 let state = self.storage.query_state().await;
                 let events = state
                     .commands
-                    .get(&command.id)
+                    .get(&receipt_id)
                     .ok_or_else(|| Status::internal("claim renewal receipt unavailable"))?;
                 let claim = events
                     .iter()
@@ -1068,7 +1078,7 @@ impl WorkerSvc for GraphServices {
             Err(err)
                 if matches!(
                     err.kind,
-                    ErrorKind::Unavailable | ErrorKind::DeadlineExceeded
+                    ErrorKind::Unavailable | ErrorKind::DeadlineExceeded | ErrorKind::AlreadyExists
                 ) =>
             {
                 Err(status_error(err))
@@ -1084,7 +1094,7 @@ impl WorkerSvc for GraphServices {
     async fn report(&self, request: Request<ReportRequest>) -> Result<Response<Ack>, Status> {
         let session = WorkerSessionId::from_hex(&request.get_ref().session_id)
             .map_err(Status::invalid_argument)?;
-        self.worker_session(&request, session).await?;
+        let peer = self.worker_session(&request, session).await?;
         let req = request.into_inner();
         let run = parse_run(&req.run_id)?;
         let activation =
@@ -1123,7 +1133,7 @@ impl WorkerSvc for GraphServices {
         };
         let id = parse_publication_command_id(&req.command_id)?;
         let state = self.storage.query_state().await;
-        if worker_duplicate(&state, id, &body)? {
+        if worker_duplicate(&state, id, &body, peer.principal_id().as_str())? {
             return ack(Ok(()));
         }
         let act = state
@@ -1162,7 +1172,8 @@ impl WorkerSvc for GraphServices {
                 id,
                 time: now(),
                 body,
-            },
+            }
+            .authenticated_peer(&peer),
         )
         .await;
         if result.is_ok() {
@@ -1176,7 +1187,7 @@ impl WorkerSvc for GraphServices {
     async fn reconcile(&self, request: Request<ReconcileRequest>) -> Result<Response<Ack>, Status> {
         let session = WorkerSessionId::from_hex(&request.get_ref().session_id)
             .map_err(Status::invalid_argument)?;
-        self.worker_session(&request, session).await?;
+        let peer = self.worker_session(&request, session).await?;
         let req = request.into_inner();
         let outcome = match req.outcome.as_str() {
             "applied" => crate::domain::ReconcileOutcome::Applied,
@@ -1228,7 +1239,7 @@ impl WorkerSvc for GraphServices {
         };
         let id = parse_publication_command_id(&req.command_id)?;
         let state = self.storage.query_state().await;
-        if worker_duplicate(&state, id, &body)? {
+        if worker_duplicate(&state, id, &body, peer.principal_id().as_str())? {
             return ack(Ok(()));
         }
         let (name, version, _) = crate::domain::activity_key(&state, activation)
@@ -1253,7 +1264,8 @@ impl WorkerSvc for GraphServices {
                 id,
                 time: now(),
                 body,
-            },
+            }
+            .authenticated_peer(&peer),
         )
         .await;
         if result.is_ok() {
@@ -1338,7 +1350,7 @@ fn ack(result: Result<(), crate::error::Error>) -> Result<Response<Ack>, Status>
         Err(err)
             if matches!(
                 err.kind,
-                ErrorKind::Unavailable | ErrorKind::DeadlineExceeded
+                ErrorKind::Unavailable | ErrorKind::DeadlineExceeded | ErrorKind::AlreadyExists
             ) =>
         {
             Err(status_error(err))

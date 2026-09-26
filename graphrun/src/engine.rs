@@ -397,6 +397,7 @@ impl LocalBuilder {
             storage.clone(),
             notify.clone(),
             handlers.clone(),
+            publication_auth.clone(),
         ));
         let sock = data_dir.join("control.sock");
         let _ = std::fs::remove_file(&sock);
@@ -557,6 +558,7 @@ impl Engine {
                 storage.clone(),
                 notify.clone(),
                 handlers.clone(),
+                publication_auth.clone(),
             )))
         } else {
             None
@@ -1382,6 +1384,11 @@ impl Engine {
     }
 
     async fn write(&self, command: Command) -> Result<()> {
+        let command = if matches!(command.body, CommandBody::Progress { .. }) {
+            command
+        } else {
+            command.authenticated_context(&self.publication_auth)
+        };
         write_raft(&self.raft, &self.storage, command).await
     }
 }
@@ -1775,7 +1782,7 @@ async fn dispatch_control(
             catalog,
             input,
             wait_ms,
-        } => match start_via_raft(raft, storage, notify, &yaml, catalog, input).await {
+        } => match start_via_raft(raft, storage, notify, &yaml, catalog, input, auth).await {
             Ok(run) => {
                 if let Some(ms) = wait_ms {
                     match wait_via_raft(raft, storage, notify, run, Duration::from_millis(ms)).await
@@ -1815,7 +1822,8 @@ async fn dispatch_control(
                             key,
                             payload,
                         },
-                    },
+                    }
+                    .authenticated_context(auth),
                 )
                 .await
                 .map(|_| {
@@ -1833,7 +1841,8 @@ async fn dispatch_control(
                     id: CommandId::generate(),
                     time: now(),
                     body: CommandBody::Cancel { run, reason },
-                },
+                }
+                .authenticated_context(auth),
             )
             .await
             .map(|_| {
@@ -1904,7 +1913,8 @@ async fn dispatch_control(
                 id: CommandId::generate(),
                 time: now(),
                 body: CommandBody::AcknowledgeRecovery { reason },
-            },
+            }
+            .authenticated_context(auth),
         )
         .await
         .map(|_| {
@@ -1935,7 +1945,8 @@ async fn dispatch_control(
                         forward,
                         input,
                     },
-                },
+                }
+                .authenticated_context(auth),
             )
             .await
             .map(|_| {
@@ -1952,7 +1963,8 @@ async fn dispatch_control(
                     id: CommandId::generate(),
                     time: now(),
                     body: CommandBody::AbandonCompensation { run, reason },
-                },
+                }
+                .authenticated_context(auth),
             )
             .await
             .map(|_| {
@@ -2043,6 +2055,7 @@ async fn start_via_raft(
     yaml: &str,
     catalog: Catalog,
     input: Value,
+    auth: &crate::publication::AuthContext,
 ) -> Result<RunId> {
     let definition = compile_yaml(yaml, &catalog)?;
     let run = RunId::generate();
@@ -2058,7 +2071,8 @@ async fn start_via_raft(
                 input,
                 catalog: Box::new(catalog),
             },
-        },
+        }
+        .authenticated_context(auth),
     )
     .await?;
     wake(notify);
@@ -2333,6 +2347,7 @@ async fn worker_loop(
     storage: StorageHandle,
     notify: Arc<Notify>,
     handlers: Handlers,
+    auth: crate::publication::AuthContext,
 ) {
     let session = crate::ids::WorkerSessionId::generate();
     let blocking_slots = Arc::new(Semaphore::new(limits::BLOCKING_POOL_DEFAULT as usize));
@@ -2351,7 +2366,8 @@ async fn worker_loop(
                 activities: vec!["*".to_owned()],
                 capacity: crate::limits::CLAIM_BATCH,
             },
-        },
+        }
+        .authenticated_context(&auth),
     )
     .await;
     loop {
@@ -2473,6 +2489,17 @@ async fn worker_loop(
                 session,
                 capacity: crate::limits::CLAIM_BATCH,
             },
+        }
+        .authenticated_context(&auth);
+        let receipt_id = match crate::domain::authenticated_command_id(
+            &auth.key(claim.id).principal_id,
+            claim.id,
+        ) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::error!(%err, "local worker has an invalid command identity");
+                continue;
+            }
         };
         if write_raft(&raft, &storage, claim.clone()).await.is_err() {
             let _ = write_raft(
@@ -2486,7 +2513,8 @@ async fn worker_loop(
                         activities: vec!["*".to_owned()],
                         capacity: crate::limits::CLAIM_BATCH,
                     },
-                },
+                }
+                .authenticated_context(&auth),
             )
             .await;
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -2494,7 +2522,7 @@ async fn worker_loop(
         }
         let mut did_work = false;
         let state = storage.query_state().await;
-        let events = state.commands.get(&claim.id).cloned().unwrap_or_default();
+        let events = state.commands.get(&receipt_id).cloned().unwrap_or_default();
         let Ok(assignments) = crate::domain::assignments_from(&state, &events) else {
             tracing::error!("committed local claim has an unavailable assignment");
             continue;
@@ -2550,7 +2578,8 @@ async fn worker_loop(
                             outcome: outcome.0,
                             output: outcome.1,
                         },
-                    },
+                    }
+                    .authenticated_context(&auth),
                 )
                 .await;
             } else {
@@ -2609,7 +2638,8 @@ async fn worker_loop(
                                     generation: assignment.generation,
                                     revision: assignment.revision,
                                 },
-                            },
+                            }
+                            .authenticated_context(&auth),
                         )
                         .await;
                     }
@@ -2631,7 +2661,8 @@ async fn worker_loop(
                                     code,
                                     message,
                                 },
-                            },
+                            }
+                            .authenticated_context(&auth),
                         )
                         .await;
                     }
