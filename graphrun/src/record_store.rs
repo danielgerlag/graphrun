@@ -2,18 +2,30 @@ use crate::domain::State;
 use crate::error::{Error, ErrorKind, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub(crate) const FORMAT: &str = "graphrun.state-record/v1";
+pub(crate) const FRAGMENT_FORMAT: &str = "graphrun.record-fragments/v1";
 const NESTED_FIELDS: &[&str] = &["published_definitions", "start_keys"];
 const HISTORY_FIELDS: &[&str] = &["history", "history_records"];
 const LIST_FIELDS: &[&str] = &["inbox", "obligations"];
+const FRAGMENT_BYTES: usize = 1024 * 1024;
+const MAX_RECORD_BYTES: usize = 65 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct VersionedRecord {
     format: String,
     revision: u64,
     value: Value,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FragmentHeader {
+    format: String,
+    bytes: u64,
+    chunks: u32,
+    sha256: String,
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -107,6 +119,109 @@ pub(crate) fn same_value(left: &[u8], right: &[u8]) -> Result<bool> {
         return Err(invalid("unsupported state record version"));
     }
     Ok(left.value == right.value)
+}
+
+pub(crate) fn frame_records(
+    logical: impl IntoIterator<Item = (String, Vec<u8>)>,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut physical = BTreeMap::new();
+    for (key, bytes) in logical {
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(invalid("state record exceeds the 65 MiB per-record limit"));
+        }
+        if bytes.len() <= FRAGMENT_BYTES {
+            if physical.insert(key, bytes).is_some() {
+                return Err(invalid("duplicate physical state record"));
+            }
+            continue;
+        }
+        let chunks = bytes.len().div_ceil(FRAGMENT_BYTES);
+        let header = FragmentHeader {
+            format: FRAGMENT_FORMAT.to_owned(),
+            bytes: bytes.len() as u64,
+            chunks: u32::try_from(chunks).map_err(|_| invalid("too many record fragments"))?,
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        };
+        let head = serde_json::to_vec(&header).map_err(|err| Error::invalid(err.to_string()))?;
+        if physical.insert(key.clone(), head).is_some() {
+            return Err(invalid("duplicate physical state record"));
+        }
+        for (index, fragment) in bytes.chunks(FRAGMENT_BYTES).enumerate() {
+            let fragment_key = format!("{key}/fragment/{index:08}");
+            if physical.insert(fragment_key, fragment.to_vec()).is_some() {
+                return Err(invalid("duplicate state record fragment"));
+            }
+        }
+    }
+    Ok(physical)
+}
+
+pub(crate) fn restore_records(
+    physical: impl IntoIterator<Item = (String, Vec<u8>)>,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut heads = BTreeMap::new();
+    let mut fragments: BTreeMap<String, BTreeMap<u32, Vec<u8>>> = BTreeMap::new();
+    for (key, value) in physical {
+        let segments: Vec<_> = key.split('/').collect();
+        if segments.len() == 6 {
+            if heads.insert(key, value).is_some() {
+                return Err(invalid("duplicate state record"));
+            }
+        } else if segments.len() == 8 && segments[6] == "fragment" {
+            let index = segments[7]
+                .parse::<u32>()
+                .map_err(|err| invalid(format!("invalid fragment index: {err}")))?;
+            let base = segments[..6].join("/");
+            if fragments
+                .entry(base)
+                .or_default()
+                .insert(index, value)
+                .is_some()
+            {
+                return Err(invalid("duplicate state record fragment"));
+            }
+        } else {
+            return Err(invalid("unsupported physical state record key"));
+        }
+    }
+    for (key, chunks) in fragments {
+        let header = heads
+            .get_mut(&key)
+            .ok_or_else(|| invalid("state record fragments have no header"))?;
+        let manifest: FragmentHeader = serde_json::from_slice(header)
+            .map_err(|err| invalid(format!("invalid state record fragment header: {err}")))?;
+        let total = usize::try_from(manifest.bytes)
+            .map_err(|_| invalid("state record fragment length overflows usize"))?;
+        if manifest.format != FRAGMENT_FORMAT
+            || total > MAX_RECORD_BYTES
+            || manifest.chunks as usize != chunks.len()
+            || manifest.chunks == 0
+        {
+            return Err(invalid("unsupported or incomplete state record fragments"));
+        }
+        let mut assembled = Vec::with_capacity(total);
+        for index in 0..manifest.chunks {
+            let fragment = chunks
+                .get(&index)
+                .ok_or_else(|| invalid("state record fragment sequence has a gap"))?;
+            if fragment.is_empty() || fragment.len() > FRAGMENT_BYTES {
+                return Err(invalid("state record fragment has invalid length"));
+            }
+            assembled.extend_from_slice(fragment);
+        }
+        if assembled.len() != total || hex::encode(Sha256::digest(&assembled)) != manifest.sha256 {
+            return Err(invalid("state record fragment checksum mismatch"));
+        }
+        *header = assembled;
+    }
+    for value in heads.values() {
+        if let Ok(header) = serde_json::from_slice::<FragmentHeader>(value)
+            && header.format == FRAGMENT_FORMAT
+        {
+            return Err(invalid("state record fragments are missing"));
+        }
+    }
+    Ok(heads)
 }
 
 pub(crate) fn encode(
@@ -431,6 +546,41 @@ mod tests {
         corrupted.insert(key.replace(&run.to_hex(), &"f".repeat(32)), value);
         assert_eq!(
             decode(corrupted, 1).unwrap_err().kind,
+            ErrorKind::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn fragments_large_rows_and_rejects_missing_or_corrupt_chunks() {
+        let key = record_key(1, None, "recovery", "scalar", "", None);
+        let value = serde_json::to_vec(&VersionedRecord {
+            format: FORMAT.to_owned(),
+            revision: 1,
+            value: Value::String("x".repeat(5 * FRAGMENT_BYTES)),
+        })
+        .unwrap();
+        let rows = frame_records(std::iter::once((key.clone(), value.clone()))).unwrap();
+        assert!(rows.len() > 5);
+        assert!(
+            rows.values()
+                .all(|fragment| fragment.len() <= FRAGMENT_BYTES)
+        );
+        assert_eq!(restore_records(rows.clone()).unwrap()[&key], value);
+        let fragment = rows
+            .keys()
+            .find(|key| key.contains("/fragment/"))
+            .unwrap()
+            .clone();
+        let mut missing = rows.clone();
+        missing.remove(&fragment);
+        assert_eq!(
+            restore_records(missing).unwrap_err().kind,
+            ErrorKind::FailedPrecondition
+        );
+        let mut corrupt = rows;
+        corrupt.get_mut(&fragment).unwrap()[0] ^= 1;
+        assert_eq!(
+            restore_records(corrupt).unwrap_err().kind,
             ErrorKind::FailedPrecondition
         );
     }

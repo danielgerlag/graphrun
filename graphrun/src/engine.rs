@@ -463,7 +463,7 @@ impl Engine {
         let cluster_id = hex::encode(&ca_digest[..16]);
         let db_path = data_dir.join("member.redb");
         let existing_identity = read_identity(&data_dir, Some(&cluster_id))?;
-        let (storage, storage_thread) = StorageHandle::open(&db_path)?;
+        let (storage, storage_thread) = StorageHandle::open_member(&db_path)?;
         let publication_auth = match existing_identity {
             Some((auth, _)) => auth,
             None => write_identity(&data_dir, Some(&cluster_id))?,
@@ -1103,6 +1103,8 @@ impl Engine {
                 crate::history::EVENT_FORMAT.to_owned(),
                 crate::history::CHECKPOINT_FORMAT.to_owned(),
                 crate::publication::RESULT_FORMAT.to_owned(),
+                crate::record_store::FORMAT.to_owned(),
+                crate::record_store::FRAGMENT_FORMAT.to_owned(),
             ],
         };
         let stage_path = out.join(format!("application-{id}.snap.tmp"));
@@ -1186,6 +1188,8 @@ impl Engine {
             crate::history::EVENT_FORMAT,
             crate::history::CHECKPOINT_FORMAT,
             crate::publication::RESULT_FORMAT,
+            crate::record_store::FORMAT,
+            crate::record_store::FRAGMENT_FORMAT,
         ];
         if manifest.sha256 != hex::encode(digest)
             || framing.generation != 0
