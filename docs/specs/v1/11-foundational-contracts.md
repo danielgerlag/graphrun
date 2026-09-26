@@ -29,6 +29,18 @@ An accepted forward result with a blocked compensation-input obligation is
 `Applied` with the intervention state, not a failed submission to be retried.
 Unknown tagged versions fail closed; roll out readers before writers.
 
+For embedded 0.1 nonpublication commands, the replicated authenticated cause
+derives a domain-separated internal command ID from the signed principal and
+external command ID within the cluster store. Command receipts, worker request
+digests, and child IDs use this internal ID; history and caller APIs keep the
+external ID and signed actor. The state retains the original ID to detect a
+truncated-hash collision and a versioned canonical request digest to reject
+changed-body retries (including signal and cancel). Inline start excludes the
+server-generated run ID from its request digest. These command indexes expire
+together after 24 hours and are excluded from run checkpoint projections.
+Internal scheduler commands and top-level publication command keys keep their
+existing identities; this does not change published definition identity.
+
 ## Immutable published and retained artifact identity
 
 A published definition has identity `(workflow_name, explicit_version,
@@ -105,6 +117,10 @@ The authoritative event key is `(run_id, monotonically increasing u64
 run_sequence)`; an event stores its record version, command/principal cause,
 payload artifact reference, and recorded decisions. A committed command's
 inclusive event range and eager domain state share the apply transaction.
+Authenticated client/worker events retain the signed peer's principal ID;
+owner-only local control retains `local-owner`. A null principal is reserved
+for internal scheduler, retention, and clock work, never a caller-supplied
+identity hint.
 Checkpoint keys are `(run_id, through_run_sequence)` with a versioned
 projection and the exact pinned definition/reader dependency. History pages
 are ordered by sequence and return `retained_from`, `retained_through`, and a

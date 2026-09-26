@@ -51,6 +51,8 @@ pub struct RaftRequest {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RaftResponse {
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<crate::error::ErrorKind>,
     #[serde(default)]
     pub command_result: Option<crate::publication::CommandResult>,
     #[serde(default)]
@@ -836,6 +838,7 @@ fn apply_entries(
                     || key.principal_id.is_empty()
                 {
                     reply.error = Some("invalid authenticated command identity".to_owned());
+                    reply.error_kind = Some(crate::error::ErrorKind::InvalidArgument);
                 } else {
                     let mut command = req.command.clone();
                     if !next_domain.command_results.contains_key(&key.storage_key()) {
@@ -849,6 +852,7 @@ fn apply_entries(
                     let receipt =
                         crate::publication::apply(&mut next_domain, &command, key, operation);
                     if let Err(err) = receipt.ensure_applied() {
+                        reply.error_kind = Some(err.kind);
                         reply.error = Some(err.to_string());
                     }
                     reply.command_result = Some(receipt);
@@ -864,7 +868,10 @@ fn apply_entries(
                             _ => None,
                         });
                     }
-                    Err(err) => reply.error = Some(err.to_string()),
+                    Err(err) => {
+                        reply.error_kind = Some(err.kind);
+                        reply.error = Some(err.to_string());
+                    }
                 }
             }
         }

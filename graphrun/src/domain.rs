@@ -270,6 +270,11 @@ pub enum ScopeRole {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CommandBody {
+    /// Replicated provenance minted at a verified ingress, not decoded from a client request.
+    Authenticated {
+        principal_id: String,
+        body: Box<CommandBody>,
+    },
     Publication {
         key: crate::publication::CommandKey,
         operation: crate::publication::PublicationOperation,
@@ -421,6 +426,53 @@ pub struct Command {
     pub id: CommandId,
     pub body: CommandBody,
     pub time: EngineTime,
+}
+
+impl Command {
+    pub(crate) fn authenticated_peer(mut self, peer: &crate::tls::VerifiedPeerIdentity) -> Self {
+        self.body = CommandBody::Authenticated {
+            principal_id: peer.principal_id().as_str().to_owned(),
+            body: Box::new(self.body),
+        };
+        self
+    }
+
+    pub(crate) fn authenticated_context(mut self, owner: &crate::publication::AuthContext) -> Self {
+        self.body = CommandBody::Authenticated {
+            principal_id: owner.key(self.id).principal_id,
+            body: Box::new(self.body),
+        };
+        self
+    }
+
+    fn into_cause(self) -> Result<(Self, Option<String>)> {
+        let Self { id, body, time } = self;
+        match body {
+            CommandBody::Authenticated { principal_id, body } => {
+                if crate::tls::PrincipalId::parse(principal_id.as_str()).is_err()
+                    || matches!(
+                        *body,
+                        CommandBody::Authenticated { .. }
+                            | CommandBody::Publication { .. }
+                            | CommandBody::PruneHistory { .. }
+                            | CommandBody::Progress { .. }
+                            | CommandBody::ResolveTimer { .. }
+                    )
+                {
+                    return Err(Error::invalid("invalid authenticated command cause"));
+                }
+                Ok((
+                    Self {
+                        id,
+                        body: *body,
+                        time,
+                    },
+                    Some(principal_id),
+                ))
+            }
+            body => Ok((Self { id, body, time }, None)),
+        }
+    }
 }
 
 struct IdGen {
@@ -621,6 +673,12 @@ pub struct State {
     pub waits: HashMap<WaitId, WaitState>,
     pub inbox: Vec<InboxEntry>,
     pub commands: HashMap<CommandId, Vec<DomainEvent>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub command_actors: HashMap<CommandId, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub command_external_ids: HashMap<CommandId, CommandId>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub authenticated_request_digests: HashMap<CommandId, String>,
     #[serde(default)]
     pub legacy_start_digests: HashMap<CommandId, String>,
     #[serde(default)]
@@ -678,6 +736,7 @@ pub struct Decision {
 }
 
 pub fn decide(state: &State, command: &Command) -> Result<Decision> {
+    verify_command_identity(state, command.id, None, command.id, None)?;
     if let Some(events) = state.commands.get(&command.id) {
         return Ok(Decision {
             events: events.clone(),
@@ -685,6 +744,9 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
     }
     let mut ids = IdGen::new(command.id);
     match &command.body {
+        CommandBody::Authenticated { .. } => Err(Error::invalid(
+            "authenticated cause requires replicated apply",
+        )),
         CommandBody::Publication { .. } => {
             Err(Error::invalid("publication requires replicated apply"))
         }
@@ -4403,6 +4465,7 @@ pub fn start_run(
     let CommandBody::Start { run, .. } = &command.body else {
         return Err(Error::invalid("start_run requires Start"));
     };
+    verify_command_identity(state, command.id, None, command.id, None)?;
     if let Some(events) = state.commands.get(&command.id) {
         return Ok(events.clone());
     }
@@ -4439,9 +4502,137 @@ pub fn start_run(
 }
 
 pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEvent>> {
+    let (command, actor) = command.into_cause()?;
+    let (command, external_id, digest) = prepare_command(state, command, actor.as_deref())?;
+    apply_command_with_actor(state, command, actor.as_deref(), external_id, digest)
+}
+
+pub(crate) fn authenticated_command_id(actor: &str, external_id: CommandId) -> Result<CommandId> {
+    crate::tls::PrincipalId::parse(actor)?;
+    let mut hash = Sha256::new();
+    hash.update(b"graphrun.authenticated-command-id/v1\0");
+    hash.update((actor.len() as u64).to_le_bytes());
+    hash.update(actor.as_bytes());
+    hash.update(external_id.as_bytes());
+    Ok(CommandId::from_bytes(
+        hash.finalize()[..16].try_into().expect("16 bytes"),
+    ))
+}
+
+fn authenticated_request_digest(body: &CommandBody) -> Result<String> {
+    let (logical, kind) = match body {
+        // The inline start run ID is allocated by the server on each submission.
+        CommandBody::Start {
+            definition,
+            input,
+            catalog,
+            ..
+        } => (
+            serde_json::to_value((&**definition, input, &**catalog)),
+            b"start\0".as_slice(),
+        ),
+        body => (serde_json::to_value(body), b"body\0".as_slice()),
+    };
+    let logical = logical.map_err(|err| Error::invalid(err.to_string()))?;
+    let mut hash = Sha256::new();
+    hash.update(b"graphrun.authenticated-request/v1\0");
+    hash.update(kind);
+    hash.update(crate::value::canonical_json(&logical)?);
+    Ok(format!(
+        "graphrun.authenticated-request/v1:{}",
+        hex::encode(hash.finalize())
+    ))
+}
+
+fn verify_command_identity(
+    state: &State,
+    id: CommandId,
+    actor: Option<&str>,
+    external_id: CommandId,
+    digest: Option<&str>,
+) -> Result<()> {
+    if !state.commands.contains_key(&id) {
+        if state.command_actors.contains_key(&id)
+            || state.command_external_ids.contains_key(&id)
+            || state.authenticated_request_digests.contains_key(&id)
+        {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "command identity has no retained receipt",
+            ));
+        }
+        return Ok(());
+    }
+    if state.command_actors.get(&id).map(String::as_str) != actor
+        || actor.is_some() && state.command_external_ids.get(&id) != Some(&external_id)
+        || actor.is_none()
+            && (state.command_external_ids.contains_key(&id)
+                || state.authenticated_request_digests.contains_key(&id))
+    {
+        return Err(Error::new(
+            crate::error::ErrorKind::AlreadyExists,
+            "command ID collides with another command identity",
+        ));
+    }
+    if actor.is_some() {
+        let expected = state.authenticated_request_digests.get(&id);
+        if expected.is_some_and(|value| !value.starts_with("graphrun.authenticated-request/v1:")) {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "unsupported authenticated request digest format",
+            ));
+        }
+        if expected.map(String::as_str) != digest {
+            return Err(Error::new(
+                crate::error::ErrorKind::AlreadyExists,
+                "command ID reused with different authenticated request",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_command(
+    state: &State,
+    mut command: Command,
+    actor: Option<&str>,
+) -> Result<(Command, CommandId, Option<String>)> {
+    let external_id = command.id;
+    let digest = actor
+        .map(|_| authenticated_request_digest(&command.body))
+        .transpose()?;
+    if let Some(actor) = actor {
+        command.id = authenticated_command_id(actor, external_id)?;
+    }
+    verify_command_identity(state, command.id, actor, external_id, digest.as_deref())?;
+    Ok((command, external_id, digest))
+}
+
+pub(crate) fn authenticated_receipt<'a>(
+    state: &'a State,
+    external_id: CommandId,
+    actor: &str,
+    body: &CommandBody,
+) -> Result<Option<&'a Vec<DomainEvent>>> {
+    let id = authenticated_command_id(actor, external_id)?;
+    let digest = authenticated_request_digest(body)?;
+    verify_command_identity(state, id, Some(actor), external_id, Some(&digest))?;
+    if state.commands.contains_key(&id) {
+        verify_worker_retry(state, id, worker_request_digest(body)?.as_deref())?;
+    }
+    Ok(state.commands.get(&id))
+}
+
+fn apply_command_with_actor(
+    state: &mut State,
+    command: Command,
+    actor: Option<&str>,
+    external_id: CommandId,
+    authenticated_digest: Option<String>,
+) -> Result<Vec<DomainEvent>> {
     let worker_digest = worker_request_digest(&command.body)?;
     if let Some(events) = state.commands.get(&command.id) {
-        verify_worker_retry(state, &command, worker_digest.as_deref())?;
+        verify_worker_retry(state, command.id, worker_digest.as_deref())?;
         return Ok(events.clone());
     }
     let mut command = command;
@@ -4452,8 +4643,8 @@ pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEv
     apply_events_with_cause(
         state,
         &decision.events,
-        Some(command.id),
-        None,
+        Some(external_id),
+        actor,
         command.time,
     )?;
     for event in &decision.events {
@@ -4469,6 +4660,14 @@ pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEv
         }
     }
     state.commands.insert(command.id, decision.events.clone());
+    if let Some(actor) = actor {
+        state.command_actors.insert(command.id, actor.to_owned());
+        state.command_external_ids.insert(command.id, external_id);
+        state.authenticated_request_digests.insert(
+            command.id,
+            authenticated_digest.expect("authenticated command has a request digest"),
+        );
+    }
     state
         .command_times
         .insert(command.id, command.time.as_millis());
@@ -4507,8 +4706,8 @@ pub(crate) fn worker_request_digest(body: &CommandBody) -> Result<Option<String>
     ))))
 }
 
-fn verify_worker_retry(state: &State, command: &Command, digest: Option<&str>) -> Result<()> {
-    match (state.worker_command_digests.get(&command.id), digest) {
+fn verify_worker_retry(state: &State, id: CommandId, digest: Option<&str>) -> Result<()> {
+    match (state.worker_command_digests.get(&id), digest) {
         (Some(expected), Some(actual)) if expected == actual => Ok(()),
         (None, None) => Ok(()),
         _ => Err(Error::new(
@@ -4519,11 +4718,12 @@ fn verify_worker_retry(state: &State, command: &Command, digest: Option<&str>) -
 }
 
 pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainEvent>> {
-    let mut command = command;
+    let (mut command, actor) = command.into_cause()?;
     if let CommandBody::PruneHistory { limit } = &command.body {
         if *limit == 0 || *limit > 1024 {
             return Err(Error::invalid("retention batch must be 1..=1024"));
         }
+        verify_command_identity(state, command.id, None, command.id, None)?;
         if let Some(events) = state.commands.get(&command.id) {
             return Ok(events.clone());
         }
@@ -4555,6 +4755,8 @@ pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainE
         receipt.ensure_applied()?;
         return Ok(Vec::new());
     }
+    let (command, external_id, authenticated_digest) =
+        prepare_command(state, command, actor.as_deref())?;
     let start_digest = if let CommandBody::Start {
         definition,
         input,
@@ -4571,7 +4773,7 @@ pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainE
     };
     let worker_digest = worker_request_digest(&command.body)?;
     if let Some(events) = state.commands.get(&command.id) {
-        verify_worker_retry(state, &command, worker_digest.as_deref())?;
+        verify_worker_retry(state, command.id, worker_digest.as_deref())?;
         if let (Some(expected), Some(actual)) = (
             state.legacy_start_digests.get(&command.id),
             start_digest.as_ref(),
@@ -4612,7 +4814,13 @@ pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainE
         }
     }
     let id = command.id;
-    let events = apply_command(state, command)?;
+    let events = apply_command_with_actor(
+        state,
+        command,
+        actor.as_deref(),
+        external_id,
+        authenticated_digest,
+    )?;
     if let Some(digest) = start_digest {
         state.legacy_start_digests.insert(id, digest);
     }
