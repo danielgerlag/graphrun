@@ -1106,6 +1106,7 @@ impl Engine {
                 crate::record_store::FORMAT.to_owned(),
                 crate::record_store::FRAGMENT_FORMAT.to_owned(),
             ],
+            record_count: 1,
         };
         let stage_path = out.join(format!("application-{id}.snap.tmp"));
         let digest = write_snapshot(

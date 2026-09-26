@@ -30,6 +30,7 @@ use std::ops::Bound;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(test, feature = "fault-injection"))]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -181,14 +182,19 @@ fn sto_err(verb: ErrorVerb, err: impl std::fmt::Display) -> StoErr {
     StorageIOError::new(ErrorSubject::Store, verb, AnyError::error(err.to_string())).into()
 }
 
+#[cfg(any(test, feature = "fault-injection"))]
 struct Cut {
     point: &'static str,
 }
 
+#[cfg(any(test, feature = "fault-injection"))]
 static CUT: Mutex<Option<Cut>> = Mutex::new(None);
 
+#[cfg(any(test, feature = "fault-injection"))]
 thread_local! {
     static LOCAL_CUT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+thread_local! {
     static COMMIT_UNCERTAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -225,6 +231,7 @@ pub fn clear_cut() {
     *CUT.lock().unwrap() = None;
 }
 
+#[cfg(any(test, feature = "fault-injection"))]
 fn after_persist(point: &'static str) -> std::result::Result<(), StoErr> {
     let cut = {
         let local = LOCAL_CUT.with(|cell| cell.get() == Some(point));
@@ -251,6 +258,11 @@ fn after_persist(point: &'static str) -> std::result::Result<(), StoErr> {
         COMMIT_UNCERTAIN.with(|uncertain| uncertain.set(true));
         return Err(sto_err(ErrorVerb::Write, format!("fault cut {point}")));
     }
+    Ok(())
+}
+
+#[cfg(not(any(test, feature = "fault-injection")))]
+fn after_persist(_point: &'static str) -> std::result::Result<(), StoErr> {
     Ok(())
 }
 
@@ -2850,11 +2862,13 @@ fn apply_entries(
                 .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         }
     }
+    after_persist("after-applied-metadata")?;
     let record_revision = next_applied
         .map_or(0, |id| id.index)
         .checked_add(1)
         .ok_or_else(|| sto_err(ErrorVerb::Write, "record revision exhausted"))?;
     write_app_delta(&txn, domain, &next_domain, generation, record_revision)?;
+    after_persist("after-event-append")?;
     release_applied_credits(&txn, previous_applied, next_applied)?;
     let next_revision = update_schedule(
         &txn,
@@ -2865,6 +2879,7 @@ fn apply_entries(
         next_applied.map_or(0, |id| id.index),
         next_domain.engine_time_watermark_ms,
     )?;
+    after_persist("after-domain-index")?;
     commit_immediate(txn)?;
     *last_applied = next_applied;
     *last_membership = next_membership;
@@ -2963,6 +2978,7 @@ fn build_snapshot(
             record_store::FORMAT.to_owned(),
             record_store::FRAGMENT_FORMAT.to_owned(),
         ],
+        record_count: 1,
     };
     std::fs::create_dir_all(dir).map_err(|err| sto_err(ErrorVerb::Write, err))?;
     admit_snapshot_space(dir, db_path, manifest.payload_bytes, clustered)?;
@@ -3630,6 +3646,81 @@ nodes:
     }
 
     #[test]
+    fn event_index_and_applied_metadata_cuts_leave_the_old_generation() {
+        let catalog = crate::Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let definition = crate::compile_yaml(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        for (index, point) in [
+            "after-applied-metadata",
+            "after-event-append",
+            "after-domain-index",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("member.redb");
+            let db = Database::create(&path).unwrap();
+            initialize_publication_store(&db).unwrap();
+            let run = crate::ids::RunId::from_bytes([index as u8 + 1; 16]);
+            let entry = Entry::<TypeConfig> {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+                payload: EntryPayload::Normal(RaftRequest {
+                    command: crate::domain::Command {
+                        id: crate::ids::CommandId::from_bytes([9; 16]),
+                        time: crate::time::EngineTime::from_millis(1),
+                        body: crate::domain::CommandBody::Start {
+                            run,
+                            definition: Box::new(definition.clone()),
+                            input: crate::Value::Object(
+                                [
+                                    ("order_id".to_owned(), crate::Value::String("r1".to_owned())),
+                                    ("amount".to_owned(), crate::Value::Int(1)),
+                                ]
+                                .into_iter()
+                                .collect(),
+                            ),
+                            catalog: Box::new(catalog.clone()),
+                        },
+                    },
+                }),
+            };
+            let mut applied = None;
+            let mut membership = StoredMembership::new(None, Membership::new(vec![], None));
+            let mut domain = State::default();
+            let mut revision = 0;
+            inject_cut(point);
+            let error = apply_entries(
+                &db,
+                &mut applied,
+                &mut membership,
+                &mut domain,
+                &mut revision,
+                vec![entry],
+            )
+            .unwrap_err();
+            clear_cut();
+            assert!(error.to_string().contains(point));
+            let disk: State = required_json(&db, "domain").unwrap();
+            assert!(disk.runs.is_empty());
+            assert!(load_app_generation(&db, 1).unwrap().runs.is_empty());
+            assert!(load_json::<_, Option<LogIdT>>(&db, "last_applied").is_none());
+            drop(db);
+            let (handle, thread) = StorageHandle::open(&path).unwrap();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            assert!(runtime.block_on(handle.query_state()).runs.is_empty());
+            handle.shutdown();
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
     fn snapshot_install_cut_keeps_generation() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("member.redb");
@@ -3662,6 +3753,7 @@ nodes:
                     record_store::FORMAT.to_owned(),
                     record_store::FRAGMENT_FORMAT.to_owned(),
                 ],
+                record_count: 1,
             },
         )
         .unwrap();

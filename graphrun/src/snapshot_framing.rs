@@ -103,6 +103,8 @@ pub(crate) struct SnapshotManifest {
     pub payload_bytes: u64,
     #[prost(string, repeated, tag = "6")]
     pub record_formats: Vec<String>,
+    #[prost(uint64, tag = "7")]
+    pub record_count: u64,
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -274,6 +276,7 @@ mod tests {
             membership_json: b"{}".to_vec(),
             payload_bytes: payload.len() as u64,
             record_formats: vec!["graphrun.domain/v1".into()],
+            record_count: 1,
         };
         let digest = write_snapshot(&mut payload.as_slice(), &path, &manifest).unwrap();
         assert_eq!(verify_snapshot(&path).unwrap(), (manifest.clone(), digest));
