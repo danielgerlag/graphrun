@@ -82,5 +82,10 @@ REPLAY-004	REQ-REPLAY	integration	Raft snapshot/log compaction versus domain his
 E2E-001	REQ-E2E	e2e	Complete YAML and Rust-built application	All required primitives execute through production artifact paths with expected outputs
 E2E-002	REQ-E2E	e2e	No periodic runnable discovery	Quiescent ready-index reads do not recur during the 60-second observation window
 E2E-003	REQ-E2E	e2e	Report completeness and child cleanup	Every matrix ID has evidence and all owned processes are reaped with no silent skips
+CONTRACT-001	REQ-DURABILITY	integration	Committed command result and immutable artifact identity	Retries return the atomic typed v1 result/event range; conflicting requests and changed published bytes reject; retained artifact digests verify
+CONTRACT-002	REQ-DURABILITY	storage	Format compatibility and indexed history	Reader-first activation fences old writers; retained sequence pages and snapshot generations reject unsupported or missing records without fallback
+CONTRACT-003	REQ-CLUSTER	protocol	Authenticated worker capability and signed principal	Only signed same-cluster principal/role and pinned capability/roster admit authorized assignments and results, including dedup/cache paths
+GATE-001	REQ-E2E	unit	Fresh case evidence and complete report	Every expected ID occurs once with matching invocation/source/binary, existing in-run artifacts, and passing executed tests
+GATE-002	REQ-E2E	unit	Verification status and certification	Functional failure/blocked/ignored/stale evidence exits nonzero; only measured PERF hardware blocker passes normal mode with release_certified false, strict mode fails
 PERF-001	REQ-E2E	performance	Command/compile/local-ready targets	Reference workload measurements are recorded and targets pass or are explicitly blocked
 PERF-002	REQ-E2E	performance	History, nesting, concurrency, and snapshot cost	Resource growth and configured limits are measured on representative retained state

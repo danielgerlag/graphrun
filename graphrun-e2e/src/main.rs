@@ -1,10 +1,25 @@
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+static ACTIVE_CHILDREN: AtomicUsize = AtomicUsize::new(0);
+static CHILD_LEDGER_ERROR: AtomicBool = AtomicBool::new(false);
+static CHILD_EXITS: Mutex<Vec<ChildExit>> = Mutex::new(Vec::new());
+
+#[derive(Serialize)]
+struct ChildExit {
+    pid: u32,
+    status: Option<String>,
+    error: Option<String>,
+}
 
 #[derive(Parser)]
 #[command(name = "graphrun-e2e", version, about = "Graphrun verification driver")]
@@ -22,6 +37,8 @@ enum Commands {
         matrix: PathBuf,
         #[arg(long)]
         artifacts: PathBuf,
+        #[arg(long)]
+        release_certification: bool,
     },
     #[command(name = "fixture-member")]
     FixtureMember {
@@ -68,7 +85,7 @@ enum Commands {
     },
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 struct CaseResult {
     id: String,
     requirement: String,
@@ -80,6 +97,22 @@ struct CaseResult {
     expected: String,
     actual: String,
     artifacts: Vec<String>,
+    run_id: String,
+    source_sha256: String,
+    cli_sha256: String,
+    cli_version: String,
+    driver_sha256: String,
+    driver_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    performance: Option<PerformanceEvidence>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct PerformanceEvidence {
+    hardware: String,
+    reference_hardware_available: bool,
+    measurements: Vec<String>,
+    reason: String,
 }
 
 fn main() -> ExitCode {
@@ -88,7 +121,8 @@ fn main() -> ExitCode {
             cli,
             matrix,
             artifacts,
-        } => verify(&cli, &matrix, &artifacts),
+            release_certification,
+        } => verify(&cli, &matrix, &artifacts, release_certification),
         Commands::FixtureMember {
             data_dir,
             bind,
@@ -123,8 +157,19 @@ fn main() -> ExitCode {
     }
 }
 
-fn verify(cli: &Path, matrix: &Path, artifacts: &Path) -> ExitCode {
-    let started = Instant::now();
+fn verify(cli: &Path, matrix: &Path, artifacts: &Path, strict: bool) -> ExitCode {
+    if ACTIVE_CHILDREN.load(Ordering::SeqCst) != 0 {
+        eprintln!("cannot start verification with owned child processes still active");
+        return ExitCode::from(2);
+    }
+    match CHILD_EXITS.lock() {
+        Ok(mut exits) => exits.clear(),
+        Err(err) => {
+            eprintln!("cannot reset child exit ledger: {err}");
+            return ExitCode::from(2);
+        }
+    }
+    CHILD_LEDGER_ERROR.store(false, Ordering::SeqCst);
     if let Err(err) = fs::create_dir_all(artifacts) {
         eprintln!("cannot create artifacts dir: {err}");
         return ExitCode::from(2);
@@ -136,30 +181,149 @@ fn verify(cli: &Path, matrix: &Path, artifacts: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let evidence = collect_evidence(artifacts);
-    let mut results = Vec::new();
-    let mut failed = false;
-    for row in &rows {
-        let result = run_case(cli, artifacts, &evidence, row);
-        if result.status != "PASS" && result.status != "BLOCKED" {
-            failed = true;
+    let run_dir = match tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(artifacts)
+    {
+        Ok(dir) => dir.keep(),
+        Err(err) => {
+            eprintln!("cannot create fresh evidence directory: {err}");
+            return ExitCode::from(2);
         }
-        let path = artifacts.join(format!("{}.json", row.id));
-        if let Err(err) = fs::write(&path, serde_json::to_vec_pretty(&result).unwrap()) {
-            eprintln!("cannot write {}: {err}", path.display());
-            failed = true;
+    };
+    let mut context = match RunContext::new(cli, &run_dir) {
+        Ok(context) => context,
+        Err(err) => {
+            eprintln!("cannot identify source/binaries: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let cli_check = Command::new(cli).arg("--version").output();
+    let cli_error = match cli_check {
+        _ if context.cli_sha256.starts_with("UNAVAILABLE: ") => Some(context.cli_sha256.clone()),
+        Ok(output) if output.status.success() => {
+            context.cli_version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if context.cli_version.is_empty() {
+                Some("CLI --version returned no version identifier".to_owned())
+            } else {
+                None
+            }
+        }
+        Ok(output) => Some(format!(
+            "CLI --version exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(err) => Some(format!("cannot execute CLI {}: {err}", cli.display())),
+    };
+    let evidence = if cli_error.is_none() {
+        match collect_evidence(&run_dir) {
+            Ok(evidence) => Some(evidence),
+            Err(err) => {
+                eprintln!("cannot collect test evidence: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut results = Vec::new();
+    for row in rows.iter().filter(|row| row.id != "E2E-003") {
+        let result = match (&cli_error, &evidence) {
+            (Some(err), _) => fail(row, "CLI preflight", err),
+            (_, None) => fail(
+                row,
+                "test evidence preflight",
+                "test suite evidence unavailable",
+            ),
+            (None, Some(evidence)) => run_case(cli, &run_dir, evidence, row),
+        };
+        let result = context.bind(enforce_case(row, result, &run_dir));
+        if let Err(err) = write_case(&run_dir, &result) {
+            eprintln!("{err}");
+            return ExitCode::from(2);
         }
         results.push(result);
     }
+    if rows.iter().any(|row| row.id == "E2E-003") {
+        let result = context.bind(e2e_report_complete(&run_dir, &rows, &results, &context));
+        if let Err(err) = write_case(&run_dir, &result) {
+            eprintln!("{err}");
+            return ExitCode::from(2);
+        }
+        results.push(result);
+    }
+    let source_integrity = match source_fingerprint(&run_dir) {
+        Ok(fingerprint) if fingerprint == context.source_sha256 => None,
+        Ok(_) => Some("source files changed during verification".to_owned()),
+        Err(err) => Some(format!("cannot recheck source fingerprint: {err}")),
+    };
+    let cli_integrity = match hash_file(cli) {
+        Ok(hash) if hash == context.cli_sha256 => None,
+        Ok(_) => Some("CLI binary changed during verification".to_owned()),
+        Err(err) if cli_error.is_some() => Some(format!("CLI unavailable: {err}")),
+        Err(err) => Some(format!("cannot recheck CLI fingerprint: {err}")),
+    };
+    let driver_integrity = match std::env::current_exe()
+        .map_err(|err| err.to_string())
+        .and_then(|path| hash_file(&path))
+    {
+        Ok(hash) if hash == context.driver_sha256 => None,
+        Ok(_) => Some("verification driver changed during run".to_owned()),
+        Err(err) => Some(format!("cannot recheck driver fingerprint: {err}")),
+    };
+    let integrity = source_integrity.or(cli_integrity).or(driver_integrity);
+    if let Some(reason) = &integrity {
+        for result in &mut results {
+            if result.status != "FAIL" {
+                result.status = "FAIL".to_owned();
+                result.actual = format!("evidence invalidated: {reason}");
+                if let Err(err) = write_case(&run_dir, result) {
+                    eprintln!("{err}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    }
+    let coverage = validate_coverage(&rows, &results, &run_dir, &context);
+    let (exit_code, release_certified) = verification_gate(&results, strict);
+    let canonical_matrix = release_matrix_complete(&rows);
+    let matrix_complete = canonical_matrix.as_ref().is_ok_and(|complete| *complete);
+    let failed = exit_code != ExitCode::SUCCESS
+        || integrity.is_some()
+        || coverage.is_err()
+        || canonical_matrix.is_err()
+        || (strict && !matrix_complete);
+    let certified = release_certified && matrix_complete && !failed;
     let report = serde_json::json!({
-        "run_id": format!("e2e-{}", started.elapsed().as_millis()),
+        "run_id": context.run_id,
+        "source_sha256": context.source_sha256,
+        "cli_sha256": context.cli_sha256,
+        "cli_version": context.cli_version,
+        "driver_sha256": context.driver_sha256,
+        "driver_version": context.driver_version,
         "cli": cli.display().to_string(),
         "matrix": matrix.display().to_string(),
+        "release_matrix_complete": matrix_complete,
+        "release_matrix_error": canonical_matrix.err(),
+        "strict_release_certification": strict,
+        "release_certified": certified,
+        "coverage_error": coverage.err(),
+        "source_integrity_error": integrity,
         "results": results,
     });
-    let report_path = artifacts.join("report.json");
-    if let Err(err) = fs::write(&report_path, serde_json::to_vec_pretty(&report).unwrap()) {
-        eprintln!("cannot write report: {err}");
+    let report_bytes = match serde_json::to_vec_pretty(&report) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("cannot serialize report: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let report_path = run_dir.join("report.json");
+    if let Err(err) = fs::write(&report_path, &report_bytes)
+        .and_then(|()| fs::write(artifacts.join("report.json"), &report_bytes))
+    {
+        eprintln!("cannot write report {}: {err}", report_path.display());
         return ExitCode::from(2);
     }
     if failed {
@@ -170,11 +334,244 @@ fn verify(cli: &Path, matrix: &Path, artifacts: &Path) -> ExitCode {
         );
         ExitCode::from(1)
     } else {
-        println!("verification passed; {} cases", rows.len());
+        println!(
+            "verification passed; {} cases, release_certified={}",
+            rows.len(),
+            certified
+        );
         ExitCode::SUCCESS
     }
 }
 
+struct RunContext {
+    run_id: String,
+    source_sha256: String,
+    cli_sha256: String,
+    cli_version: String,
+    driver_sha256: String,
+    driver_version: String,
+}
+
+impl RunContext {
+    fn new(cli: &Path, run_dir: &Path) -> Result<Self, String> {
+        let run_id = run_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("invalid evidence directory name")?
+            .to_owned();
+        let driver = std::env::current_exe().map_err(|err| err.to_string())?;
+        Ok(Self {
+            run_id,
+            source_sha256: source_fingerprint(run_dir)?,
+            cli_sha256: hash_file(cli).unwrap_or_else(|err| format!("UNAVAILABLE: {err}")),
+            cli_version: "UNAVAILABLE".to_owned(),
+            driver_sha256: hash_file(&driver)?,
+            driver_version: env!("CARGO_PKG_VERSION").to_owned(),
+        })
+    }
+
+    fn bind(&self, mut result: CaseResult) -> CaseResult {
+        result.run_id.clone_from(&self.run_id);
+        result.source_sha256.clone_from(&self.source_sha256);
+        result.cli_sha256.clone_from(&self.cli_sha256);
+        result.cli_version.clone_from(&self.cli_version);
+        result.driver_sha256.clone_from(&self.driver_sha256);
+        result.driver_version.clone_from(&self.driver_version);
+        result
+    }
+}
+
+fn hash_file(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn source_fingerprint(run_dir: &Path) -> Result<String, String> {
+    let root = fs::canonicalize(std::env::current_dir().map_err(|err| err.to_string())?)
+        .map_err(|err| err.to_string())?;
+    let artifact_root = fs::canonicalize(
+        run_dir
+            .parent()
+            .ok_or_else(|| "run directory has no artifacts root".to_owned())?,
+    )
+    .map_err(|err| err.to_string())?;
+    if root.starts_with(&artifact_root) {
+        return Err("artifacts root must not contain the source repository".to_owned());
+    }
+    let mut pending = vec![root.clone()];
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let entries =
+            fs::read_dir(&directory).map_err(|err| format!("{}: {err}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let path = entry.path();
+            if path.starts_with(&artifact_root)
+                || matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(".git" | "target" | "target-e2e-artifacts")
+                )
+            {
+                continue;
+            }
+            let kind = entry.file_type().map_err(|err| err.to_string())?;
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file() {
+                files.push(path);
+            } else {
+                return Err(format!("unsupported source entry {}", path.display()));
+            }
+        }
+    }
+    files.sort_unstable();
+    let mut digest = Sha256::new();
+    for file in files {
+        let relative = file.strip_prefix(&root).map_err(|err| err.to_string())?;
+        digest.update(
+            relative
+                .to_str()
+                .ok_or_else(|| format!("invalid source path {}", file.display()))?
+                .as_bytes(),
+        );
+        digest.update([0]);
+        digest.update(fs::read(&file).map_err(|err| format!("{}: {err}", file.display()))?);
+        digest.update([0]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn write_case(run_dir: &Path, result: &CaseResult) -> Result<(), String> {
+    let path = run_dir.join(format!("{}.json", result.id));
+    let bytes = serde_json::to_vec_pretty(result).map_err(|err| err.to_string())?;
+    fs::write(&path, bytes).map_err(|err| format!("cannot write {}: {err}", path.display()))
+}
+
+fn check_case_artifacts(result: &CaseResult, run_dir: &Path) -> Result<(), String> {
+    if result.status != "PASS" && result.status != "BLOCKED" {
+        return Ok(());
+    }
+    if result.artifacts.is_empty() {
+        return Err(format!("{} has no fresh artifact paths", result.id));
+    }
+    let root = fs::canonicalize(run_dir).map_err(|err| err.to_string())?;
+    for artifact in &result.artifacts {
+        let path = fs::canonicalize(artifact)
+            .map_err(|err| format!("{} artifact {artifact}: {err}", result.id))?;
+        if !path.starts_with(&root) {
+            return Err(format!(
+                "{} artifact {artifact} is outside the current run",
+                result.id
+            ));
+        }
+    }
+    if result.status == "BLOCKED" {
+        let perf = result
+            .performance
+            .as_ref()
+            .ok_or_else(|| format!("{} lacks performance evidence", result.id))?;
+        if !result.id.starts_with("PERF-")
+            || perf.reference_hardware_available
+            || perf.hardware.is_empty()
+            || perf.measurements.is_empty()
+            || perf.reason.is_empty()
+        {
+            return Err(format!("{} is not a measured hardware blocker", result.id));
+        }
+    }
+    Ok(())
+}
+
+fn enforce_case(row: &MatrixRow, result: CaseResult, run_dir: &Path) -> CaseResult {
+    match check_case_artifacts(&result, run_dir) {
+        Ok(()) => result,
+        Err(err) => fail(row, &result.command, err),
+    }
+}
+
+fn validate_coverage(
+    rows: &[MatrixRow],
+    results: &[CaseResult],
+    run_dir: &Path,
+    context: &RunContext,
+) -> Result<(), String> {
+    let mut expected = HashMap::new();
+    for row in rows {
+        if expected.insert(row.id.as_str(), row).is_some() {
+            return Err(format!("duplicate matrix ID {}", row.id));
+        }
+    }
+    if results.len() != expected.len() {
+        return Err(format!(
+            "expected {} cases, got {}",
+            expected.len(),
+            results.len()
+        ));
+    }
+    let mut seen = HashSet::new();
+    for result in results {
+        let row = expected
+            .get(result.id.as_str())
+            .ok_or_else(|| format!("unexpected case {}", result.id))?;
+        if !seen.insert(result.id.as_str()) {
+            return Err(format!("duplicate case {}", result.id));
+        }
+        if result.requirement != row.requirement
+            || result.layer != row.layer
+            || result.scenario != row.scenario
+            || result.expected != row.pass_criterion
+            || result.run_id != context.run_id
+            || result.source_sha256 != context.source_sha256
+            || result.cli_sha256 != context.cli_sha256
+            || result.cli_version != context.cli_version
+            || result.driver_sha256 != context.driver_sha256
+            || result.driver_version != context.driver_version
+        {
+            return Err(format!("{} has stale/mismatched case identity", result.id));
+        }
+        if !matches!(result.status.as_str(), "PASS" | "FAIL" | "BLOCKED") {
+            return Err(format!(
+                "{} has invalid status {}",
+                result.id, result.status
+            ));
+        }
+        check_case_artifacts(result, run_dir)?;
+        let path = run_dir.join(format!("{}.json", result.id));
+        let bytes = fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+        let saved: CaseResult =
+            serde_json::from_slice(&bytes).map_err(|err| format!("{}: {err}", path.display()))?;
+        if &saved != result {
+            return Err(format!("{} does not match fresh case record", result.id));
+        }
+    }
+    Ok(())
+}
+
+fn verification_gate(results: &[CaseResult], strict: bool) -> (ExitCode, bool) {
+    let certified = results.iter().all(|result| result.status == "PASS");
+    let allowed = results.iter().all(|result| {
+        result.status == "PASS"
+            || (!strict
+                && result.status == "BLOCKED"
+                && result.id.starts_with("PERF-")
+                && result.performance.as_ref().is_some_and(|perf| {
+                    !perf.reference_hardware_available
+                        && !perf.hardware.is_empty()
+                        && !perf.measurements.is_empty()
+                        && !perf.reason.is_empty()
+                }))
+    });
+    (
+        if allowed {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        },
+        certified,
+    )
+}
+
+#[derive(Clone)]
 struct MatrixRow {
     id: String,
     requirement: String,
@@ -185,14 +582,48 @@ struct MatrixRow {
 
 fn load_matrix(path: &Path) -> Result<Vec<MatrixRow>, String> {
     let text = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    parse_matrix(&text)
+}
+
+fn release_matrix_complete(rows: &[MatrixRow]) -> Result<bool, String> {
+    let expected = parse_matrix(include_str!("../../docs/specs/v1/verification-matrix.tsv"))?;
+    Ok(rows.len() == expected.len()
+        && expected.iter().all(|case| {
+            rows.iter().any(|row| {
+                row.id == case.id
+                    && row.requirement == case.requirement
+                    && row.layer == case.layer
+                    && row.scenario == case.scenario
+                    && row.pass_criterion == case.pass_criterion
+            })
+        }))
+}
+
+fn parse_matrix(text: &str) -> Result<Vec<MatrixRow>, String> {
     let mut rows = Vec::new();
+    let mut ids = HashSet::new();
     for (i, line) in text.lines().enumerate() {
-        if i == 0 || line.trim().is_empty() {
+        if i == 0 {
+            if line != "id\trequirement\tlayer\tscenario\tpass_criterion" {
+                return Err("matrix header is invalid".to_owned());
+            }
             continue;
         }
+        if line.trim().is_empty() {
+            return Err(format!("matrix line {} is blank", i + 1));
+        }
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 5 {
+        if cols.len() != 5 || cols.iter().any(|column| column.is_empty()) {
             return Err(format!("matrix line {} is malformed", i + 1));
+        }
+        if !cols[0]
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(format!("matrix line {} has an unsafe ID", i + 1));
+        }
+        if !ids.insert(cols[0]) {
+            return Err(format!("matrix line {} duplicates ID {}", i + 1, cols[0]));
         }
         rows.push(MatrixRow {
             id: cols[0].to_owned(),
@@ -208,110 +639,163 @@ fn load_matrix(path: &Path) -> Result<Vec<MatrixRow>, String> {
     Ok(rows)
 }
 
-struct Evidence {
-    lib: String,
-    api: String,
-    api_ok: bool,
-    ui_ok: bool,
-    crash_ok: bool,
+struct TestSuite {
+    command: String,
+    log: PathBuf,
+    passed: HashSet<String>,
+    success: bool,
+    duration_ms: u128,
 }
 
-fn collect_evidence(artifacts: &Path) -> Evidence {
-    let lib = Command::new("cargo")
-        .args([
-            "test", "-p", "graphrun", "--lib", "--locked", "--color", "never",
-        ])
-        .output();
-    let api = Command::new("cargo")
-        .args([
-            "test", "-p", "graphrun", "--test", "api", "--locked", "--color", "never",
-        ])
-        .output();
-    let ui = Command::new("cargo")
-        .args([
-            "test", "-p", "graphrun", "--test", "ui", "--locked", "--color", "never",
-        ])
-        .output();
-    let crash = Command::new("cargo")
-        .args([
-            "test",
-            "-p",
-            "graphrun",
-            "--test",
-            "crash_cut",
-            "--features",
-            "fault-injection",
-            "--locked",
-            "--color",
-            "never",
-        ])
-        .output();
-    let api_ok = api.as_ref().is_ok_and(|o| o.status.success());
-    let ui_ok = ui.as_ref().is_ok_and(|o| o.status.success());
-    let crash_ok = crash.as_ref().is_ok_and(|o| o.status.success());
-    let snapshot = Command::new("cargo")
-        .args([
-            "test",
-            "-p",
-            "graphrun",
-            "--lib",
-            "snapshot_controller_fires_at_20000_entries",
-            "--locked",
-            "--color",
-            "never",
-            "--",
-            "--ignored",
-            "--nocapture",
-        ])
-        .output();
-    let snapshot_text = match snapshot {
-        Ok(output) => format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ),
-        Err(err) => err.to_string(),
-    };
-    let _ = fs::write(artifacts.join("cargo-snapshot.log"), &snapshot_text);
-    let lib_text = match lib {
-        Ok(output) => format!(
-            "{}\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-            snapshot_text
-        ),
-        Err(err) => format!("{err}\n{snapshot_text}"),
-    };
-    let api_text = match api {
-        Ok(output) => format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ),
-        Err(err) => err.to_string(),
-    };
-    let crash_text = match crash {
-        Ok(output) => format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ),
-        Err(err) => err.to_string(),
-    };
-    let _ = fs::write(artifacts.join("cargo-lib.log"), &lib_text);
-    let _ = fs::write(artifacts.join("cargo-api.log"), &api_text);
-    let _ = fs::write(artifacts.join("cargo-crash.log"), crash_text);
-    Evidence {
-        lib: lib_text,
-        api: api_text,
-        api_ok,
-        ui_ok,
-        crash_ok,
+impl TestSuite {
+    fn run(run_dir: &Path, label: &str, args: &[&str]) -> Result<Self, String> {
+        let command = format!("cargo {}", args.join(" "));
+        let started = Instant::now();
+        let output = Command::new("cargo").args(args).output();
+        let duration_ms = started.elapsed().as_millis();
+        let (text, test_output, exited) = match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                (
+                    format!("{stdout}\n{}", String::from_utf8_lossy(&output.stderr)),
+                    stdout,
+                    output.status.success(),
+                )
+            }
+            Err(err) => (format!("cannot run {command}: {err}"), String::new(), false),
+        };
+        let log = run_dir.join(format!("cargo-{label}.log"));
+        fs::write(&log, &text).map_err(|err| format!("{}: {err}", log.display()))?;
+        Ok(Self::from_output(
+            command,
+            log,
+            &test_output,
+            exited,
+            duration_ms,
+        ))
+    }
+
+    fn from_output(
+        command: String,
+        log: PathBuf,
+        text: &str,
+        exited: bool,
+        duration_ms: u128,
+    ) -> Self {
+        let (passed, complete) = parse_test_results(text);
+        Self {
+            command,
+            log,
+            passed,
+            success: exited && complete,
+            duration_ms,
+        }
+    }
+
+    fn passed(&self, name: &str) -> bool {
+        self.success && self.passed.contains(name)
     }
 }
 
-fn test_ok(evidence: &Evidence, name: &str) -> bool {
-    evidence.lib.contains(&format!("test {name} ... ok"))
+fn parse_test_results(text: &str) -> (HashSet<String>, bool) {
+    let passed: HashSet<_> = text
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("test ")
+                .and_then(|line| line.strip_suffix(" ... ok"))
+                .map(str::to_owned)
+        })
+        .collect();
+    let summary = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("test result: ok. "))
+        .filter_map(|line| line.split_whitespace().next()?.parse::<usize>().ok())
+        .next();
+    let complete = summary.is_some_and(|count| count > 0 && count == passed.len());
+    (passed, complete)
+}
+
+struct Evidence {
+    lib: TestSuite,
+    api: TestSuite,
+    ui: TestSuite,
+    crash: TestSuite,
+    snapshot: TestSuite,
+    driver: TestSuite,
+}
+
+fn collect_evidence(run_dir: &Path) -> Result<Evidence, String> {
+    Ok(Evidence {
+        lib: TestSuite::run(
+            run_dir,
+            "lib",
+            &[
+                "test", "-p", "graphrun", "--lib", "--locked", "--color", "never",
+            ],
+        )?,
+        api: TestSuite::run(
+            run_dir,
+            "api",
+            &[
+                "test", "-p", "graphrun", "--test", "api", "--locked", "--color", "never",
+            ],
+        )?,
+        ui: TestSuite::run(
+            run_dir,
+            "ui",
+            &[
+                "test", "-p", "graphrun", "--test", "ui", "--locked", "--color", "never",
+            ],
+        )?,
+        crash: TestSuite::run(
+            run_dir,
+            "crash",
+            &[
+                "test",
+                "-p",
+                "graphrun",
+                "--test",
+                "crash_cut",
+                "--features",
+                "fault-injection",
+                "--locked",
+                "--color",
+                "never",
+            ],
+        )?,
+        snapshot: TestSuite::run(
+            run_dir,
+            "snapshot",
+            &[
+                "test",
+                "-p",
+                "graphrun",
+                "--lib",
+                "snapshot_controller_fires_at_20000_entries",
+                "--locked",
+                "--color",
+                "never",
+                "--",
+                "--ignored",
+                "--show-output",
+            ],
+        )?,
+        driver: TestSuite::run(
+            run_dir,
+            "driver",
+            &[
+                "test",
+                "-p",
+                "graphrun-e2e",
+                "--bin",
+                "graphrun-e2e",
+                "--locked",
+                "--color",
+                "never",
+            ],
+        )?,
+    })
 }
 
 fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) -> CaseResult {
@@ -346,8 +830,8 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
                 ),
             ],
         ),
-        "API-001" => from_flag(row, evidence.api_ok, "cargo test --test api"),
-        "API-002" => from_flag(row, evidence.ui_ok, "cargo test --test ui"),
+        "API-001" => from_suite(row, &evidence.api, &[]),
+        "API-002" => from_suite(row, &evidence.ui, &[]),
         "API-003" => from_api_test(evidence, row, "yaml_and_builder_while_match"),
         "API-004" => from_api_test(evidence, row, "field_path_and_cross_scope_errors"),
         "API-005" => from_api_test(
@@ -628,13 +1112,16 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             "domain::tests::captured_policy_defaults_are_stable",
         ),
         "STORE-001" => from_test(evidence, row, "storage::tests::openraft_storage_suite"),
-        "STORE-002" => from_flag(
+        "STORE-002" => all_of(
             row,
-            test_ok(
-                evidence,
-                "storage::tests::log_cut_after_persist_keeps_entries",
-            ) && evidence.crash_ok,
-            "cargo test log_cut_after_persist_keeps_entries && crash_cut",
+            vec![
+                from_test(
+                    evidence,
+                    row,
+                    "storage::tests::log_cut_after_persist_keeps_entries",
+                ),
+                from_suite(row, &evidence.crash, &[]),
+            ],
         ),
         "STORE-003" => from_test(
             evidence,
@@ -742,12 +1229,15 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             "domain::tests::reconstruct_matches_live_state",
         ),
         "REPLAY-002" => replay_readonly(cli, artifacts, row),
-        "REPLAY-004" => from_tests(
-            evidence,
+        "REPLAY-004" => all_of(
             row,
-            &[
-                "engine::tests::snapshot_writes_file",
-                "engine::tests::snapshot_controller_fires_at_20000_entries",
+            vec![
+                from_test(evidence, row, "engine::tests::snapshot_writes_file"),
+                from_suite(
+                    row,
+                    &evidence.snapshot,
+                    &["engine::tests::snapshot_controller_fires_at_20000_entries"],
+                ),
             ],
         ),
         "REPLAY-003" => from_test(
@@ -763,13 +1253,30 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             ],
         ),
         "E2E-002" => e2e_no_ready_scan(cli, artifacts, row),
-        "E2E-003" => e2e_report_complete(artifacts, row),
         "PERF-001" => perf_command_compile(cli, artifacts, row),
-        "PERF-002" => perf_history_snapshot(cli, artifacts, row),
+        "PERF-002" => perf_history_snapshot(cli, artifacts, evidence, row),
+        "GATE-001" => from_suite(
+            row,
+            &evidence.driver,
+            &[
+                "tests::coverage_rejects_missing_duplicate_and_stale_cases",
+                "tests::test_evidence_requires_executed_pass_and_successful_exit",
+            ],
+        ),
+        "GATE-002" => from_suite(
+            row,
+            &evidence.driver,
+            &["tests::status_and_certification_gate"],
+        ),
+        "CONTRACT-001" | "CONTRACT-002" | "CONTRACT-003" => fail(
+            row,
+            "contract acceptance",
+            "normative contract defined; runtime acceptance not implemented yet",
+        ),
         _ => fail(row, "unimplemented", "no implementation evidence yet"),
     };
     CaseResult {
-        duration_ms: started.elapsed().as_millis(),
+        duration_ms: started.elapsed().as_millis().max(result.duration_ms),
         ..result
     }
 }
@@ -785,35 +1292,71 @@ fn catalog() -> PathBuf {
 fn yaml_validate_all(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
     let catalog = catalog();
     let mut failures = Vec::new();
+    let mut observations = Vec::new();
     let mut ok = 0;
-    if let Ok(entries) = fs::read_dir(examples()) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
-                continue;
-            }
-            let output = Command::new(cli)
-                .args([
-                    "validate",
-                    "--definition",
-                    path.to_str().unwrap(),
-                    "--catalog",
-                    catalog.to_str().unwrap(),
-                ])
-                .output();
-            match output {
-                Ok(output) if output.status.success() => ok += 1,
-                Ok(output) => failures.push(format!(
-                    "{}: {}",
-                    path.display(),
-                    String::from_utf8_lossy(&output.stderr)
-                )),
-                Err(err) => failures.push(err.to_string()),
+    match fs::read_dir(examples()) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = match entry {
+                    Ok(entry) => entry.path(),
+                    Err(err) => {
+                        failures.push(format!("cannot enumerate examples: {err}"));
+                        continue;
+                    }
+                };
+                if path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
+                    continue;
+                }
+                let output = Command::new(cli)
+                    .args([
+                        "validate",
+                        "--definition",
+                        path.to_str().unwrap(),
+                        "--catalog",
+                        catalog.to_str().unwrap(),
+                    ])
+                    .output();
+                match output {
+                    Ok(output) if output.status.success() => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let valid = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                            .ok()
+                            .is_some_and(|body| {
+                                body.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+                                    && body
+                                        .get("digest")
+                                        .and_then(serde_json::Value::as_str)
+                                        .is_some()
+                            });
+                        observations.push(format!("{}: {stdout}", path.display()));
+                        if valid {
+                            ok += 1;
+                        } else {
+                            failures.push(format!("{}: invalid validation result", path.display()));
+                        }
+                    }
+                    Ok(output) => failures.push(format!(
+                        "{}: {}",
+                        path.display(),
+                        String::from_utf8_lossy(&output.stderr)
+                    )),
+                    Err(err) => failures.push(format!("{}: {err}", path.display())),
+                }
             }
         }
+        Err(err) => failures.push(format!("cannot read examples directory: {err}")),
     }
     let log = artifacts.join(format!("{}-validate.log", row.id));
-    let _ = fs::write(&log, failures.join("\n"));
+    if let Err(err) = fs::write(
+        &log,
+        format!("{}\n{}", observations.join("\n"), failures.join("\n")),
+    ) {
+        return fail(
+            row,
+            "validate fixtures",
+            format!("cannot write evidence: {err}"),
+        );
+    }
     finish(
         row,
         if failures.is_empty() && ok > 0 {
@@ -956,8 +1499,23 @@ fn local_start_in(
             let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             let log = dir.join("start.log");
-            let _ = fs::write(&log, format!("{stdout}\n{stderr}"));
-            let ok = output.status.success() && stdout.contains(expect);
+            if let Err(err) = fs::write(&log, format!("{stdout}\n{stderr}")) {
+                return fail(
+                    row,
+                    "graphrun start",
+                    format!("cannot write evidence: {err}"),
+                );
+            }
+            let body = serde_json::from_str::<serde_json::Value>(&stdout);
+            let ok = output.status.success()
+                && body.as_ref().is_ok_and(|body| {
+                    body.get("status").and_then(serde_json::Value::as_str) == Some("succeeded")
+                        && (expect == "succeeded"
+                            || body
+                                .get("output")
+                                .and_then(|value| serde_json::to_string(value).ok())
+                                .is_some_and(|output| output.contains(expect)))
+                });
             finish(
                 row,
                 if ok { "PASS" } else { "FAIL" },
@@ -975,54 +1533,52 @@ fn local_start_in(
 }
 
 fn from_test(evidence: &Evidence, row: &MatrixRow, name: &str) -> CaseResult {
-    from_flag(row, test_ok(evidence, name), format!("cargo test {name}"))
+    from_suite(row, &evidence.lib, &[name])
 }
 
 fn from_api_test(evidence: &Evidence, row: &MatrixRow, name: &str) -> CaseResult {
-    from_flag(
-        row,
-        evidence.api.contains(&format!("test {name} ... ok")),
-        format!("cargo test --test api {name}"),
-    )
+    from_suite(row, &evidence.api, &[name])
 }
 
 fn from_tests(evidence: &Evidence, row: &MatrixRow, names: &[&str]) -> CaseResult {
+    from_suite(row, &evidence.lib, names)
+}
+
+fn from_suite(row: &MatrixRow, suite: &TestSuite, names: &[&str]) -> CaseResult {
     let missing: Vec<&str> = names
         .iter()
         .copied()
-        .filter(|name| !test_ok(evidence, name))
+        .filter(|name| !suite.passed(name))
         .collect();
-    from_flag(
+    let mut result = finish(
         row,
-        missing.is_empty(),
-        format!("cargo test {}", names.join(" ")),
-    )
-}
-
-fn from_flag(row: &MatrixRow, ok: bool, command: impl Into<String>) -> CaseResult {
-    finish(
-        row,
-        if ok { "PASS" } else { "FAIL" },
-        command,
-        if ok {
-            "observed passing test"
+        if suite.success && missing.is_empty() {
+            "PASS"
         } else {
-            "required test did not pass"
+            "FAIL"
         },
-        Vec::new(),
-    )
+        &suite.command,
+        if suite.success && missing.is_empty() {
+            format!("{} executed tests passed", suite.passed.len())
+        } else {
+            format!(
+                "suite failed or missing/ignored tests: {}",
+                missing.join(", ")
+            )
+        },
+        vec![suite.log.clone()],
+    );
+    result.duration_ms = suite.duration_ms;
+    result
 }
 
 fn fail(row: &MatrixRow, command: &str, actual: impl Into<String>) -> CaseResult {
     finish(row, "FAIL", command, actual.into(), Vec::new())
 }
 
-fn blocked(row: &MatrixRow, command: &str, actual: impl Into<String>) -> CaseResult {
-    finish(row, "BLOCKED", command, actual.into(), Vec::new())
-}
-
 fn all_of(row: &MatrixRow, parts: Vec<CaseResult>) -> CaseResult {
     let ok = parts.iter().all(|part| part.status == "PASS");
+    let duration_ms = parts.iter().map(|part| part.duration_ms).sum();
     let command = parts
         .iter()
         .map(|part| part.command.clone())
@@ -1034,13 +1590,15 @@ fn all_of(row: &MatrixRow, parts: Vec<CaseResult>) -> CaseResult {
         .collect::<Vec<_>>()
         .join(" | ");
     let artifacts: Vec<String> = parts.into_iter().flat_map(|part| part.artifacts).collect();
-    finish(
+    let mut result = finish(
         row,
         if ok { "PASS" } else { "FAIL" },
         command,
         actual,
         artifacts.into_iter().map(PathBuf::from).collect(),
-    )
+    );
+    result.duration_ms = duration_ms;
+    result
 }
 
 fn parse_peer(
@@ -1092,25 +1650,68 @@ fn finish(
             .into_iter()
             .map(|path| path.display().to_string())
             .collect(),
+        run_id: String::new(),
+        source_sha256: String::new(),
+        cli_sha256: String::new(),
+        cli_version: String::new(),
+        driver_sha256: String::new(),
+        driver_version: String::new(),
+        performance: None,
     }
 }
 
 struct ChildProc(Child);
 
+impl ChildProc {
+    fn new(child: Child) -> Self {
+        ACTIVE_CHILDREN.fetch_add(1, Ordering::SeqCst);
+        Self(child)
+    }
+}
+
 impl Drop for ChildProc {
     fn drop(&mut self) {
-        terminate(&mut self.0);
+        let outcome = terminate_status(&mut self.0);
+        let event = ChildExit {
+            pid: self.0.id(),
+            status: outcome.as_ref().ok().map(ToString::to_string),
+            error: outcome.err(),
+        };
+        if let Ok(mut exits) = CHILD_EXITS.lock() {
+            exits.push(event);
+        } else {
+            CHILD_LEDGER_ERROR.store(true, Ordering::SeqCst);
+        }
+        ACTIVE_CHILDREN.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 fn terminate(child: &mut Child) {
+    let _ = terminate_status(child);
+}
+
+fn terminate_status(child: &mut Child) -> Result<std::process::ExitStatus, String> {
+    if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+        return Ok(status);
+    }
     let pid = child.id().to_string();
-    let _ = Command::new("kill")
+    let signalled = Command::new("kill")
         .args(["-TERM", &pid])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
-    let _ = child.wait();
+        .status()
+        .is_ok_and(|status| status.success());
+    if signalled {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    child.kill().map_err(|err| err.to_string())?;
+    child.wait().map_err(|err| err.to_string())
 }
 
 fn wait_path(path: &Path, timeout: Duration) -> bool {
@@ -1158,7 +1759,10 @@ fn run_cli_timeout(cli: &Path, args: &[&str], timeout: Duration) -> (bool, Strin
                 return (false, String::new(), "timed out".to_owned());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(err) => return (false, String::new(), err.to_string()),
+            Err(err) => {
+                terminate(&mut child);
+                return (false, String::new(), err.to_string());
+            }
         }
     }
 }
@@ -1181,7 +1785,7 @@ fn local_restart_wait(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResu
         .stderr(Stdio::piped())
         .spawn()
     {
-        Ok(child) => ChildProc(child),
+        Ok(child) => ChildProc::new(child),
         Err(err) => return fail(row, "graphrun serve", err.to_string()),
     };
     if !wait_path(&dir.join("control.sock"), Duration::from_secs(10)) {
@@ -1255,7 +1859,7 @@ fn local_restart_wait(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResu
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(child) => ChildProc(child),
+        Ok(child) => ChildProc::new(child),
         Err(err) => return fail(row, "graphrun serve restart", err.to_string()),
     };
     if !wait_path(&dir.join("control.sock"), Duration::from_secs(10)) {
@@ -1338,18 +1942,56 @@ fn replay_readonly(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult 
         Ok(bytes) => bytes,
         Err(err) => return fail(row, "read store", err.to_string()),
     };
-    let run = started.actual.split('"').find(|part| part.len() == 32);
-    let mut args = vec!["replay", "--local-dir", dir.to_str().unwrap()];
-    let run_owned;
-    if let Some(run) = run {
-        run_owned = run.to_owned();
-        args.extend(["--run", &run_owned]);
-    }
-    let (ok, stdout, stderr) = run_cli(cli, &args);
+    let run = match serde_json::from_str::<serde_json::Value>(&started.actual)
+        .ok()
+        .and_then(|body| body.get("run")?.as_str().map(str::to_owned))
+    {
+        Some(run) if run.len() == 32 && run.bytes().all(|byte| byte.is_ascii_hexdigit()) => run,
+        _ => {
+            return fail(
+                row,
+                "graphrun replay",
+                "start did not return a valid run ID",
+            );
+        }
+    };
+    let (ok, stdout, stderr) = run_cli(
+        cli,
+        &[
+            "replay",
+            "--local-dir",
+            dir.to_str().unwrap(),
+            "--run",
+            &run,
+        ],
+    );
     if !ok {
         return fail(row, "graphrun replay", format!("{stdout}\n{stderr}"));
     }
-    let after = fs::read(&db).unwrap_or_default();
+    let replay = match serde_json::from_str::<serde_json::Value>(&stdout) {
+        Ok(body) => body,
+        Err(err) => return fail(row, "graphrun replay", format!("invalid JSON: {err}")),
+    };
+    if replay.get("run").and_then(serde_json::Value::as_str) != Some(run.as_str())
+        || replay
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|events| events.is_empty())
+        || !replay
+            .get("output")
+            .and_then(|output| serde_json::to_string(output).ok())
+            .is_some_and(|output| output.contains("pay-1"))
+    {
+        return fail(
+            row,
+            "graphrun replay",
+            "replay did not contain the expected run evidence",
+        );
+    }
+    let after = match fs::read(&db) {
+        Ok(bytes) => bytes,
+        Err(err) => return fail(row, "read store after replay", err.to_string()),
+    };
     if after != before {
         return fail(row, "graphrun replay", "replay wrote the store");
     }
@@ -1397,16 +2039,26 @@ fn e2e_all_yaml(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
         ("timeout-recovery.yaml", r#"{"value":1}"#, r#""value":1"#),
     ];
     let mut logs = Vec::new();
+    let mut case_artifacts = Vec::new();
     for (yaml, input, expect) in cases {
-        let result = local_start(cli, artifacts, row, yaml, input, expect);
+        let result = local_start_in(
+            cli,
+            artifacts,
+            row,
+            yaml.trim_end_matches(".yaml"),
+            yaml,
+            input,
+            expect,
+        );
         logs.push(format!("{yaml}: {} {}", result.status, result.actual));
+        case_artifacts.extend(result.artifacts.into_iter().map(PathBuf::from));
         if result.status != "PASS" {
             return finish(
                 row,
                 "FAIL",
                 format!("graphrun start {yaml}"),
                 logs.join("\n"),
-                vec![artifacts.join(format!("{}-data", row.id))],
+                case_artifacts,
             );
         }
     }
@@ -1415,48 +2067,73 @@ fn e2e_all_yaml(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
         "PASS",
         "graphrun start all completing yaml fixtures",
         logs.join("\n"),
-        vec![artifacts.join(format!("{}-data", row.id))],
+        case_artifacts,
     )
 }
 
-fn e2e_report_complete(artifacts: &Path, row: &MatrixRow) -> CaseResult {
-    let matrix = match load_matrix(&PathBuf::from("docs/specs/v1/verification-matrix.tsv")) {
-        Ok(rows) => rows,
-        Err(err) => return fail(row, "load matrix", err),
+fn e2e_report_complete(
+    run_dir: &Path,
+    rows: &[MatrixRow],
+    results: &[CaseResult],
+    context: &RunContext,
+) -> CaseResult {
+    let row = rows.iter().find(|row| row.id == "E2E-003").unwrap();
+    let other_rows: Vec<MatrixRow> = rows
+        .iter()
+        .filter(|row| row.id != "E2E-003")
+        .cloned()
+        .collect();
+    if let Err(err) = validate_coverage(&other_rows, results, run_dir, context) {
+        return fail(row, "fresh in-run matrix coverage", err);
+    }
+    let active = ACTIVE_CHILDREN.load(Ordering::SeqCst);
+    if active != 0 {
+        return fail(
+            row,
+            "owned process cleanup",
+            format!("{active} owned child processes not reaped"),
+        );
+    }
+    if CHILD_LEDGER_ERROR.load(Ordering::SeqCst) {
+        return fail(
+            row,
+            "owned process cleanup",
+            "child exit ledger is unavailable",
+        );
+    }
+    let exits = match CHILD_EXITS.lock() {
+        Ok(exits) => exits,
+        Err(err) => return fail(row, "owned process cleanup", err.to_string()),
     };
-    let mut missing = Vec::new();
-    let mut seen_self = false;
-    for item in &matrix {
-        if item.id == row.id {
-            seen_self = true;
-            continue;
-        }
-        if seen_self {
-            continue;
-        }
-        let path = artifacts.join(format!("{}.json", item.id));
-        if !path.exists() {
-            missing.push(item.id.clone());
-        }
-    }
-    if missing.is_empty() {
-        finish(
+    if exits
+        .iter()
+        .any(|exit| exit.status.is_none() || exit.error.is_some())
+    {
+        return fail(
             row,
-            "PASS",
-            "artifact coverage",
-            format!(
-                "{} prior cases have evidence files",
-                matrix.len().saturating_sub(1)
-            ),
-            vec![artifacts.to_path_buf()],
-        )
-    } else {
-        fail(
-            row,
-            "artifact coverage",
-            format!("missing {}", missing.join(",")),
-        )
+            "owned process cleanup",
+            "a child has no confirmed exit status",
+        );
     }
+    let path = run_dir.join("owned-children.json");
+    let bytes = match serde_json::to_vec_pretty(&*exits) {
+        Ok(bytes) => bytes,
+        Err(err) => return fail(row, "owned process cleanup", err.to_string()),
+    };
+    if let Err(err) = fs::write(&path, bytes) {
+        return fail(row, "owned process cleanup", err.to_string());
+    }
+    finish(
+        row,
+        "PASS",
+        "fresh in-run matrix coverage and owned process exits",
+        format!(
+            "{} other cases validated; {} owned processes reaped",
+            results.len(),
+            exits.len()
+        ),
+        vec![path],
+    )
 }
 
 fn e2e_no_ready_scan(_cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
@@ -1542,7 +2219,7 @@ fn perf_command_compile(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseRe
         return fail(row, "validate timing", format!("{stdout}\n{stderr}"));
     }
     let start = Instant::now();
-    let _started = local_start(
+    let started_run = local_start(
         cli,
         artifacts,
         row,
@@ -1551,6 +2228,9 @@ fn perf_command_compile(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseRe
         "pay-1",
     );
     let local_ms = start.elapsed().as_millis();
+    if started_run.status != "PASS" {
+        return fail(row, "local readiness timing", started_run.actual);
+    }
     let yaml512 = artifacts.join("PERF-001-512.yaml");
     let mut body512 = String::from(
         "dsl: graphrun/v1\nid: n512\nversion: 1\ninput_schema: unit/v1\noutput_schema: unit/v1\nstart: n0\nnodes:\n",
@@ -1567,7 +2247,9 @@ fn perf_command_compile(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseRe
             ));
         }
     }
-    let _ = fs::write(&yaml512, body512);
+    if let Err(err) = fs::write(&yaml512, body512) {
+        return fail(row, "512-node fixture", err.to_string());
+    }
     let compile512_started = Instant::now();
     let (ok512, _, _) = run_cli(
         cli,
@@ -1580,26 +2262,29 @@ fn perf_command_compile(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseRe
         ],
     );
     let compile512_ms = compile512_started.elapsed().as_millis();
-    let rate = measure_progress_rate(artifacts);
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    if !ok512 {
+        return fail(row, "512-node validation", "validation failed");
+    }
+    let (cmds, p95_us, wall_ms) = match measure_progress_rate(artifacts) {
+        Ok(rate) => rate,
+        Err(err) => return fail(row, "progress-rate measurement", err),
+    };
     let body = format!(
-        "compile_ms={compile_ms} compile512_ok={ok512} compile512_ms={compile512_ms} local_start_ms={local_ms} {} cpus={cpus} arch={}",
-        match &rate {
-            Ok((cmds, p95_us, wall_ms)) =>
-                format!("progress_cmds=1000 cmds_per_s={cmds:.1} p95_us={p95_us} wall_ms={wall_ms}"),
-            Err(err) => format!("progress_rate_error={err}"),
-        },
-        std::env::consts::ARCH
+        "validate_cli_wall_ms={compile_ms} validate_512_cli_wall_ms={compile512_ms} local_start_wall_ms={local_ms} progress_commands=1000 progress_commands_per_s={cmds:.1} progress_p95_us={p95_us} progress_wall_ms={wall_ms}"
     );
-    let _ = fs::write(artifacts.join("PERF-001-measure.txt"), &body);
-    blocked(
+    perf_blocked(
         row,
-        "measured compile/local-start/progress on this host",
-        format!(
-            "{body}; reference target is 1000 committed commands/s p95<100ms on three 4-vCPU members"
-        ),
+        artifacts,
+        "measured CLI validation/local startup/single-member progress",
+        &body,
+        vec![
+            format!("validate_cli_wall_ms={compile_ms}"),
+            format!("validate_512_cli_wall_ms={compile512_ms}"),
+            format!("local_start_wall_ms={local_ms}"),
+            format!("progress_commands_per_s={cmds:.1}"),
+            format!("progress_p95_us={p95_us}"),
+            format!("progress_wall_ms={wall_ms}"),
+        ],
     )
 }
 
@@ -1649,7 +2334,12 @@ fn measure_progress_rate(artifacts: &Path) -> Result<(f64, u128, u128), String> 
     })
 }
 
-fn perf_history_snapshot(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
+fn perf_history_snapshot(
+    cli: &Path,
+    artifacts: &Path,
+    evidence: &Evidence,
+    row: &MatrixRow,
+) -> CaseResult {
     let nested_started = Instant::now();
     let nested = local_start_in(
         cli,
@@ -1661,50 +2351,106 @@ fn perf_history_snapshot(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
         "succeeded",
     );
     let nested_ms = nested_started.elapsed().as_millis();
-    let history_ms = if nested.status == "PASS" {
-        let run = nested
-            .actual
-            .split('"')
-            .find(|part| part.len() == 32)
-            .unwrap_or("")
-            .to_owned();
-        let dir = artifacts.join(format!("{}-nested", row.id));
-        let started = Instant::now();
-        let _ = run_cli(
-            cli,
-            &[
-                "history",
-                "--run",
-                &run,
-                "--local-dir",
-                dir.to_str().unwrap(),
-            ],
-        );
-        started.elapsed().as_millis()
-    } else {
-        0
+    if nested.status != "PASS" {
+        return fail(row, "nested timing", nested.actual);
+    }
+    let run = match serde_json::from_str::<serde_json::Value>(&nested.actual)
+        .ok()
+        .and_then(|body| body.get("run")?.as_str().map(str::to_owned))
+        .filter(|run| run.len() == 32 && run.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        Some(run) => run,
+        None => return fail(row, "nested timing", "start did not return a valid run ID"),
     };
-    let snapshot_log = artifacts.join("cargo-snapshot.log");
-    let snapshot_note = fs::read_to_string(&snapshot_log).unwrap_or_default();
-    let snapshot_line = if snapshot_log.exists() {
-        snapshot_note
-            .lines()
-            .find(|line| line.contains("finished in") || line.contains("snapshot fill"))
-            .unwrap_or("see cargo-snapshot.log")
-            .to_owned()
-    } else {
-        "cargo-snapshot.log missing".to_owned()
+    let dir = artifacts.join(format!("{}-nested", row.id));
+    let started = Instant::now();
+    let (history_ok, history, history_err) = run_cli(
+        cli,
+        &[
+            "history",
+            "--run",
+            &run,
+            "--local-dir",
+            dir.to_str().unwrap(),
+        ],
+    );
+    let history_ms = started.elapsed().as_millis();
+    if !history_ok || serde_json::from_str::<serde_json::Value>(&history).is_err() {
+        return fail(row, "history timing", format!("{history}\n{history_err}"));
+    }
+    if !evidence
+        .snapshot
+        .passed("engine::tests::snapshot_controller_fires_at_20000_entries")
+    {
+        return fail(
+            row,
+            "snapshot measurement",
+            "snapshot test did not execute and pass",
+        );
+    }
+    let snapshot_note = match fs::read_to_string(&evidence.snapshot.log) {
+        Ok(note) => note,
+        Err(err) => return fail(row, "snapshot measurement", err.to_string()),
+    };
+    let snapshot_line = match snapshot_note
+        .lines()
+        .find(|line| line.contains("snapshot fill writes="))
+    {
+        Some(line) => line,
+        None => return fail(row, "snapshot measurement", "snapshot progress is missing"),
     };
     let body = format!(
-        "nested_ms={nested_ms} nested_status={} history_ms={history_ms} snapshot={snapshot_line}",
-        nested.status
+        "nested_cli_wall_ms={nested_ms} history_cli_wall_ms={history_ms} snapshot_test_wall_ms={} {snapshot_line}",
+        evidence.snapshot.duration_ms
     );
-    let _ = fs::write(artifacts.join("PERF-002-measure.txt"), &body);
-    blocked(
+    perf_blocked(
         row,
-        "measured nested/history/snapshot on this host",
-        format!("{body}; reference 4-vCPU cluster hardware is not this machine"),
+        artifacts,
+        "measured nested/history/snapshot test on this host",
+        &body,
+        vec![
+            format!("nested_cli_wall_ms={nested_ms}"),
+            format!("history_cli_wall_ms={history_ms}"),
+            format!("snapshot_test_wall_ms={}", evidence.snapshot.duration_ms),
+            snapshot_line.to_owned(),
+        ],
     )
+}
+
+fn perf_blocked(
+    row: &MatrixRow,
+    artifacts: &Path,
+    command: &str,
+    body: &str,
+    measurements: Vec<String>,
+) -> CaseResult {
+    let measure_path = artifacts.join(format!("{}-measure.txt", row.id));
+    let hardware = format!(
+        "os={} arch={} logical_cpus={} observed_members=1 memory=unmeasured storage=unmeasured",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::thread::available_parallelism()
+            .map(|cpus| cpus.get().to_string())
+            .unwrap_or_else(|err| format!("unavailable ({err})"))
+    );
+    let reason = "reference three same-region 4-vCPU/8-GiB SSD members unavailable; local measurement is not a reference benchmark";
+    if let Err(err) = fs::write(&measure_path, format!("{body}\n{hardware}\n{reason}\n")) {
+        return fail(row, command, format!("measurement write failed: {err}"));
+    }
+    let mut result = finish(
+        row,
+        "BLOCKED",
+        command,
+        format!("{body}; {hardware}; {reason}"),
+        vec![measure_path],
+    );
+    result.performance = Some(PerformanceEvidence {
+        hardware,
+        reference_hardware_available: false,
+        measurements,
+        reason: reason.to_owned(),
+    });
+    result
 }
 
 struct LiveCluster {
@@ -1821,7 +2567,9 @@ fn spawn_fixture_member(
     }
     cmd.stdout(Stdio::null())
         .stderr(fs::File::create(log).map_err(|err| err.to_string())?);
-    cmd.spawn().map(ChildProc).map_err(|err| err.to_string())
+    cmd.spawn()
+        .map(ChildProc::new)
+        .map_err(|err| err.to_string())
 }
 
 fn spawn_fixture_worker(cluster: &LiveCluster, i: usize) -> Result<ChildProc, String> {
@@ -1889,7 +2637,9 @@ fn spawn_worker_on(
     if let Ok(file) = fs::File::create(log) {
         cmd.stderr(file);
     }
-    cmd.spawn().map(ChildProc).map_err(|err| err.to_string())
+    cmd.spawn()
+        .map(ChildProc::new)
+        .map_err(|err| err.to_string())
 }
 
 fn cluster_connect<'a>(cluster: &'a LiveCluster, node: usize, extra: &[&'a str]) -> Vec<String> {
@@ -2392,7 +3142,7 @@ fn serve_local(cli: &Path, dir: &Path) -> Result<ChildProc, String> {
     if !wait_path(&dir.join("control.sock"), Duration::from_secs(10)) {
         return Err("control socket missing".to_owned());
     }
-    Ok(ChildProc(child))
+    Ok(ChildProc::new(child))
 }
 
 fn snapshot_unfinished_parallel_cli(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
@@ -2866,7 +3616,7 @@ fn forged_worker_process(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
         cmd.stderr(file);
     }
     let _member = match cmd.spawn() {
-        Ok(child) => ChildProc(child),
+        Ok(child) => ChildProc::new(child),
         Err(err) => return fail(row, "fixture-member", err.to_string()),
     };
     let tcp_deadline = Instant::now() + Duration::from_secs(10);
@@ -3021,7 +3771,7 @@ fn forged_worker_process(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
         worker_cmd.stderr(file);
     }
     let _worker = match worker_cmd.spawn() {
-        Ok(child) => ChildProc(child),
+        Ok(child) => ChildProc::new(child),
         Err(err) => return fail(row, "fixture-worker", err.to_string()),
     };
     let done = Instant::now() + Duration::from_secs(20);
@@ -3096,7 +3846,7 @@ fn spawn_provider(dir: &Path) -> Result<(ChildProc, String), String> {
     if url.is_empty() {
         return Err("did not print GRAPHUN_PROVIDER_URL".to_owned());
     }
-    Ok((ChildProc(provider), url))
+    Ok((ChildProc::new(provider), url))
 }
 
 fn provider_idempotent_effect(artifacts: &Path, row: &MatrixRow) -> CaseResult {
@@ -3238,7 +3988,7 @@ fn provider_delayed_forward(cli: &Path, artifacts: &Path, row: &MatrixRow) -> Ca
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(child) => ChildProc(child),
+        Ok(child) => ChildProc::new(child),
         Err(err) => return fail(row, "graphrun serve", err.to_string()),
     };
     if !wait_path(&local.join("control.sock"), Duration::from_secs(10)) {
@@ -3427,7 +4177,7 @@ fn disaster_restore_cli(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseRe
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(child) => ChildProc(child),
+        Ok(child) => ChildProc::new(child),
         Err(err) => return fail(row, "graphrun serve", err.to_string()),
     };
     if !wait_path(&src.join("control.sock"), Duration::from_secs(10)) {
@@ -3561,7 +4311,7 @@ fn disaster_restore_cli(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseRe
         .stderr(Stdio::null())
         .spawn()
     {
-        Ok(child) => ChildProc(child),
+        Ok(child) => ChildProc::new(child),
         Err(err) => return fail(row, "serve restored", err.to_string()),
     };
     if !wait_path(&dest.join("control.sock"), Duration::from_secs(10)) {
@@ -3772,4 +4522,213 @@ fn fixture_worker(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &str) -> MatrixRow {
+        MatrixRow {
+            id: id.to_owned(),
+            requirement: "REQ-E2E".to_owned(),
+            layer: "unit".to_owned(),
+            scenario: "gate".to_owned(),
+            pass_criterion: "current evidence".to_owned(),
+        }
+    }
+
+    fn context(run_dir: &Path) -> RunContext {
+        RunContext {
+            run_id: run_dir.file_name().unwrap().to_string_lossy().into_owned(),
+            source_sha256: "source-1".to_owned(),
+            cli_sha256: "cli-1".to_owned(),
+            cli_version: "0.1.test".to_owned(),
+            driver_sha256: "driver-1".to_owned(),
+            driver_version: "test".to_owned(),
+        }
+    }
+
+    fn passing_case(row: &MatrixRow, run_dir: &Path, context: &RunContext) -> CaseResult {
+        let log = run_dir.join(format!("{}.log", row.id));
+        fs::write(&log, "observed").unwrap();
+        context.bind(finish(row, "PASS", "test", "observed", vec![log]))
+    }
+
+    #[test]
+    fn coverage_rejects_missing_duplicate_and_stale_cases() {
+        let parent = tempfile::tempdir().unwrap();
+        let run_dir = parent.path().join("run-new");
+        fs::create_dir(&run_dir).unwrap();
+        let old_run = parent.path().join("run-old");
+        fs::create_dir(&old_run).unwrap();
+        let rows = vec![row("A"), row("B")];
+        let context = context(&run_dir);
+        let first = passing_case(&rows[0], &run_dir, &context);
+        let second = passing_case(&rows[1], &run_dir, &context);
+        write_case(&run_dir, &first).unwrap();
+        write_case(&run_dir, &second).unwrap();
+        let results = vec![first.clone(), second.clone()];
+        assert!(validate_coverage(&rows, &results, &run_dir, &context).is_ok());
+        fs::remove_file(run_dir.join("B.json")).unwrap();
+        assert!(validate_coverage(&rows, &results, &run_dir, &context).is_err());
+        write_case(&run_dir, &second).unwrap();
+        assert!(
+            validate_coverage(&rows, &[first.clone(), first.clone()], &run_dir, &context)
+                .unwrap_err()
+                .contains("duplicate")
+        );
+        let mut stale = second.clone();
+        stale.run_id = "run-old".to_owned();
+        write_case(&run_dir, &stale).unwrap();
+        assert!(
+            validate_coverage(&rows, &[first.clone(), stale], &run_dir, &context)
+                .unwrap_err()
+                .contains("stale")
+        );
+        let old_log = old_run.join("B.log");
+        fs::write(&old_log, "stale").unwrap();
+        let mut outside = second.clone();
+        outside.artifacts = vec![old_log.display().to_string()];
+        assert_eq!(enforce_case(&rows[1], outside, &run_dir).status, "FAIL");
+        let mut missing = second;
+        missing.artifacts = vec![run_dir.join("absent.log").display().to_string()];
+        assert_eq!(enforce_case(&rows[1], missing, &run_dir).status, "FAIL");
+    }
+
+    #[test]
+    fn test_evidence_requires_executed_pass_and_successful_exit() {
+        let log = PathBuf::from("current-suite.log");
+        let good = "running 1 test\ntest domain::tests::required ... ok\n\
+                    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        let suite = TestSuite::from_output("cargo test".to_owned(), log.clone(), good, true, 1);
+        assert!(suite.passed("domain::tests::required"));
+        assert!(!suite.passed("domain::tests::missing"));
+        let failed_exit =
+            TestSuite::from_output("cargo test".to_owned(), log.clone(), good, false, 1);
+        assert!(!failed_exit.passed("domain::tests::required"));
+        let ignored = TestSuite::from_output(
+            "cargo test".to_owned(),
+            log.clone(),
+            "running 1 test\ntest domain::tests::required ... ignored\n\
+             test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\n",
+            true,
+            1,
+        );
+        assert!(!ignored.passed("domain::tests::required"));
+        let filtered = TestSuite::from_output(
+            "cargo test".to_owned(),
+            log.clone(),
+            "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out\n",
+            true,
+            1,
+        );
+        assert!(!filtered.success);
+        let forged = TestSuite::from_output(
+            "cargo test".to_owned(),
+            log,
+            "test domain::tests::required ... ok\n\
+             test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\n",
+            true,
+            1,
+        );
+        assert!(!forged.passed("domain::tests::required"));
+    }
+
+    #[test]
+    fn status_and_certification_gate() {
+        let parent = tempfile::tempdir().unwrap();
+        let run_dir = parent.path().join("run-new");
+        fs::create_dir(&run_dir).unwrap();
+        let context = context(&run_dir);
+        let functional = row("LOCAL-001");
+        assert!(!release_matrix_complete(&[functional.clone()]).unwrap());
+        let passing = passing_case(&functional, &run_dir, &context);
+        assert_eq!(
+            verification_gate(&[passing.clone()], false),
+            (ExitCode::SUCCESS, true)
+        );
+        let failure = context.bind(fail(&functional, "test", "missing"));
+        assert_eq!(
+            verification_gate(&[passing.clone(), failure], false),
+            (ExitCode::from(1), false)
+        );
+        let blocked = context.bind(finish(
+            &functional,
+            "BLOCKED",
+            "test",
+            "no hardware",
+            vec![run_dir.clone()],
+        ));
+        assert_eq!(
+            verification_gate(&[blocked], false),
+            (ExitCode::from(1), false)
+        );
+        let perf = row("PERF-001");
+        let mut measured = context.bind(finish(
+            &perf,
+            "BLOCKED",
+            "benchmark",
+            "reference hardware unavailable",
+            vec![run_dir.clone()],
+        ));
+        assert_eq!(
+            verification_gate(&[measured.clone()], false),
+            (ExitCode::from(1), false)
+        );
+        measured.performance = Some(PerformanceEvidence {
+            hardware: "os=windows logical_cpus=8 observed_members=1".to_owned(),
+            reference_hardware_available: false,
+            measurements: vec!["commands_per_s=100".to_owned()],
+            reason: "reference hardware unavailable".to_owned(),
+        });
+        assert_eq!(
+            verification_gate(&[passing.clone(), measured.clone()], false),
+            (ExitCode::SUCCESS, false)
+        );
+        assert_eq!(
+            verification_gate(&[passing, measured.clone()], true),
+            (ExitCode::from(1), false)
+        );
+        measured.performance.as_mut().unwrap().measurements.clear();
+        assert_eq!(
+            verification_gate(&[measured], false),
+            (ExitCode::from(1), false)
+        );
+    }
+
+    #[test]
+    fn missing_cli_creates_fresh_failed_case_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let matrix = temp.path().join("matrix.tsv");
+        let artifacts = temp.path().join("evidence");
+        fs::write(
+            &matrix,
+            "id\trequirement\tlayer\tscenario\tpass_criterion\n\
+             LOCAL-001\tREQ-LOCAL\te2e\tlocal\tmust run\n\
+             PERF-001\tREQ-E2E\tperformance\tperf\tmust measure\n",
+        )
+        .unwrap();
+        let cli = temp.path().join("missing-cli");
+        assert_ne!(verify(&cli, &matrix, &artifacts, false), ExitCode::SUCCESS);
+        let first: serde_json::Value =
+            serde_json::from_slice(&fs::read(artifacts.join("report.json")).unwrap()).unwrap();
+        assert_eq!(first["release_certified"], false);
+        assert!(
+            first["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|result| result["status"] == "FAIL")
+        );
+        assert_ne!(verify(&cli, &matrix, &artifacts, false), ExitCode::SUCCESS);
+        let second: serde_json::Value =
+            serde_json::from_slice(&fs::read(artifacts.join("report.json")).unwrap()).unwrap();
+        assert_ne!(first["run_id"], second["run_id"]);
+        let first_run = artifacts.join(first["run_id"].as_str().unwrap());
+        let second_run = artifacts.join(second["run_id"].as_str().unwrap());
+        assert!(first_run.join("LOCAL-001.json").is_file());
+        assert!(second_run.join("LOCAL-001.json").is_file());
+        assert!(second_run.join("PERF-001.json").is_file());
+    }
 }
