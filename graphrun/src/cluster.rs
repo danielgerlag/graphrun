@@ -326,20 +326,7 @@ mod tests {
         ca: &crate::tls::CertificateAuthority,
         id: u64,
     ) -> crate::Result<crate::tls::TlsMaterial> {
-        use sha2::Digest;
-        let cluster =
-            ClusterId::parse(hex::encode(&sha2::Sha256::digest(ca.pem.as_bytes())[..16]))?;
-        let identity = PrincipalIdentity::new(
-            cluster,
-            PrincipalId::parse(format!("node-{id}"))?,
-            [
-                PeerRole::Member,
-                PeerRole::Worker,
-                PeerRole::Client,
-                PeerRole::Admin,
-            ],
-        )?;
-        issue_principal(ca, &identity, &format!("node-{id}.graphrun.local"))
+        crate::tls::issue_node(ca, id)
     }
 
     fn register_worker(
@@ -374,7 +361,7 @@ mod tests {
             session_id: session.to_hex(),
             capacity: 8,
             capabilities,
-            principal_id: "node-1".to_owned(),
+            principal_id: "1".to_owned(),
             protocol_min: 1,
             protocol_max: 1,
             command_id: crate::ids::CommandId::generate().to_hex(),
@@ -484,6 +471,28 @@ mod tests {
         let ca = generate_ca().unwrap();
         let addr = unused_addr();
         let server_tls = issue_node(&ca, 1).unwrap();
+        let wrong_principal = PrincipalIdentity::new(
+            crate::tls::cluster_id_from_ca(&ca.pem).unwrap(),
+            PrincipalId::parse("node-1").unwrap(),
+            [PeerRole::Member],
+        )
+        .unwrap();
+        let wrong_tls = issue_principal(&ca, &wrong_principal, &server_tls.server_name).unwrap();
+        let wrong_dir = tempfile::tempdir().unwrap();
+        let rejected = Engine::member(MemberConfig {
+            data_dir: wrong_dir.path().to_path_buf(),
+            node_id: 1,
+            bind: unused_addr(),
+            peers: BTreeMap::new(),
+            tls: wrong_tls,
+            host_activities: false,
+            initialize: true,
+        })
+        .await
+        .err()
+        .expect("member role and DNS cannot mask a wrong signed principal");
+        assert_eq!(rejected.kind, crate::error::ErrorKind::PermissionDenied);
+        assert!(!wrong_dir.path().join("member.redb").exists());
         let dir = tempfile::tempdir().unwrap();
         let server = Engine::member(MemberConfig {
             data_dir: dir.path().to_path_buf(),

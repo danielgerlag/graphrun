@@ -124,7 +124,7 @@ async fn member() -> (Engine, tempfile::TempDir, TlsMaterial, String) {
             peers: BTreeMap::new(),
             tls: signed(
                 &ca,
-                "node-1",
+                "1",
                 &[PeerRole::Member, PeerRole::Client, PeerRole::Admin],
             ),
             host_activities: false,
@@ -140,11 +140,36 @@ async fn member() -> (Engine, tempfile::TempDir, TlsMaterial, String) {
                     format!("https://{addr}"),
                 );
             }
-            Err(err) if err.message.starts_with("member gRPC bind:") => continue,
+            Err(err) if err.message.starts_with("member listener") => continue,
             Err(err) => panic!("member startup: {err}"),
         }
     }
     panic!("no available member test port");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn member_rejects_wrong_signed_principal_with_matching_dns() {
+    let ca = generate_ca().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let error = Engine::member(MemberConfig {
+        data_dir: dir.path().to_path_buf(),
+        node_id: 1,
+        bind: unused_addr(),
+        peers: BTreeMap::new(),
+        tls: signed(
+            &ca,
+            "node-1",
+            &[PeerRole::Member, PeerRole::Client, PeerRole::Admin],
+        ),
+        host_activities: false,
+        initialize: true,
+    })
+    .await
+    .err()
+    .expect("a member certificate with the wrong signed principal must be rejected");
+    assert_eq!(error.kind, graphrun::ErrorKind::PermissionDenied);
+    assert!(!dir.path().join("identity.json").exists());
+    assert!(!dir.path().join("member.redb").exists());
 }
 
 async fn provider() -> (
@@ -773,7 +798,7 @@ async fn worker_keeps_assignment_across_leader_change() {
     let members_tls = [1, 2, 3].map(|id| {
         signed_for_host(
             &ca,
-            &format!("node-{id}"),
+            &id.to_string(),
             &[PeerRole::Member, PeerRole::Client, PeerRole::Admin],
             &format!("node-{id}.graphrun.local"),
         )
@@ -995,7 +1020,7 @@ async fn worker_registration_waits_for_member_startup() {
         peers: BTreeMap::new(),
         tls: signed(
             &ca,
-            "node-1",
+            "1",
             &[PeerRole::Member, PeerRole::Client, PeerRole::Admin],
         ),
         host_activities: false,
@@ -1042,7 +1067,7 @@ async fn occupied_member_port_rejects_startup_without_persisting_identity() {
     let ca = generate_ca().unwrap();
     let tls = signed(
         &ca,
-        "node-1",
+        "1",
         &[PeerRole::Member, PeerRole::Client, PeerRole::Admin],
     );
     let dir = tempfile::tempdir().unwrap();
@@ -1061,8 +1086,8 @@ async fn occupied_member_port_rejects_startup_without_persisting_identity() {
         .await
         .err()
         .expect("port is occupied");
-    assert_eq!(error.kind, graphrun::ErrorKind::Unavailable);
-    assert!(error.message.contains("member gRPC bind"));
+    assert_eq!(error.kind, graphrun::ErrorKind::FailedPrecondition);
+    assert!(error.message.contains("member listener"));
     assert!(!dir.path().join("identity.json").exists());
     drop(occupied);
     let engine = Engine::member(config).await.unwrap();
