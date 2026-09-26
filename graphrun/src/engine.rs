@@ -8,7 +8,9 @@ use crate::ids::{CommandId, EventId, RunId};
 use crate::ir::Definition;
 use crate::limits;
 use crate::rpc::serve_grpc;
-use crate::snapshot_framing::{SnapshotManifest, copy_payload, verify_snapshot, write_snapshot};
+use crate::snapshot_framing::{
+    RemoveOnDrop, SnapshotManifest, copy_payload, verify_snapshot, write_snapshot,
+};
 use crate::storage::{
     LocalNetwork, ScheduleWake, StorageHandle, TypeConfig, load_domain_readonly,
     validate_history_store,
@@ -130,18 +132,6 @@ struct LogicalBackupManifest {
     kind: String,
     snapshot: String,
     sha256: String,
-}
-
-struct RemoveOnDrop(PathBuf);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.0)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(path = %self.0.display(), %error, "temporary backup file cleanup failed");
-        }
-    }
 }
 
 fn private_file(path: &Path) -> std::io::Result<std::fs::File> {

@@ -114,6 +114,24 @@ fn insert(
     Ok(())
 }
 
+pub(crate) fn encode_scalar(
+    generation: u64,
+    revision: u64,
+    field: &str,
+    value: Value,
+) -> Result<(String, Vec<u8>)> {
+    if field != "engine_time_watermark_ms" {
+        return Err(invalid("unsupported scalar update"));
+    }
+    let key = record_key(generation, None, field, "scalar", "", None);
+    let mut rows = BTreeMap::new();
+    insert(&mut rows, key.clone(), value, revision)?;
+    let bytes = rows
+        .remove(&key)
+        .ok_or_else(|| invalid("scalar encoding failed"))?;
+    Ok((key, bytes))
+}
+
 pub(crate) fn same_value(left: &[u8], right: &[u8]) -> Result<bool> {
     let left: VersionedRecord = serde_json::from_slice(left)
         .map_err(|err| invalid(format!("stored state record is corrupt: {err}")))?;

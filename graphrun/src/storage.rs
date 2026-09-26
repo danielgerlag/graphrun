@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::record_store;
 use crate::schedule::{RunSchedule, retention_deadline};
 use crate::snapshot_framing::{
-    SnapshotManifest, SnapshotStream, copy_payload, verify_snapshot, write_snapshot,
+    RemoveOnDrop, SnapshotManifest, SnapshotStream, copy_payload, verify_snapshot, write_snapshot,
 };
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -25,7 +25,7 @@ use redb::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::ops::Bound;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
@@ -68,6 +68,9 @@ const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
 const LOG: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("log");
 const SCHEDULE: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("schedule");
 const APP_ROWS: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("app_records_v2");
+const RECORD_MAGIC: &[u8] = b"graphrun.records/v1\0";
+const MAX_RECORD_KEY_BYTES: usize = 4 * 1024;
+const MAX_RECORD_VALUE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct StoreManifest {
@@ -359,15 +362,15 @@ impl StorageHandle {
                     "incompatible pre-publication store; migrate explicitly (directory left untouched)",
                 ));
             }
-            let state = load_json::<_, State>(&db, "domain").ok_or_else(|| {
-                Error::new(
-                    crate::error::ErrorKind::FailedPrecondition,
-                    "domain missing or unreadable (directory left untouched)",
-                )
-            })?;
-            validate_history_store(&state)?;
             let store_manifest = verified_store_manifest(&db)?;
-            verify_app_mirror(&db, &state, store_manifest.active_generation)?;
+            let state =
+                load_app_generation(&db, store_manifest.active_generation).map_err(|err| {
+                    Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        format!("active application records unavailable: {err}"),
+                    )
+                })?;
+            validate_history_store(&state)?;
             if let Some(registry) = optional_json::<_, SnapshotRegistry>(&db, "snapshot_registry")?
             {
                 if registry.generation != store_manifest.active_generation {
@@ -714,15 +717,14 @@ pub fn load_domain_readonly(path: impl AsRef<Path>) -> Result<State> {
             "incompatible store format",
         ));
     }
-    let state = load_json(&db, "domain").ok_or_else(|| {
+    let store_manifest = verified_store_manifest(&db)?;
+    let state = load_app_generation(&db, store_manifest.active_generation).map_err(|err| {
         Error::new(
             crate::error::ErrorKind::FailedPrecondition,
-            "domain missing or unreadable",
+            format!("active application records unavailable: {err}"),
         )
     })?;
     validate_history_store(&state)?;
-    let store_manifest = verified_store_manifest(&db)?;
-    verify_app_mirror(&db, &state, store_manifest.active_generation)?;
     if let Some(registry) = optional_json::<_, SnapshotRegistry>(&db, "snapshot_registry")? {
         if registry.generation != store_manifest.active_generation {
             return Err(Error::new(
@@ -763,9 +765,9 @@ pub fn compact_offline(path: impl AsRef<Path>) -> Result<CompactOutcome> {
         )
     })?;
     let manifest = verified_store_manifest(&db)?;
-    let state: State = required_json(&db, "domain")?;
+    let state = load_app_generation(&db, manifest.active_generation)
+        .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))?;
     validate_history_store(&state)?;
-    verify_app_mirror(&db, &state, manifest.active_generation)?;
     let mut passes = 0;
     while passes < 16 {
         let compacted = db.compact().map_err(|err| {
@@ -926,10 +928,12 @@ fn storage_thread(
             optional_json::<_, Option<LogIdT>>(db.as_ref(), "last_applied")?.flatten();
         let membership = optional_json::<_, MembershipT>(db.as_ref(), "membership")?
             .unwrap_or_else(|| StoredMembership::new(None, Membership::new(vec![], None)));
-        let domain: State = required_json(db.as_ref(), "domain")?;
-        validate_history_store(&domain)?;
         let manifest = verified_store_manifest(db.as_ref())?;
-        verify_app_mirror(db.as_ref(), &domain, manifest.active_generation)?;
+        let domain =
+            load_app_generation(db.as_ref(), manifest.active_generation).map_err(|err| {
+                Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string())
+            })?;
+        validate_history_store(&domain)?;
         optional_json::<_, VoteT>(db.as_ref(), "vote")?;
         Ok((last_purged, last_applied, membership, domain))
     })();
@@ -990,6 +994,7 @@ fn storage_thread(
     let mut app_gc_pending = true;
     let mut deferred = VecDeque::new();
     let mut snapshot_building = false;
+    let mut snapshot_builder: Option<JoinHandle<()>> = None;
     schedule_watch.send_replace(schedule_revision);
     let _ = ready.send(Ok(()));
     while let Some(req) = deferred.pop_front().or_else(|| rx.blocking_recv()) {
@@ -1077,7 +1082,7 @@ fn storage_thread(
                 let db = db.clone();
                 let path = path.clone();
                 let dir = snapshot_dir.clone();
-                std::thread::spawn(move || {
+                snapshot_builder = Some(std::thread::spawn(move || {
                     let result = build_snapshot(&db, &path, &dir, clustered);
                     if sender
                         .blocking_send(Req::SnapshotBuilt(result, tx))
@@ -1085,9 +1090,18 @@ fn storage_thread(
                     {
                         tracing::error!("storage owner stopped before snapshot publication");
                     }
-                });
+                }));
             }
             Req::SnapshotBuilt(result, tx) => {
+                if let Some(builder) = snapshot_builder.take()
+                    && builder.join().is_err()
+                {
+                    let _ = tx.send(Err(sto_err(
+                        ErrorVerb::Write,
+                        "snapshot builder thread panicked",
+                    )));
+                    break;
+                }
                 snapshot_building = false;
                 let res = result.and_then(|(snap, registry)| {
                     let active = verified_store_manifest(db.as_ref())
@@ -1198,15 +1212,6 @@ fn storage_thread(
                             .map_err(|err| sto_err(ErrorVerb::Read, err))?
                             .active_generation;
                         let txn = begin_immediate(&db)?;
-                        {
-                            let mut meta = txn
-                                .open_table(META)
-                                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-                            let bytes = serde_json::to_vec(&next)
-                                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-                            meta.insert("domain", bytes.as_slice())
-                                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-                        }
                         write_app_delta(
                             &txn,
                             &domain,
@@ -1265,6 +1270,12 @@ fn storage_thread(
             }
         }
     }
+    rx.close();
+    if let Some(builder) = snapshot_builder.take()
+        && builder.join().is_err()
+    {
+        tracing::error!("snapshot builder panicked during storage shutdown");
+    }
 }
 
 fn initialize_publication_store(db: &Database) -> std::result::Result<(), StoErr> {
@@ -1275,11 +1286,7 @@ fn initialize_publication_store(db: &Database) -> std::result::Result<(), StoErr
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         let format = serde_json::to_vec("graphrun.publication-store/v1")
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        let domain =
-            serde_json::to_vec(&State::default()).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         meta.insert("publication_start_format", format.as_slice())
-            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        meta.insert("domain", domain.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         let generation = serde_json::to_vec(&1u64).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         meta.insert("active_generation", generation.as_slice())
@@ -1557,6 +1564,7 @@ fn load_app_run<D: ReadableDatabase>(
     record_store::decode(logical, generation).map_err(|err| sto_err(ErrorVerb::Read, err))
 }
 
+#[cfg(test)]
 fn verify_app_mirror<D: ReadableDatabase>(db: &D, state: &State, generation: u64) -> Result<()> {
     let records = load_app_generation(db, generation)
         .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))?;
@@ -1751,6 +1759,7 @@ fn persist_import_batch(
     after_persist("after-generation-batch")
 }
 
+#[cfg(test)]
 fn stage_app_generation(
     db: &Database,
     state: &State,
@@ -1795,6 +1804,110 @@ fn stage_app_generation(
     }
     verify_app_mirror(db, state, generation).map_err(|err| sto_err(ErrorVerb::Read, err))?;
     Ok(stats)
+}
+
+fn stage_record_file(
+    db: &Database,
+    file: &Path,
+    source_generation: u64,
+    generation: u64,
+    expected_count: u64,
+    mut between_batches: impl FnMut() -> std::result::Result<(), StoErr>,
+) -> std::result::Result<(ImportStats, State), StoErr> {
+    clear_inactive_generation(db, generation, &mut between_batches)?;
+    let mut source = std::fs::File::open(file).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let mut magic = vec![0u8; RECORD_MAGIC.len()];
+    source
+        .read_exact(&mut magic)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    if magic != RECORD_MAGIC {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "unsupported snapshot record framing",
+        ));
+    }
+    let mut count = [0u8; 8];
+    source
+        .read_exact(&mut count)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let count = u64::from_le_bytes(count);
+    if count == 0 || count != expected_count {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "snapshot record count does not match manifest",
+        ));
+    }
+    let source_prefix = format!("{source_generation:016x}/");
+    let target_prefix = format!("{generation:016x}/");
+    let mut stats = ImportStats::default();
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0usize;
+    for _ in 0..count {
+        let mut header = [0u8; 8];
+        source
+            .read_exact(&mut header)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        let key_len = u32::from_le_bytes(header[..4].try_into().expect("four bytes")) as usize;
+        let value_len = u32::from_le_bytes(header[4..].try_into().expect("four bytes")) as usize;
+        if key_len == 0
+            || key_len > MAX_RECORD_KEY_BYTES
+            || value_len == 0
+            || value_len > MAX_RECORD_VALUE_BYTES
+        {
+            return Err(sto_err(
+                ErrorVerb::Read,
+                "snapshot record exceeds frame bounds",
+            ));
+        }
+        let mut key = vec![0u8; key_len];
+        let mut value = vec![0u8; value_len];
+        source
+            .read_exact(&mut key)
+            .and_then(|_| source.read_exact(&mut value))
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        let key = std::str::from_utf8(&key).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        let suffix = key.strip_prefix(&source_prefix).ok_or_else(|| {
+            sto_err(
+                ErrorVerb::Read,
+                "snapshot row belongs to another generation",
+            )
+        })?;
+        let key = format!("{target_prefix}{suffix}");
+        let size = key.len() + value.len();
+        if batch.len() == 4_096 || batch_bytes.saturating_add(size) > 4 * 1024 * 1024 {
+            persist_import_batch(db, &batch)?;
+            between_batches()?;
+            stats.transactions += 1;
+            stats.largest_batch_bytes = stats.largest_batch_bytes.max(batch_bytes);
+            stats.largest_batch_records = stats.largest_batch_records.max(batch.len());
+            batch.clear();
+            batch_bytes = 0;
+        }
+        batch_bytes += size;
+        batch.push((key, value));
+        stats.records += 1;
+    }
+    let mut trailing = [0u8; 1];
+    if source
+        .read(&mut trailing)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        != 0
+    {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "snapshot record stream has trailing bytes",
+        ));
+    }
+    if !batch.is_empty() {
+        persist_import_batch(db, &batch)?;
+        between_batches()?;
+        stats.transactions += 1;
+        stats.largest_batch_bytes = stats.largest_batch_bytes.max(batch_bytes);
+        stats.largest_batch_records = stats.largest_batch_records.max(batch.len());
+    }
+    let state = load_app_generation(db, generation)?;
+    validate_history_store(&state).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    Ok((stats, state))
 }
 
 fn gc_inactive_app_rows(db: &Database) -> std::result::Result<bool, StoErr> {
@@ -2299,6 +2412,14 @@ fn verify_registry(dir: &Path, registry: &SnapshotRegistry) -> std::result::Resu
             .record_formats
             .iter()
             .any(|format| format == record_store::FRAGMENT_FORMAT)
+        || !manifest
+            .record_formats
+            .iter()
+            .any(|format| format == record_store::FORMAT)
+        || !manifest
+            .record_formats
+            .iter()
+            .any(|format| format == record_store::FRAGMENT_FORMAT)
         || manifest.record_formats.iter().any(|format| {
             !matches!(
                 format.as_str(),
@@ -2737,7 +2858,6 @@ fn apply_entries(
     let mut next_applied = previous_applied;
     let mut next_membership = last_membership.clone();
     let mut next_domain = domain.clone();
-    let mut domain_changed = false;
     let mut membership_changed = false;
     let mut affected = BTreeMap::<crate::ids::RunId, Option<bool>>::new();
     let mut applied_bytes = 0u64;
@@ -2756,7 +2876,6 @@ fn apply_entries(
         }
         let mut reply = RaftResponse::default();
         if let EntryPayload::Normal(req) = &entry.payload {
-            domain_changed = true;
             if let domain::CommandBody::Publication { key, operation } = &req.command.body {
                 if key.command_id != req.command.id
                     || key.cluster_id.is_empty()
@@ -2825,7 +2944,6 @@ fn apply_entries(
                             }
                         }
                         next_domain = candidate;
-                        domain_changed = true;
                         reply.run_id = events.iter().find_map(|event| match event {
                             domain::DomainEvent::RunAdmitted { run, .. } => Some(*run),
                             _ => None,
@@ -2865,12 +2983,6 @@ fn apply_entries(
             let membership = serde_json::to_vec(&next_membership)
                 .map_err(|err| sto_err(ErrorVerb::Write, err))?;
             meta.insert("membership", membership.as_slice())
-                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        }
-        if domain_changed {
-            let domain_bytes =
-                serde_json::to_vec(&next_domain).map_err(|err| sto_err(ErrorVerb::Write, err))?;
-            meta.insert("domain", domain_bytes.as_slice())
                 .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         }
     }
@@ -2963,25 +3075,44 @@ fn build_snapshot(
         serde_json::to_vec(&meta.last_log_id).map_err(|err| sto_err(ErrorVerb::Write, err))?;
     let membership =
         serde_json::to_vec(&meta.last_membership).map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    let domain = table
-        .get("domain")
+    let app = txn
+        .open_table(APP_ROWS)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let prefix = format!("{generation:016x}/");
+    let mut record_count = 0u64;
+    let mut payload_bytes = (RECORD_MAGIC.len() + 8) as u64;
+    for record in app
+        .range(prefix.as_str()..)
         .map_err(|err| sto_err(ErrorVerb::Read, err))?
-        .ok_or_else(|| sto_err(ErrorVerb::Read, "snapshot domain is missing"))?;
-    let mut prefix = Vec::with_capacity(applied.len() + membership.len() + 3);
-    prefix.push(b'[');
-    prefix.extend_from_slice(&applied);
-    prefix.push(b',');
-    prefix.extend_from_slice(&membership);
-    prefix.push(b',');
+    {
+        let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        if !key.value().starts_with(&prefix) {
+            break;
+        }
+        let key_len = key.value().len();
+        let value_len = value.value().len();
+        if key_len > MAX_RECORD_KEY_BYTES || value_len > MAX_RECORD_VALUE_BYTES {
+            return Err(sto_err(
+                ErrorVerb::Read,
+                "snapshot row exceeds frame bounds",
+            ));
+        }
+        record_count = record_count
+            .checked_add(1)
+            .ok_or_else(|| sto_err(ErrorVerb::Read, "snapshot row count overflow"))?;
+        payload_bytes = payload_bytes
+            .checked_add(8 + key_len as u64 + value_len as u64)
+            .ok_or_else(|| sto_err(ErrorVerb::Read, "snapshot length overflow"))?;
+    }
+    if record_count == 0 {
+        return Err(sto_err(ErrorVerb::Read, "active generation has no records"));
+    }
     let manifest = SnapshotManifest {
         framing_version: 1,
         generation,
         applied_json: applied,
         membership_json: membership,
-        payload_bytes: (prefix.len() as u64)
-            .checked_add(domain.value().len() as u64)
-            .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| sto_err(ErrorVerb::Write, "snapshot length overflow"))?,
+        payload_bytes,
         record_formats: vec![
             "graphrun.domain/v1".to_owned(),
             crate::history::EVENT_FORMAT.to_owned(),
@@ -2990,17 +3121,61 @@ fn build_snapshot(
             record_store::FORMAT.to_owned(),
             record_store::FRAGMENT_FORMAT.to_owned(),
         ],
-        record_count: 1,
+        record_count,
     };
     std::fs::create_dir_all(dir).map_err(|err| sto_err(ErrorVerb::Write, err))?;
     admit_snapshot_space(dir, db_path, manifest.payload_bytes, clustered)?;
     let name = format!("{}.snap", meta.snapshot_id);
     let stage = dir.join(format!("{name}.tmp"));
-    let mut source = io::Cursor::new(prefix)
-        .chain(io::Cursor::new(domain.value()))
-        .chain(io::Cursor::new(b"]".as_slice()));
-    let digest = write_snapshot(&mut source, &stage, &manifest)
+    let raw = dir.join(format!("{}-records.tmp", meta.snapshot_id));
+    let mut options = std::fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut records = options
+        .open(&raw)
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let _raw_cleanup = RemoveOnDrop(raw.clone());
+    records
+        .write_all(RECORD_MAGIC)
+        .and_then(|_| records.write_all(&record_count.to_le_bytes()))
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let mut written = (RECORD_MAGIC.len() + 8) as u64;
+    for record in app
+        .range(prefix.as_str()..)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+    {
+        let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        if !key.value().starts_with(&prefix) {
+            break;
+        }
+        let key_bytes = key.value().as_bytes();
+        let value_bytes = value.value();
+        records
+            .write_all(&(key_bytes.len() as u32).to_le_bytes())
+            .and_then(|_| records.write_all(&(value_bytes.len() as u32).to_le_bytes()))
+            .and_then(|_| records.write_all(key_bytes))
+            .and_then(|_| records.write_all(value_bytes))
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        written += 8 + key_bytes.len() as u64 + value_bytes.len() as u64;
+    }
+    if written != payload_bytes {
+        return Err(sto_err(ErrorVerb::Read, "snapshot read generation changed"));
+    }
+    records
+        .sync_all()
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    drop(records);
+    after_persist("after-snapshot-record-file")?;
+    let digest = write_snapshot(
+        &mut std::fs::File::open(&raw).map_err(|err| sto_err(ErrorVerb::Read, err))?,
+        &stage,
+        &manifest,
+    )
+    .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     let final_path = dir.join(&name);
     std::fs::rename(&stage, &final_path).map_err(|err| sto_err(ErrorVerb::Write, err))?;
     std::fs::File::open(dir)
@@ -3080,41 +3255,24 @@ fn install_snapshot(
         ));
     }
     let raw = dir.join(format!(
-        "import-{}.json.tmp",
+        "import-{}.records.tmp",
         crate::ids::CommandId::generate().to_hex()
     ));
-    let decoded = (|| -> std::result::Result<_, StoErr> {
-        let mut file = std::fs::File::options()
-            .write(true)
-            .create_new(true)
-            .open(&raw)
-            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        copy_payload(&staged, &mut file).map_err(|err| sto_err(ErrorVerb::Read, err))?;
-        file.sync_all()
-            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        let file = std::fs::File::open(&raw).map_err(|err| sto_err(ErrorVerb::Read, err))?;
-        serde_json::from_reader::<_, (Option<LogIdT>, MembershipT, State)>(file)
-            .map_err(|err| sto_err(ErrorVerb::Read, err))
-    })();
-    if let Err(err) = std::fs::remove_file(&raw) {
-        if decoded.is_ok() {
-            return Err(sto_err(ErrorVerb::Write, err));
-        }
-        if err.kind() != io::ErrorKind::NotFound {
-            tracing::warn!(path = %raw.display(), %err, "failed to remove rejected snapshot payload");
-        }
+    let mut options = std::fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    let (applied, membership, mut restored) = decoded?;
-    if applied != meta.last_log_id || membership != meta.last_membership {
-        return Err(sto_err(
-            ErrorVerb::Read,
-            "snapshot payload does not match its Raft metadata",
-        ));
-    }
-    restored.engine_time_watermark_ms = restored
-        .engine_time_watermark_ms
-        .max(domain.engine_time_watermark_ms);
-    validate_history_store(&restored).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let mut file = options
+        .open(&raw)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let _raw_cleanup = RemoveOnDrop(raw.clone());
+    copy_payload(&staged, &mut file).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    file.sync_all()
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    drop(file);
     let mut store_manifest =
         verified_store_manifest(db).map_err(|err| sto_err(ErrorVerb::Read, err))?;
     let generation = store_manifest
@@ -3122,19 +3280,48 @@ fn install_snapshot(
         .checked_add(1)
         .ok_or_else(|| sto_err(ErrorVerb::Write, "snapshot generation exhausted"))?;
     store_manifest.active_generation = generation;
+    let applied = meta.last_log_id;
+    let membership = meta.last_membership.clone();
     let record_revision = applied
         .map_or(0, |id| id.index)
         .checked_add(1)
         .ok_or_else(|| sto_err(ErrorVerb::Write, "record revision exhausted"))?;
-    let imported = stage_app_generation(db, &restored, generation, record_revision, || {
-        if started.elapsed() >= std::time::Duration::from_secs(2 * 60 * 60) {
-            return Err(sto_err(
-                ErrorVerb::Write,
-                "snapshot install exceeded two hours",
-            ));
-        }
-        between_batches()
-    })?;
+    let (imported, mut restored) = stage_record_file(
+        db,
+        &raw,
+        manifest.generation,
+        generation,
+        manifest.record_count,
+        || {
+            if started.elapsed() >= std::time::Duration::from_secs(2 * 60 * 60) {
+                return Err(sto_err(
+                    ErrorVerb::Write,
+                    "snapshot install exceeded two hours",
+                ));
+            }
+            between_batches()
+        },
+    )?;
+    let clamped = restored
+        .engine_time_watermark_ms
+        .max(domain.engine_time_watermark_ms);
+    if clamped != restored.engine_time_watermark_ms {
+        let (key, bytes) = record_store::encode_scalar(
+            generation,
+            record_revision,
+            "engine_time_watermark_ms",
+            serde_json::Value::from(clamped),
+        )
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let txn = begin_immediate(db)?;
+        txn.open_table(APP_ROWS)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?
+            .insert(key.as_str(), bytes.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        commit_immediate(txn)?;
+        after_persist("after-generation-watermark")?;
+        restored.engine_time_watermark_ms = clamped;
+    }
     if started.elapsed() >= std::time::Duration::from_secs(2 * 60 * 60) {
         return Err(sto_err(
             ErrorVerb::Write,
@@ -3193,11 +3380,6 @@ fn install_snapshot(
             serde_json::to_vec(&membership).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         table
             .insert("membership", membership_bytes.as_slice())
-            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        let domain_bytes =
-            serde_json::to_vec(&restored).map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        table
-            .insert("domain", domain_bytes.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         let meta_bytes =
             serde_json::to_vec(&registry).map_err(|err| sto_err(ErrorVerb::Write, err))?;
@@ -3590,9 +3772,14 @@ nodes:
             domain::RunStatus::Active
         ));
         let compatible = domain.clone();
+        let txn = begin_immediate(&db).unwrap();
+        write_app_delta(&txn, &State::default(), &domain, 1, 2).unwrap();
+        commit_immediate(txn).unwrap();
         domain.history_records.clear();
         domain.history_dependencies.clear();
-        put_json(&db, "domain", &domain).unwrap();
+        let txn = begin_immediate(&db).unwrap();
+        write_app_delta(&txn, &compatible, &domain, 1, 3).unwrap();
+        commit_immediate(txn).unwrap();
         drop(db);
 
         let error = StorageHandle::open(&path)
@@ -3604,7 +3791,7 @@ nodes:
             "error must explain the incompatible store: {error}"
         );
         let db = ReadOnlyDatabase::open(&path).unwrap();
-        let untouched: State = load_json(&db, "domain").unwrap();
+        let untouched = load_app_generation(&db, 1).unwrap();
         assert!(untouched.runs.contains_key(&run));
         assert!(untouched.history_records.is_empty());
 
@@ -3719,8 +3906,6 @@ nodes:
             .unwrap_err();
             clear_cut();
             assert!(error.to_string().contains(point));
-            let disk: State = required_json(&db, "domain").unwrap();
-            assert!(disk.runs.is_empty());
             assert!(load_app_generation(&db, 1).unwrap().runs.is_empty());
             assert!(load_json::<_, Option<LogIdT>>(&db, "last_applied").is_none());
             drop(db);
@@ -3743,11 +3928,20 @@ nodes:
         let old_domain = State::default();
         put_json(&db, "last_applied", &old_applied).unwrap();
         put_json(&db, "membership", &old_membership).unwrap();
-        put_json(&db, "domain", &old_domain).unwrap();
         let new_applied = Some(LogId::new(openraft::CommittedLeaderId::new(1, 1), 9));
         let new_membership = old_membership.clone();
         let new_domain = State::default();
-        let data = serde_json::to_vec(&(new_applied, new_membership.clone(), &new_domain)).unwrap();
+        let rows =
+            record_store::frame_records(record_store::encode(&new_domain, 1, 1).unwrap()).unwrap();
+        let mut data = Vec::new();
+        data.extend_from_slice(RECORD_MAGIC);
+        data.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+        for (key, value) in &rows {
+            data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            data.extend_from_slice(key.as_bytes());
+            data.extend_from_slice(value);
+        }
         let snapshot_dir = dir.path().join("snapshots");
         std::fs::create_dir_all(&snapshot_dir).unwrap();
         let staged = snapshot_dir.join("receiving.snap.tmp");
@@ -3765,7 +3959,7 @@ nodes:
                     record_store::FORMAT.to_owned(),
                     record_store::FRAGMENT_FORMAT.to_owned(),
                 ],
-                record_count: 1,
+                record_count: rows.len() as u64,
             },
         )
         .unwrap();
@@ -3798,7 +3992,7 @@ nodes:
         clear_cut();
         assert!(err.to_string().contains("fault cut"));
         let disk_applied: Option<LogIdT> = load_json(&db, "last_applied");
-        let disk_domain: State = load_json(&db, "domain").unwrap();
+        let disk_domain = load_app_generation(&db, 2).unwrap();
         let registry: SnapshotRegistry = load_json(&db, "snapshot_registry").unwrap();
         let active_generation: u64 = load_json(&db, "active_generation").unwrap();
         assert_eq!(disk_applied, new_applied);
@@ -3810,7 +4004,10 @@ nodes:
         verify_registry(&snapshot_dir, &registry).unwrap();
         assert!(snapshot_dir.join("receiving.snap.tmp").exists());
         assert!(load_bytes(&db, "snapshot_data").is_none());
-        let _ = (old_domain, disk_domain);
+        assert_eq!(
+            serde_json::to_value(disk_domain).unwrap(),
+            serde_json::to_value(new_domain).unwrap()
+        );
     }
 
     #[test]
@@ -4179,18 +4376,20 @@ nodes:
             history,
             ..State::default()
         };
-        put_json(&db, "domain", &domain).unwrap();
+        let txn = begin_immediate(&db).unwrap();
+        write_app_delta(&txn, &State::default(), &domain, 1, 1).unwrap();
+        commit_immediate(txn).unwrap();
         let through = LogId::new(openraft::CommittedLeaderId::new(1, 1), 2);
         purge_logs(&db, 2, &through).unwrap();
         let remaining = get_logs(&db, 0, u64::MAX).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].get_log_id().index, 3);
-        let loaded: State = load_json(&db, "domain").unwrap();
+        let loaded = load_app_generation(&db, 1).unwrap();
         assert_eq!(loaded.history, domain.history);
         truncate_logs(&db, 3).unwrap();
         let after_truncate = get_logs(&db, 0, u64::MAX).unwrap();
         assert!(after_truncate.is_empty());
-        let loaded_again: State = load_json(&db, "domain").unwrap();
+        let loaded_again = load_app_generation(&db, 1).unwrap();
         assert_eq!(loaded_again.history, domain.history);
         let resurrected = get_logs(&db, 1, 3).unwrap();
         assert!(resurrected.is_empty());

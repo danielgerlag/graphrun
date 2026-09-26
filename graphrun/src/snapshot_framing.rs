@@ -11,6 +11,18 @@ const MAGIC: &[u8] = b"graphrun.snapshot/v1\0";
 const FRAME_BYTES: usize = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
+pub(crate) struct RemoveOnDrop(pub PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.0)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.0.display(), %error, "snapshot staging cleanup failed");
+        }
+    }
+}
+
 pub struct SnapshotStream {
     pub path: PathBuf,
     file: tokio::fs::File,
