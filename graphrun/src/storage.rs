@@ -321,7 +321,7 @@ impl StorageHandle {
         }
     }
 
-    pub async fn applied_members(&self) -> Result<BTreeMap<u64, String>> {
+    pub async fn applied_membership(&self) -> Result<StoredMembership<u64, BasicNode>> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(Req::AppliedState(tx)).map_err(|_| {
             Error::new(
@@ -338,7 +338,13 @@ impl StorageHandle {
                 )
             })?
             .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))?;
-        Ok(membership
+        Ok(membership)
+    }
+
+    pub async fn applied_members(&self) -> Result<BTreeMap<u64, String>> {
+        Ok(self
+            .applied_membership()
+            .await?
             .nodes()
             .map(|(id, node)| (*id, node.addr.clone()))
             .collect())
