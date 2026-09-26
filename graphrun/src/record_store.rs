@@ -132,6 +132,22 @@ pub(crate) fn encode_scalar(
     Ok((key, bytes))
 }
 
+pub(crate) fn scalar_key(generation: u64, field: &str) -> String {
+    record_key(generation, None, field, "scalar", "", None)
+}
+
+pub(crate) fn decode_scalar(field: &str, bytes: &[u8]) -> Result<Value> {
+    if !matches!(field, "artifact_origins" | "current_cluster_id") {
+        return Err(invalid("unsupported scalar read"));
+    }
+    let record: VersionedRecord = serde_json::from_slice(bytes)
+        .map_err(|err| invalid(format!("corrupt {field} scalar: {err}")))?;
+    if record.format != FORMAT || record.revision == 0 {
+        return Err(invalid(format!("unsupported {field} scalar version")));
+    }
+    Ok(record.value)
+}
+
 pub(crate) fn same_value(left: &[u8], right: &[u8]) -> Result<bool> {
     let left: VersionedRecord = serde_json::from_slice(left)
         .map_err(|err| invalid(format!("stored state record is corrupt: {err}")))?;

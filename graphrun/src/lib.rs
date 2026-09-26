@@ -58,7 +58,7 @@ pub use catalog::Catalog;
 pub use client::GrpcClient;
 pub use cluster::MemberConfig;
 pub use compiler::compile_yaml;
-pub use domain::{State, reconstruct, run_events, run_output};
+pub use domain::{State, reconstruct_in, run_events, run_output};
 pub use engine::{
     ControlRequest, ControlResponse, Engine, LedgerEntry, LocalBuilder, connect_control,
     ledger_get, replay,

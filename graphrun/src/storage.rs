@@ -23,7 +23,7 @@ use redb::{
     Database, Durability, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::io::{self, Read, Write};
 use std::ops::Bound;
@@ -78,9 +78,14 @@ struct StoreManifest {
     reader_floor: u16,
     writer_format: u16,
     active_generation: u64,
+    #[serde(default)]
+    cluster_id: Option<String>,
+    #[serde(default)]
+    member_id: Option<u64>,
     domain_format: String,
     state_record_format: String,
     fragment_format: String,
+    artifact_ref_format: String,
     event_format: String,
     checkpoint_format: String,
     result_format: String,
@@ -89,13 +94,16 @@ struct StoreManifest {
 impl StoreManifest {
     fn new() -> Self {
         Self {
-            format: "graphrun.member-store/v2".to_owned(),
-            reader_floor: 2,
-            writer_format: 2,
+            format: "graphrun.member-store/v3".to_owned(),
+            reader_floor: 3,
+            writer_format: 3,
             active_generation: 1,
+            cluster_id: None,
+            member_id: None,
             domain_format: "graphrun.domain/v1".to_owned(),
             state_record_format: record_store::FORMAT.to_owned(),
             fragment_format: record_store::FRAGMENT_FORMAT.to_owned(),
+            artifact_ref_format: crate::history::ARTIFACT_FORMAT.to_owned(),
             event_format: crate::history::EVENT_FORMAT.to_owned(),
             checkpoint_format: crate::history::CHECKPOINT_FORMAT.to_owned(),
             result_format: crate::publication::RESULT_FORMAT.to_owned(),
@@ -103,20 +111,30 @@ impl StoreManifest {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.format != "graphrun.member-store/v2"
-            || self.reader_floor > 2
-            || self.writer_format != 2
+        if self.format != "graphrun.member-store/v3"
+            || self.reader_floor > 3
+            || self.writer_format != 3
             || self.active_generation == 0
             || self.domain_format != "graphrun.domain/v1"
             || self.state_record_format != record_store::FORMAT
             || self.fragment_format != record_store::FRAGMENT_FORMAT
+            || self.artifact_ref_format != crate::history::ARTIFACT_FORMAT
             || self.event_format != crate::history::EVENT_FORMAT
             || self.checkpoint_format != crate::history::CHECKPOINT_FORMAT
             || self.result_format != crate::publication::RESULT_FORMAT
+            || self.cluster_id.is_some() != self.member_id.is_some()
         {
             return Err(Error::new(
                 crate::error::ErrorKind::FailedPrecondition,
                 "unsupported member store or retained record version; migrate explicitly",
+            ));
+        }
+        if self.cluster_id.as_ref().is_some_and(|id| {
+            crate::ids::ClusterId::from_hex(id).is_err() || self.member_id == Some(0)
+        }) {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "member store has invalid immutable genesis identity",
             ));
         }
         Ok(())
@@ -311,6 +329,11 @@ enum Req {
     QueryState(oneshot::Sender<State>),
     ScheduleView(oneshot::Sender<std::result::Result<ScheduleView, StoErr>>),
     QueryWatermark(oneshot::Sender<u64>),
+    BindIdentity(
+        String,
+        u64,
+        oneshot::Sender<std::result::Result<(), StoErr>>,
+    ),
     SetClockFault(bool, oneshot::Sender<std::result::Result<(), StoErr>>),
     InstallDomain(Box<State>, oneshot::Sender<std::result::Result<(), StoErr>>),
     Shutdown,
@@ -356,7 +379,7 @@ impl StorageHandle {
                 Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string())
             })?;
             let format: Option<String> = load_json(&db, "publication_start_format");
-            if format.as_deref() != Some("graphrun.publication-store/v1") {
+            if format.as_deref() != Some("graphrun.publication-store/v2") {
                 return Err(Error::new(
                     crate::error::ErrorKind::FailedPrecondition,
                     "incompatible pre-publication store; migrate explicitly (directory left untouched)",
@@ -371,6 +394,7 @@ impl StorageHandle {
                     )
                 })?;
             validate_history_store(&state)?;
+            validate_cluster_binding(&state, &store_manifest, restoring)?;
             if let Some(registry) = optional_json::<_, SnapshotRegistry>(&db, "snapshot_registry")?
             {
                 if registry.generation != store_manifest.active_generation {
@@ -383,9 +407,19 @@ impl StorageHandle {
                     .parent()
                     .map(|parent| parent.join("snapshots"))
                     .unwrap_or_else(|| PathBuf::from("snapshots"));
-                verify_registry(&snapshots, &registry).map_err(|err| {
+                let retained = verify_registry(&snapshots, &registry).map_err(|err| {
                     Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string())
                 })?;
+                if retained
+                    .artifact_origin_ids
+                    .iter()
+                    .any(|origin| !state.artifact_origins.contains(origin))
+                {
+                    return Err(Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        "active snapshot references an unavailable artifact origin",
+                    ));
+                }
             } else if load_bytes(&db, "snapshot_meta").is_some()
                 || load_bytes(&db, "snapshot_data").is_some()
             {
@@ -445,6 +479,7 @@ impl StorageHandle {
                     stored_schedule_watch,
                     stored_schedule_reads,
                     clustered,
+                    restoring,
                 )
             })
             .map_err(|err| Error::invalid(err.to_string()))?;
@@ -483,6 +518,21 @@ impl StorageHandle {
 
     pub fn clock(&self) -> &crate::clock::ClockAuthority {
         &self.clock
+    }
+
+    pub(crate) async fn bind_identity(&self, cluster_id: String, member_id: u64) -> Result<()> {
+        crate::ids::ClusterId::from_hex(&cluster_id).map_err(Error::invalid)?;
+        if member_id == 0 {
+            return Err(Error::invalid("member identity must be nonzero"));
+        }
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Req::BindIdentity(cluster_id, member_id, tx))
+            .await
+            .map_err(|_| Error::new(crate::error::ErrorKind::Unavailable, "storage stopped"))?;
+        rx.await
+            .map_err(|_| Error::new(crate::error::ErrorKind::Unavailable, "storage dropped"))?
+            .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))
     }
 
     pub(crate) fn subscribe_schedule(&self) -> watch::Receiver<u64> {
@@ -711,7 +761,7 @@ pub fn load_domain_readonly(path: impl AsRef<Path>) -> Result<State> {
     let db = ReadOnlyDatabase::open(path.as_ref())
         .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))?;
     let format: Option<String> = load_json(&db, "publication_start_format");
-    if format.as_deref() != Some("graphrun.publication-store/v1") {
+    if format.as_deref() != Some("graphrun.publication-store/v2") {
         return Err(Error::new(
             crate::error::ErrorKind::FailedPrecondition,
             "incompatible store format",
@@ -725,6 +775,7 @@ pub fn load_domain_readonly(path: impl AsRef<Path>) -> Result<State> {
         )
     })?;
     validate_history_store(&state)?;
+    validate_cluster_binding(&state, &store_manifest, false)?;
     if let Some(registry) = optional_json::<_, SnapshotRegistry>(&db, "snapshot_registry")? {
         if registry.generation != store_manifest.active_generation {
             return Err(Error::new(
@@ -737,9 +788,19 @@ pub fn load_domain_readonly(path: impl AsRef<Path>) -> Result<State> {
             .parent()
             .map(|parent| parent.join("snapshots"))
             .unwrap_or_else(|| PathBuf::from("snapshots"));
-        verify_registry(&snapshots, &registry).map_err(|err| {
+        let retained = verify_registry(&snapshots, &registry).map_err(|err| {
             Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string())
         })?;
+        if retained
+            .artifact_origin_ids
+            .iter()
+            .any(|origin| !state.artifact_origins.contains(origin))
+        {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "active snapshot references an unavailable artifact origin",
+            ));
+        }
     } else if load_bytes(&db, "snapshot_meta").is_some()
         || load_bytes(&db, "snapshot_data").is_some()
     {
@@ -768,6 +829,7 @@ pub fn compact_offline(path: impl AsRef<Path>) -> Result<CompactOutcome> {
     let state = load_app_generation(&db, manifest.active_generation)
         .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))?;
     validate_history_store(&state)?;
+    validate_cluster_binding(&state, &manifest, false)?;
     let mut passes = 0;
     while passes < 16 {
         let compacted = db.compact().map_err(|err| {
@@ -791,6 +853,18 @@ pub fn compact_offline(path: impl AsRef<Path>) -> Result<CompactOutcome> {
 }
 
 pub(crate) fn validate_history_store(state: &State) -> Result<()> {
+    let verify_origin = |artifact: &crate::history::ArtifactRef| -> Result<()> {
+        if !state.current_cluster_id.is_empty() {
+            artifact.validate_identity()?;
+            if !state.artifact_origins.contains(&artifact.cluster_id) {
+                return Err(Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "retained artifact origin is missing from the generation",
+                ));
+            }
+        }
+        Ok(())
+    };
     for run in state.runs.keys() {
         let incompatible = || {
             Error::new(
@@ -801,15 +875,15 @@ pub(crate) fn validate_history_store(state: &State) -> Result<()> {
                 ),
             )
         };
-        let (history, records) = match (
+        let (history, records, dependencies) = match (
             state.history.get(run),
             state.history_records.get(run),
             state.history_dependencies.get(run),
         ) {
-            (Some(history), Some(records), Some(_))
+            (Some(history), Some(records), Some(dependencies))
                 if !history.is_empty() && records.len() == history.len() =>
             {
-                (history, records)
+                (history, records, dependencies)
             }
             _ => return Err(incompatible()),
         };
@@ -831,6 +905,177 @@ pub(crate) fn validate_history_store(state: &State) -> Result<()> {
                 ),
             ));
         }
+        let run_state = &state.runs[run];
+        dependencies.verify(run_state)?;
+        for reference in [
+            &dependencies.definition,
+            &dependencies.catalog,
+            &dependencies.policy,
+        ]
+        .into_iter()
+        .chain(dependencies.schemas.values())
+        .chain(dependencies.contracts.values())
+        {
+            verify_origin(reference)?;
+        }
+        let mut claimed_output_schemas = HashMap::new();
+        for (record, event) in records.iter().zip(history) {
+            verify_origin(&record.payload)?;
+            record.payload.verify("graphrun.domain-event/v1", event)?;
+            let input = match event {
+                domain::DomainEvent::RunAdmitted { input, .. }
+                | domain::DomainEvent::ClaimGranted { input, .. } => Some(input),
+                domain::DomainEvent::EventAccepted { payload, .. } => Some(payload),
+                _ => None,
+            };
+            let output = match event {
+                domain::DomainEvent::LeafSucceeded { output, .. }
+                | domain::DomainEvent::RunSucceeded { output, .. } => Some(output),
+                domain::DomainEvent::ReconciliationRecorded {
+                    output: Some(output),
+                    ..
+                } => Some(output),
+                _ => None,
+            };
+            match (input, &record.input_ref) {
+                (Some(value), Some(reference)) => {
+                    verify_origin(reference)?;
+                    reference.verify(&reference.schema, value)?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        "accepted input is missing its immutable payload reference",
+                    ));
+                }
+            }
+            match (output, &record.output_ref) {
+                (Some(value), Some(reference)) => {
+                    verify_origin(reference)?;
+                    reference.verify(&reference.schema, value)?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        "accepted output is missing its immutable payload reference",
+                    ));
+                }
+            }
+            match event {
+                domain::DomainEvent::RunAdmitted { .. } => {
+                    let expected =
+                        crate::history::schema_identity(&run_state.definition.input_schema)?;
+                    if record
+                        .input_ref
+                        .as_ref()
+                        .is_none_or(|reference| reference.schema != expected)
+                    {
+                        return Err(Error::new(
+                            crate::error::ErrorKind::FailedPrecondition,
+                            "run admission input does not use its pinned schema",
+                        ));
+                    }
+                }
+                domain::DomainEvent::ClaimGranted {
+                    activation,
+                    handler,
+                    handler_version,
+                    role,
+                    ..
+                } => {
+                    let (expected_input, expected_output) =
+                        crate::history::activity_schema_identity(
+                            state,
+                            *run,
+                            handler,
+                            *handler_version,
+                            *role,
+                        )?;
+                    if record
+                        .input_ref
+                        .as_ref()
+                        .is_none_or(|reference| reference.schema != expected_input)
+                    {
+                        return Err(Error::new(
+                            crate::error::ErrorKind::FailedPrecondition,
+                            "activity input does not use its pinned schema",
+                        ));
+                    }
+                    claimed_output_schemas.insert(*activation, expected_output);
+                }
+                domain::DomainEvent::EventAccepted { signal, .. } => {
+                    let declaration =
+                        run_state.definition.signals.get(signal).ok_or_else(|| {
+                            Error::new(
+                                crate::error::ErrorKind::FailedPrecondition,
+                                "accepted event has no pinned signal schema",
+                            )
+                        })?;
+                    let expected = crate::history::schema_identity(&declaration.schema)?;
+                    if record
+                        .input_ref
+                        .as_ref()
+                        .is_none_or(|reference| reference.schema != expected)
+                    {
+                        return Err(Error::new(
+                            crate::error::ErrorKind::FailedPrecondition,
+                            "signal input does not use its pinned schema",
+                        ));
+                    }
+                }
+                domain::DomainEvent::LeafSucceeded { activation, .. }
+                | domain::DomainEvent::ReconciliationRecorded {
+                    activation,
+                    output: Some(_),
+                    ..
+                } => {
+                    let expected = claimed_output_schemas.get(activation).ok_or_else(|| {
+                        Error::new(
+                            crate::error::ErrorKind::FailedPrecondition,
+                            "accepted activity result has no retained claim schema",
+                        )
+                    })?;
+                    if record
+                        .output_ref
+                        .as_ref()
+                        .is_none_or(|reference| &reference.schema != expected)
+                    {
+                        return Err(Error::new(
+                            crate::error::ErrorKind::FailedPrecondition,
+                            "activity output does not use its pinned schema",
+                        ));
+                    }
+                }
+                domain::DomainEvent::RunSucceeded { .. } => {
+                    let expected =
+                        crate::history::schema_identity(&run_state.definition.output_schema)?;
+                    if record
+                        .output_ref
+                        .as_ref()
+                        .is_none_or(|reference| reference.schema != expected)
+                    {
+                        return Err(Error::new(
+                            crate::error::ErrorKind::FailedPrecondition,
+                            "run output does not use its pinned schema",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(checkpoint) = state.checkpoints.get(run) {
+            checkpoint.required.verify(run_state)?;
+            checkpoint.projection_ref.verify(
+                "graphrun.run-projection/v2",
+                &(checkpoint.through_run_sequence, &checkpoint.projection),
+            )?;
+            verify_origin(&checkpoint.projection_ref)?;
+        }
+    }
+    for tombstone in state.signal_tombstones.values() {
+        verify_origin(&tombstone.payload)?;
     }
     Ok(())
 }
@@ -895,6 +1140,59 @@ fn service_import_io(
     None
 }
 
+fn bind_store_identity(
+    db: &Database,
+    state: &mut State,
+    cluster_id: &str,
+    member_id: u64,
+) -> std::result::Result<(), StoErr> {
+    let mut manifest = verified_store_manifest(db).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    if let Some(existing) = &manifest.cluster_id {
+        if existing != cluster_id
+            || manifest.member_id != Some(member_id)
+            || state.current_cluster_id != cluster_id
+        {
+            return Err(sto_err(
+                ErrorVerb::Read,
+                "immutable member genesis differs from requested identity",
+            ));
+        }
+        return Ok(());
+    }
+    let restoring = state.recovery.as_ref().is_some_and(|hold| !hold.authorized);
+    if (!state.runs.is_empty() || !state.history.is_empty() || !state.terminal_summaries.is_empty())
+        && !restoring
+    {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "unbound application history requires explicit migration or disaster restore",
+        ));
+    }
+    if !state.current_cluster_id.is_empty() && state.current_cluster_id != cluster_id && !restoring
+    {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "application origin differs from new member authority",
+        ));
+    }
+    let previous = state.clone();
+    let mut bound = previous.clone();
+    bound.current_cluster_id = cluster_id.to_owned();
+    bound.artifact_origins.insert(cluster_id.to_owned());
+    manifest.cluster_id = Some(cluster_id.to_owned());
+    manifest.member_id = Some(member_id);
+    let txn = begin_immediate(db)?;
+    write_app_delta(&txn, &previous, &bound, manifest.active_generation, 1)?;
+    let bytes = serde_json::to_vec(&manifest).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    txn.open_table(META)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?
+        .insert("store_manifest", bytes.as_slice())
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    commit_immediate(txn)?;
+    *state = bound;
+    Ok(())
+}
+
 fn storage_thread(
     path: PathBuf,
     mut rx: mpsc::Receiver<Req>,
@@ -904,6 +1202,7 @@ fn storage_thread(
     schedule_watch: watch::Sender<u64>,
     schedule_reads: Arc<AtomicU64>,
     clustered: bool,
+    restoring: bool,
 ) {
     let db = match Database::create(&path) {
         Ok(db) => Arc::new(db),
@@ -934,6 +1233,7 @@ fn storage_thread(
                 Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string())
             })?;
         validate_history_store(&domain)?;
+        validate_cluster_binding(&domain, &manifest, restoring)?;
         optional_json::<_, VoteT>(db.as_ref(), "vote")?;
         Ok((last_purged, last_applied, membership, domain))
     })();
@@ -959,7 +1259,17 @@ fn storage_thread(
             let result = serde_json::from_slice::<SnapshotRegistry>(&bytes)
                 .map_err(|err| sto_err(ErrorVerb::Read, err))
                 .and_then(|registry| {
-                    verify_registry(&snapshot_dir, &registry)?;
+                    let retained = verify_registry(&snapshot_dir, &registry)?;
+                    if retained
+                        .artifact_origin_ids
+                        .iter()
+                        .any(|origin| !domain.artifact_origins.contains(origin))
+                    {
+                        return Err(sto_err(
+                            ErrorVerb::Read,
+                            "active snapshot has an unavailable artifact origin",
+                        ));
+                    }
                     Ok(registry)
                 });
             match result {
@@ -1175,9 +1485,9 @@ fn storage_thread(
                     watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
                     schedule_watch.send_replace(schedule_revision);
                     gc_pending = true;
-                    app_gc_pending = true;
                 }
                 let _ = tx.send(res);
+                app_gc_pending = true;
                 cleanup_pending = true;
             }
             Req::CurrentSnapshot(tx) => {
@@ -1196,6 +1506,17 @@ fn storage_thread(
             }
             Req::QueryWatermark(tx) => {
                 let _ = tx.send(domain.engine_time_watermark_ms);
+            }
+            Req::BindIdentity(cluster_id, member_id, tx) => {
+                let result = if snapshot_building {
+                    Err(sto_err(
+                        ErrorVerb::Write,
+                        "cannot bind member identity during a snapshot build",
+                    ))
+                } else {
+                    bind_store_identity(&db, &mut domain, &cluster_id, member_id)
+                };
+                let _ = tx.send(result);
             }
             Req::SetClockFault(faulted, tx) => {
                 let _ = tx.send(put_json(&db, "clock_fault", &faulted));
@@ -1284,7 +1605,7 @@ fn initialize_publication_store(db: &Database) -> std::result::Result<(), StoErr
         let mut meta = txn
             .open_table(META)
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        let format = serde_json::to_vec("graphrun.publication-store/v1")
+        let format = serde_json::to_vec("graphrun.publication-store/v2")
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         meta.insert("publication_start_format", format.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
@@ -1424,6 +1745,34 @@ fn verified_store_manifest<D: ReadableDatabase>(db: &D) -> Result<StoreManifest>
         ));
     }
     Ok(manifest)
+}
+
+fn validate_cluster_binding(
+    state: &State,
+    manifest: &StoreManifest,
+    restoring: bool,
+) -> Result<()> {
+    let pristine = state.current_cluster_id.is_empty()
+        && state.artifact_origins.is_empty()
+        && state.runs.is_empty()
+        && state.history.is_empty()
+        && state.commands.is_empty()
+        && state.sessions.is_empty();
+    let controlled_restore = restoring
+        && state.recovery.as_ref().is_some_and(|hold| !hold.authorized)
+        && crate::ids::ClusterId::from_hex(&state.current_cluster_id).is_ok()
+        && state.artifact_origins.contains(&state.current_cluster_id);
+    if let Some(cluster_id) = &manifest.cluster_id {
+        if state.current_cluster_id == *cluster_id && state.artifact_origins.contains(cluster_id) {
+            return Ok(());
+        }
+    } else if pristine || controlled_restore {
+        return Ok(());
+    }
+    Err(Error::new(
+        crate::error::ErrorKind::FailedPrecondition,
+        "application origin is not bound to the immutable member identity; migrate explicitly",
+    ))
 }
 
 fn load_bytes<D: ReadableDatabase>(db: &D, key: &str) -> Option<Vec<u8>> {
@@ -2381,7 +2730,10 @@ fn append_logs(db: &Database, entries: &[EntryT]) -> std::result::Result<(), Sto
     admit_and_append(db, load_json(db, "last_applied"), entries)
 }
 
-fn verify_registry(dir: &Path, registry: &SnapshotRegistry) -> std::result::Result<(), StoErr> {
+fn verify_registry(
+    dir: &Path,
+    registry: &SnapshotRegistry,
+) -> std::result::Result<SnapshotManifest, StoErr> {
     if registry.format != 1
         || registry.file_name.is_empty()
         || Path::new(&registry.file_name).components().count() != 1
@@ -2438,7 +2790,21 @@ fn verify_registry(dir: &Path, registry: &SnapshotRegistry) -> std::result::Resu
             "snapshot registry or required record version does not match file",
         ));
     }
-    Ok(())
+    if manifest
+        .artifact_origin_ids
+        .iter()
+        .any(|origin| crate::ids::ClusterId::from_hex(origin).is_err())
+        || manifest
+            .artifact_origin_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "snapshot artifact origin list is invalid or unordered",
+        ));
+    }
+    Ok(manifest)
 }
 
 fn current_snapshot(
@@ -2862,6 +3228,14 @@ fn apply_entries(
     let mut affected = BTreeMap::<crate::ids::RunId, Option<bool>>::new();
     let mut applied_bytes = 0u64;
     for entry in entries {
+        if matches!(&entry.payload, EntryPayload::Normal(_))
+            && next_domain.current_cluster_id.is_empty()
+        {
+            return Err(sto_err(
+                ErrorVerb::Write,
+                "member artifact origin is unbound; open through Engine",
+            ));
+        }
         if entry.get_log_id().index > previous_applied.map_or(0, |id| id.index) {
             let encoded =
                 serde_json::to_vec(&entry).map_err(|err| sto_err(ErrorVerb::Write, err))?;
@@ -3078,6 +3452,15 @@ fn build_snapshot(
     let app = txn
         .open_table(APP_ROWS)
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let origins_key = record_store::scalar_key(generation, "artifact_origins");
+    let origins = app
+        .get(origins_key.as_str())
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        .ok_or_else(|| sto_err(ErrorVerb::Read, "snapshot artifact origins are missing"))?;
+    let origins = record_store::decode_scalar("artifact_origins", origins.value())
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let origins: std::collections::BTreeSet<String> =
+        serde_json::from_value(origins).map_err(|err| sto_err(ErrorVerb::Read, err))?;
     let prefix = format!("{generation:016x}/");
     let mut record_count = 0u64;
     let mut payload_bytes = (RECORD_MAGIC.len() + 8) as u64;
@@ -3122,6 +3505,7 @@ fn build_snapshot(
             record_store::FRAGMENT_FORMAT.to_owned(),
         ],
         record_count,
+        artifact_origin_ids: origins.into_iter().collect(),
     };
     std::fs::create_dir_all(dir).map_err(|err| sto_err(ErrorVerb::Write, err))?;
     admit_snapshot_space(dir, db_path, manifest.payload_bytes, clustered)?;
@@ -3302,6 +3686,22 @@ fn install_snapshot(
             between_batches()
         },
     )?;
+    if manifest.artifact_origin_ids
+        != restored
+            .artifact_origins
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+        || store_manifest
+            .cluster_id
+            .as_ref()
+            .is_some_and(|id| *id != restored.current_cluster_id)
+    {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "snapshot artifact origins or cluster authority differ from retained state",
+        ));
+    }
     let clamped = restored
         .engine_time_watermark_ms
         .max(domain.engine_time_watermark_ms);
@@ -3667,6 +4067,14 @@ mod tests {
     use openraft::testing::StoreBuilder;
     use redb::ReadableTableMetadata;
 
+    const TEST_CLUSTER_ID: &str = "11111111111111111111111111111111";
+
+    fn bound_fixture(db: &Database) -> State {
+        let mut state = State::default();
+        bind_store_identity(db, &mut state, TEST_CLUSTER_ID, 1).unwrap();
+        state
+    }
+
     pub struct RedbStoreBuilder;
 
     impl StoreBuilder<TypeConfig, LogStore, StateMachineStore, tempfile::TempDir> for RedbStoreBuilder {
@@ -3731,6 +4139,8 @@ mod tests {
         let path = dir.path().join("member.redb");
         let db = Database::create(&path).unwrap();
         initialize_publication_store(&db).unwrap();
+        let mut domain = bound_fixture(&db);
+        let before = domain.clone();
         let catalog = crate::catalog::Catalog::from_json(include_bytes!(
             "../../docs/specs/v1/examples/activity-catalog.json"
         ))
@@ -3752,7 +4162,6 @@ nodes:
         )
         .unwrap();
         let run = crate::ids::RunId::from_bytes([8; 16]);
-        let mut domain = State::default();
         domain::commit_command(
             &mut domain,
             Command {
@@ -3773,7 +4182,7 @@ nodes:
         ));
         let compatible = domain.clone();
         let txn = begin_immediate(&db).unwrap();
-        write_app_delta(&txn, &State::default(), &domain, 1, 2).unwrap();
+        write_app_delta(&txn, &before, &domain, 1, 2).unwrap();
         commit_immediate(txn).unwrap();
         domain.history_records.clear();
         domain.history_dependencies.clear();
@@ -3797,6 +4206,10 @@ nodes:
 
         let fresh = dir.path().join("fresh.redb");
         let (handle, thread) = StorageHandle::open(&fresh).unwrap();
+        handle
+            .bind_identity(TEST_CLUSTER_ID.to_owned(), 1)
+            .await
+            .unwrap();
         let restore_error = handle.install_domain(domain).await.unwrap_err();
         assert_eq!(
             restore_error.kind,
@@ -3867,6 +4280,7 @@ nodes:
             let path = dir.path().join("member.redb");
             let db = Database::create(&path).unwrap();
             initialize_publication_store(&db).unwrap();
+            let mut domain = bound_fixture(&db);
             let run = crate::ids::RunId::from_bytes([index as u8 + 1; 16]);
             let entry = Entry::<TypeConfig> {
                 log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
@@ -3892,7 +4306,6 @@ nodes:
             };
             let mut applied = None;
             let mut membership = StoredMembership::new(None, Membership::new(vec![], None));
-            let mut domain = State::default();
             let mut revision = 0;
             inject_cut(point);
             let error = apply_entries(
@@ -3960,6 +4373,7 @@ nodes:
                     record_store::FRAGMENT_FORMAT.to_owned(),
                 ],
                 record_count: rows.len() as u64,
+                artifact_origin_ids: Vec::new(),
             },
         )
         .unwrap();
@@ -4039,7 +4453,7 @@ nodes:
         let db = Database::create(&path).unwrap();
         initialize_publication_store(&db).unwrap();
         let mut manifest = StoreManifest::new();
-        manifest.reader_floor = 3;
+        manifest.reader_floor = 4;
         put_json(&db, "store_manifest", &manifest).unwrap();
         drop(db);
         let original = std::fs::read(&path).unwrap();
@@ -4510,6 +4924,7 @@ nodes:
         let path = dir.path().join("member.redb");
         let db = Database::create(&path).unwrap();
         initialize_publication_store(&db).unwrap();
+        let mut state = bound_fixture(&db);
         let catalog = crate::catalog::Catalog::from_json(include_bytes!(
             "../../docs/specs/v1/examples/activity-catalog.json"
         ))
@@ -4555,7 +4970,6 @@ nodes:
         append_logs(&db, &[start.clone(), progress.clone()]).unwrap();
         let mut applied = None;
         let mut membership = StoredMembership::new(None, Membership::new(vec![], None));
-        let mut state = State::default();
         let mut schedule_revision = 0;
         let responses = apply_entries(
             &db,

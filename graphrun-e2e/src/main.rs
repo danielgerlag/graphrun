@@ -2257,6 +2257,31 @@ fn cluster_local_health(
     serde_json::from_str(&body).map_err(|err| format!("member {} health: {err}", node + 1))
 }
 
+fn cluster_is_quiescent(statuses: &[serde_json::Value]) -> bool {
+    let Some(revision) = statuses
+        .first()
+        .and_then(|status| status["schedule_revision"].as_u64())
+    else {
+        return false;
+    };
+    statuses.len() == 3
+        && statuses
+            .iter()
+            .filter(|status| status["state"] == "Leader")
+            .count()
+            == 1
+        && statuses.iter().all(|status| {
+            status["active_runs"] == 1
+                && status["pending_waits"] == 1
+                && status["apply_lag"] == 0
+                && status["schedule_revision"].as_u64() == Some(revision)
+                && status["ready_index_discovery_reads"].as_u64().is_some()
+                && (status["state"] == "Follower"
+                    || (status["state"] == "Leader"
+                        && status["scheduler_observed_revision"].as_u64() == Some(revision)))
+        })
+}
+
 fn e2e_no_ready_scan(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
     let cluster = match boot_three(artifacts, row, 2) {
         Ok(cluster) => cluster,
@@ -2298,15 +2323,7 @@ nodes:
             .map(|node| cluster_local_health(cli, &cluster, node))
             .collect();
         if let Ok(statuses) = &statuses
-            && statuses.iter().all(|status| {
-                status["active_runs"] == 1
-                    && status["pending_waits"] == 1
-                    && status["ready_index_discovery_reads"].as_u64().is_some()
-                    && (status["state"] == "Follower"
-                        || (status["state"] == "Leader"
-                            && status["scheduler_observed_revision"]
-                                == status["schedule_revision"]))
-            })
+            && cluster_is_quiescent(statuses)
         {
             break statuses.clone();
         }
@@ -4731,6 +4748,39 @@ fn fixture_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiescence_barrier_requires_caught_up_members_and_one_observing_leader() {
+        let node = |state: &str, revision: u64, observed: u64, lag: u64| {
+            serde_json::json!({
+                "state": state,
+                "active_runs": 1,
+                "pending_waits": 1,
+                "ready_index_discovery_reads": 18,
+                "schedule_revision": revision,
+                "scheduler_observed_revision": observed,
+                "apply_lag": lag,
+            })
+        };
+        let healthy = vec![
+            node("Leader", 3, 3, 0),
+            node("Follower", 3, 0, 0),
+            node("Follower", 3, 0, 0),
+        ];
+        assert!(cluster_is_quiescent(&healthy));
+        let mut wrong = healthy.clone();
+        wrong[1]["schedule_revision"] = serde_json::json!(2);
+        assert!(!cluster_is_quiescent(&wrong));
+        wrong = healthy.clone();
+        wrong[0]["apply_lag"] = serde_json::json!(1);
+        assert!(!cluster_is_quiescent(&wrong));
+        wrong = healthy.clone();
+        wrong[0]["scheduler_observed_revision"] = serde_json::json!(2);
+        assert!(!cluster_is_quiescent(&wrong));
+        wrong = healthy;
+        wrong[2]["state"] = serde_json::json!("Leader");
+        assert!(!cluster_is_quiescent(&wrong));
+    }
 
     #[test]
     fn fixture_node_cert_uses_numeric_member_id_and_node_dns() {

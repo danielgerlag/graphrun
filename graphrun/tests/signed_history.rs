@@ -78,6 +78,17 @@ impl TestDirectory {
     }
 }
 
+fn state_with_origin() -> State {
+    let mut state = State {
+        current_cluster_id: "22222222222222222222222222222222".to_owned(),
+        ..State::default()
+    };
+    state
+        .artifact_origins
+        .insert(state.current_cluster_id.clone());
+    state
+}
+
 #[test]
 fn replicated_cause_is_backward_readable_and_scoped_before_dedup() {
     let run = graphrun::RunId::generate();
@@ -96,7 +107,7 @@ fn replicated_cause_is_backward_readable_and_scoped_before_dedup() {
         },
     };
     let encoded = serde_json::to_vec(&legacy).unwrap();
-    let mut state = State::default();
+    let mut state = state_with_origin();
     commit_command(&mut state, serde_json::from_slice(&encoded).unwrap()).unwrap();
     assert!(
         state.history_records[&run]
@@ -245,7 +256,7 @@ fn replicated_cause_is_backward_readable_and_scoped_before_dedup() {
 
 #[test]
 fn same_external_start_id_creates_distinct_principal_scoped_execution_ids() {
-    let mut state = State::default();
+    let mut state = state_with_origin();
     let external = CommandId::generate();
     let catalog = worker_catalog();
     let definition = graphrun::compile_yaml(WORKER_YAML, &catalog).unwrap();
@@ -303,7 +314,7 @@ fn same_external_start_id_creates_distinct_principal_scoped_execution_ids() {
 
 #[test]
 fn principal_scoped_worker_claims_keep_distinct_effects_and_durable_receipts() {
-    let mut state = State::default();
+    let mut state = state_with_origin();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

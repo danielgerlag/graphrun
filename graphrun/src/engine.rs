@@ -339,8 +339,14 @@ impl LocalBuilder {
             Some((auth, _)) => auth,
             None => write_identity(&data_dir, None)?,
         };
+        let restoring = restored_domain.is_some();
         if let Some(domain) = restored_domain {
             storage.install_domain(domain).await?;
+        }
+        storage
+            .bind_identity(publication_auth.cluster_id().to_owned(), 1)
+            .await?;
+        if restoring {
             std::fs::remove_file(&restored_path).map_err(|err| Error::invalid(err.to_string()))?;
         }
         let log_store = storage.log_store();
@@ -459,6 +465,9 @@ impl Engine {
             Some((auth, _)) => auth,
             None => write_identity(&data_dir, Some(&cluster_id))?,
         };
+        storage
+            .bind_identity(publication_auth.cluster_id().to_owned(), config.node_id)
+            .await?;
         let log_store = storage.log_store();
         let state_machine = storage.state_machine();
         let raft_config = Config {
@@ -1099,6 +1108,7 @@ impl Engine {
                 crate::record_store::FRAGMENT_FORMAT.to_owned(),
             ],
             record_count: 1,
+            artifact_origin_ids: state.artifact_origins.iter().cloned().collect(),
         };
         let stage_path = out.join(format!("application-{id}.snap.tmp"));
         let digest = write_snapshot(
@@ -1127,7 +1137,7 @@ impl Engine {
             .and_then(|file| file.sync_all())
             .map_err(|err| Error::invalid(err.to_string()))?;
         let manifest = LogicalBackupManifest {
-            format: "graphrun.backup/v2".to_owned(),
+            format: "graphrun.backup/v3".to_owned(),
             kind: "logical-application".to_owned(),
             snapshot: snapshot_name,
             sha256: hex::encode(digest),
@@ -1148,18 +1158,15 @@ impl Engine {
         Ok(())
     }
 
-    pub fn restore(from: impl AsRef<Path>, dest: impl AsRef<Path>, reason: &str) -> Result<()> {
-        if reason.is_empty() {
-            return Err(Error::invalid("restore requires a reason"));
-        }
+    /// Verify a logical backup without opening an engine or dispatching handlers.
+    pub fn read_backup(from: impl AsRef<Path>) -> Result<State> {
         let from = from.as_ref();
-        let dest = dest.as_ref();
         let manifest: LogicalBackupManifest = serde_json::from_slice(
             &std::fs::read(from.join("manifest.json"))
                 .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?,
         )
         .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
-        if manifest.format != "graphrun.backup/v2"
+        if manifest.format != "graphrun.backup/v3"
             || manifest.kind != "logical-application"
             || !manifest.snapshot.starts_with("application-")
             || !manifest.snapshot.ends_with(".snap")
@@ -1209,11 +1216,35 @@ impl Engine {
         raw.sync_all()
             .map_err(|err| Error::invalid(err.to_string()))?;
         drop(raw);
-        let mut domain: State = serde_json::from_reader(
+        let domain: State = serde_json::from_reader(
             std::fs::File::open(&raw_path).map_err(|err| Error::invalid(err.to_string()))?,
         )
         .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
-        validate_history_store(&domain)?;
+        if framing.artifact_origin_ids
+            != domain.artifact_origins.iter().cloned().collect::<Vec<_>>()
+            || crate::ids::ClusterId::from_hex(&domain.current_cluster_id).is_err()
+            || !domain.artifact_origins.contains(&domain.current_cluster_id)
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "backup artifact origins differ from retained records",
+            ));
+        }
+        validate_history_store(&domain).map_err(|err| {
+            Error::new(
+                ErrorKind::FailedPrecondition,
+                format!("retained backup artifact is unavailable: {err}"),
+            )
+        })?;
+        Ok(domain)
+    }
+
+    pub fn restore(from: impl AsRef<Path>, dest: impl AsRef<Path>, reason: &str) -> Result<()> {
+        if reason.is_empty() {
+            return Err(Error::invalid("restore requires a reason"));
+        }
+        let dest = dest.as_ref();
+        let mut domain = Self::read_backup(from)?;
         if dest.exists()
             && std::fs::read_dir(dest)
                 .map_err(|err| Error::invalid(err.to_string()))?
@@ -3840,6 +3871,129 @@ nodes:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_keeps_source_artifact_identity_and_uses_new_origin_for_signals() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let run = {
+            let engine = Engine::local(source.path()).await.unwrap();
+            let run = engine
+                .start_yaml(
+                    include_str!("../../docs/specs/v1/examples/events.yaml"),
+                    &catalog(),
+                    Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if engine
+                        .inspect(run)
+                        .await
+                        .unwrap()
+                        .waits
+                        .values()
+                        .any(|wait| wait.pending)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let state = engine.inspect(run).await.unwrap();
+            validate_history_store(&state).unwrap();
+            assert!(!state.current_cluster_id.is_empty());
+            assert!(
+                state.history_records[&run]
+                    .iter()
+                    .any(|record| record.input_ref.is_some())
+            );
+            assert!(
+                state.history_records[&run]
+                    .iter()
+                    .any(|record| record.output_ref.is_some())
+            );
+            let old_origin = state.current_cluster_id.clone();
+            let old_through = state.history_records[&run].last().unwrap().sequence;
+            let prior = serde_json::to_value(&state.history_records[&run]).unwrap();
+            engine.shutdown().await.unwrap();
+            Engine::backup(source.path(), backup.path()).unwrap();
+            let decoded = Engine::read_backup(backup.path()).unwrap();
+            assert_eq!(decoded.current_cluster_id, old_origin);
+            assert_eq!(
+                serde_json::to_value(&decoded.history_records[&run]).unwrap(),
+                prior
+            );
+            Engine::restore(backup.path(), destination.path(), "drill").unwrap();
+            let restored = Engine::local(destination.path()).await.unwrap();
+            let state = restored.inspect(run).await.unwrap();
+            assert_ne!(state.current_cluster_id, old_origin);
+            assert!(state.artifact_origins.contains(&old_origin));
+            assert!(state.artifact_origins.contains(&state.current_cluster_id));
+            assert_eq!(
+                serde_json::to_value(&state.history_records[&run]).unwrap(),
+                prior
+            );
+            assert_eq!(
+                restored
+                    .reconstruct_at(run, old_through)
+                    .await
+                    .unwrap()
+                    .current_cluster_id,
+                old_origin
+            );
+            restored
+                .acknowledge_recovery("operator verified restored effects")
+                .await
+                .unwrap();
+            restored
+                .signal(
+                    run,
+                    EventId::generate(),
+                    "approval",
+                    "k1",
+                    Value::Object(BTreeMap::from([("approved".to_owned(), Value::Bool(true))])),
+                )
+                .await
+                .unwrap();
+            restored
+                .wait_terminal(run, Duration::from_secs(10))
+                .await
+                .unwrap();
+            let finished = restored.inspect(run).await.unwrap();
+            let accepted = finished.history_records[&run]
+                .iter()
+                .zip(&finished.history[&run])
+                .find(|(_, event)| {
+                    matches!(event, crate::domain::DomainEvent::EventAccepted { .. })
+                })
+                .unwrap()
+                .0;
+            assert_eq!(
+                accepted.input_ref.as_ref().unwrap().cluster_id,
+                finished.current_cluster_id
+            );
+            assert_eq!(
+                restored
+                    .reconstruct_at(run, finished.history_records[&run].len() as u64)
+                    .await
+                    .unwrap()
+                    .current_cluster_id,
+                finished.current_cluster_id
+            );
+            validate_history_store(&finished).unwrap();
+            restored.shutdown().await.unwrap();
+            run
+        };
+        assert_ne!(run.as_bytes(), &[0; 16]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_rejects_corrupt_and_legacy_backups_without_writing_destination() {
         let source = tempfile::tempdir().unwrap();
         let backup = tempfile::tempdir().unwrap();
@@ -3860,14 +4014,74 @@ nodes:
         assert_eq!(std::fs::read(&snapshot_path).unwrap(), corrupt);
         assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
 
-        std::fs::write(
-            backup.path().join("manifest.json"),
-            br#"{"format":"graphrun.backup/v1","kind":"logical-domain"}"#,
-        )
-        .unwrap();
-        let error = Engine::restore(backup.path(), destination.path(), "recovery")
-            .expect_err("old backup format must be rejected");
+        for old in ["graphrun.backup/v1", "graphrun.backup/v2"] {
+            std::fs::write(
+                backup.path().join("manifest.json"),
+                format!(r#"{{"format":"{old}","kind":"logical-domain"}}"#),
+            )
+            .unwrap();
+            let error = Engine::restore(backup.path(), destination.path(), "recovery")
+                .expect_err("old backup format must be rejected");
+            assert_eq!(error.kind, ErrorKind::FailedPrecondition);
+            assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_rejects_retained_definition_corruption_with_valid_snapshot_checksums() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let engine = Engine::local(source.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                &catalog(),
+                order(),
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_terminal(run, Duration::from_secs(10))
+            .await
+            .unwrap();
+        engine.shutdown().await.unwrap();
+        Engine::backup(source.path(), backup.path()).unwrap();
+
+        let verified = Engine::read_backup(backup.path()).unwrap();
+        assert!(verified.runs.contains_key(&run));
+        assert!(!verified.history_records[&run].is_empty());
+        let manifest_path = backup.path().join("manifest.json");
+        let mut manifest: LogicalBackupManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let old_snapshot = backup.path().join(&manifest.snapshot);
+        let (mut framing, _) = verify_snapshot(&old_snapshot).unwrap();
+        let mut raw = Vec::new();
+        copy_payload(&old_snapshot, &mut raw).unwrap();
+        let mut retained: State = serde_json::from_slice(&raw).unwrap();
+        retained
+            .history_dependencies
+            .get_mut(&run)
+            .unwrap()
+            .definition
+            .sha256 = "0".repeat(64);
+        raw = serde_json::to_vec(&retained).unwrap();
+        framing.payload_bytes = raw.len() as u64;
+        let stage = backup.path().join("application-forged.snap.tmp");
+        let digest = write_snapshot(&mut raw.as_slice(), &stage, &framing).unwrap();
+        manifest.snapshot = format!("application-{}.snap", hex::encode(digest));
+        manifest.sha256 = hex::encode(digest);
+        std::fs::rename(stage, backup.path().join(&manifest.snapshot)).unwrap();
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(verify_snapshot(&backup.path().join(&manifest.snapshot)).is_ok());
+        let read_error = Engine::read_backup(backup.path()).unwrap_err();
+        assert_eq!(read_error.kind, ErrorKind::FailedPrecondition);
+        assert!(read_error.message.contains("retained backup artifact"));
+
+        let error = Engine::restore(backup.path(), destination.path(), "drill")
+            .expect_err("retained definition digest must be verified before restore");
         assert_eq!(error.kind, ErrorKind::FailedPrecondition);
         assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+        assert!(old_snapshot.exists());
     }
 }

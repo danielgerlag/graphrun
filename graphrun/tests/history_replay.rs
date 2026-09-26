@@ -21,6 +21,8 @@ id: replay_loop
 version: 1
 input_schema: unit/v1
 output_schema: unit/v1
+signals:
+  approval: {schema: unit/v1}
 start: outer
 nodes:
   outer:
@@ -50,9 +52,20 @@ fn catalog() -> Catalog {
     .unwrap()
 }
 
+fn test_state() -> State {
+    let mut state = State {
+        current_cluster_id: "11111111111111111111111111111111".to_owned(),
+        ..State::default()
+    };
+    state
+        .artifact_origins
+        .insert(state.current_cluster_id.clone());
+    state
+}
+
 fn started() -> (State, RunId) {
     let definition = compile_yaml(WORKFLOW, &catalog()).unwrap();
-    let mut state = State::default();
+    let mut state = test_state();
     let run = RunId::generate();
     domain::commit_command(
         &mut state,
@@ -98,7 +111,7 @@ fn checkpointed() -> (State, RunId, u64) {
 fn bounded_command_cleanup_is_identical_with_independent_hash_order() {
     let ids: Vec<_> = (1..=16).map(|n| CommandId::from_bytes([n; 16])).collect();
     for _ in 0..24 {
-        let mut state = State::default();
+        let mut state = test_state();
         for (index, id) in ids.iter().enumerate() {
             state.command_times.insert(*id, index as u64 + 1);
         }
@@ -127,7 +140,7 @@ fn bounded_run_cleanup_is_identical_with_independent_hash_order() {
     let template = &seed.runs[&first];
     let ids: Vec<_> = (1..=16).map(|n| RunId::from_bytes([n; 16])).collect();
     for _ in 0..24 {
-        let mut state = State::default();
+        let mut state = test_state();
         for (index, id) in ids.iter().enumerate() {
             let mut run = template.clone();
             run.id = *id;
@@ -160,7 +173,7 @@ fn bounded_run_cleanup_is_identical_with_independent_hash_order() {
 fn bounded_summary_cleanup_is_identical_with_independent_hash_order() {
     let ids: Vec<_> = (1..=16).map(|n| RunId::from_bytes([n; 16])).collect();
     for _ in 0..24 {
-        let mut state = State::default();
+        let mut state = test_state();
         for (index, id) in ids.iter().enumerate() {
             state.terminal_summaries.insert(
                 *id,
@@ -362,7 +375,8 @@ fn missing_or_unknown_record_and_artifact_versions_fail_closed() {
             .kind,
         ErrorKind::Unavailable
     );
-    let definition_hash = graphrun::history::ArtifactRef::capture(
+    let definition_hash = graphrun::history::ArtifactRef::capture_in(
+        &state.current_cluster_id,
         "graphrun.definition/v1",
         &state.runs[&run].definition,
     )

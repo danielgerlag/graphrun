@@ -1,7 +1,7 @@
 //! Recorded workflow facts and read-only historical projections.
 use crate::domain::{self, DomainEvent, RunState, RunStatus, State};
 use crate::error::{Error, ErrorKind, Result};
-use crate::ids::{CommandId, EventId, RunId};
+use crate::ids::{ActivityKey, CommandId, EventId, ExecutionRole, RunId};
 use crate::time::EngineTime;
 use crate::value::canonical_json;
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ pub const MAX_PAGE_LIMIT: u32 = 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRef {
+    pub cluster_id: String,
     pub format: String,
     pub schema: String,
     pub byte_len: u64,
@@ -24,7 +25,31 @@ pub struct ArtifactRef {
 }
 
 impl ArtifactRef {
-    pub fn capture<T: Serialize>(schema: &str, value: &T) -> Result<Self> {
+    pub(crate) fn validate_identity(&self) -> Result<()> {
+        if self.format != ARTIFACT_FORMAT
+            || crate::ids::ClusterId::from_hex(&self.cluster_id).is_err()
+            || self.sha256.len() != 64
+            || hex::decode(&self.sha256).is_err()
+        {
+            return Err(unavailable(
+                "retained artifact has an unsupported origin or digest",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn capture_in<T: Serialize>(cluster_id: &str, schema: &str, value: &T) -> Result<Self> {
+        #[cfg(not(test))]
+        if cluster_id.is_empty() {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "artifact origin cluster ID is required",
+            ));
+        }
+        if !cluster_id.is_empty() {
+            crate::ids::ClusterId::from_hex(cluster_id)
+                .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        }
         let json = serde_json::to_value(value)
             .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
         let bytes = canonical_json(&json)
@@ -35,6 +60,7 @@ impl ArtifactRef {
         digest.update([0]);
         digest.update(&bytes);
         Ok(Self {
+            cluster_id: cluster_id.to_owned(),
             format: ARTIFACT_FORMAT.to_owned(),
             schema: schema.to_owned(),
             byte_len: bytes.len() as u64,
@@ -43,7 +69,10 @@ impl ArtifactRef {
     }
 
     pub fn verify<T: Serialize>(&self, schema: &str, value: &T) -> Result<()> {
-        if self != &Self::capture(schema, value).map_err(|err| unavailable(err.message))? {
+        if self
+            != &Self::capture_in(&self.cluster_id, schema, value)
+                .map_err(|err| unavailable(err.message))?
+        {
             return Err(unavailable(
                 "missing, corrupt or unsupported retained artifact",
             ));
@@ -66,13 +95,13 @@ pub struct RequiredArtifacts {
 }
 
 impl RequiredArtifacts {
-    fn capture(run: &RunState) -> Result<Self> {
+    fn capture(run: &RunState, cluster_id: &str) -> Result<Self> {
         let mut schemas = BTreeMap::new();
         for (key, schema) in &run.catalog.schemas {
             let key = key.as_stable_name();
             schemas.insert(
                 key.clone(),
-                ArtifactRef::capture(&format!("graphrun.schema/{key}"), schema)?,
+                ArtifactRef::capture_in(cluster_id, &format!("graphrun.schema/{key}"), schema)?,
             );
         }
         let mut contracts = BTreeMap::new();
@@ -80,27 +109,34 @@ impl RequiredArtifacts {
             let key = format!("activity/{}", key.as_stable_name());
             contracts.insert(
                 key.clone(),
-                ArtifactRef::capture(&format!("graphrun.contract/{key}"), contract)?,
+                ArtifactRef::capture_in(cluster_id, &format!("graphrun.contract/{key}"), contract)?,
             );
         }
         for (key, contract) in &run.catalog.reconcilers {
             let key = format!("reconciler/{}", key.as_stable_name());
             contracts.insert(
                 key.clone(),
-                ArtifactRef::capture(&format!("graphrun.contract/{key}"), contract)?,
+                ArtifactRef::capture_in(cluster_id, &format!("graphrun.contract/{key}"), contract)?,
             );
         }
         Ok(Self {
-            definition: ArtifactRef::capture("graphrun.definition/v1", &run.definition)?,
-            catalog: ArtifactRef::capture("graphrun.catalog/v1", &run.catalog)?,
-            policy: ArtifactRef::capture("graphrun.run-policy/v1", &run.policy)?,
+            definition: ArtifactRef::capture_in(
+                cluster_id,
+                "graphrun.definition/v1",
+                &run.definition,
+            )?,
+            catalog: ArtifactRef::capture_in(cluster_id, "graphrun.catalog/v1", &run.catalog)?,
+            policy: ArtifactRef::capture_in(cluster_id, "graphrun.run-policy/v1", &run.policy)?,
             schemas,
             contracts,
         })
     }
 
-    fn verify(&self, run: &RunState) -> Result<()> {
-        if self != &Self::capture(run).map_err(|err| unavailable(err.message))? {
+    pub(crate) fn verify(&self, run: &RunState) -> Result<()> {
+        if self
+            != &Self::capture(run, &self.definition.cluster_id)
+                .map_err(|err| unavailable(err.message))?
+        {
             return Err(unavailable(
                 "missing, corrupt or unsupported retained definition, schema, contract or policy",
             ));
@@ -123,6 +159,10 @@ pub struct HistoryEntry {
     pub principal_id: Option<String>,
     pub recorded_ms: u64,
     pub payload: ArtifactRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_ref: Option<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_ref: Option<ArtifactRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -178,6 +218,133 @@ pub struct SignalTombstone {
     pub payload: ArtifactRef,
 }
 
+pub(crate) fn schema_identity(schema: &crate::schema::SchemaRef) -> Result<String> {
+    match schema {
+        crate::schema::SchemaRef::Named { key } => Ok(key.as_stable_name()),
+        _ => {
+            let value = serde_json::to_value(schema)
+                .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+            let bytes = canonical_json(&value)?;
+            String::from_utf8(bytes)
+                .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))
+        }
+    }
+}
+
+pub(crate) fn activity_schema_identity(
+    state: &State,
+    run: RunId,
+    name: &str,
+    version: u32,
+    role: ExecutionRole,
+) -> Result<(String, String)> {
+    let run_state = state
+        .runs
+        .get(&run)
+        .ok_or_else(|| unavailable("accepted activity has no retained run"))?;
+    let (input, output) = crate::worker_contract::contract_schemas(
+        &run_state.catalog,
+        &ActivityKey::new(name, version),
+        role,
+    )
+    .map_err(|err| unavailable(err.message))?;
+    Ok((schema_identity(input)?, schema_identity(output)?))
+}
+
+fn activity_for_result(
+    state: &State,
+    activation: crate::ids::ActivationId,
+    fallback_role: ExecutionRole,
+) -> Result<(String, u32, ExecutionRole)> {
+    let act = state
+        .activations
+        .get(&activation)
+        .ok_or_else(|| unavailable("accepted result has no activation"))?;
+    let role = act.claim.as_ref().map_or(fallback_role, |claim| claim.role);
+    let (name, version, _) = domain::activity_key(state, activation)
+        .ok_or_else(|| unavailable("accepted result has no pinned activity"))?;
+    Ok((name, version, role))
+}
+
+pub(crate) fn io_references(
+    state: &State,
+    run: RunId,
+    event: &DomainEvent,
+    cluster_id: &str,
+) -> Result<(Option<ArtifactRef>, Option<ArtifactRef>)> {
+    let run_state = state
+        .runs
+        .get(&run)
+        .ok_or_else(|| unavailable("recorded event has no retained run"))?;
+    let mut input = None;
+    let mut output = None;
+    match event {
+        DomainEvent::RunAdmitted { input: value, .. } => {
+            input = Some(ArtifactRef::capture_in(
+                cluster_id,
+                &schema_identity(&run_state.definition.input_schema)?,
+                value,
+            )?);
+        }
+        DomainEvent::ClaimGranted {
+            handler,
+            handler_version,
+            role,
+            input: value,
+            ..
+        } => {
+            let (schema, _) =
+                activity_schema_identity(state, run, handler, *handler_version, *role)?;
+            input = Some(ArtifactRef::capture_in(cluster_id, &schema, value)?);
+        }
+        DomainEvent::LeafSucceeded {
+            activation,
+            role,
+            output: value,
+            ..
+        } => {
+            let (name, version, actual_role) = activity_for_result(state, *activation, *role)?;
+            let (_, schema) = activity_schema_identity(state, run, &name, version, actual_role)?;
+            output = Some(ArtifactRef::capture_in(cluster_id, &schema, value)?);
+        }
+        DomainEvent::ReconciliationRecorded {
+            activation,
+            output: Some(value),
+            ..
+        } => {
+            let (name, version, role) =
+                activity_for_result(state, *activation, ExecutionRole::Reconciliation)?;
+            let (_, schema) = activity_schema_identity(state, run, &name, version, role)?;
+            output = Some(ArtifactRef::capture_in(cluster_id, &schema, value)?);
+        }
+        DomainEvent::EventAccepted {
+            signal,
+            payload: value,
+            ..
+        } => {
+            let signal = run_state
+                .definition
+                .signals
+                .get(signal)
+                .ok_or_else(|| unavailable("accepted event has no pinned signal schema"))?;
+            input = Some(ArtifactRef::capture_in(
+                cluster_id,
+                &schema_identity(&signal.schema)?,
+                value,
+            )?);
+        }
+        DomainEvent::RunSucceeded { output: value, .. } => {
+            output = Some(ArtifactRef::capture_in(
+                cluster_id,
+                &schema_identity(&run_state.definition.output_schema)?,
+                value,
+            )?);
+        }
+        _ => {}
+    }
+    Ok((input, output))
+}
+
 pub(crate) fn append(
     state: &mut State,
     run: RunId,
@@ -185,26 +352,31 @@ pub(crate) fn append(
     command_id: Option<CommandId>,
     principal_id: Option<&str>,
     recorded_ms: u64,
+    (input_ref, output_ref): (Option<ArtifactRef>, Option<ArtifactRef>),
 ) -> Result<()> {
     let sequence = state
         .history
         .get(&run)
         .map_or(1, |events| events.len() as u64 + 1);
+    let origin = state.current_cluster_id.clone();
     let required = if matches!(event, DomainEvent::RunAdmitted { .. }) {
-        Some(RequiredArtifacts::capture(&state.runs[&run])?)
+        Some(RequiredArtifacts::capture(&state.runs[&run], &origin)?)
     } else {
         None
     };
-    let payload_ref = ArtifactRef::capture("graphrun.domain-event/v1", event)?;
+    let payload_ref = ArtifactRef::capture_in(&origin, "graphrun.domain-event/v1", event)?;
     let signal_ref = match event {
-        DomainEvent::EventAccepted { payload, .. } => {
-            Some(ArtifactRef::capture("graphrun.signal-payload/v1", payload)?)
-        }
+        DomainEvent::EventAccepted { payload, .. } => Some(ArtifactRef::capture_in(
+            &origin,
+            "graphrun.signal-payload/v1",
+            payload,
+        )?),
         _ => None,
     };
     if let Some(required) = required {
         state.history_dependencies.insert(run, required);
     }
+    state.artifact_origins.insert(origin);
     state.history.entry(run).or_default().push(event.clone());
     state
         .history_records
@@ -218,6 +390,8 @@ pub(crate) fn append(
             principal_id: principal_id.map(str::to_owned),
             recorded_ms,
             payload: payload_ref,
+            input_ref,
+            output_ref,
         });
     if let DomainEvent::EventAccepted {
         event_id,
@@ -406,7 +580,8 @@ pub fn reconstruct_at(state: &State, run: RunId, through: u64, now: EngineTime) 
                 return Err(unavailable("missing run admission event"));
             };
             (
-                domain::reconstruct(
+                domain::reconstruct_in(
+                    &entries[0].record.payload.cluster_id,
                     source.definition.clone(),
                     source.catalog.clone(),
                     std::slice::from_ref(first),
@@ -417,6 +592,10 @@ pub fn reconstruct_at(state: &State, run: RunId, through: u64, now: EngineTime) 
         }
     };
     for entry in entries.iter().skip(first as usize) {
+        projection.current_cluster_id = entry.record.payload.cluster_id.clone();
+        projection
+            .artifact_origins
+            .insert(projection.current_cluster_id.clone());
         domain::evolve(&mut projection, &entry.event);
         if matches!(
             entry.event,
@@ -492,8 +671,14 @@ pub fn checkpoint_after_command(state: &mut State, run: RunId, time: EngineTime)
     projection.published_definitions.clear();
     projection.start_keys.clear();
     projection.sessions.clear();
-    let projection_ref =
-        ArtifactRef::capture("graphrun.run-projection/v2", &(through, &projection))?;
+    let projection_ref = ArtifactRef::capture_in(
+        &state.current_cluster_id,
+        "graphrun.run-projection/v2",
+        &(through, &projection),
+    )?;
+    state
+        .artifact_origins
+        .insert(state.current_cluster_id.clone());
     state.checkpoints.insert(
         run,
         RunCheckpoint {

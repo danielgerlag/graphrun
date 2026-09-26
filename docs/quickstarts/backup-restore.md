@@ -12,7 +12,9 @@ graphrun backup \
 	--out ./graphrun-backup
 ```
 
-The directory contains `manifest.json` and a checksummed, framed `application-<digest>.snap`. Keep both files. Restore verifies the digest and every retained record version before it creates a new member directory. An older `domain.json` backup is not imported automatically.
+The directory contains `manifest.json` and a checksummed, framed `application-<digest>.snap`. Keep both files. Restore verifies the digest, original artifact cluster IDs, and every retained record version before it creates a new member directory. Older backups without artifact origins are rejected without changing the destination.
+
+To verify and inspect a backup without starting a member or calling an activity, use `graphrun::Engine::read_backup("./graphrun-backup")` from Rust. It returns the retained state only after the framing, artifact origins, and retained payload digests pass validation.
 
 ```sh
 graphrun restore \

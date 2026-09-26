@@ -42,6 +42,10 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
+    pub(crate) fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
     pub(crate) fn local_owner(cluster_id: String) -> Self {
         Self {
             cluster_id,

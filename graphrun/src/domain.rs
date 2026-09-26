@@ -673,6 +673,10 @@ pub struct InboxEntry {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
+    pub current_cluster_id: String,
+    #[serde(default)]
+    pub artifact_origins: std::collections::BTreeSet<String>,
+    #[serde(default)]
     pub engine_time_watermark_ms: u64,
     pub runs: HashMap<RunId, RunState>,
     pub scopes: HashMap<ScopeId, ScopeState>,
@@ -2321,7 +2325,11 @@ fn decide_signal(
         if existing.signal == signal
             && existing.key == key
             && existing.payload
-                == crate::history::ArtifactRef::capture("graphrun.signal-payload/v1", &payload)?
+                == crate::history::ArtifactRef::capture_in(
+                    &existing.payload.cluster_id,
+                    "graphrun.signal-payload/v1",
+                    &payload,
+                )?
         {
             return Ok(Decision { events: Vec::new() });
         }
@@ -3834,6 +3842,9 @@ pub fn apply_events_with_cause(
 ) -> Result<()> {
     for event in events {
         let run = event_owner(state, event)?;
+        let io_refs = run
+            .map(|run| crate::history::io_references(state, run, event, &state.current_cluster_id))
+            .transpose()?;
         evolve(state, event);
         if let Some(run) = run {
             crate::history::append(
@@ -3843,6 +3854,7 @@ pub fn apply_events_with_cause(
                 command_id,
                 principal_id,
                 time.as_millis(),
+                io_refs.expect("run event has artifact references"),
             )?;
         }
     }
@@ -5110,7 +5122,8 @@ fn validate_leaf_output(state: &State, act: &ActivationState, output: &Value) ->
     run.catalog.validate_value(&contract.output_schema, output)
 }
 
-pub fn reconstruct(
+pub fn reconstruct_in(
+    cluster_id: &str,
     definition: Definition,
     catalog: Catalog,
     events: &[DomainEvent],
@@ -5125,7 +5138,13 @@ pub fn reconstruct(
     else {
         return Err(Error::invalid("history must start with run admission"));
     };
-    let mut state = State::default();
+    let mut state = State {
+        current_cluster_id: cluster_id.to_owned(),
+        ..State::default()
+    };
+    if !cluster_id.is_empty() {
+        state.artifact_origins.insert(cluster_id.to_owned());
+    }
     state.runs.insert(
         *run,
         RunState {
@@ -5787,7 +5806,8 @@ nodes:
         );
         let run = *live.runs.keys().next().unwrap();
         let run_state = live.runs.get(&run).unwrap();
-        let rebuilt = reconstruct(
+        let rebuilt = reconstruct_in(
+            &live.current_cluster_id,
             run_state.definition.clone(),
             run_state.catalog.clone(),
             live.history.get(&run).unwrap(),
@@ -6303,7 +6323,8 @@ nodes:
             }
 
             let run_state = &state.runs[&run];
-            let rebuilt = reconstruct(
+            let rebuilt = reconstruct_in(
+                &state.current_cluster_id,
                 run_state.definition.clone(),
                 run_state.catalog.clone(),
                 &state.history[&run],
@@ -6933,7 +6954,8 @@ nodes:
             })
             .unwrap();
         assert_eq!(admitted, *policy);
-        let rebuilt = reconstruct(
+        let rebuilt = reconstruct_in(
+            &state.current_cluster_id,
             state.runs.get(&run).unwrap().definition.clone(),
             state.runs.get(&run).unwrap().catalog.clone(),
             state.history.get(&run).unwrap(),
@@ -9574,7 +9596,8 @@ nodes:
         let events =
             history_or_unavailable(&state, run, EngineTime::from_millis(terminal)).unwrap();
         assert!(!events.is_empty());
-        let rebuilt = reconstruct(
+        let rebuilt = reconstruct_in(
+            &state.current_cluster_id,
             state.runs.get(&run).unwrap().definition.clone(),
             state.runs.get(&run).unwrap().catalog.clone(),
             events,
