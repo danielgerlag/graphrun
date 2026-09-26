@@ -4,10 +4,10 @@
 //! First step uses the run or region input; later steps use the previous
 //! output. The published graph is still data.
 
-use crate::binding::Condition;
+use crate::binding::{Binding, Condition};
 use crate::builder::{
-    ActivityRef, Branch, Case, NodeRef, Region, RegionBuilder, RegionGraphBuilder, SignalRef,
-    TimedWaitRef, ValueRef, WorkflowBuilder,
+    ActivityRef, Branch, Case, NodeRef, ParallelBranches, Region, RegionBuilder,
+    RegionGraphBuilder, SignalRef, TimedWaitRef, ValueRef, WorkflowBuilder,
 };
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
@@ -443,7 +443,86 @@ pub struct ParallelStart<I, Cur> {
     key: String,
 }
 
+mod parallel_bodies_sealed {
+    pub trait Sealed {}
+}
+
+/// An ordered tuple of 1 to 16 named regions, each accepting the current
+/// sequence value and producing its own output type.
+///
+/// ```compile_fail
+/// use graphrun::{flow::region, builder::Region};
+/// fn wrong_input(body: Region<i64, i64>) {
+///     let _ = region::<String>().parallel("p").branches((("wrong", body),));
+/// }
+/// ```
+pub trait ParallelBodies<Cur: DurablePayload>: parallel_bodies_sealed::Sealed {
+    type Output: DurablePayload;
+    type Branches: ParallelBranches<Output = Self::Output>;
+
+    #[doc(hidden)]
+    fn bind(self, input: Binding) -> Self::Branches;
+}
+
+macro_rules! impl_parallel_bodies {
+    ($($name:ident $output:ident $branch:ident),+) => {
+        impl<Cur: DurablePayload, $($name: Into<String>, $output: DurablePayload),+>
+            parallel_bodies_sealed::Sealed for ($(($name, Region<Cur, $output>),)+) {}
+
+        impl<Cur: DurablePayload, $($name: Into<String>, $output: DurablePayload),+>
+            ParallelBodies<Cur> for ($(($name, Region<Cur, $output>),)+)
+        {
+            type Output = ($($output,)+);
+            type Branches = ($(Branch<Cur, $output>,)+);
+
+            fn bind(self, input: Binding) -> Self::Branches {
+                let ($($branch,)+) = self;
+                ($(Branch {
+                    name: $branch.0.into(),
+                    input: input.clone(),
+                    body: $branch.1,
+                },)+)
+            }
+        }
+    };
+}
+
+impl_parallel_bodies!(N0 O0 b0);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3, N4 O4 b4);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3, N4 O4 b4, N5 O5 b5);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3, N4 O4 b4, N5 O5 b5, N6 O6 b6);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3, N4 O4 b4, N5 O5 b5, N6 O6 b6, N7 O7 b7);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3, N4 O4 b4, N5 O5 b5, N6 O6 b6, N7 O7 b7, N8 O8 b8);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3, N4 O4 b4, N5 O5 b5, N6 O6 b6, N7 O7 b7, N8 O8 b8, N9 O9 b9);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3, N4 O4 b4, N5 O5 b5, N6 O6 b6, N7 O7 b7, N8 O8 b8, N9 O9 b9, N10 O10 b10);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3, N4 O4 b4, N5 O5 b5, N6 O6 b6, N7 O7 b7, N8 O8 b8, N9 O9 b9, N10 O10 b10, N11 O11 b11);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3, N4 O4 b4, N5 O5 b5, N6 O6 b6, N7 O7 b7, N8 O8 b8, N9 O9 b9, N10 O10 b10, N11 O11 b11, N12 O12 b12);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3, N4 O4 b4, N5 O5 b5, N6 O6 b6, N7 O7 b7, N8 O8 b8, N9 O9 b9, N10 O10 b10, N11 O11 b11, N12 O12 b12, N13 O13 b13);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3, N4 O4 b4, N5 O5 b5, N6 O6 b6, N7 O7 b7, N8 O8 b8, N9 O9 b9, N10 O10 b10, N11 O11 b11, N12 O12 b12, N13 O13 b13, N14 O14 b14);
+impl_parallel_bodies!(N0 O0 b0, N1 O1 b1, N2 O2 b2, N3 O3 b3, N4 O4 b4, N5 O5 b5, N6 O6 b6, N7 O7 b7, N8 O8 b8, N9 O9 b9, N10 O10 b10, N11 O11 b11, N12 O12 b12, N13 O13 b13, N14 O14 b14, N15 O15 b15);
+
 impl<I: DurablePayload, Cur: DurablePayload> ParallelStart<I, Cur> {
+    /// Compose 1 to 16 named regions; tuple position determines output position.
+    pub fn branches<B: ParallelBodies<Cur>>(
+        self,
+        bodies: B,
+    ) -> Result<AfterParallel<I, B::Output>> {
+        let mut seq = self.seq;
+        let branches = bodies.bind(seq.last.binding().clone());
+        let node = seq.inner.parallel(&self.key, branches)?;
+        Ok(AfterParallel {
+            name: self.name,
+            seq: Sequence {
+                inner: seq.inner,
+                last: node.output(),
+                last_activity: None,
+            },
+        })
+    }
+
     pub fn branch<A: DurablePayload>(
         self,
         name: impl Into<String>,
@@ -473,29 +552,12 @@ impl<I: DurablePayload, Cur: DurablePayload, A: DurablePayload> ParallelOne<I, C
         name: impl Into<String>,
         body: Region<Cur, B>,
     ) -> Result<AfterParallel<I, (A, B)>> {
-        let mut seq = self.seq;
-        let input = seq.last.clone();
-        let node = seq.inner.parallel2(
-            &self.key,
-            Branch {
-                name: self.left_name,
-                input: input.binding().clone(),
-                body: self.left,
-            },
-            Branch {
-                name: name.into(),
-                input: input.binding().clone(),
-                body,
-            },
-        )?;
-        Ok(AfterParallel {
+        ParallelStart {
             name: self.workflow_name,
-            seq: Sequence {
-                inner: seq.inner,
-                last: node.output(),
-                last_activity: None,
-            },
-        })
+            seq: self.seq,
+            key: self.key,
+        }
+        .branches(((self.left_name, self.left), (name.into(), body)))
     }
 }
 
@@ -505,6 +567,18 @@ pub struct AfterParallel<I, Cur> {
 }
 
 impl<I: DurablePayload, Cur: DurablePayload> AfterParallel<I, Cur> {
+    pub fn finish_region(self) -> Result<Region<I, Cur>> {
+        self.seq.finish()
+    }
+
+    pub fn complete(self, key: &str) -> Result<Region<I, Cur>> {
+        self.seq.complete(key)
+    }
+
+    pub fn into_sequence(self) -> Sequence<I, Cur> {
+        self.seq
+    }
+
     pub fn finish(self, catalog: &Catalog) -> Result<Definition> {
         let name = self
             .name
