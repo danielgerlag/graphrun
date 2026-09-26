@@ -71,6 +71,191 @@ fn started() -> (State, RunId) {
     (state, run)
 }
 
+fn checkpointed() -> (State, RunId, u64) {
+    let (mut state, run) = started();
+    for millis in 2..12 {
+        domain::commit_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(millis),
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        if let Some(sequence) = state
+            .checkpoints
+            .get(&run)
+            .map(|cp| cp.through_run_sequence)
+        {
+            return (state, run, sequence);
+        }
+    }
+    panic!("terminal command did not create a checkpoint");
+}
+
+#[test]
+fn bounded_command_cleanup_is_identical_with_independent_hash_order() {
+    let ids: Vec<_> = (1..=16).map(|n| CommandId::from_bytes([n; 16])).collect();
+    for _ in 0..24 {
+        let mut state = State::default();
+        for (index, id) in ids.iter().enumerate() {
+            state.command_times.insert(*id, index as u64 + 1);
+        }
+        domain::commit_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(24 * 60 * 60 * 1000 + 100),
+                body: CommandBody::PruneHistory { limit: 1 },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ids.iter()
+                .filter(|id| !state.command_times.contains_key(id))
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![ids[0]]
+        );
+    }
+}
+
+#[test]
+fn bounded_run_cleanup_is_identical_with_independent_hash_order() {
+    let (seed, first) = started();
+    let template = &seed.runs[&first];
+    let ids: Vec<_> = (1..=16).map(|n| RunId::from_bytes([n; 16])).collect();
+    for _ in 0..24 {
+        let mut state = State::default();
+        for (index, id) in ids.iter().enumerate() {
+            let mut run = template.clone();
+            run.id = *id;
+            run.status = RunStatus::Succeeded {
+                output: Value::Null,
+            };
+            run.terminal_ms = index as u64 + 1;
+            state.runs.insert(*id, run);
+        }
+        domain::commit_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(31 * 24 * 60 * 60 * 1000),
+                body: CommandBody::PruneHistory { limit: 1 },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ids.iter()
+                .filter(|id| !state.runs.contains_key(id))
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![ids[0]]
+        );
+    }
+}
+
+#[test]
+fn bounded_summary_cleanup_is_identical_with_independent_hash_order() {
+    let ids: Vec<_> = (1..=16).map(|n| RunId::from_bytes([n; 16])).collect();
+    for _ in 0..24 {
+        let mut state = State::default();
+        for (index, id) in ids.iter().enumerate() {
+            state.terminal_summaries.insert(
+                *id,
+                graphrun::history::TerminalSummary {
+                    run: *id,
+                    workflow: "old".to_owned(),
+                    version: 1,
+                    status: "succeeded".to_owned(),
+                    terminal_ms: 1,
+                    expires_ms: index as u64 + 1,
+                    history_through: 3,
+                },
+            );
+        }
+        domain::commit_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(100),
+                body: CommandBody::PruneHistory { limit: 1 },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ids.iter()
+                .filter(|id| !state.terminal_summaries.contains_key(id))
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![ids[0]]
+        );
+    }
+}
+
+#[test]
+fn checkpoint_replay_rejects_corrupt_preceding_event() {
+    let (mut state, run, through) = checkpointed();
+    state.history_records.get_mut(&run).unwrap()[0]
+        .payload
+        .sha256 = "damaged".to_owned();
+    assert_eq!(
+        graphrun::reconstruct_at(&state, run, through, EngineTime::from_millis(12))
+            .unwrap_err()
+            .kind,
+        ErrorKind::Unavailable
+    );
+}
+
+#[test]
+fn checkpoint_replay_rejects_shortened_records_without_panicking() {
+    let (mut state, run, through) = checkpointed();
+    state.history_records.get_mut(&run).unwrap().pop();
+    assert_eq!(
+        graphrun::reconstruct_at(&state, run, through, EngineTime::from_millis(12))
+            .unwrap_err()
+            .kind,
+        ErrorKind::Unavailable
+    );
+}
+
+#[test]
+fn checkpoint_replay_rejects_invalid_and_altered_sequence() {
+    let (mut state, run, through) = checkpointed();
+    state.checkpoints.get_mut(&run).unwrap().format = "graphrun.run-checkpoint/v1".to_owned();
+    assert_eq!(
+        graphrun::reconstruct_at(&state, run, through, EngineTime::from_millis(12))
+            .unwrap_err()
+            .kind,
+        ErrorKind::Unavailable
+    );
+    state.checkpoints.get_mut(&run).unwrap().format =
+        graphrun::history::CHECKPOINT_FORMAT.to_owned();
+    state
+        .checkpoints
+        .get_mut(&run)
+        .unwrap()
+        .through_run_sequence = through + 1;
+    assert_eq!(
+        graphrun::reconstruct_at(&state, run, through - 1, EngineTime::from_millis(12))
+            .unwrap_err()
+            .kind,
+        ErrorKind::Unavailable
+    );
+    state
+        .checkpoints
+        .get_mut(&run)
+        .unwrap()
+        .through_run_sequence = through - 1;
+    assert_eq!(
+        graphrun::reconstruct_at(&state, run, through, EngineTime::from_millis(12))
+            .unwrap_err()
+            .kind,
+        ErrorKind::Unavailable
+    );
+}
+
 #[test]
 fn checkpoint_labels_complete_multi_event_boundary_and_projection_is_as_of() {
     let (mut state, run) = started();

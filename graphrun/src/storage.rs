@@ -182,12 +182,13 @@ impl StorageHandle {
                     "incompatible pre-publication store; migrate explicitly (directory left untouched)",
                 ));
             }
-            if load_json::<_, State>(&db, "domain").is_none() {
-                return Err(Error::new(
+            let state = load_json::<_, State>(&db, "domain").ok_or_else(|| {
+                Error::new(
                     crate::error::ErrorKind::FailedPrecondition,
                     "domain missing or unreadable (directory left untouched)",
-                ));
-            }
+                )
+            })?;
+            validate_history_store(&state)?;
         } else if !restoring
             && path
                 .parent()
@@ -233,6 +234,7 @@ impl StorageHandle {
     }
 
     pub async fn install_domain(&self, state: State) -> Result<()> {
+        validate_history_store(&state)?;
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Req::InstallDomain(Box::new(state), tx))
@@ -266,12 +268,59 @@ pub fn load_domain_readonly(path: impl AsRef<Path>) -> Result<State> {
             "incompatible store format",
         ));
     }
-    load_json(&db, "domain").ok_or_else(|| {
+    let state = load_json(&db, "domain").ok_or_else(|| {
         Error::new(
             crate::error::ErrorKind::FailedPrecondition,
             "domain missing or unreadable",
         )
-    })
+    })?;
+    validate_history_store(&state)?;
+    Ok(state)
+}
+
+fn validate_history_store(state: &State) -> Result<()> {
+    for run in state.runs.keys() {
+        let incompatible = || {
+            Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                format!(
+                    "run {} has incompatible pre-history records; migrate explicitly (directory left untouched)",
+                    run.to_hex()
+                ),
+            )
+        };
+        let (history, records) = match (
+            state.history.get(run),
+            state.history_records.get(run),
+            state.history_dependencies.get(run),
+        ) {
+            (Some(history), Some(records), Some(_))
+                if !history.is_empty() && records.len() == history.len() =>
+            {
+                (history, records)
+            }
+            _ => return Err(incompatible()),
+        };
+        let history_len = history.len() as u64;
+        if records.iter().enumerate().any(|(i, record)| {
+            record.format != crate::history::EVENT_FORMAT
+                || record.run != *run
+                || record.sequence != i as u64 + 1
+        }) || state.checkpoints.get(run).is_some_and(|checkpoint| {
+            checkpoint.format != crate::history::CHECKPOINT_FORMAT
+                || checkpoint.through_run_sequence == 0
+                || checkpoint.through_run_sequence > history_len
+        }) {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                format!(
+                    "run {} has unsupported history or checkpoint format; migrate explicitly (directory left untouched)",
+                    run.to_hex()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn storage_thread(
@@ -400,8 +449,12 @@ fn storage_thread(
                 let _ = tx.send(domain.clone());
             }
             Req::InstallDomain(next, tx) => {
-                domain = *next;
-                let res = put_json(&db, "domain", &domain);
+                let res = validate_history_store(&next)
+                    .map_err(|err| sto_err(ErrorVerb::Write, err))
+                    .and_then(|()| put_json(&db, "domain", &next));
+                if res.is_ok() {
+                    domain = *next;
+                }
                 let _ = tx.send(res);
             }
         }
@@ -756,6 +809,7 @@ fn install_snapshot(
 ) -> std::result::Result<(), StoErr> {
     let (applied, membership, restored): (Option<LogIdT>, MembershipT, State) =
         serde_json::from_slice(&data).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    validate_history_store(&restored).map_err(|err| sto_err(ErrorVerb::Write, err))?;
     let mut txn = db
         .begin_write()
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
@@ -1075,6 +1129,89 @@ mod tests {
         assert!(err.to_string().contains("fault cut"));
         let loaded = get_logs(&db, 1, 2).unwrap();
         assert_eq!(loaded.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn open_rejects_pre_history_active_run_before_starting_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let catalog = crate::catalog::Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let definition = crate::compiler::compile_yaml(
+            "\
+dsl: graphrun/v1
+id: old_active_store
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {literal: null}
+",
+            &catalog,
+        )
+        .unwrap();
+        let run = crate::ids::RunId::from_bytes([8; 16]);
+        let mut domain = State::default();
+        domain::commit_command(
+            &mut domain,
+            Command {
+                id: crate::ids::CommandId::from_bytes([9; 16]),
+                time: crate::time::EngineTime::from_millis(1),
+                body: domain::CommandBody::Start {
+                    run,
+                    definition: Box::new(definition),
+                    input: crate::value::Value::Null,
+                    catalog: Box::new(catalog),
+                },
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            domain.runs[&run].status,
+            domain::RunStatus::Active
+        ));
+        let compatible = domain.clone();
+        domain.history_records.clear();
+        domain.history_dependencies.clear();
+        put_json(&db, "domain", &domain).unwrap();
+        drop(db);
+
+        let error = StorageHandle::open(&path)
+            .err()
+            .expect("pre-history active store must be rejected");
+        assert_eq!(error.kind, crate::error::ErrorKind::FailedPrecondition);
+        assert!(
+            error.message.contains("history") && error.message.contains("migrate"),
+            "error must explain the incompatible store: {error}"
+        );
+        let db = ReadOnlyDatabase::open(&path).unwrap();
+        let untouched: State = load_json(&db, "domain").unwrap();
+        assert!(untouched.runs.contains_key(&run));
+        assert!(untouched.history_records.is_empty());
+
+        let fresh = dir.path().join("fresh.redb");
+        let (handle, thread) = StorageHandle::open(&fresh).unwrap();
+        let restore_error = handle.install_domain(domain).await.unwrap_err();
+        assert_eq!(
+            restore_error.kind,
+            crate::error::ErrorKind::FailedPrecondition
+        );
+        assert!(handle.query_state().await.runs.is_empty());
+        handle.install_domain(compatible).await.unwrap();
+        assert!(handle.query_state().await.runs.contains_key(&run));
+        handle.shutdown();
+        thread.join().unwrap();
+        let (handle, thread) = StorageHandle::open(&fresh).unwrap();
+        assert!(handle.query_state().await.runs.contains_key(&run));
+        handle.shutdown();
+        thread.join().unwrap();
     }
 
     #[test]

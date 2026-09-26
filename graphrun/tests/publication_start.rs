@@ -573,7 +573,6 @@ async fn committed_command_result_survives_leader_change() {
     }
     let follower2 = members.remove(1).await.unwrap();
     let follower3 = members.remove(1).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
     let original = members.remove(0).await.unwrap();
     original.publish_catalog(1, catalog()).await.unwrap();
     original
@@ -596,6 +595,43 @@ async fn committed_command_result_survives_leader_change() {
         .reconstruct_at(run, original_page.retained_through)
         .await
         .unwrap();
+    let committed_index = original.last_applied_index().await;
+    let receipt_key = original
+        .command_result(command)
+        .await
+        .unwrap()
+        .key
+        .storage_key();
+    let catchup_deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    loop {
+        let second = follower2.last_applied_index().await;
+        let third = follower3.last_applied_index().await;
+        let second_voters = follower2.voter_ids();
+        let third_voters = follower3.voter_ids();
+        if second >= committed_index
+            && third >= committed_index
+            && second_voters == [1, 2, 3]
+            && third_voters == [1, 2, 3]
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < catchup_deadline,
+            "followers did not apply committed index {committed_index} and voter roster before shutdown: node2 index {second} voters {second_voters:?}, node3 index {third} voters {third_voters:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    for follower in [&follower2, &follower3] {
+        assert!(
+            follower
+                .inspect(run)
+                .await
+                .unwrap()
+                .command_results
+                .contains_key(&receipt_key),
+            "follower applied the log but not the start receipt"
+        );
+    }
     original.shutdown().await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
     let leader = loop {
@@ -607,7 +643,11 @@ async fn committed_command_result_survives_leader_change() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "no replacement leader"
+            "no replacement leader after both followers applied index {committed_index}: node2 index {} voters {:?}, node3 index {} voters {:?}",
+            follower2.raft_applied_index(),
+            follower2.voter_ids(),
+            follower3.raft_applied_index(),
+            follower3.voter_ids(),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };

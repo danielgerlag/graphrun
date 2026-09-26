@@ -6,10 +6,10 @@ use crate::time::EngineTime;
 use crate::value::canonical_json;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BinaryHeap};
 
 pub const EVENT_FORMAT: &str = "graphrun.run-event/v1";
-pub const CHECKPOINT_FORMAT: &str = "graphrun.run-checkpoint/v1";
+pub const CHECKPOINT_FORMAT: &str = "graphrun.run-checkpoint/v2";
 pub const ARTIFACT_FORMAT: &str = "graphrun-artifact/v1";
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 pub const PAGE_LIMIT: u32 = 100;
@@ -374,29 +374,33 @@ pub fn reconstruct_at(state: &State, run: RunId, through: u64, now: EngineTime) 
             "requested sequence {through} is outside retained range 1..={available}"
         )));
     }
-    let checkpoint = state
-        .checkpoints
-        .get(&run)
-        .filter(|checkpoint| checkpoint.through_run_sequence <= through);
-    let (mut projection, first) = match checkpoint {
-        Some(checkpoint) => {
-            if checkpoint.format != CHECKPOINT_FORMAT
-                || checkpoint.through_run_sequence == 0
-                || checkpoint.through_run_sequence > available
-            {
-                return Err(unavailable("unsupported retained checkpoint"));
-            }
-            checkpoint.required.verify(source)?;
-            checkpoint
-                .projection_ref
-                .verify("graphrun.run-projection/v1", &checkpoint.projection)?;
-            (
-                (*checkpoint.projection).clone(),
-                checkpoint.through_run_sequence,
-            )
+    let entries = validated_entries(state, run, 1, through)?;
+    let checkpoint = state.checkpoints.get(&run);
+    if let Some(checkpoint) = checkpoint {
+        if checkpoint.format != CHECKPOINT_FORMAT
+            || checkpoint.through_run_sequence == 0
+            || checkpoint.through_run_sequence > available
+        {
+            return Err(unavailable(
+                "unsupported or out-of-range retained checkpoint",
+            ));
         }
+        checkpoint.required.verify(source)?;
+        checkpoint.projection_ref.verify(
+            "graphrun.run-projection/v2",
+            &(checkpoint.through_run_sequence, &checkpoint.projection),
+        )?;
+        if !checkpoint.projection.runs.contains_key(&run) {
+            return Err(unavailable("retained checkpoint has no projected run"));
+        }
+    }
+    let checkpoint = checkpoint.filter(|checkpoint| checkpoint.through_run_sequence <= through);
+    let (mut projection, first) = match checkpoint {
+        Some(checkpoint) => (
+            (*checkpoint.projection).clone(),
+            checkpoint.through_run_sequence,
+        ),
         None => {
-            let entries = validated_entries(state, run, 1, 1)?;
             let first = &entries[0].event;
             let DomainEvent::RunAdmitted { .. } = first else {
                 return Err(unavailable("missing run admission event"));
@@ -406,17 +410,13 @@ pub fn reconstruct_at(state: &State, run: RunId, through: u64, now: EngineTime) 
                     source.definition.clone(),
                     source.catalog.clone(),
                     std::slice::from_ref(first),
-                )?,
+                )
+                .map_err(|err| unavailable(err.message))?,
                 1,
             )
         }
     };
-    let entries = if first < through {
-        validated_entries(state, run, first + 1, through)?
-    } else {
-        Vec::new()
-    };
-    for entry in &entries {
+    for entry in entries.iter().skip(first as usize) {
         domain::evolve(&mut projection, &entry.event);
         if matches!(
             entry.event,
@@ -434,12 +434,13 @@ pub fn reconstruct_at(state: &State, run: RunId, through: u64, now: EngineTime) 
         .get_mut(&run)
         .expect("admitted run")
         .published = source.published.clone();
-    projection
-        .history
-        .insert(run, state.history[&run][..through as usize].to_vec());
+    projection.history.insert(
+        run,
+        entries.iter().map(|entry| entry.event.clone()).collect(),
+    );
     projection.history_records.insert(
         run,
-        state.history_records[&run][..through as usize].to_vec(),
+        entries.iter().map(|entry| entry.record.clone()).collect(),
     );
     Ok(projection)
 }
@@ -487,7 +488,8 @@ pub fn checkpoint_after_command(state: &mut State, run: RunId, time: EngineTime)
     projection.published_definitions.clear();
     projection.start_keys.clear();
     projection.sessions.clear();
-    let projection_ref = ArtifactRef::capture("graphrun.run-projection/v1", &projection)?;
+    let projection_ref =
+        ArtifactRef::capture("graphrun.run-projection/v2", &(through, &projection))?;
     state.checkpoints.insert(
         run,
         RunCheckpoint {
@@ -510,41 +512,39 @@ pub(crate) fn prune(
     let now = time.as_millis();
     let mut remaining = limit;
     let mut expired_events = Vec::new();
-    let old_results: Vec<_> = state
-        .command_results
-        .iter()
-        .filter(|(_, receipt)| now >= receipt.recorded_ms.saturating_add(24 * 60 * 60 * 1000))
-        .take(remaining)
-        .map(|(key, _)| key.clone())
-        .collect();
+    let old_results = earliest_due(
+        state.command_results.iter().filter_map(|(key, receipt)| {
+            let due = receipt.recorded_ms.saturating_add(24 * 60 * 60 * 1000);
+            (now >= due).then(|| (due, key.clone()))
+        }),
+        remaining,
+    );
     for key in old_results {
         state.command_results.remove(&key);
         remaining -= 1;
     }
-    let old_commands: Vec<_> = state
-        .command_times
-        .iter()
-        .filter(|(_, recorded)| now >= recorded.saturating_add(24 * 60 * 60 * 1000))
-        .take(remaining)
-        .map(|(id, _)| *id)
-        .collect();
+    let old_commands = earliest_due(
+        state.command_times.iter().filter_map(|(id, recorded)| {
+            let due = recorded.saturating_add(24 * 60 * 60 * 1000);
+            (now >= due).then_some((due, *id))
+        }),
+        remaining,
+    );
     for id in old_commands {
         state.command_times.remove(&id);
         state.commands.remove(&id);
         state.legacy_start_digests.remove(&id);
         remaining -= 1;
     }
-    let expired_inbox: Vec<_> = state
-        .inbox
-        .iter()
-        .filter(|entry| {
-            entry.expires_ms != 0
+    let expired_inbox = earliest_due(
+        state.inbox.iter().filter_map(|entry| {
+            (entry.expires_ms != 0
                 && now >= entry.expires_ms
-                && (entry.consumed || entry.reserved_wait.is_none())
-        })
-        .take(remaining)
-        .map(|entry| entry.event_id)
-        .collect();
+                && (entry.consumed || entry.reserved_wait.is_none()))
+            .then_some((entry.expires_ms, entry.event_id))
+        }),
+        remaining,
+    );
     for id in expired_inbox {
         let entry = state
             .inbox
@@ -581,20 +581,16 @@ pub(crate) fn prune(
         }
         remaining -= 1;
     }
-    let expired_runs: Vec<_> = state
-        .runs
-        .values()
-        .filter(|run| {
-            !matches!(run.status, RunStatus::Active)
-                && run.terminal_ms != 0
-                && now
-                    >= run
-                        .terminal_ms
-                        .saturating_add(run.policy.terminal_history_days.saturating_mul(DAY_MS))
-        })
-        .take(remaining)
-        .map(|run| run.id)
-        .collect();
+    let expired_runs = earliest_due(
+        state.runs.values().filter_map(|run| {
+            let due = run
+                .terminal_ms
+                .saturating_add(run.policy.terminal_history_days.saturating_mul(DAY_MS));
+            (!matches!(run.status, RunStatus::Active) && run.terminal_ms != 0 && now >= due)
+                .then_some((due, run.id))
+        }),
+        remaining,
+    );
     for id in expired_runs {
         let run = state.runs.remove(&id).expect("selected run");
         state.terminal_summaries.insert(
@@ -644,13 +640,14 @@ pub(crate) fn prune(
         state.obligations.retain(|item| item.run != id);
         remaining -= 1;
     }
-    let old_summaries: Vec<_> = state
-        .terminal_summaries
-        .values()
-        .filter(|summary| now >= summary.expires_ms)
-        .take(remaining)
-        .map(|summary| summary.run)
-        .collect();
+    let old_summaries = earliest_due(
+        state
+            .terminal_summaries
+            .values()
+            .filter(|summary| now >= summary.expires_ms)
+            .map(|summary| (summary.expires_ms, summary.run)),
+        remaining,
+    );
     for id in old_summaries {
         state.terminal_summaries.remove(&id);
         state.signal_tombstones.retain(|_, signal| signal.run != id);
@@ -659,6 +656,26 @@ pub(crate) fn prune(
         }
     }
     Ok(expired_events)
+}
+
+fn earliest_due<K: Ord>(candidates: impl Iterator<Item = (u64, K)>, limit: usize) -> Vec<K> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut selected = BinaryHeap::new();
+    for candidate in candidates {
+        if selected.len() < limit {
+            selected.push(candidate);
+        } else if selected.peek().is_some_and(|latest| candidate < *latest) {
+            selected.pop();
+            selected.push(candidate);
+        }
+    }
+    selected
+        .into_sorted_vec()
+        .into_iter()
+        .map(|(_, key)| key)
+        .collect()
 }
 
 pub fn summary_view(summary: &TerminalSummary) -> serde_json::Value {
