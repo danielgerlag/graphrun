@@ -158,3 +158,14 @@ unless **every** matrix ID passes, including performance. Missing measurements
 or failing scenarios are `FAIL`, never a performance hardware exception.
 Specifying this gate does not attest that any as-yet-unimplemented contract
 has passed.
+
+`CONTRACT-002` also needs two executable identities in its fresh case
+record: `old_reader` and `current_release`. The old executable and both build
+logs must be artifacts from that invocation. Record each executable path,
+source revision, `--version` output, and SHA-256 before and after the case.
+Recheck the bytes and versions at report validation. The current source
+revision is the verification run's source SHA-256; the old source revision
+must identify the pinned source actually built by the case. A missing old
+binary, a reused current binary, or an unproved version cannot yield `PASS`.
+Static rejection of an older writer alone does not establish reader-first
+rolling activation.

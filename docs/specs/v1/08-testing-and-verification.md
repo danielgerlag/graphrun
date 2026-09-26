@@ -150,6 +150,34 @@ Also run the workspace on the selected minimum toolchain. If the pinned dependen
 
 The release build command must not enable test-only features through workspace feature unification. Assert that the resulting binary exposes no test fault controls.
 
+`GATE-003` rebuilds the release CLI in a separate Cargo invocation, compares
+its SHA-256 with `--cli`, rejects `fault-injection` and `fixture-worker` in
+that package's feature graph, and runs a workflow with the fault environment
+variable set. It also requires two independent worker PIDs in a three-voter
+run. A debug CLI or a test-feature build does not satisfy this case.
+
+For a focused, non-certifying process check, run one of these after building
+the release CLI:
+
+```sh
+cargo run --locked -p graphrun-e2e -- smoke-release \
+	--cli target/release/graphrun --artifacts target/release-smoke
+cargo run --locked -p graphrun-e2e -- smoke-provider \
+	--cli target/release/graphrun --artifacts target/provider-smoke
+cargo run --locked -p graphrun-e2e -- smoke-reconciliation \
+	--cli target/release/graphrun --artifacts target/reconciliation-smoke
+cargo run --locked -p graphrun-e2e -- smoke-saga-settlement \
+	--cli target/release/graphrun --artifacts target/saga-smoke
+cargo run --locked -p graphrun-e2e -- smoke-security \
+	--cli target/release/graphrun --artifacts target/security-smoke
+```
+
+These commands do not produce a matrix report. `verify` must run all cases in
+the same fresh invocation; CI does not skip the snapshot-controller test.
+`CONTRACT-002` remains a failure until its current and old release binaries
+are built in the same run, their identities and build logs are validated,
+and the mixed-version reader-first rollout is observed through real members.
+
 ## Evidence format
 
 The driver writes a machine-readable report with one result per matrix ID in
@@ -188,6 +216,14 @@ The full matrix and fault campaign are required before declaring end-to-end impl
 Performance targets use the declared reference configuration. If that configuration is unavailable, report the performance gate blocked and record actual hardware. Do not relabel a weaker measurement as the target.
 
 The reference target is 1,000 committed engine commands/second with p95 receipt latency below 100 ms on three same-region four-vCPU/8-GiB members with local durable SSDs and 1 KiB payloads. Exclude slow application activity time from command latency.
+
+The current one-host diagnostic measures 1,000 locally committed start
+commands with 1 KiB input, pure 512-node compilation, and reopening that
+existing store. `PERF-002` also records nested and parallel execution,
+history paging, snapshot publication time and bytes, replay time, and store
+bytes. These values are
+not a three-host receipt benchmark or a complete snapshot-throughput claim.
+Do not infer SSD class or separate machines from three local processes.
 
 Target local readiness below one second for an existing store with at most 10,000 events and 1 KiB payloads. Target compilation below 100 ms for a 512-node definition on the same reference machine class. Also report snapshot, replay, retained-history, and nested-control resource costs.
 

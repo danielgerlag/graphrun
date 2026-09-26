@@ -356,6 +356,8 @@ impl WorkerBuilder {
                 let wrapped: Handler = Arc::new(move |input, context| {
                     let name = name.clone();
                     Box::pin(async move {
+                        let retryable_inventory_effect =
+                            name == "inventory.reserve" && role == ExecutionRole::Forward;
                         let result = tokio::task::spawn_blocking(move || {
                             crate::engine::dispatch_handler(
                                 &name,
@@ -365,6 +367,26 @@ impl WorkerBuilder {
                         })
                         .await
                         .map_err(|err| Error::invalid(format!("fixture worker panicked: {err}")))?;
+                        if retryable_inventory_effect
+                            && result.is_ok()
+                            && let Some(marker) =
+                                std::env::var_os("GRAPHUN_FIXTURE_LOSE_RESULT_ONCE")
+                        {
+                            match std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(marker)
+                            {
+                                Ok(_) => {
+                                    return Ok(Outcome::Failure(ActivityError::new(
+                                        "inventory.unavailable",
+                                        "fixture lost provider acknowledgement after applying effect",
+                                    )));
+                                }
+                                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                                Err(err) => return Err(Error::invalid(err.to_string())),
+                            }
+                        }
                         match result {
                             Ok(output) => Ok(Outcome::Success(output)),
                             Err(err) => Ok(Outcome::Failure(ActivityError::new(
