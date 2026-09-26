@@ -7199,6 +7199,60 @@ fn spawn_provider(dir: &Path) -> Result<(ChildProc, String), String> {
     Ok((ChildProc::new(provider), url))
 }
 
+fn verify_lost_result_retry(
+    history: &serde_json::Value,
+    ledger: &serde_json::Value,
+    effect_key: &str,
+    exited_workers: &[(u32, i32)],
+) -> Result<(), String> {
+    if exited_workers.len() != 1 || exited_workers[0].1 != 79 {
+        return Err(
+            "lost-result proof requires one fixture worker to exit after applying its effect"
+                .to_owned(),
+        );
+    }
+    let events = history["events"]
+        .as_array()
+        .ok_or("lost-result proof lacks committed history")?;
+    let claims: Vec<_> = events
+        .iter()
+        .filter_map(|entry| {
+            let event = &entry["event"];
+            (event["kind"] == "claim_granted"
+                && event["handler"] == "inventory.reserve"
+                && event["role"] == "forward")
+                .then_some(event)
+        })
+        .collect();
+    if claims.len() < 2
+        || claims.iter().any(|claim| claim["effect_key"] != effect_key)
+        || claims[0]["session"] == claims[1]["session"]
+    {
+        return Err(
+            "crashed and recovering workers did not claim the same durable effect key".to_owned(),
+        );
+    }
+    if events.iter().any(|entry| {
+        entry["event"]["kind"] == "leaf_failed" && entry["event"]["code"] == "inventory.unavailable"
+    }) {
+        return Err(
+            "declared business retry cannot substitute for a lost worker result".to_owned(),
+        );
+    }
+    let effect = &ledger["entries"][effect_key];
+    if effect["kind"] != "forward"
+        || effect["status"] != "applied"
+        || effect["physical"].as_u64().is_none_or(|count| count < 2)
+        || effect["logical"] != 1
+        || effect["output"]["reservation_id"] != "res-1"
+    {
+        return Err(format!(
+            "provider did not preserve one logical effect for {effect_key}: {effect}"
+        ));
+    }
+    Ok(())
+}
+
 fn provider_idempotent_effect(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
     let result = (|| -> Result<(serde_json::Value, serde_json::Value, serde_json::Value, PathBuf), String> {
         let provider_dir = artifacts.join("ACT-006-provider");
@@ -7219,7 +7273,7 @@ fn provider_idempotent_effect(cli: &Path, artifacts: &Path, row: &MatrixRow) -> 
             false,
         )?;
         let view_text =
-            wait_nodes_succeeded(cli, &cluster, &run, [0, 1, 2], 2, Duration::from_secs(30))?;
+            wait_nodes_succeeded(cli, &cluster, &run, [0, 1, 2], 2, Duration::from_secs(55))?;
         let view: serde_json::Value =
             serde_json::from_str(&view_text).map_err(|err| err.to_string())?;
         if view["run"] != run
@@ -7260,16 +7314,26 @@ fn provider_idempotent_effect(cli: &Path, artifacts: &Path, row: &MatrixRow) -> 
         }
         let history: serde_json::Value =
             serde_json::from_str(&history_text).map_err(|err| err.to_string())?;
-        if history["events"].as_array().is_none_or(Vec::is_empty) {
-            return Err(format!("workflow has no committed history: {history}"));
+        let effect_key = fs::read_to_string(&marker)
+            .map_err(|err| format!("lost-result marker is missing its effect key: {err}"))?;
+        let mut exited_workers = Vec::new();
+        for worker in &mut cluster.workers {
+            if let Some(status) = worker.0.try_wait().map_err(|err| err.to_string())? {
+                let code = status
+                    .code()
+                    .ok_or_else(|| format!("worker {} was terminated by signal", worker.0.id()))?;
+                exited_workers.push((worker.0.id(), code));
+            }
         }
+        verify_lost_result_retry(&history, &ledger, &effect_key, &exited_workers)?;
         let observation = cluster.dir.join("provider-observation.json");
         let worker_pids: Vec<u32> = cluster.workers.iter().map(|worker| worker.0.id()).collect();
         fs::write(
             &observation,
             serde_json::to_vec_pretty(&serde_json::json!({
                 "run": run, "view": view, "history": history, "ledger": ledger,
-                "worker_pids": worker_pids, "lost_result_marker": marker,
+                "worker_pids": worker_pids, "exited_workers": exited_workers,
+                "lost_result_marker": marker, "lost_effect_key": effect_key,
             }))
             .map_err(|err| err.to_string())?,
         )
@@ -7280,7 +7344,7 @@ fn provider_idempotent_effect(cli: &Path, artifacts: &Path, row: &MatrixRow) -> 
         Ok((view, history, ledger, observation)) => finish(
             row,
             "PASS",
-            "release CLI three-voter run; independent fixture workers lose one provider acknowledgement and retry the same effect key",
+            "release CLI three-voter run; a fixture worker exits after provider apply, before reporting; another worker reclaims the same effect key",
             format!(
                 "run={} committed_events={} provider={ledger}",
                 view["run"],
@@ -8763,6 +8827,41 @@ mod tests {
             1,
         );
         assert!(!forged.passed("domain::tests::required"));
+    }
+
+    #[test]
+    fn declared_business_retry_cannot_prove_a_lost_worker_result() {
+        let mut history = serde_json::json!({
+            "events": [
+                {"event":{"kind":"claim_granted","handler":"inventory.reserve","role":"forward","effect_key":"effect-1","session":"worker-1"}},
+                {"event":{"kind":"leaf_failed","code":"inventory.unavailable"}},
+                {"event":{"kind":"claim_granted","handler":"inventory.reserve","role":"forward","effect_key":"effect-1","session":"worker-2"}}
+            ]
+        });
+        let ledger = serde_json::json!({
+            "entries":{"effect-1":{
+                "kind":"forward","status":"applied","physical":2,"logical":1,
+                "output":{"reservation_id":"res-1"}
+            }}
+        });
+        assert!(
+            verify_lost_result_retry(&history, &ledger, "effect-1", &[])
+                .unwrap_err()
+                .contains("exit")
+        );
+        assert!(
+            verify_lost_result_retry(&history, &ledger, "effect-1", &[(42, 79)])
+                .unwrap_err()
+                .contains("business retry")
+        );
+        history["events"].as_array_mut().unwrap().remove(1);
+        assert!(verify_lost_result_retry(&history, &ledger, "effect-1", &[(42, 79)]).is_ok());
+        history["events"][1]["event"]["effect_key"] = serde_json::json!("different-key");
+        assert!(
+            verify_lost_result_retry(&history, &ledger, "effect-1", &[(42, 79)])
+                .unwrap_err()
+                .contains("same durable effect key")
+        );
     }
 
     #[test]

@@ -358,6 +358,7 @@ impl WorkerBuilder {
                     Box::pin(async move {
                         let retryable_inventory_effect =
                             name == "inventory.reserve" && role == ExecutionRole::Forward;
+                        let lost_effect_key = context.effect_key.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             crate::engine::dispatch_handler(
                                 &name,
@@ -377,11 +378,18 @@ impl WorkerBuilder {
                                 .create_new(true)
                                 .open(marker)
                             {
-                                Ok(_) => {
-                                    return Ok(Outcome::Failure(ActivityError::new(
-                                        "inventory.unavailable",
-                                        "fixture lost provider acknowledgement after applying effect",
-                                    )));
+                                Ok(mut file) => {
+                                    std::io::Write::write_all(
+                                        &mut file,
+                                        lost_effect_key.as_bytes(),
+                                    )
+                                    .map_err(|err| Error::invalid(err.to_string()))?;
+                                    file.sync_all()
+                                        .map_err(|err| Error::invalid(err.to_string()))?;
+                                    eprintln!(
+                                        "fixture worker exited after applying effect {lost_effect_key} without reporting the result"
+                                    );
+                                    std::process::exit(79);
                                 }
                                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
                                 Err(err) => return Err(Error::invalid(err.to_string())),
