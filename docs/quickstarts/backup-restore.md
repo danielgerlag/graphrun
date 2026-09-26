@@ -12,7 +12,7 @@ graphrun backup \
 	--out ./graphrun-backup
 ```
 
-The directory contains `manifest.json` and `domain.json`.
+The directory contains `manifest.json` and a checksummed, framed `application-<digest>.snap`. Keep both files. Restore verifies the digest and every retained record version before it creates a new member directory. An older `domain.json` backup is not imported automatically.
 
 ```sh
 graphrun restore \

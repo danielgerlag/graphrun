@@ -18,7 +18,8 @@ async fn child_main(dir: PathBuf) {
         ("amount".to_owned(), Value::Int(1000)),
     ]));
     let _ = engine.start(definition, catalog, input).await;
-    std::process::exit(2);
+    std::fs::write(dir.join("cut-ready"), b"after-log").expect("write cut barrier");
+    std::future::pending::<()>().await;
 }
 
 #[test]
@@ -33,15 +34,37 @@ fn reopen_after_child_cut() {
     }
     let dir = tempfile::tempdir().unwrap();
     let exe = std::env::current_exe().unwrap();
-    let status = Command::new(exe)
+    let stderr = dir.path().join("child.stderr");
+    let mut child = Command::new(exe)
         .arg("reopen_after_child_cut")
         .arg("--exact")
         .env("GRAPHUN_CRASH_DIR", dir.path())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn()
         .unwrap();
-    assert!(!status.success(), "child should exit after the cut");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !dir.path().join("cut-ready").exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "child exited {status} before crash barrier: {}",
+                std::fs::read_to_string(&stderr).unwrap_or_default()
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!(
+                "child did not reach crash barrier: {}",
+                std::fs::read_to_string(&stderr).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let killed_pid = child.id();
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "owned child {killed_pid} must be killed");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

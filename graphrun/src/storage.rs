@@ -3,6 +3,9 @@
 use crate::domain::{self, Command, State};
 use crate::error::{Error, Result};
 use crate::schedule::{RunSchedule, retention_deadline};
+use crate::snapshot_framing::{
+    SnapshotManifest, SnapshotStream, copy_payload, verify_snapshot, write_snapshot,
+};
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -19,10 +22,9 @@ use redb::{
     Database, Durability, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::io::{self, Cursor, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::ops::Bound;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
@@ -31,7 +33,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 openraft::declare_raft_types!(
     pub TypeConfig:
@@ -40,7 +42,7 @@ openraft::declare_raft_types!(
         NodeId = u64,
         Node = BasicNode,
         Entry = Entry<TypeConfig>,
-        SnapshotData = Cursor<Vec<u8>>,
+        SnapshotData = SnapshotStream,
         AsyncRuntime = openraft::TokioRuntime,
 );
 
@@ -62,10 +64,73 @@ const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
 const LOG: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("log");
 const SCHEDULE: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("schedule");
 
+#[derive(Clone, Serialize, Deserialize)]
+struct StoreManifest {
+    format: String,
+    reader_floor: u16,
+    writer_format: u16,
+    active_generation: u64,
+    domain_format: String,
+    event_format: String,
+    checkpoint_format: String,
+    result_format: String,
+}
+
+impl StoreManifest {
+    fn new() -> Self {
+        Self {
+            format: "graphrun.member-store/v2".to_owned(),
+            reader_floor: 2,
+            writer_format: 2,
+            active_generation: 1,
+            domain_format: "graphrun.domain/v1".to_owned(),
+            event_format: crate::history::EVENT_FORMAT.to_owned(),
+            checkpoint_format: crate::history::CHECKPOINT_FORMAT.to_owned(),
+            result_format: crate::publication::RESULT_FORMAT.to_owned(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.format != "graphrun.member-store/v2"
+            || self.reader_floor > 2
+            || self.writer_format != 2
+            || self.active_generation == 0
+            || self.domain_format != "graphrun.domain/v1"
+            || self.event_format != crate::history::EVENT_FORMAT
+            || self.checkpoint_format != crate::history::CHECKPOINT_FORMAT
+            || self.result_format != crate::publication::RESULT_FORMAT
+        {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "unsupported member store or retained record version; migrate explicitly",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SnapshotRegistry {
+    format: u16,
+    meta: SnapMeta,
+    file_name: String,
+    sha256: String,
+    generation: u64,
+    source_generation: u64,
+}
+
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
 struct PendingCredits {
     entries: u32,
     bytes: u64,
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+pub struct SnapshotProgress {
+    pub applied_bytes: u64,
+    pub last_snapshot_bytes: u64,
+    pub last_snapshot_applied: u64,
+    pub last_snapshot_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +188,16 @@ fn commit_immediate(txn: redb::WriteTransaction) -> std::result::Result<(), StoE
         COMMIT_UNCERTAIN.with(|uncertain| uncertain.set(true));
         sto_err(ErrorVerb::Write, err)
     })
+}
+
+fn begin_immediate(db: &Database) -> std::result::Result<redb::WriteTransaction, StoErr> {
+    let mut txn = db
+        .begin_write()
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    txn.set_durability(Durability::Immediate)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    txn.set_quick_repair(true);
+    Ok(txn)
 }
 
 #[cfg(any(test, feature = "fault-injection"))]
@@ -187,6 +262,7 @@ enum Req {
     ),
     AppliedState(oneshot::Sender<std::result::Result<(Option<LogIdT>, MembershipT), StoErr>>),
     UnappliedUsage(oneshot::Sender<std::result::Result<(u32, u64), StoErr>>),
+    SnapshotProgress(oneshot::Sender<std::result::Result<SnapshotProgress, StoErr>>),
     PreflightAppend(
         Vec<(u64, u64)>,
         oneshot::Sender<std::result::Result<(u32, u64), StoErr>>,
@@ -198,7 +274,7 @@ enum Req {
     BuildSnapshot(oneshot::Sender<std::result::Result<Snapshot<TypeConfig>, StoErr>>),
     InstallSnapshot(
         SnapMeta,
-        Vec<u8>,
+        PathBuf,
         oneshot::Sender<std::result::Result<(), StoErr>>,
     ),
     CurrentSnapshot(oneshot::Sender<std::result::Result<Option<Snapshot<TypeConfig>>, StoErr>>),
@@ -220,6 +296,8 @@ pub struct StorageHandle {
     scheduler_observed: Arc<AtomicU64>,
     local_worker_observed: Arc<AtomicU64>,
     schedule_wakes: Arc<[AtomicU64; 5]>,
+    snapshot_dir: Arc<PathBuf>,
+    inbound_snapshot: Arc<Semaphore>,
 }
 
 impl StorageHandle {
@@ -253,6 +331,30 @@ impl StorageHandle {
                 )
             })?;
             validate_history_store(&state)?;
+            let store_manifest = verified_store_manifest(&db)?;
+            if let Some(registry) = optional_json::<_, SnapshotRegistry>(&db, "snapshot_registry")?
+            {
+                if registry.generation != store_manifest.active_generation {
+                    return Err(Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        "snapshot registry is not in the active generation",
+                    ));
+                }
+                let snapshots = path
+                    .parent()
+                    .map(|parent| parent.join("snapshots"))
+                    .unwrap_or_else(|| PathBuf::from("snapshots"));
+                verify_registry(&snapshots, &registry).map_err(|err| {
+                    Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string())
+                })?;
+            } else if load_bytes(&db, "snapshot_meta").is_some()
+                || load_bytes(&db, "snapshot_data").is_some()
+            {
+                return Err(Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "pre-file snapshot store is incompatible; directory left untouched",
+                ));
+            }
             initial_watermark = state.engine_time_watermark_ms;
             if let Some(bytes) = load_bytes(&db, "clock_fault") {
                 clock_faulted = serde_json::from_slice(&bytes).map_err(|_| {
@@ -277,6 +379,11 @@ impl StorageHandle {
         }
         let (tx, rx) = mpsc::channel(crate::limits::MAX_QUEUED_COMMANDS as usize);
         let (ready_tx, ready_rx) = std_mpsc::channel();
+        let snapshot_dir = Arc::new(
+            path.parent()
+                .map(|parent| parent.join("snapshots"))
+                .unwrap_or_else(|| PathBuf::from("snapshots")),
+        );
         let (schedule_watch, _) = watch::channel(0);
         let schedule_reads = Arc::new(AtomicU64::new(0));
         let scheduler_observed = Arc::new(AtomicU64::new(0));
@@ -310,6 +417,8 @@ impl StorageHandle {
                     scheduler_observed,
                     local_worker_observed,
                     schedule_wakes,
+                    snapshot_dir,
+                    inbound_snapshot: Arc::new(Semaphore::new(1)),
                 },
                 handle,
             )),
@@ -507,6 +616,17 @@ impl StorageHandle {
             .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))
     }
 
+    pub async fn snapshot_progress(&self) -> Result<SnapshotProgress> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Req::SnapshotProgress(tx))
+            .await
+            .map_err(|_| Error::new(crate::error::ErrorKind::Unavailable, "storage stopped"))?;
+        rx.await
+            .map_err(|_| Error::new(crate::error::ErrorKind::Unavailable, "storage dropped"))?
+            .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))
+    }
+
     pub async fn projected_append_usage(&self, entries: Vec<(u64, u64)>) -> Result<(u32, u64)> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -562,10 +682,72 @@ pub fn load_domain_readonly(path: impl AsRef<Path>) -> Result<State> {
         )
     })?;
     validate_history_store(&state)?;
+    let store_manifest = verified_store_manifest(&db)?;
+    if let Some(registry) = optional_json::<_, SnapshotRegistry>(&db, "snapshot_registry")? {
+        if registry.generation != store_manifest.active_generation {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "snapshot registry is not in the active generation",
+            ));
+        }
+        let snapshots = path
+            .as_ref()
+            .parent()
+            .map(|parent| parent.join("snapshots"))
+            .unwrap_or_else(|| PathBuf::from("snapshots"));
+        verify_registry(&snapshots, &registry).map_err(|err| {
+            Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string())
+        })?;
+    } else if load_bytes(&db, "snapshot_meta").is_some()
+        || load_bytes(&db, "snapshot_data").is_some()
+    {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "pre-file snapshot store is incompatible; directory left untouched",
+        ));
+    }
     Ok(state)
 }
 
-fn validate_history_store(state: &State) -> Result<()> {
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct CompactOutcome {
+    pub passes: u32,
+    pub complete: bool,
+}
+
+pub fn compact_offline(path: impl AsRef<Path>) -> Result<CompactOutcome> {
+    let mut db = Database::open(path.as_ref()).map_err(|err| {
+        Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            format!("offline compaction requires an existing, unowned member store: {err}"),
+        )
+    })?;
+    verified_store_manifest(&db)?;
+    let state: State = required_json(&db, "domain")?;
+    validate_history_store(&state)?;
+    let mut passes = 0;
+    while passes < 16 {
+        let compacted = db.compact().map_err(|err| {
+            Error::new(
+                crate::error::ErrorKind::Unavailable,
+                format!("redb compaction outcome uncertain; reopen before retry: {err}"),
+            )
+        })?;
+        if !compacted {
+            return Ok(CompactOutcome {
+                passes,
+                complete: true,
+            });
+        }
+        passes += 1;
+    }
+    Ok(CompactOutcome {
+        passes,
+        complete: false,
+    })
+}
+
+pub(crate) fn validate_history_store(state: &State) -> Result<()> {
     for run in state.runs.keys() {
         let incompatible = || {
             Error::new(
@@ -631,28 +813,74 @@ fn storage_thread(
             return;
         }
     }
-    let mut last_purged: Option<LogIdT> = load_json(&db, "last_purged");
-    let mut last_applied: Option<LogIdT> = load_json(&db, "last_applied");
-    let mut last_membership: MembershipT = load_json(&db, "membership")
-        .unwrap_or_else(|| StoredMembership::new(None, Membership::new(vec![], None)));
-    let mut domain: State = load_json(&db, "domain").unwrap_or_default();
+    if let Err(err) = verified_store_manifest(&db) {
+        let _ = ready.send(Err(err.to_string()));
+        return;
+    }
+    let loaded = (|| -> Result<_> {
+        let last_purged = optional_json::<_, Option<LogIdT>>(&db, "last_purged")?.flatten();
+        let last_applied = optional_json::<_, Option<LogIdT>>(&db, "last_applied")?.flatten();
+        let membership = optional_json::<_, MembershipT>(&db, "membership")?
+            .unwrap_or_else(|| StoredMembership::new(None, Membership::new(vec![], None)));
+        let domain: State = required_json(&db, "domain")?;
+        validate_history_store(&domain)?;
+        optional_json::<_, VoteT>(&db, "vote")?;
+        Ok((last_purged, last_applied, membership, domain))
+    })();
+    let (mut last_purged, mut last_applied, mut last_membership, mut domain) = match loaded {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            let _ = ready.send(Err(err.to_string()));
+            return;
+        }
+    };
     let Some(mut schedule_revision): Option<u64> = load_json(&db, "schedule_revision") else {
         let _ = ready.send(Err("schedule index is missing or corrupt".to_owned()));
         return;
     };
-    schedule_watch.send_replace(schedule_revision);
-    let _ = ready.send(Ok(()));
     let snapshot_dir = path
         .parent()
         .map(|parent| parent.join("snapshots"))
         .unwrap_or_else(|| PathBuf::from("snapshots"));
-    let mut snapshot: Option<(SnapMeta, Vec<u8>)> = match (
-        load_json(&db, "snapshot_meta"),
-        load_bytes(&db, "snapshot_data"),
-    ) {
-        (Some(meta), Some(data)) => Some((meta, data)),
-        _ => None,
+    let mut snapshot: Option<SnapshotRegistry> = match load_bytes(&db, "snapshot_registry") {
+        Some(bytes) => {
+            let result = serde_json::from_slice::<SnapshotRegistry>(&bytes)
+                .map_err(|err| sto_err(ErrorVerb::Read, err))
+                .and_then(|registry| {
+                    verify_registry(&snapshot_dir, &registry)?;
+                    Ok(registry)
+                });
+            match result {
+                Ok(registry) => Some(registry),
+                Err(err) => {
+                    let _ = ready.send(Err(format!("active snapshot unavailable: {err}")));
+                    return;
+                }
+            }
+        }
+        None => {
+            if load_bytes(&db, "snapshot_meta").is_some()
+                || load_bytes(&db, "snapshot_data").is_some()
+            {
+                let _ = ready.send(Err(
+                    "pre-file snapshot registry is incompatible; directory left untouched"
+                        .to_owned(),
+                ));
+                return;
+            }
+            None
+        }
     };
+    let mut cleanup_pending = match cleanup_staged_snapshots(&snapshot_dir, snapshot.as_ref(), 16) {
+        Ok(pending) => pending,
+        Err(err) => {
+            let _ = ready.send(Err(format!("snapshot cleanup failed: {err}")));
+            return;
+        }
+    };
+    let mut gc_pending = true;
+    schedule_watch.send_replace(schedule_revision);
+    let _ = ready.send(Ok(()));
     while let Some(req) = rx.blocking_recv() {
         match req {
             Req::Shutdown => break,
@@ -660,18 +888,24 @@ fn storage_thread(
                 let _ = tx.send(put_json(&db, "vote", &vote));
             }
             Req::ReadVote(tx) => {
-                let _ = tx.send(Ok(load_json(&db, "vote")));
+                let _ = tx
+                    .send(optional_json(&db, "vote").map_err(|err| sto_err(ErrorVerb::Read, err)));
             }
             Req::Append(entries, tx) => {
                 let _ = tx.send(admit_and_append(&db, last_applied, &entries));
             }
             Req::Truncate(log_id, tx) => {
-                let _ = tx.send(truncate_logs(&db, log_id.index));
+                let result = truncate_logs(&db, log_id.index);
+                if result.is_ok() {
+                    gc_pending = true;
+                }
+                let _ = tx.send(result);
             }
             Req::Purge(log_id, tx) => {
                 let res = purge_logs(&db, log_id.index, &log_id);
                 if res.is_ok() {
                     last_purged = Some(log_id);
+                    gc_pending = true;
                 }
                 let _ = tx.send(res);
             }
@@ -687,6 +921,9 @@ fn storage_thread(
             Req::UnappliedUsage(tx) => {
                 let _ =
                     tx.send(persisted_credits(&db).map(|credits| (credits.entries, credits.bytes)));
+            }
+            Req::SnapshotProgress(tx) => {
+                let _ = tx.send(read_snapshot_progress(&db));
             }
             Req::PreflightAppend(entries, tx) => {
                 let _ = tx.send(
@@ -713,37 +950,21 @@ fn storage_thread(
                 let _ = tx.send(res);
             }
             Req::BuildSnapshot(tx) => {
-                let res = build_snapshot(last_applied, last_membership.clone(), &domain);
-                let res = match res {
-                    Ok(snap) => {
-                        if let Err(err) =
-                            write_snapshot_file(&snapshot_dir, &snap.meta, snap.snapshot.get_ref())
-                        {
-                            Err(sto_err(ErrorVerb::Write, err))
-                        } else if let Err(err) = after_persist("after-snapshot-file") {
-                            Err(err)
-                        } else {
-                            snapshot = Some((snap.meta.clone(), snap.snapshot.get_ref().clone()));
-                            if let Err(err) = put_json(&db, "snapshot_meta", &snap.meta) {
-                                Err(err)
-                            } else if let Err(err) =
-                                put_bytes(&db, "snapshot_data", snap.snapshot.get_ref())
-                            {
-                                Err(err)
-                            } else if let Err(err) = after_persist("after-snapshot-activate") {
-                                Err(err)
-                            } else {
-                                Ok(snap)
-                            }
-                        }
-                    }
-                    Err(err) => Err(err),
-                };
+                let res = build_snapshot(&db, &snapshot_dir, last_applied, last_membership.clone())
+                    .and_then(|(snap, registry)| {
+                        after_persist("after-snapshot-file")?;
+                        publish_snapshot_registry(&db, &registry)?;
+                        snapshot = Some(registry);
+                        after_persist("after-snapshot-activate")?;
+                        Ok(snap)
+                    });
                 let _ = tx.send(res);
+                cleanup_pending = true;
             }
             Req::InstallSnapshot(meta, data, tx) => {
                 let res = install_snapshot(
                     &db,
+                    &snapshot_dir,
                     &mut last_applied,
                     &mut last_membership,
                     &mut domain,
@@ -755,15 +976,17 @@ fn storage_thread(
                 if res.is_ok() {
                     watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
                     schedule_watch.send_replace(schedule_revision);
+                    gc_pending = true;
                 }
                 let _ = tx.send(res);
+                cleanup_pending = true;
             }
             Req::CurrentSnapshot(tx) => {
-                let out = snapshot.as_ref().map(|(meta, data)| Snapshot {
-                    meta: meta.clone(),
-                    snapshot: Box::new(Cursor::new(data.clone())),
-                });
-                let _ = tx.send(Ok(out));
+                let out = snapshot
+                    .as_ref()
+                    .map(|registry| current_snapshot(&snapshot_dir, registry))
+                    .transpose();
+                let _ = tx.send(out);
             }
             Req::QueryState(tx) => {
                 let _ = tx.send(domain.clone());
@@ -786,11 +1009,7 @@ fn storage_thread(
                 let res = validate_history_store(&next)
                     .map_err(|err| sto_err(ErrorVerb::Write, err))
                     .and_then(|()| {
-                        let mut txn = db
-                            .begin_write()
-                            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-                        txn.set_durability(Durability::Immediate)
-                            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+                        let txn = begin_immediate(&db)?;
                         {
                             let mut meta = txn
                                 .open_table(META)
@@ -822,15 +1041,29 @@ fn storage_thread(
             tracing::error!("storage commit outcome uncertain; member must reopen before writing");
             break;
         }
+        if cleanup_pending {
+            match cleanup_staged_snapshots(&snapshot_dir, snapshot.as_ref(), 16) {
+                Ok(pending) => cleanup_pending = pending,
+                Err(err) => {
+                    tracing::error!(%err, "snapshot cleanup failed; member must reopen");
+                    break;
+                }
+            }
+        }
+        if gc_pending {
+            match gc_invisible_logs(&db) {
+                Ok(more) => gc_pending = more,
+                Err(err) => {
+                    tracing::error!(%err, "invisible log cleanup failed; member must reopen");
+                    break;
+                }
+            }
+        }
     }
 }
 
 fn initialize_publication_store(db: &Database) -> std::result::Result<(), StoErr> {
-    let mut txn = db
-        .begin_write()
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    txn.set_durability(Durability::Immediate)
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let txn = begin_immediate(db)?;
     {
         let mut meta = txn
             .open_table(META)
@@ -842,6 +1075,17 @@ fn initialize_publication_store(db: &Database) -> std::result::Result<(), StoErr
         meta.insert("publication_start_format", format.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         meta.insert("domain", domain.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let generation = serde_json::to_vec(&1u64).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("active_generation", generation.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let visible_log = serde_json::to_vec(&Option::<LogIdT>::None)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("visible_log_end", visible_log.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let store_manifest = serde_json::to_vec(&StoreManifest::new())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("store_manifest", store_manifest.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         meta.insert(
             "schedule_revision",
@@ -856,6 +1100,15 @@ fn initialize_publication_store(db: &Database) -> std::result::Result<(), StoErr
         let credits = serde_json::to_vec(&PendingCredits::default())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         meta.insert("unapplied_credits", credits.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let progress = SnapshotProgress {
+            last_snapshot_ms: crate::time::wall_millis()
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?,
+            ..SnapshotProgress::default()
+        };
+        let progress_bytes =
+            serde_json::to_vec(&progress).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("snapshot_progress", progress_bytes.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     }
     txn.open_table(LOG)
@@ -876,6 +1129,79 @@ where
     serde_json::from_slice(value.value()).ok()
 }
 
+fn optional_json<D, T>(db: &D, key: &str) -> Result<Option<T>>
+where
+    D: ReadableDatabase,
+    T: for<'de> Deserialize<'de>,
+{
+    let txn = db
+        .begin_read()
+        .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))?;
+    let table = txn
+        .open_table(META)
+        .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))?;
+    let value = table
+        .get(key)
+        .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))?;
+    value
+        .map(|value| {
+            serde_json::from_slice(value.value()).map_err(|err| {
+                Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    format!("{key} is corrupt or unsupported: {err}"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn required_json<D, T>(db: &D, key: &str) -> Result<T>
+where
+    D: ReadableDatabase,
+    T: for<'de> Deserialize<'de>,
+{
+    optional_json(db, key)?.ok_or_else(|| {
+        Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            format!("required {key} missing; directory left untouched"),
+        )
+    })
+}
+
+fn verified_store_manifest<D: ReadableDatabase>(db: &D) -> Result<StoreManifest> {
+    let manifest: StoreManifest = required_json(db, "store_manifest")?;
+    manifest.validate()?;
+    let active: u64 = required_json(db, "active_generation")?;
+    if active != manifest.active_generation {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "active generation disagrees with store manifest",
+        ));
+    }
+    let progress: SnapshotProgress = required_json(db, "snapshot_progress")?;
+    let visible_end: Option<LogIdT> = required_json(db, "visible_log_end")?;
+    let applied = optional_json::<_, Option<LogIdT>>(db, "last_applied")?
+        .flatten()
+        .map_or(0, |id| id.index);
+    if progress.last_snapshot_ms == 0
+        || progress.last_snapshot_bytes > progress.applied_bytes
+        || progress.last_snapshot_applied > applied
+    {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "snapshot progress record contradicts applied metadata",
+        ));
+    }
+    let purged = optional_json::<_, Option<LogIdT>>(db, "last_purged")?.flatten();
+    if purged.is_some_and(|purged| visible_end.is_some_and(|end| end.index < purged.index)) {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "visible log boundary precedes durable purge",
+        ));
+    }
+    Ok(manifest)
+}
+
 fn load_bytes<D: ReadableDatabase>(db: &D, key: &str) -> Option<Vec<u8>> {
     let txn = db.begin_read().ok()?;
     let table = txn.open_table(META).ok()?;
@@ -889,11 +1215,7 @@ fn put_json<T: Serialize>(db: &Database, key: &str, value: &T) -> std::result::R
 }
 
 fn put_bytes(db: &Database, key: &str, bytes: &[u8]) -> std::result::Result<(), StoErr> {
-    let mut txn = db
-        .begin_write()
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    txn.set_durability(Durability::Immediate)
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let txn = begin_immediate(db)?;
     {
         let mut table = txn
             .open_table(META)
@@ -1109,6 +1431,26 @@ fn persisted_credits(db: &Database) -> std::result::Result<PendingCredits, StoEr
     serde_json::from_slice(value.value()).map_err(|err| sto_err(ErrorVerb::Read, err))
 }
 
+fn read_snapshot_progress(db: &Database) -> std::result::Result<SnapshotProgress, StoErr> {
+    required_json(db, "snapshot_progress").map_err(|err| sto_err(ErrorVerb::Read, err))
+}
+
+fn visible_log_end(db: &Database) -> std::result::Result<Option<LogIdT>, StoErr> {
+    required_json(db, "visible_log_end").map_err(|err| sto_err(ErrorVerb::Read, err))
+}
+
+fn persisted_applied(db: &Database) -> std::result::Result<Option<LogIdT>, StoErr> {
+    optional_json::<_, Option<LogIdT>>(db, "last_applied")
+        .map(|value| value.flatten())
+        .map_err(|err| sto_err(ErrorVerb::Read, err))
+}
+
+fn persisted_purged(db: &Database) -> std::result::Result<Option<LogIdT>, StoErr> {
+    optional_json::<_, Option<LogIdT>>(db, "last_purged")
+        .map(|value| value.flatten())
+        .map_err(|err| sto_err(ErrorVerb::Read, err))
+}
+
 fn projected_append_usage(
     db: &Database,
     applied: Option<LogIdT>,
@@ -1118,21 +1460,24 @@ fn projected_append_usage(
         .begin_read()
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
     let mut projected = persisted_credits(db)?;
+    let visible = visible_log_end(db)?;
+    let purged = persisted_purged(db)?;
     let log = txn
         .open_table(LOG)
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
-    let applied = applied.map_or(0, |id| id.index);
     let mut overwritten = BTreeMap::new();
     for &(index, length) in entries {
-        if index <= applied {
+        if applied.is_some_and(|id| index <= id.index) || purged.is_some_and(|id| index <= id.index)
+        {
             continue;
         }
         let previous = match overwritten.insert(index, length) {
             Some(previous) => Some(previous),
-            None => log
+            None if visible.is_some_and(|end| index <= end.index) => log
                 .get(&index)
                 .map_err(|err| sto_err(ErrorVerb::Read, err))?
                 .map(|value| value.value().len() as u64),
+            None => None,
         };
         if let Some(previous) = previous {
             projected.bytes = projected
@@ -1180,13 +1525,30 @@ fn remove_pending_credit(
     Ok(())
 }
 
+fn visible_in_txn(txn: &redb::WriteTransaction) -> std::result::Result<Option<LogIdT>, StoErr> {
+    let meta = txn
+        .open_table(META)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let value = meta
+        .get("visible_log_end")
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        .ok_or_else(|| sto_err(ErrorVerb::Read, "visible log boundary missing"))?;
+    serde_json::from_slice(value.value()).map_err(|err| sto_err(ErrorVerb::Read, err))
+}
+
 fn release_applied_credits(
     txn: &redb::WriteTransaction,
     from: Option<LogIdT>,
     through: Option<LogIdT>,
 ) -> std::result::Result<(), StoErr> {
-    let start = from.map_or(0, |id| id.index).saturating_add(1);
-    let end = through.map_or(0, |id| id.index);
+    let Some(through) = through else {
+        return Ok(());
+    };
+    let start = from.map_or(0, |id| id.index.saturating_add(1));
+    let Some(visible) = visible_in_txn(txn)? else {
+        return Ok(());
+    };
+    let end = through.index.min(visible.index);
     if start > end {
         return Ok(());
     }
@@ -1209,31 +1571,34 @@ fn recount_unapplied_credits(
     txn: &redb::WriteTransaction,
     applied: Option<LogIdT>,
 ) -> std::result::Result<(), StoErr> {
-    let start = applied.map_or(0, |id| id.index).saturating_add(1);
+    let start = applied.map_or(0, |id| id.index.saturating_add(1));
+    let visible = visible_in_txn(txn)?;
     let log = txn
         .open_table(LOG)
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
     let mut credits = PendingCredits::default();
-    for record in log
-        .range(start..)
-        .map_err(|err| sto_err(ErrorVerb::Read, err))?
-    {
-        let (_, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
-        credits.entries = credits
-            .entries
-            .checked_add(1)
-            .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied count overflow"))?;
-        credits.bytes = credits
-            .bytes
-            .checked_add(value.value().len() as u64)
-            .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied byte overflow"))?;
-        if credits.entries > crate::limits::UNAPPLIED_ENTRIES
-            || credits.bytes > crate::limits::UNAPPLIED_BYTES
+    if let Some(end) = visible.filter(|end| start <= end.index) {
+        for record in log
+            .range(start..=end.index)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
         {
-            return Err(sto_err(
-                ErrorVerb::Read,
-                "snapshot leaves an over-limit unapplied log",
-            ));
+            let (_, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+            credits.entries = credits
+                .entries
+                .checked_add(1)
+                .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied count overflow"))?;
+            credits.bytes = credits
+                .bytes
+                .checked_add(value.value().len() as u64)
+                .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied byte overflow"))?;
+            if credits.entries > crate::limits::UNAPPLIED_ENTRIES
+                || credits.bytes > crate::limits::UNAPPLIED_BYTES
+            {
+                return Err(sto_err(
+                    ErrorVerb::Read,
+                    "snapshot leaves an over-limit unapplied log",
+                ));
+            }
         }
     }
     drop(log);
@@ -1245,12 +1610,11 @@ fn admit_and_append(
     last_applied: Option<LogIdT>,
     entries: &[EntryT],
 ) -> std::result::Result<(), StoErr> {
-    let applied = last_applied.map_or(0, |id| id.index);
-    let mut txn = db
-        .begin_write()
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    txn.set_durability(Durability::Immediate)
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let previous_visible = visible_log_end(db)?;
+    let purged = persisted_purged(db)?;
+    let mut visible = previous_visible;
+    let mut appended = BTreeMap::new();
+    let txn = begin_immediate(db)?;
     let mut credits = read_credits(&txn)?;
     {
         let mut table = txn
@@ -1259,14 +1623,29 @@ fn admit_and_append(
         for entry in entries {
             let bytes = serde_json::to_vec(entry).map_err(|err| sto_err(ErrorVerb::Write, err))?;
             let index = entry.get_log_id().index;
-            if index > applied {
-                if let Some(previous) = table
-                    .get(&index)
-                    .map_err(|err| sto_err(ErrorVerb::Read, err))?
-                {
+            if let Some(last) = visible.or(purged)
+                && index > last.index.saturating_add(1)
+            {
+                return Err(sto_err(ErrorVerb::Write, "append would expose a log gap"));
+            }
+            if visible.is_none_or(|last| index >= last.index) {
+                visible = Some(*entry.get_log_id());
+            }
+            if last_applied.is_none_or(|id| index > id.index)
+                && purged.is_none_or(|id| index > id.index)
+            {
+                let previous = match appended.insert(index, bytes.len() as u64) {
+                    Some(previous) => Some(previous),
+                    None if previous_visible.is_some_and(|last| index <= last.index) => table
+                        .get(&index)
+                        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+                        .map(|value| value.value().len() as u64),
+                    None => None,
+                };
+                if let Some(previous) = previous {
                     credits.bytes = credits
                         .bytes
-                        .checked_sub(previous.value().len() as u64)
+                        .checked_sub(previous)
                         .ok_or_else(|| sto_err(ErrorVerb::Read, "unapplied ledger mismatch"))?;
                 } else {
                     credits.entries = credits
@@ -1294,6 +1673,11 @@ fn admit_and_append(
         }
     }
     write_credits(&txn, credits)?;
+    let bytes = serde_json::to_vec(&visible).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    txn.open_table(META)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?
+        .insert("visible_log_end", bytes.as_slice())
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     commit_immediate(txn)?;
     after_persist("after-log")?;
     Ok(())
@@ -1304,50 +1688,186 @@ fn append_logs(db: &Database, entries: &[EntryT]) -> std::result::Result<(), Sto
     admit_and_append(db, load_json(db, "last_applied"), entries)
 }
 
-fn write_snapshot_file(dir: &Path, meta: &SnapMeta, data: &[u8]) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let digest = hex::encode(Sha256::digest(data));
-    let take = digest.len().min(16);
-    let name = format!("{}-{}.snap", meta.snapshot_id, &digest[..take]);
-    let tmp = dir.join(format!("{name}.tmp"));
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(tmp, dir.join(name))?;
+fn verify_registry(dir: &Path, registry: &SnapshotRegistry) -> std::result::Result<(), StoErr> {
+    if registry.format != 1
+        || registry.file_name.is_empty()
+        || Path::new(&registry.file_name).components().count() != 1
+        || registry.file_name.contains('/')
+        || registry.file_name.contains('\\')
+        || registry.file_name.contains(':')
+    {
+        return Err(sto_err(ErrorVerb::Read, "unsupported snapshot registry"));
+    }
+    let (manifest, digest) = verify_snapshot(&dir.join(&registry.file_name))
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let applied = serde_json::to_vec(&registry.meta.last_log_id)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let membership = serde_json::to_vec(&registry.meta.last_membership)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    if manifest.generation != registry.source_generation
+        || manifest.applied_json != applied
+        || manifest.membership_json != membership
+        || !manifest
+            .record_formats
+            .iter()
+            .any(|format| format == "graphrun.domain/v1")
+        || manifest.record_formats.iter().any(|format| {
+            !matches!(
+                format.as_str(),
+                "graphrun.domain/v1"
+                    | crate::history::EVENT_FORMAT
+                    | crate::history::CHECKPOINT_FORMAT
+                    | crate::publication::RESULT_FORMAT
+            )
+        })
+        || hex::encode(digest) != registry.sha256
+    {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "snapshot registry or required record version does not match file",
+        ));
+    }
     Ok(())
 }
 
+fn current_snapshot(
+    dir: &Path,
+    registry: &SnapshotRegistry,
+) -> std::result::Result<Snapshot<TypeConfig>, StoErr> {
+    verify_registry(dir, registry)?;
+    let stream = SnapshotStream::open(dir.join(&registry.file_name), false)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    Ok(Snapshot {
+        meta: registry.meta.clone(),
+        snapshot: Box::new(stream),
+    })
+}
+
+fn publish_snapshot_registry(
+    db: &Database,
+    registry: &SnapshotRegistry,
+) -> std::result::Result<(), StoErr> {
+    let mut progress = read_snapshot_progress(db)?;
+    progress.last_snapshot_applied = registry.meta.last_log_id.map_or(0, |id| id.index);
+    progress.last_snapshot_bytes = progress.applied_bytes;
+    progress.last_snapshot_ms =
+        crate::time::wall_millis().map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let txn = begin_immediate(db)?;
+    let mut table = txn
+        .open_table(META)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let registry_bytes =
+        serde_json::to_vec(registry).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    table
+        .insert("snapshot_registry", registry_bytes.as_slice())
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let progress_bytes =
+        serde_json::to_vec(&progress).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    table
+        .insert("snapshot_progress", progress_bytes.as_slice())
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    drop(table);
+    commit_immediate(txn)
+}
+
+fn cleanup_staged_snapshots(
+    dir: &Path,
+    active: Option<&SnapshotRegistry>,
+    limit: usize,
+) -> std::result::Result<bool, StoErr> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(sto_err(ErrorVerb::Read, err)),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if active.is_some_and(|registry| registry.file_name == name) {
+            continue;
+        }
+        let generated = (name.starts_with("snap-") || name.starts_with("received-"))
+            && name.ends_with(".snap")
+            || (name.starts_with("receiving-")
+                || name.starts_with("import-")
+                || name.starts_with("snap-"))
+                && name.ends_with(".tmp");
+        if !generated
+            || !entry
+                .file_type()
+                .map_err(|err| sto_err(ErrorVerb::Read, err))?
+                .is_file()
+        {
+            continue;
+        }
+        if removed == limit {
+            return Ok(true);
+        }
+        std::fs::remove_file(entry.path()).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        after_persist("after-snapshot-cleanup")?;
+        removed += 1;
+    }
+    Ok(false)
+}
+
 fn truncate_logs(db: &Database, from: u64) -> std::result::Result<(), StoErr> {
-    let mut txn = db
-        .begin_write()
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    txn.set_durability(Durability::Immediate)
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    let applied = load_json::<_, Option<LogIdT>>(db, "last_applied")
-        .flatten()
-        .map_or(0, |id| id.index);
+    let Some(old_visible) = visible_log_end(db)? else {
+        return Ok(());
+    };
+    if from > old_visible.index {
+        return Ok(());
+    }
+    let purged = persisted_purged(db)?;
+    if purged.is_some_and(|id| from <= id.index) {
+        return Err(sto_err(ErrorVerb::Write, "truncate crosses durable purge"));
+    }
+    let applied = persisted_applied(db)?;
+    let txn = begin_immediate(db)?;
     let mut credits = read_credits(&txn)?;
-    {
-        let mut table = txn
-            .open_table(LOG)
-            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        let keys: Vec<(u64, usize)> = table
-            .range(from..)
-            .map_err(|err| sto_err(ErrorVerb::Write, err))?
-            .map(|row| {
-                row.map(|(key, value)| (key.value(), value.value().len()))
+    let table = txn
+        .open_table(LOG)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let predecessor = if let Some(index) = from.checked_sub(1) {
+        table
+            .get(&index)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+            .map(|record| {
+                serde_json::from_slice::<EntryT>(record.value())
+                    .map(|entry| *entry.get_log_id())
                     .map_err(|err| sto_err(ErrorVerb::Read, err))
             })
-            .collect::<std::result::Result<_, _>>()?;
-        for (key, bytes) in keys {
-            if key > applied {
-                remove_pending_credit(&mut credits, bytes)?;
-            }
-            table
-                .remove(&key)
-                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            .transpose()?
+            .or(purged.filter(|id| id.index == index))
+    } else {
+        purged
+    };
+    if from != 0 && predecessor.is_none() {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "visible log predecessor missing during truncate",
+        ));
+    }
+    let start = applied.map_or(from, |id| from.max(id.index.saturating_add(1)));
+    if start <= old_visible.index {
+        for record in table
+            .range(start..=old_visible.index)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        {
+            let (_, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+            remove_pending_credit(&mut credits, value.value().len())?;
         }
     }
+    drop(table);
     write_credits(&txn, credits)?;
+    let bytes = serde_json::to_vec(&predecessor).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    txn.open_table(META)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?
+        .insert("visible_log_end", bytes.as_slice())
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     commit_immediate(txn)?;
+    after_persist("after-log-boundary")?;
     Ok(())
 }
 
@@ -1356,34 +1876,42 @@ fn purge_logs(
     through: u64,
     last_purged: &LogIdT,
 ) -> std::result::Result<(), StoErr> {
-    let mut txn = db
-        .begin_write()
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    txn.set_durability(Durability::Immediate)
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    let applied = load_json::<_, Option<LogIdT>>(db, "last_applied")
-        .flatten()
-        .map_or(0, |id| id.index);
+    let old_visible = visible_log_end(db)?;
+    let previous_purged = persisted_purged(db)?;
+    if let Some(old) = previous_purged {
+        if through < old.index {
+            return Ok(());
+        }
+        if through == old.index {
+            if *last_purged != old {
+                return Err(sto_err(ErrorVerb::Read, "purged log identity changed"));
+            }
+            return Ok(());
+        }
+    }
+    let applied = persisted_applied(db)?;
+    let txn = begin_immediate(db)?;
     let mut credits = read_credits(&txn)?;
     {
-        let mut logs = txn
+        let logs = txn
             .open_table(LOG)
-            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        let keys: Vec<(u64, usize)> = logs
-            .range(..=through)
-            .map_err(|err| sto_err(ErrorVerb::Write, err))?
-            .map(|row| {
-                row.map(|(key, value)| (key.value(), value.value().len()))
-                    .map_err(|err| sto_err(ErrorVerb::Read, err))
-            })
-            .collect::<std::result::Result<_, _>>()?;
-        for (key, bytes) in keys {
-            if key > applied {
-                remove_pending_credit(&mut credits, bytes)?;
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        let first = previous_purged.map_or(0, |id| id.index.saturating_add(1));
+        let first = applied.map_or(first, |id| first.max(id.index.saturating_add(1)));
+        if let Some(last) = old_visible
+            .map(|visible| through.min(visible.index))
+            .filter(|last| first <= *last)
+        {
+            for record in logs
+                .range(first..=last)
+                .map_err(|err| sto_err(ErrorVerb::Read, err))?
+            {
+                let (_, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+                remove_pending_credit(&mut credits, value.value().len())?;
             }
-            logs.remove(&key)
-                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         }
+    }
+    {
         let mut meta = txn
             .open_table(META)
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
@@ -1391,9 +1919,16 @@ fn purge_logs(
             serde_json::to_vec(last_purged).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         meta.insert("last_purged", bytes.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let visible = old_visible
+            .filter(|visible| visible.index > through)
+            .or(Some(*last_purged));
+        let bytes = serde_json::to_vec(&visible).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("visible_log_end", bytes.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     }
     write_credits(&txn, credits)?;
     commit_immediate(txn)?;
+    after_persist("after-log-boundary")?;
     Ok(())
 }
 
@@ -1401,27 +1936,32 @@ fn log_state(
     db: &Database,
     last_purged: Option<LogIdT>,
 ) -> std::result::Result<LogState<TypeConfig>, StoErr> {
-    let txn = db
-        .begin_read()
-        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
-    let table = txn
-        .open_table(LOG)
-        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
-    let last_log_id = match table.last().map_err(|err| sto_err(ErrorVerb::Read, err))? {
-        Some((_, value)) => {
-            let entry: EntryT = serde_json::from_slice(value.value())
-                .map_err(|err| sto_err(ErrorVerb::Read, err))?;
-            Some(*entry.get_log_id())
-        }
-        None => last_purged,
-    };
+    let visible = visible_log_end(db)?;
+    if last_purged.is_some_and(|purged| visible.is_some_and(|end| end.index < purged.index)) {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "visible log precedes durable purge",
+        ));
+    }
     Ok(LogState {
         last_purged_log_id: last_purged,
-        last_log_id,
+        last_log_id: visible.or(last_purged),
     })
 }
 
 fn get_logs(db: &Database, start: u64, end: u64) -> std::result::Result<Vec<EntryT>, StoErr> {
+    let Some(visible) = visible_log_end(db)? else {
+        return Ok(Vec::new());
+    };
+    if start >= end {
+        return Ok(Vec::new());
+    }
+    let purged = persisted_purged(db)?;
+    let first = purged.map_or(start, |id| start.max(id.index.saturating_add(1)));
+    let last = visible.index.min(end - 1);
+    if first > last || purged.is_some_and(|id| id.index == u64::MAX) {
+        return Ok(Vec::new());
+    }
     let txn = db
         .begin_read()
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
@@ -1430,7 +1970,7 @@ fn get_logs(db: &Database, start: u64, end: u64) -> std::result::Result<Vec<Entr
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
     let mut out = Vec::new();
     let iter = table
-        .range(start..end)
+        .range(first..=last)
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
     for row in iter {
         let (_, value) = row.map_err(|err| sto_err(ErrorVerb::Read, err))?;
@@ -1439,6 +1979,74 @@ fn get_logs(db: &Database, start: u64, end: u64) -> std::result::Result<Vec<Entr
         out.push(entry);
     }
     Ok(out)
+}
+
+fn select_gc_key(keys: &mut Vec<u64>, bytes: &mut usize, index: u64, size: usize) -> bool {
+    if keys.len() == 4_096 || (!keys.is_empty() && bytes.saturating_add(size) > 4 * 1024 * 1024) {
+        return false;
+    }
+    keys.push(index);
+    *bytes = bytes.saturating_add(size);
+    true
+}
+
+fn gc_invisible_logs(db: &Database) -> std::result::Result<bool, StoErr> {
+    let visible = visible_log_end(db)?;
+    let purged = persisted_purged(db)?;
+    let txn = begin_immediate(db)?;
+    let mut table = txn
+        .open_table(LOG)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let mut keys = Vec::new();
+    let mut bytes = 0usize;
+    let mut more = false;
+    if let Some(purged) = purged {
+        for record in table
+            .range(..=purged.index)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        {
+            let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+            if !select_gc_key(&mut keys, &mut bytes, key.value(), value.value().len()) {
+                more = true;
+                break;
+            }
+        }
+    }
+    if !more {
+        if let Some(visible) = visible {
+            if let Some(first) = visible.index.checked_add(1) {
+                for record in table
+                    .range(first..)
+                    .map_err(|err| sto_err(ErrorVerb::Read, err))?
+                {
+                    let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+                    if !select_gc_key(&mut keys, &mut bytes, key.value(), value.value().len()) {
+                        more = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            for record in table.iter().map_err(|err| sto_err(ErrorVerb::Read, err))? {
+                let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+                if !select_gc_key(&mut keys, &mut bytes, key.value(), value.value().len()) {
+                    more = true;
+                    break;
+                }
+            }
+        }
+    }
+    for key in &keys {
+        table
+            .remove(key)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    }
+    drop(table);
+    if !keys.is_empty() {
+        commit_immediate(txn)?;
+        after_persist("after-log-gc")?;
+    }
+    Ok(more)
 }
 
 fn apply_entries(
@@ -1457,7 +2065,15 @@ fn apply_entries(
     let mut domain_changed = false;
     let mut membership_changed = false;
     let mut affected = BTreeMap::<crate::ids::RunId, Option<bool>>::new();
+    let mut applied_bytes = 0u64;
     for entry in entries {
+        if entry.get_log_id().index > previous_applied.map_or(0, |id| id.index) {
+            let encoded =
+                serde_json::to_vec(&entry).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            applied_bytes = applied_bytes
+                .checked_add(encoded.len() as u64)
+                .ok_or_else(|| sto_err(ErrorVerb::Write, "applied byte counter overflow"))?;
+        }
         next_applied = Some(*entry.get_log_id());
         if let Some(membership) = openraft::entry::RaftPayload::get_membership(&entry.payload) {
             next_membership = StoredMembership::new(Some(*entry.get_log_id()), membership.clone());
@@ -1539,11 +2155,12 @@ fn apply_entries(
         }
         replies.push(reply);
     }
-    let mut txn = db
-        .begin_write()
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    txn.set_durability(Durability::Immediate)
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let mut snapshot_progress = read_snapshot_progress(db)?;
+    snapshot_progress.applied_bytes = snapshot_progress
+        .applied_bytes
+        .checked_add(applied_bytes)
+        .ok_or_else(|| sto_err(ErrorVerb::Write, "applied byte counter overflow"))?;
+    let txn = begin_immediate(db)?;
     {
         let mut meta = txn
             .open_table(META)
@@ -1551,6 +2168,10 @@ fn apply_entries(
         let applied =
             serde_json::to_vec(&next_applied).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         meta.insert("last_applied", applied.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let progress_bytes =
+            serde_json::to_vec(&snapshot_progress).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        meta.insert("snapshot_progress", progress_bytes.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         if membership_changed {
             let membership = serde_json::to_vec(&next_membership)
@@ -1586,44 +2207,201 @@ fn apply_entries(
 }
 
 fn build_snapshot(
+    db: &Database,
+    dir: &Path,
     last_applied: Option<LogIdT>,
     last_membership: MembershipT,
-    domain: &State,
-) -> std::result::Result<Snapshot<TypeConfig>, StoErr> {
-    let payload = serde_json::to_vec(&(last_applied, last_membership.clone(), domain))
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+) -> std::result::Result<(Snapshot<TypeConfig>, SnapshotRegistry), StoErr> {
+    let generation = verified_store_manifest(db)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        .active_generation;
     let meta = SnapshotMeta {
         last_log_id: last_applied,
         last_membership,
-        snapshot_id: format!("snap-{}", last_applied.map(|id| id.index).unwrap_or(0)),
+        snapshot_id: format!(
+            "snap-{}-{}",
+            last_applied.map_or(0, |id| id.index),
+            crate::ids::CommandId::generate().to_hex()
+        ),
     };
-    Ok(Snapshot {
+    let applied =
+        serde_json::to_vec(&meta.last_log_id).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let membership =
+        serde_json::to_vec(&meta.last_membership).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let txn = db
+        .begin_read()
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let table = txn
+        .open_table(META)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let domain = table
+        .get("domain")
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        .ok_or_else(|| sto_err(ErrorVerb::Read, "snapshot domain is missing"))?;
+    let mut prefix = Vec::with_capacity(applied.len() + membership.len() + 3);
+    prefix.push(b'[');
+    prefix.extend_from_slice(&applied);
+    prefix.push(b',');
+    prefix.extend_from_slice(&membership);
+    prefix.push(b',');
+    let manifest = SnapshotManifest {
+        framing_version: 1,
+        generation,
+        applied_json: applied,
+        membership_json: membership,
+        payload_bytes: (prefix.len() as u64)
+            .checked_add(domain.value().len() as u64)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| sto_err(ErrorVerb::Write, "snapshot length overflow"))?,
+        record_formats: vec![
+            "graphrun.domain/v1".to_owned(),
+            crate::history::EVENT_FORMAT.to_owned(),
+            crate::history::CHECKPOINT_FORMAT.to_owned(),
+            crate::publication::RESULT_FORMAT.to_owned(),
+        ],
+    };
+    std::fs::create_dir_all(dir).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let name = format!("{}.snap", meta.snapshot_id);
+    let stage = dir.join(format!("{name}.tmp"));
+    let mut source = io::Cursor::new(prefix)
+        .chain(io::Cursor::new(domain.value()))
+        .chain(io::Cursor::new(b"]".as_slice()));
+    let digest = write_snapshot(&mut source, &stage, &manifest)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let final_path = dir.join(&name);
+    std::fs::rename(&stage, &final_path).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    std::fs::File::open(dir)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let registry = SnapshotRegistry {
+        format: 1,
         meta,
-        snapshot: Box::new(Cursor::new(payload)),
-    })
+        file_name: name,
+        sha256: hex::encode(digest),
+        generation,
+        source_generation: generation,
+    };
+    let snapshot = current_snapshot(dir, &registry)?;
+    Ok((snapshot, registry))
 }
 
 fn install_snapshot(
     db: &Database,
+    dir: &Path,
     last_applied: &mut Option<LogIdT>,
     last_membership: &mut MembershipT,
     domain: &mut State,
-    snapshot: &mut Option<(SnapMeta, Vec<u8>)>,
+    snapshot: &mut Option<SnapshotRegistry>,
     schedule_revision: &mut u64,
     meta: SnapMeta,
-    data: Vec<u8>,
+    received: PathBuf,
 ) -> std::result::Result<(), StoErr> {
-    let (applied, membership, mut restored): (Option<LogIdT>, MembershipT, State) =
-        serde_json::from_slice(&data).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    std::fs::create_dir_all(dir).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let staged = dir.join(format!(
+        "import-{}.snap.tmp",
+        crate::ids::CommandId::generate().to_hex()
+    ));
+    let mut source = std::fs::File::open(&received).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let mut destination = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    io::copy(&mut source, &mut destination).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    destination
+        .sync_all()
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let (manifest, digest) =
+        verify_snapshot(&staged).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let expected_applied =
+        serde_json::to_vec(&meta.last_log_id).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let expected_membership =
+        serde_json::to_vec(&meta.last_membership).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    if manifest.applied_json != expected_applied
+        || manifest.membership_json != expected_membership
+        || !manifest
+            .record_formats
+            .iter()
+            .any(|format| format == "graphrun.domain/v1")
+    {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "snapshot manifest does not match Raft metadata or required readers",
+        ));
+    }
+    let raw = dir.join(format!(
+        "import-{}.json.tmp",
+        crate::ids::CommandId::generate().to_hex()
+    ));
+    let decoded = (|| -> std::result::Result<_, StoErr> {
+        let mut file = std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&raw)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        copy_payload(&staged, &mut file).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        file.sync_all()
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let file = std::fs::File::open(&raw).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        serde_json::from_reader::<_, (Option<LogIdT>, MembershipT, State)>(file)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))
+    })();
+    if let Err(err) = std::fs::remove_file(&raw) {
+        if decoded.is_ok() {
+            return Err(sto_err(ErrorVerb::Write, err));
+        }
+        if err.kind() != io::ErrorKind::NotFound {
+            tracing::warn!(path = %raw.display(), %err, "failed to remove rejected snapshot payload");
+        }
+    }
+    let (applied, membership, mut restored) = decoded?;
+    if applied != meta.last_log_id || membership != meta.last_membership {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "snapshot payload does not match its Raft metadata",
+        ));
+    }
     restored.engine_time_watermark_ms = restored
         .engine_time_watermark_ms
         .max(domain.engine_time_watermark_ms);
     validate_history_store(&restored).map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    let mut txn = db
-        .begin_write()
+    let mut store_manifest =
+        verified_store_manifest(db).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let generation = store_manifest
+        .active_generation
+        .checked_add(1)
+        .ok_or_else(|| sto_err(ErrorVerb::Write, "snapshot generation exhausted"))?;
+    store_manifest.active_generation = generation;
+    let file_name = format!(
+        "received-{}.snap",
+        crate::ids::CommandId::generate().to_hex()
+    );
+    std::fs::rename(&staged, dir.join(&file_name)).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    std::fs::File::open(dir)
+        .and_then(|file| file.sync_all())
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    txn.set_durability(Durability::Immediate)
-        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    after_persist("after-snapshot-file")?;
+    let registry = SnapshotRegistry {
+        format: 1,
+        meta: meta.clone(),
+        file_name,
+        sha256: hex::encode(digest),
+        generation,
+        source_generation: manifest.generation,
+    };
+    verify_registry(dir, &registry)?;
+    let mut progress = read_snapshot_progress(db)?;
+    progress.last_snapshot_applied = applied.map_or(0, |id| id.index);
+    progress.last_snapshot_bytes = progress.applied_bytes;
+    progress.last_snapshot_ms =
+        crate::time::wall_millis().map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let old_visible = visible_log_end(db)?;
+    let visible = match (old_visible, applied) {
+        (Some(old), Some(new)) if new.index > old.index => Some(new),
+        (None, Some(new)) => Some(new),
+        (old, _) => old,
+    };
+    let txn = begin_immediate(db)?;
     {
         let mut table = txn
             .open_table(META)
@@ -1643,12 +2421,30 @@ fn install_snapshot(
         table
             .insert("domain", domain_bytes.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        let meta_bytes = serde_json::to_vec(&meta).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let meta_bytes =
+            serde_json::to_vec(&registry).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         table
-            .insert("snapshot_meta", meta_bytes.as_slice())
+            .insert("snapshot_registry", meta_bytes.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let progress_bytes =
+            serde_json::to_vec(&progress).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         table
-            .insert("snapshot_data", data.as_slice())
+            .insert("snapshot_progress", progress_bytes.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let generation_bytes =
+            serde_json::to_vec(&generation).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        table
+            .insert("active_generation", generation_bytes.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let visible_bytes =
+            serde_json::to_vec(&visible).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        table
+            .insert("visible_log_end", visible_bytes.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let store_bytes =
+            serde_json::to_vec(&store_manifest).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        table
+            .insert("store_manifest", store_bytes.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     }
     let new_revision = replace_schedule(
@@ -1662,8 +2458,9 @@ fn install_snapshot(
     *last_applied = applied;
     *last_membership = membership;
     *domain = restored;
-    *snapshot = Some((meta, data));
+    *snapshot = Some(registry);
     *schedule_revision = new_revision;
+    after_persist("after-snapshot-activate")?;
     after_persist("after-snapshot")?;
     Ok(())
 }
@@ -1810,21 +2607,42 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
 
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> std::result::Result<Box<Cursor<Vec<u8>>>, StoErr> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    ) -> std::result::Result<Box<SnapshotStream>, StoErr> {
+        let permit = self
+            .handle
+            .inbound_snapshot
+            .clone()
+            .try_acquire_owned()
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        std::fs::create_dir_all(&*self.handle.snapshot_dir)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let path = self.handle.snapshot_dir.join(format!(
+            "receiving-{}.snap.tmp",
+            crate::ids::CommandId::generate().to_hex()
+        ));
+        std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let stream =
+            SnapshotStream::open(path, true).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        Ok(Box::new(stream.with_permit(permit)))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapMeta,
-        mut snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: Box<SnapshotStream>,
     ) -> std::result::Result<(), StoErr> {
         snapshot
-            .seek(SeekFrom::Start(0))
+            .sync_all()
+            .await
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        let data = snapshot.get_ref().clone();
+        let path = snapshot.path.clone();
         let meta = meta.clone();
-        self.send(|tx| Req::InstallSnapshot(meta, data, tx)).await
+        self.send(|tx| Req::InstallSnapshot(meta, path, tx)).await
     }
 
     async fn get_current_snapshot(
@@ -1886,6 +2704,7 @@ impl RaftNetwork<TypeConfig> for IsolatedPeer {
 mod tests {
     use super::*;
     use openraft::testing::StoreBuilder;
+    use redb::ReadableTableMetadata;
 
     pub struct RedbStoreBuilder;
 
@@ -2075,6 +2894,22 @@ nodes:
         let new_membership = old_membership.clone();
         let new_domain = State::default();
         let data = serde_json::to_vec(&(new_applied, new_membership.clone(), &new_domain)).unwrap();
+        let snapshot_dir = dir.path().join("snapshots");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        let staged = snapshot_dir.join("receiving.snap.tmp");
+        write_snapshot(
+            &mut data.as_slice(),
+            &staged,
+            &SnapshotManifest {
+                framing_version: 1,
+                generation: 1,
+                applied_json: serde_json::to_vec(&new_applied).unwrap(),
+                membership_json: serde_json::to_vec(&new_membership).unwrap(),
+                payload_bytes: data.len() as u64,
+                record_formats: vec!["graphrun.domain/v1".to_owned()],
+            },
+        )
+        .unwrap();
         let meta = SnapshotMeta {
             last_log_id: new_applied,
             last_membership: new_membership.clone(),
@@ -2088,27 +2923,169 @@ nodes:
         inject_cut("after-snapshot");
         let err = install_snapshot(
             &db,
+            &snapshot_dir,
             &mut last_applied,
             &mut last_membership,
             &mut domain,
             &mut snapshot,
             &mut schedule_revision,
             meta,
-            data,
+            staged,
         )
         .unwrap_err();
         clear_cut();
         assert!(err.to_string().contains("fault cut"));
         let disk_applied: Option<LogIdT> = load_json(&db, "last_applied");
         let disk_domain: State = load_json(&db, "domain").unwrap();
-        let disk_meta: Option<SnapMeta> = load_json(&db, "snapshot_meta");
-        let disk_data: Option<Vec<u8>> = load_bytes(&db, "snapshot_data");
+        let registry: SnapshotRegistry = load_json(&db, "snapshot_registry").unwrap();
+        let active_generation: u64 = load_json(&db, "active_generation").unwrap();
         assert_eq!(disk_applied, new_applied);
         assert_eq!(last_applied, new_applied);
         assert_eq!(disk_applied, last_applied);
-        assert!(disk_meta.is_some());
-        assert!(disk_data.is_some());
+        assert_eq!(active_generation, 2);
+        assert_eq!(registry.generation, 2);
+        assert!(!registry.file_name.contains("receiving"));
+        verify_registry(&snapshot_dir, &registry).unwrap();
+        assert!(snapshot_dir.join("receiving.snap.tmp").exists());
+        assert!(load_bytes(&db, "snapshot_data").is_none());
         let _ = (old_domain, disk_domain);
+    }
+
+    #[test]
+    fn corrupted_active_snapshot_rejects_reopen_without_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let snapshots = dir.path().join("snapshots");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let membership = StoredMembership::new(None, Membership::new(vec![], None));
+        let (_, registry) = build_snapshot(&db, &snapshots, None, membership).unwrap();
+        put_json(&db, "snapshot_registry", &registry).unwrap();
+        let snapshot_path = snapshots.join(&registry.file_name);
+        let mut bytes = std::fs::read(&snapshot_path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&snapshot_path, &bytes).unwrap();
+        drop(db);
+        let original_store = std::fs::read(&path).unwrap();
+        let err = StorageHandle::open(&path).err().unwrap();
+        assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+        assert!(err.message.contains("snapshot"));
+        assert_eq!(std::fs::read(&path).unwrap(), original_store);
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn unsupported_store_reader_rejects_without_reinitialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let mut manifest = StoreManifest::new();
+        manifest.reader_floor = 3;
+        put_json(&db, "store_manifest", &manifest).unwrap();
+        drop(db);
+        let original = std::fs::read(&path).unwrap();
+        let err = StorageHandle::open(&path).err().unwrap();
+        assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+        assert!(err.message.contains("version"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn snapshot_cleanup_is_bounded_and_preserves_active_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = [
+            "snap-old.snap",
+            "receiving-abcd.snap.tmp",
+            "import-abcd.json.tmp",
+            "snap-active.snap",
+            "backup-owned-by-user",
+        ];
+        for name in names {
+            std::fs::write(dir.path().join(name), b"file").unwrap();
+        }
+        let registry = SnapshotRegistry {
+            format: 1,
+            meta: SnapshotMeta {
+                last_log_id: None,
+                last_membership: StoredMembership::new(None, Membership::new(vec![], None)),
+                snapshot_id: "active".to_owned(),
+            },
+            file_name: "snap-active.snap".to_owned(),
+            sha256: String::new(),
+            generation: 1,
+            source_generation: 1,
+        };
+        let mut removed = 0;
+        while cleanup_staged_snapshots(dir.path(), Some(&registry), 1).unwrap() {
+            removed += 1;
+            assert!(removed <= 3);
+        }
+        assert_eq!(removed, 2);
+        assert!(dir.path().join("snap-active.snap").exists());
+        assert!(dir.path().join("backup-owned-by-user").exists());
+        for name in &names[..3] {
+            assert!(!dir.path().join(name).exists());
+        }
+    }
+
+    #[test]
+    fn offline_compaction_rejects_an_open_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        assert_eq!(
+            compact_offline(&path).unwrap_err().kind,
+            crate::error::ErrorKind::FailedPrecondition
+        );
+        drop(db);
+        let outcome = compact_offline(&path).unwrap();
+        assert!(outcome.complete, "rerun any partial offline compaction");
+        let (handle, thread) = StorageHandle::open(&path).unwrap();
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn snapshot_byte_progress_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let entries: Vec<EntryT> = (1..=2)
+            .map(|index| Entry {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+        append_logs(&db, &entries).unwrap();
+        let mut applied = None;
+        let mut membership = StoredMembership::new(None, Membership::new(vec![], None));
+        let mut domain = State::default();
+        let mut revision = 0;
+        apply_entries(
+            &db,
+            &mut applied,
+            &mut membership,
+            &mut domain,
+            &mut revision,
+            entries,
+        )
+        .unwrap();
+        let before = read_snapshot_progress(&db).unwrap();
+        assert!(before.applied_bytes > 0);
+        assert_eq!(before.last_snapshot_bytes, 0);
+        let (_, registry) =
+            build_snapshot(&db, &dir.path().join("snapshots"), applied, membership).unwrap();
+        publish_snapshot_registry(&db, &registry).unwrap();
+        drop(db);
+        let db = ReadOnlyDatabase::open(&path).unwrap();
+        let after: SnapshotProgress = required_json(&db, "snapshot_progress").unwrap();
+        assert_eq!(after.applied_bytes, before.applied_bytes);
+        assert_eq!(after.last_snapshot_bytes, after.applied_bytes);
+        assert_eq!(after.last_snapshot_applied, 2);
+        assert!(after.last_snapshot_ms >= before.last_snapshot_ms);
     }
 
     #[test]
@@ -2156,6 +3133,111 @@ nodes:
         assert_eq!(loaded_again.history, domain.history);
         let resurrected = get_logs(&db, 1, 3).unwrap();
         assert!(resurrected.is_empty());
+    }
+
+    #[test]
+    fn truncated_suffix_stays_invisible_before_and_after_bounded_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let entry = |index, term| Entry::<TypeConfig> {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(term, 1), index),
+            payload: EntryPayload::Blank,
+        };
+        append_logs(
+            &db,
+            &(1..=4).map(|index| entry(index, 1)).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        inject_cut("after-log-boundary");
+        assert!(truncate_logs(&db, 2).is_err());
+        clear_cut();
+        assert_eq!(log_state(&db, None).unwrap().last_log_id.unwrap().index, 1);
+        assert!(get_logs(&db, 2, u64::MAX).unwrap().is_empty());
+        let txn = db.begin_read().unwrap();
+        assert!(txn.open_table(LOG).unwrap().get(&3).unwrap().is_some());
+        drop(txn);
+        append_logs(&db, &[entry(2, 2)]).unwrap();
+        let visible = get_logs(&db, 1, u64::MAX).unwrap();
+        assert_eq!(
+            visible
+                .iter()
+                .map(|item| item.get_log_id().index)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(visible[1].get_log_id(), entry(2, 2).get_log_id());
+        assert!(!gc_invisible_logs(&db).unwrap());
+        let txn = db.begin_read().unwrap();
+        assert!(txn.open_table(LOG).unwrap().get(&3).unwrap().is_none());
+        drop(txn);
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        assert_eq!(
+            get_logs(&db, 1, u64::MAX)
+                .unwrap()
+                .iter()
+                .map(|item| item.get_log_id().index)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn physical_log_gc_limits_each_transaction_to_4096_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("member.redb")).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let entry = |index| Entry::<TypeConfig> {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Blank,
+        };
+        let first: Vec<EntryT> = (1..=4_096).map(entry).collect();
+        append_logs(&db, &first).unwrap();
+        let mut applied = None;
+        let mut membership = StoredMembership::new(None, Membership::new(vec![], None));
+        let mut state = State::default();
+        let mut revision = 0;
+        apply_entries(
+            &db,
+            &mut applied,
+            &mut membership,
+            &mut state,
+            &mut revision,
+            first,
+        )
+        .unwrap();
+        let tail: Vec<EntryT> = (4_097..=4_100).map(entry).collect();
+        append_logs(&db, &tail).unwrap();
+        apply_entries(
+            &db,
+            &mut applied,
+            &mut membership,
+            &mut state,
+            &mut revision,
+            tail,
+        )
+        .unwrap();
+        let purged = *entry(4_100).get_log_id();
+        purge_logs(&db, 4_100, &purged).unwrap();
+        assert!(get_logs(&db, 1, u64::MAX).unwrap().is_empty());
+        assert!(gc_invisible_logs(&db).unwrap());
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(LOG).unwrap();
+        assert_eq!(table.len().unwrap(), 4);
+        drop(table);
+        drop(txn);
+        assert!(!gc_invisible_logs(&db).unwrap());
+        assert_eq!(
+            db.begin_read()
+                .unwrap()
+                .open_table(LOG)
+                .unwrap()
+                .len()
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

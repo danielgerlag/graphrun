@@ -8,7 +8,11 @@ use crate::ids::{CommandId, EventId, RunId};
 use crate::ir::Definition;
 use crate::limits;
 use crate::rpc::serve_grpc;
-use crate::storage::{LocalNetwork, ScheduleWake, StorageHandle, TypeConfig, load_domain_readonly};
+use crate::snapshot_framing::{SnapshotManifest, copy_payload, verify_snapshot, write_snapshot};
+use crate::storage::{
+    LocalNetwork, ScheduleWake, StorageHandle, TypeConfig, load_domain_readonly,
+    validate_history_store,
+};
 use crate::value::Value;
 use crate::write::{
     health_view, inspect_view, linearizable_read, now, write_raft, write_raft_response,
@@ -118,6 +122,37 @@ pub struct Engine {
     cluster_net: Option<ClusterNetwork>,
     handlers: Handlers,
     publication_auth: crate::publication::AuthContext,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LogicalBackupManifest {
+    format: String,
+    kind: String,
+    snapshot: String,
+    sha256: String,
+}
+
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.0)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.0.display(), %error, "temporary backup file cleanup failed");
+        }
+    }
+}
+
+fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// Build a local engine and register activity handlers before it opens.
@@ -1042,22 +1077,79 @@ impl Engine {
     }
 
     pub fn backup(data_dir: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<()> {
+        let state = load_domain_readonly(data_dir.as_ref().join("member.redb"))?;
         let out = out.as_ref();
         std::fs::create_dir_all(out).map_err(|err| Error::invalid(err.to_string()))?;
-        let state = load_domain_readonly(data_dir.as_ref().join("member.redb"))?;
-        let body =
-            serde_json::to_vec_pretty(&state).map_err(|err| Error::invalid(err.to_string()))?;
-        std::fs::write(out.join("domain.json"), body)
+        let id = CommandId::generate().to_hex();
+        let raw_path = out.join(format!("domain-{id}.json.tmp"));
+        let mut raw = private_file(&raw_path).map_err(|err| Error::invalid(err.to_string()))?;
+        let _raw_cleanup = RemoveOnDrop(raw_path.clone());
+        serde_json::to_writer(&mut raw, &state).map_err(|err| Error::invalid(err.to_string()))?;
+        raw.sync_all()
             .map_err(|err| Error::invalid(err.to_string()))?;
-        let manifest = serde_json::json!({
-            "format": "graphrun.backup/v1",
-            "kind": "logical-domain",
-        });
-        std::fs::write(
-            out.join("manifest.json"),
-            serde_json::to_vec_pretty(&manifest).unwrap(),
+        let body_len = raw
+            .metadata()
+            .map_err(|err| Error::invalid(err.to_string()))?
+            .len();
+        drop(raw);
+        let snapshot_manifest = SnapshotManifest {
+            framing_version: 1,
+            generation: 0,
+            applied_json: b"null".to_vec(),
+            membership_json: b"null".to_vec(),
+            payload_bytes: body_len,
+            record_formats: vec![
+                "graphrun.domain/v1".to_owned(),
+                crate::history::EVENT_FORMAT.to_owned(),
+                crate::history::CHECKPOINT_FORMAT.to_owned(),
+                crate::publication::RESULT_FORMAT.to_owned(),
+            ],
+        };
+        let stage_path = out.join(format!("application-{id}.snap.tmp"));
+        let digest = write_snapshot(
+            &mut std::fs::File::open(&raw_path).map_err(|err| Error::invalid(err.to_string()))?,
+            &stage_path,
+            &snapshot_manifest,
         )
         .map_err(|err| Error::invalid(err.to_string()))?;
+        let _stage_cleanup = RemoveOnDrop(stage_path.clone());
+        let snapshot_name = format!("application-{}.snap", hex::encode(digest));
+        let snapshot_path = out.join(&snapshot_name);
+        if snapshot_path.exists() {
+            let (_, previous) =
+                verify_snapshot(&snapshot_path).map_err(|err| Error::invalid(err.to_string()))?;
+            if previous != digest {
+                return Err(Error::new(
+                    ErrorKind::AlreadyExists,
+                    "backup artifact identity collides with different bytes",
+                ));
+            }
+        } else {
+            std::fs::rename(&stage_path, &snapshot_path)
+                .map_err(|err| Error::invalid(err.to_string()))?;
+        }
+        std::fs::File::open(out)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        let manifest = LogicalBackupManifest {
+            format: "graphrun.backup/v2".to_owned(),
+            kind: "logical-application".to_owned(),
+            snapshot: snapshot_name,
+            sha256: hex::encode(digest),
+        };
+        let manifest_stage = out.join(format!("manifest-{id}.json.tmp"));
+        let mut file =
+            private_file(&manifest_stage).map_err(|err| Error::invalid(err.to_string()))?;
+        let _manifest_cleanup = RemoveOnDrop(manifest_stage.clone());
+        serde_json::to_writer_pretty(&mut file, &manifest)
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        file.sync_all()
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        std::fs::rename(&manifest_stage, out.join("manifest.json"))
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        std::fs::File::open(out)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|err| Error::invalid(err.to_string()))?;
         Ok(())
     }
 
@@ -1067,10 +1159,75 @@ impl Engine {
         }
         let from = from.as_ref();
         let dest = dest.as_ref();
-        let bytes = std::fs::read(from.join("domain.json"))
+        let manifest: LogicalBackupManifest = serde_json::from_slice(
+            &std::fs::read(from.join("manifest.json"))
+                .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?,
+        )
+        .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        if manifest.format != "graphrun.backup/v2"
+            || manifest.kind != "logical-application"
+            || !manifest.snapshot.starts_with("application-")
+            || !manifest.snapshot.ends_with(".snap")
+            || Path::new(&manifest.snapshot).components().count() != 1
+            || manifest.snapshot.contains('/')
+            || manifest.snapshot.contains('\\')
+            || manifest.snapshot.contains(':')
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "unsupported backup manifest; source left untouched",
+            ));
+        }
+        let snapshot = from.join(&manifest.snapshot);
+        let (framing, digest) = verify_snapshot(&snapshot)
+            .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        let required = [
+            "graphrun.domain/v1",
+            crate::history::EVENT_FORMAT,
+            crate::history::CHECKPOINT_FORMAT,
+            crate::publication::RESULT_FORMAT,
+        ];
+        if manifest.sha256 != hex::encode(digest)
+            || framing.generation != 0
+            || framing.applied_json != b"null"
+            || framing.membership_json != b"null"
+            || framing.record_formats.len() != required.len()
+            || required
+                .iter()
+                .any(|format| !framing.record_formats.iter().any(|stored| stored == format))
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "backup digest, authority, or retained reader versions are unavailable",
+            ));
+        }
+        let raw_path = std::env::temp_dir().join(format!(
+            "graphrun-restore-{}.json.tmp",
+            CommandId::generate().to_hex()
+        ));
+        let mut raw = private_file(&raw_path).map_err(|err| Error::invalid(err.to_string()))?;
+        let _raw_cleanup = RemoveOnDrop(raw_path.clone());
+        copy_payload(&snapshot, &mut raw)
+            .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        raw.sync_all()
             .map_err(|err| Error::invalid(err.to_string()))?;
-        let mut domain: State =
-            serde_json::from_slice(&bytes).map_err(|err| Error::invalid(err.to_string()))?;
+        drop(raw);
+        let mut domain: State = serde_json::from_reader(
+            std::fs::File::open(&raw_path).map_err(|err| Error::invalid(err.to_string()))?,
+        )
+        .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        validate_history_store(&domain)?;
+        if dest.exists()
+            && std::fs::read_dir(dest)
+                .map_err(|err| Error::invalid(err.to_string()))?
+                .next()
+                .is_some()
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "restore destination is not empty; directory left untouched",
+            ));
+        }
         domain.recovery = Some(crate::domain::RecoveryHold {
             reason: reason.to_owned(),
             authorized: false,
@@ -1096,16 +1253,23 @@ impl Engine {
             "cluster_id": crate::ids::ClusterId::generate().to_hex(),
             "restored": true,
         });
-        std::fs::write(
-            dest.join("identity.json"),
-            serde_json::to_vec_pretty(&identity).unwrap(),
-        )
-        .map_err(|err| Error::invalid(err.to_string()))?;
-        std::fs::write(
-            dest.join("restored-domain.json"),
-            serde_json::to_vec(&domain).unwrap(),
-        )
-        .map_err(|err| Error::invalid(err.to_string()))?;
+        let mut identity_file = private_file(&dest.join("identity.json"))
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        serde_json::to_writer_pretty(&mut identity_file, &identity)
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        identity_file
+            .sync_all()
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        let mut domain_file = private_file(&dest.join("restored-domain.json"))
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        serde_json::to_writer(&mut domain_file, &domain)
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        domain_file
+            .sync_all()
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        std::fs::File::open(dest)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|err| Error::invalid(err.to_string()))?;
         Ok(())
     }
 
@@ -1957,29 +2121,53 @@ async fn wait_via_raft(
 }
 
 pub const SNAPSHOT_ENTRY_THRESHOLD: u64 = 20_000;
+pub const SNAPSHOT_BYTE_THRESHOLD: u64 = 512 * 1024 * 1024;
 pub const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
-pub fn should_snapshot(applied: u64, last_snapshot: u64, since_snapshot: Duration) -> bool {
+pub fn should_snapshot(
+    applied: u64,
+    last_snapshot: u64,
+    applied_bytes_since_snapshot: u64,
+    since_snapshot: Duration,
+) -> bool {
     applied.saturating_sub(last_snapshot) >= SNAPSHOT_ENTRY_THRESHOLD
+        || applied_bytes_since_snapshot >= SNAPSHOT_BYTE_THRESHOLD
         || (since_snapshot >= SNAPSHOT_INTERVAL && applied > last_snapshot)
 }
 
-async fn snapshot_controller(raft: Raft<TypeConfig>, _storage: StorageHandle) {
-    let mut last_snapshot = 0u64;
-    let mut since_snapshot = tokio::time::Instant::now();
+async fn snapshot_controller(raft: Raft<TypeConfig>, storage: StorageHandle) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let applied = raft
-            .metrics()
-            .borrow()
-            .last_applied
-            .map(|id| id.index)
-            .unwrap_or(0);
-        if should_snapshot(applied, last_snapshot, since_snapshot.elapsed()) {
-            if raft.trigger().snapshot().await.is_ok() {
-                last_snapshot = applied;
-                since_snapshot = tokio::time::Instant::now();
+        let progress = match storage.snapshot_progress().await {
+            Ok(progress) => progress,
+            Err(error) => {
+                tracing::error!(%error, "snapshot controller cannot read durable progress");
+                return;
             }
+        };
+        let metrics = raft.metrics().borrow().clone();
+        if metrics.state != ServerState::Leader {
+            continue;
+        }
+        let applied = metrics.last_applied.map_or(0, |id| id.index);
+        let now_ms = match crate::time::wall_millis() {
+            Ok(now_ms) => now_ms,
+            Err(error) => {
+                tracing::error!(%error, "snapshot controller wall clock unavailable");
+                return;
+            }
+        };
+        let since = Duration::from_millis(now_ms.saturating_sub(progress.last_snapshot_ms));
+        if should_snapshot(
+            applied,
+            progress.last_snapshot_applied,
+            progress
+                .applied_bytes
+                .saturating_sub(progress.last_snapshot_bytes),
+            since,
+        ) && let Err(error) = raft.trigger().snapshot().await
+        {
+            tracing::warn!(%error, "snapshot threshold reached but build failed");
         }
     }
 }
@@ -3007,14 +3195,27 @@ nodes:
 
     #[test]
     fn snapshot_controller_threshold() {
-        assert!(!should_snapshot(10, 0, Duration::from_secs(1)));
+        assert!(!should_snapshot(10, 0, 0, Duration::from_secs(1)));
         assert!(should_snapshot(
             SNAPSHOT_ENTRY_THRESHOLD,
             0,
+            0,
             Duration::from_secs(1)
         ));
-        assert!(should_snapshot(5, 0, SNAPSHOT_INTERVAL));
-        assert!(!should_snapshot(0, 0, SNAPSHOT_INTERVAL));
+        assert!(should_snapshot(
+            5,
+            0,
+            SNAPSHOT_BYTE_THRESHOLD,
+            Duration::from_secs(1)
+        ));
+        assert!(!should_snapshot(
+            5,
+            0,
+            SNAPSHOT_BYTE_THRESHOLD - 1,
+            Duration::from_secs(1)
+        ));
+        assert!(should_snapshot(5, 0, 0, SNAPSHOT_INTERVAL));
+        assert!(!should_snapshot(0, 0, 0, SNAPSHOT_INTERVAL));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3610,5 +3811,37 @@ nodes:
         assert_eq!(err.kind, ErrorKind::FailedPrecondition);
         assert!(!db_path.exists());
         assert_eq!(std::fs::read(identity_path).unwrap(), identity);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_rejects_corrupt_and_legacy_backups_without_writing_destination() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let engine = Engine::local(source.path()).await.unwrap();
+        engine.shutdown().await.unwrap();
+        Engine::backup(source.path(), backup.path()).unwrap();
+        let manifest: LogicalBackupManifest =
+            serde_json::from_slice(&std::fs::read(backup.path().join("manifest.json")).unwrap())
+                .unwrap();
+        let snapshot_path = backup.path().join(&manifest.snapshot);
+        let mut corrupt = std::fs::read(&snapshot_path).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(&snapshot_path, &corrupt).unwrap();
+        let error = Engine::restore(backup.path(), destination.path(), "recovery")
+            .expect_err("corrupt snapshot must be rejected");
+        assert_eq!(error.kind, ErrorKind::FailedPrecondition);
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), corrupt);
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+
+        std::fs::write(
+            backup.path().join("manifest.json"),
+            br#"{"format":"graphrun.backup/v1","kind":"logical-domain"}"#,
+        )
+        .unwrap();
+        let error = Engine::restore(backup.path(), destination.path(), "recovery")
+            .expect_err("old backup format must be rejected");
+        assert_eq!(error.kind, ErrorKind::FailedPrecondition);
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
     }
 }

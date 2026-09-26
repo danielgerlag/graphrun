@@ -36,7 +36,6 @@ pub mod publication;
 pub mod rpc;
 mod schedule;
 pub mod schema;
-#[cfg(test)]
 mod snapshot_framing;
 
 #[doc(hidden)]

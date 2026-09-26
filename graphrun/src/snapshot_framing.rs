@@ -15,6 +15,7 @@ pub struct SnapshotStream {
     pub path: PathBuf,
     file: tokio::fs::File,
     temporary: bool,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl SnapshotStream {
@@ -24,7 +25,17 @@ impl SnapshotStream {
             path,
             file: tokio::fs::File::from_std(file),
             temporary,
+            _permit: None,
         })
+    }
+
+    pub fn with_permit(mut self, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        self._permit = Some(permit);
+        self
+    }
+
+    pub async fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all().await
     }
 }
 
@@ -137,7 +148,14 @@ pub(crate) fn write_snapshot(
         return Err(invalid("snapshot manifest exceeds framing limit"));
     }
     let length = (metadata.len() as u32).to_le_bytes();
-    let mut file = File::options().write(true).create_new(true).open(dest)?;
+    let mut options = File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(dest)?;
     let mut digest = Sha256::new();
     file.write_all(MAGIC)?;
     file.write_all(&length)?;
