@@ -24,8 +24,8 @@ Crate: https://crates.io/crates/graphrun
 - Samples: https://github.com/danielgerlag/graphrun/tree/main/samples
 - How-tos: https://github.com/danielgerlag/graphrun/tree/main/docs/quickstarts
 
-## This release
+## Handlers
 
-You cannot plug in your own activity handlers. Fixture names (`counter.increment`, `inventory.reserve`, …) run in `Engine::local`. Unknown names echo input.
+`Engine::builder(dir).activity("name", handler)?.open()`. Unregistered names fail (`activity.unregistered`). `Engine::local` enables sample fixtures only.
 
 Do not use docs/specs/v1 as a getting-started guide.

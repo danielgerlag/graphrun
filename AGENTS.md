@@ -10,12 +10,13 @@ graphrun = "0.1"
 
 Open `Engine::local(dir)` in the host Tokio process. Graphs are YAML or `workflow::<T>("id")`. Both compile to one IR. Persistence is Raft + redb in `dir`.
 
-## Hard limits of this release
+## Handlers
 
-- You cannot register custom activity handlers.
-- Catalog names such as `counter.increment` and `inventory.reserve` run built-in fixtures.
-- Unknown activity names echo their input and succeed.
-- Do not treat a custom catalog name as user code that ran.
+Register application code with `Engine::builder(dir).activity("name", |input: T| async move { ... })?.open().await`.
+
+- Unregistered catalog activities fail at `start` with `activity.unregistered`. They do not echo input.
+- `Engine::local(dir)` is a convenience that enables built-in **fixture** handlers (`counter.increment`, `inventory.reserve`, …) for samples and tests.
+- Production code should use `Engine::builder` and register the handlers it needs.
 
 ## Where to read
 
@@ -36,7 +37,7 @@ cargo run -p graphrun-samples --bin 01-hello-world
 
 ## Public entry points
 
-- `Engine::local`, `start`, `start_yaml`, `wait_terminal`, `signal`, `cancel`, `inspect`, `shutdown`
+- `Engine::builder`, `Engine::local`, `start`, `start_yaml`, `wait_terminal`, `signal`, `cancel`, `inspect`, `shutdown`
 - `Catalog::from_json`, `activity_v1`
 - `workflow`, `region`, `payload!`
 - Optional binary crate `graphrun-cli` for inspect/signal/backup against `--local-dir`

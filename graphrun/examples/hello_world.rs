@@ -1,6 +1,13 @@
-use graphrun::{Catalog, Engine, Value};
+use graphrun::{Catalog, Engine, Value, payload};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Counter {
+    value: i64,
+}
+payload!(Counter, "counter");
 
 const CATALOG: &[u8] = br#"{
   "format": "graphrun.catalog/v1",
@@ -54,7 +61,14 @@ async fn main() -> graphrun::Result<()> {
     let dir = std::env::temp_dir().join("graphrun-example-hello");
     let _ = std::fs::remove_dir_all(&dir);
     let catalog = Catalog::from_json(CATALOG)?;
-    let engine = Engine::local(&dir).await?;
+    let engine = Engine::builder(&dir)
+        .activity("counter.increment", |input: Counter| async move {
+            Ok(Counter {
+                value: input.value + 1,
+            })
+        })?
+        .open()
+        .await?;
     let input = Value::Object(BTreeMap::from([("value".into(), Value::Int(0))]));
     let run = engine.start_yaml(YAML, &catalog, input).await?;
     let output = engine.wait_terminal(run, Duration::from_secs(10)).await?;

@@ -5,6 +5,7 @@ use crate::domain::{
     Command, CommandBody, RunStatus, State, active_runs, reconstruct, run_events, run_output,
 };
 use crate::error::{Error, ErrorKind, Result};
+use crate::handlers::Handlers;
 use crate::ids::{CommandId, EventId, RunId};
 use crate::ir::Definition;
 use crate::limits;
@@ -114,6 +115,13 @@ pub struct Engine {
     raft_server: Option<tokio::task::JoinHandle<()>>,
     snapshot_task: Option<tokio::task::JoinHandle<()>>,
     cluster_net: Option<ClusterNetwork>,
+    handlers: Handlers,
+}
+
+/// Build a local engine and register activity handlers before it opens.
+pub struct LocalBuilder {
+    data_dir: PathBuf,
+    handlers: Handlers,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -181,11 +189,20 @@ pub struct ControlResponse {
 }
 
 impl Engine {
-    /// Open a one-member engine on `data_dir`.
+    /// Build a local engine. Register handlers with [`LocalBuilder::activity`]
+    /// before [`LocalBuilder::open`]. Call [`LocalBuilder::fixtures`] to enable
+    /// the sample catalog names (`counter.increment`, `inventory.reserve`, …).
+    pub fn builder(data_dir: impl AsRef<Path>) -> LocalBuilder {
+        LocalBuilder {
+            data_dir: data_dir.as_ref().to_path_buf(),
+            handlers: Handlers::empty(),
+        }
+    }
+
+    /// Open a local engine with built-in fixture handlers.
     ///
-    /// Creates the directory if needed. Restarting on the same path continues
-    /// from durable state. Local mode runs built-in fixture handlers for
-    /// catalog activity names; unknown names echo their input.
+    /// For application handlers, use [`Engine::builder`] instead. Unregistered
+    /// activity names fail; they do not echo input.
     ///
     /// ```
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -195,7 +212,43 @@ impl Engine {
     /// # });
     /// ```
     pub async fn local(data_dir: impl AsRef<Path>) -> Result<Self> {
-        let data_dir = data_dir.as_ref().to_path_buf();
+        Self::builder(data_dir).fixtures().open().await
+    }
+}
+
+impl LocalBuilder {
+    /// Enable built-in fixture handlers used by samples and tests.
+    pub fn fixtures(self) -> Self {
+        self.handlers.enable_fixtures();
+        self
+    }
+
+    /// Register an async activity handler at version 1.
+    pub fn activity<I, O, F, Fut>(self, name: &str, handler: F) -> Result<Self>
+    where
+        I: crate::schema::DurablePayload,
+        O: crate::schema::DurablePayload,
+        F: Fn(I) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<O>> + Send + 'static,
+    {
+        self.handlers.activity(name, handler)?;
+        Ok(self)
+    }
+
+    /// Register a blocking activity handler at version 1.
+    pub fn blocking<I, O, F>(self, name: &str, handler: F) -> Result<Self>
+    where
+        I: crate::schema::DurablePayload,
+        O: crate::schema::DurablePayload,
+        F: Fn(I) -> Result<O> + Send + Sync + 'static,
+    {
+        self.handlers.blocking(name, handler)?;
+        Ok(self)
+    }
+
+    pub async fn open(self) -> Result<Engine> {
+        let data_dir = self.data_dir;
+        let handlers = self.handlers;
         std::fs::create_dir_all(&data_dir).map_err(|err| Error::invalid(err.to_string()))?;
         write_identity(&data_dir)?;
         let db_path = data_dir.join("member.redb");
@@ -247,7 +300,12 @@ impl Engine {
             storage.clone(),
             notify.clone(),
         )));
-        let worker = tokio::spawn(worker_loop(raft.clone(), storage.clone(), notify.clone()));
+        let worker = tokio::spawn(worker_loop(
+            raft.clone(),
+            storage.clone(),
+            notify.clone(),
+            handlers.clone(),
+        ));
         let sock = data_dir.join("control.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).map_err(|err| Error::invalid(err.to_string()))?;
@@ -262,7 +320,7 @@ impl Engine {
             raft.clone(),
             storage.clone(),
         )));
-        Ok(Self {
+        Ok(Engine {
             raft,
             storage,
             storage_thread: Mutex::new(Some(storage_thread)),
@@ -274,9 +332,12 @@ impl Engine {
             raft_server: None,
             snapshot_task,
             cluster_net: None,
+            handlers,
         })
     }
+}
 
+impl Engine {
     pub async fn member(config: MemberConfig) -> Result<Self> {
         crate::tls::install_provider();
         let data_dir = config.data_dir.clone();
@@ -344,11 +405,17 @@ impl Engine {
                 .await
                 .map_err(|err| Error::invalid(err.to_string()))?;
         }
+        let handlers = if config.host_activities {
+            Handlers::fixtures()
+        } else {
+            Handlers::empty()
+        };
         let worker = if config.host_activities {
             Some(tokio::spawn(worker_loop(
                 raft.clone(),
                 storage.clone(),
                 notify.clone(),
+                handlers.clone(),
             )))
         } else {
             None
@@ -379,6 +446,7 @@ impl Engine {
             raft_server: Some(raft_server),
             snapshot_task,
             cluster_net: Some(network),
+            handlers,
         })
     }
 
@@ -397,6 +465,9 @@ impl Engine {
         catalog: Catalog,
         input: Value,
     ) -> Result<RunId> {
+        if self.worker.is_some() {
+            self.handlers.require_all(&definition.activity_keys())?;
+        }
         let run = RunId::generate();
         let command = Command {
             id: CommandId::generate(),
@@ -1363,7 +1434,12 @@ async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: 
     }
 }
 
-async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc<Notify>) {
+async fn worker_loop(
+    raft: Raft<TypeConfig>,
+    storage: StorageHandle,
+    notify: Arc<Notify>,
+    handlers: Handlers,
+) {
     let session = crate::ids::WorkerSessionId::generate();
     let blocking_slots = Arc::new(Semaphore::new(limits::BLOCKING_POOL_DEFAULT as usize));
     let _ = write_raft(
@@ -1426,10 +1502,10 @@ async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc
                 })
                 .is_some_and(|contract| contract.execution == ExecutionKind::Blocking);
             if assignment.role == crate::ids::ExecutionRole::Reconciliation {
-                let outcome = builtin_reconcile(
+                let outcome = handlers.reconcile(
                     &assignment.activity_name,
                     &assignment.input,
-                    Some(&assignment.effect_key.to_hex()),
+                    Some(assignment.effect_key.to_hex().as_str()),
                 );
                 let _ = write_raft(
                     &raft,
@@ -1449,47 +1525,74 @@ async fn worker_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc
                 )
                 .await;
             } else {
-                let output = if blocking {
+                let effect_key = assignment.effect_key.to_hex();
+                let ran = if blocking {
+                    let handlers = handlers.clone();
                     let name = assignment.activity_name.clone();
+                    let version = assignment.activity_version;
                     let input = assignment.input.clone();
+                    let effect_key = effect_key.clone();
                     let Ok(permit) = blocking_slots.clone().acquire_owned().await else {
                         continue;
                     };
-                    match tokio::task::spawn_blocking(move || {
+                    tokio::task::spawn_blocking(move || {
                         let _permit = permit;
-                        builtin_handler(&name, &input)
+                        handlers.run_blocking(&name, version, input, Some(effect_key.as_str()))
                     })
                     .await
-                    {
-                        Ok(Ok(output)) => output,
-                        _ => continue,
-                    }
+                    .unwrap_or_else(|err| Err(Error::invalid(err.to_string())))
                 } else {
-                    match dispatch_handler(
-                        &assignment.activity_name,
-                        &assignment.input,
-                        Some(&assignment.effect_key.to_hex()),
-                    ) {
-                        Ok(output) => output,
-                        Err(_) => continue,
-                    }
+                    handlers
+                        .run(
+                            &assignment.activity_name,
+                            assignment.activity_version,
+                            assignment.input.clone(),
+                            Some(effect_key.as_str()),
+                            false,
+                        )
+                        .await
                 };
-                let _ = write_raft(
-                    &raft,
-                    Command {
-                        id: CommandId::generate(),
-                        time: now(),
-                        body: CommandBody::ReportAssigned {
-                            run: assignment.run,
-                            activation: assignment.activation,
-                            output,
-                            session: assignment.session,
-                            generation: assignment.generation,
-                            revision: assignment.revision,
-                        },
-                    },
-                )
-                .await;
+                match ran {
+                    Ok(output) => {
+                        let _ = write_raft(
+                            &raft,
+                            Command {
+                                id: CommandId::generate(),
+                                time: now(),
+                                body: CommandBody::ReportAssigned {
+                                    run: assignment.run,
+                                    activation: assignment.activation,
+                                    output,
+                                    session: assignment.session,
+                                    generation: assignment.generation,
+                                    revision: assignment.revision,
+                                },
+                            },
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        let (code, message) = if err.message.contains("activity.unregistered") {
+                            ("activity.unregistered".to_owned(), err.message.clone())
+                        } else {
+                            ("activity.failed".to_owned(), err.message.clone())
+                        };
+                        let _ = write_raft(
+                            &raft,
+                            Command {
+                                id: CommandId::generate(),
+                                time: now(),
+                                body: CommandBody::ReportError {
+                                    run: assignment.run,
+                                    activation: assignment.activation,
+                                    code,
+                                    message,
+                                },
+                            },
+                        )
+                        .await;
+                    }
+                }
             }
             did_work = true;
         }
@@ -1592,7 +1695,7 @@ pub(crate) fn dispatch_handler(
             Ok(Value::Null)
         }
         "test.manual" => Ok(input.clone()),
-        _ => Ok(input.clone()),
+        _ => Err(Error::invalid(format!("activity.unregistered: {name}"))),
     }
 }
 
@@ -1635,6 +1738,12 @@ mod tests {
     use super::*;
 
     static COMPENSATION_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct HandlerCounter {
+        value: i64,
+    }
+    crate::payload!(HandlerCounter, "counter");
 
     fn catalog() -> Catalog {
         Catalog::from_json(include_bytes!(
@@ -1688,6 +1797,74 @@ mod tests {
             .modified()
             .unwrap();
         assert_eq!(before, after, "readonly replay must not write the store");
+    }
+
+    fn bump_yaml() -> &'static str {
+        r#"
+dsl: graphrun/v1
+id: bump
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: inc
+nodes:
+  inc:
+    kind: activity
+    activity: {name: counter.increment, version: 1}
+    input: {from: workflow.input}
+    next: done
+  done:
+    kind: complete
+    output: {from: nodes.inc.output}
+"#
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unregistered_activity_fails_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::builder(dir.path()).open().await.unwrap();
+        let err = engine
+            .start_yaml(
+                bump_yaml(),
+                &catalog(),
+                Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(0))])),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("activity.unregistered"), "{err}");
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn custom_handler_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::builder(dir.path())
+            .activity("counter.increment", |input: HandlerCounter| async move {
+                Ok(HandlerCounter {
+                    value: input.value + 10,
+                })
+            })
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+        let run = engine
+            .start_yaml(
+                bump_yaml(),
+                &catalog(),
+                Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(1))])),
+            )
+            .await
+            .unwrap();
+        let output = engine
+            .wait_terminal(run, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            output,
+            Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(11))]))
+        );
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -68,7 +68,12 @@ let definition = workflow::<Order>("passing_data")
 	.activity("charge", &charge)?
 	.finish(&catalog)?;
 
-let engine = Engine::local("./graphrun-data").await?;
+let engine = Engine::builder("./graphrun-data")
+	.activity("inventory.reserve", |order: Order| async move { /* your code */ Ok(reserved) })?
+	.activity("payment.charge", |reserved: ReservedOrder| async move { /* your code */ Ok(receipt) })?
+	.open()
+	.await?;
+// Or Engine::local("./graphrun-data") for the built-in sample fixtures.
 let run = engine.start(definition, catalog, input).await?;
 let output = engine.wait_terminal(run, std::time::Duration::from_secs(10)).await?;
 ```

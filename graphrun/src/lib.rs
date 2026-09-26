@@ -3,9 +3,8 @@
 //! Open [`Engine::local`] on a directory in your process. YAML and
 //! [`workflow`] compile to one IR. This crate does not start a server.
 //!
-//! This release runs built-in fixture handlers for catalog names such as
-//! `counter.increment`. You cannot register your own activity bodies yet.
-//! Unknown names echo their input.
+//! Register handlers with [`Engine::builder`]. Unregistered names fail.
+//! [`Engine::local`] enables sample fixture handlers.
 //!
 //! See the crate README, `examples/hello_world.rs`, and `examples/order.rs`.
 
@@ -24,6 +23,7 @@ pub mod error;
 pub mod flow;
 #[doc(hidden)]
 pub mod generated;
+pub mod handlers;
 pub mod ids;
 pub mod ir;
 pub mod limits;
@@ -51,10 +51,12 @@ pub use cluster::MemberConfig;
 pub use compiler::compile_yaml;
 pub use domain::{State, reconstruct, run_events, run_output};
 pub use engine::{
-    ControlRequest, ControlResponse, Engine, LedgerEntry, connect_control, ledger_get, replay,
+    ControlRequest, ControlResponse, Engine, LedgerEntry, LocalBuilder, connect_control,
+    ledger_get, replay,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use flow::{region, workflow};
+pub use handlers::Handlers;
 pub use ids::{EventId, RunId};
 pub use ir::Definition;
 pub use schema::{DurablePayload, SchemaRef};

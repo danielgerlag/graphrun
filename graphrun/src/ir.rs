@@ -56,6 +56,57 @@ pub struct Definition {
     pub digest: Digest,
 }
 
+impl Definition {
+    pub fn activity_keys(&self) -> Vec<crate::ids::ActivityKey> {
+        let mut keys = Vec::new();
+        collect_region_activities(&self.root, &mut keys);
+        keys.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
+        keys.dedup();
+        keys
+    }
+}
+
+fn collect_region_activities(region: &Region, keys: &mut Vec<crate::ids::ActivityKey>) {
+    for node in region.nodes.values() {
+        match node {
+            Node::Activity {
+                activity,
+                compensation,
+                ..
+            } => {
+                keys.push(activity.clone());
+                if let Some(Compensation::Activity {
+                    activity: handler, ..
+                }) = compensation
+                {
+                    keys.push(handler.clone());
+                }
+            }
+            Node::Choose { cases, default, .. } => {
+                for case in cases {
+                    collect_region_activities(&case.body, keys);
+                }
+                collect_region_activities(default, keys);
+            }
+            Node::While { body, .. }
+            | Node::DoWhile { body, .. }
+            | Node::Repeat { body, .. }
+            | Node::Foreach { body, .. }
+            | Node::Saga { body, .. } => collect_region_activities(body, keys),
+            Node::Parallel { branches, .. } => {
+                for branch in branches {
+                    collect_region_activities(&branch.body, keys);
+                }
+            }
+            Node::Delay { .. }
+            | Node::WaitUntil { .. }
+            | Node::WaitSignal { .. }
+            | Node::Complete { .. }
+            | Node::Fail { .. } => {}
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Region {
     pub path: RegionPath,

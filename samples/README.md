@@ -2,7 +2,7 @@
 
 Each folder is one graph: `workflow.yaml`, `catalog.json`, payload types, and a typed builder (`workflow` / `region`). Run it with `Engine::local`. There is no `graphrun serve` step.
 
-**You cannot register custom activity handlers.** Local mode runs built-in fixtures for names such as `counter.increment` and `inventory.reserve`. Unknown names echo their input.
+These samples use `Engine::local`, which enables built-in fixture handlers for names such as `counter.increment` and `inventory.reserve`. Application code should use `Engine::builder` and register its own handlers. Unregistered names fail.
 
 Start here, in order:
 

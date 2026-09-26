@@ -10,7 +10,7 @@ This is from the author of [Workflow Core](https://github.com/danielgerlag/workf
 
 The graph is data: YAML or a typed builder, both the same IR. Commands go through Raft onto a redb file in that directory. Restart the process on the same path and the run is still there.
 
-**This release does not let you plug in your own activity handlers.** A catalog names contracts (`counter.increment`, `inventory.reserve`, …). Local mode runs built-in fixtures for those names. An unknown name echoes its input and succeeds. Use Graphrun to persist and orchestrate those graphs; do not treat a custom catalog name as user code that ran.
+Register your own activity handlers with [`Engine::builder`](https://docs.rs/graphrun/latest/graphrun/engine/struct.Engine.html#method.builder). An activity name with no handler fails (`activity.unregistered`); it does not echo input. `Engine::local` enables the built-in sample fixtures (`counter.increment`, `inventory.reserve`, …) for tests and the sample catalog. Production code should register the handlers it needs.
 
 ## Install
 
@@ -25,12 +25,17 @@ Rust 1.90 or newer. Linux and macOS. `0.1` resolves to the latest unyanked 0.1.x
 
 ## First run
 
-Paste this into `src/main.rs`. Input `{value: 0}` finishes at `{value: 2}`.
+Paste this into `src/main.rs`. Input `{value: 0}` finishes at `{value: 2}`. The increment is **your** function.
 
 ```rust
-use graphrun::{Catalog, Engine, Value};
+use graphrun::{payload, Catalog, Engine, Value};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Counter { value: i64 }
+payload!(Counter, "counter");
 
 const CATALOG: &[u8] = br#"{
   "format": "graphrun.catalog/v1",
@@ -82,7 +87,12 @@ nodes:
 #[tokio::main]
 async fn main() -> graphrun::Result<()> {
 	let catalog = Catalog::from_json(CATALOG)?;
-	let engine = Engine::local("./graphrun-data").await?;
+	let engine = Engine::builder("./graphrun-data")
+		.activity("counter.increment", |input: Counter| async move {
+			Ok(Counter { value: input.value + 1 })
+		})?
+		.open()
+		.await?;
 	let input = Value::Object(BTreeMap::from([("value".into(), Value::Int(0))]));
 	let run = engine.start_yaml(YAML, &catalog, input).await?;
 	let output = engine.wait_terminal(run, Duration::from_secs(10)).await?;
