@@ -160,14 +160,84 @@ pub struct ClockAcknowledgeRequest {
     #[prost(string, tag = "1")]
     pub reason: ::prost::alloc::string::String,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RegisterRequest {
     #[prost(string, tag = "1")]
     pub session_id: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "2")]
-    pub activities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(uint32, tag = "3")]
     pub capacity: u32,
+    #[prost(message, repeated, tag = "4")]
+    pub capabilities: ::prost::alloc::vec::Vec<WorkerCapability>,
+    #[prost(string, tag = "5")]
+    pub principal_id: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "6")]
+    pub protocol_min: u32,
+    #[prost(uint32, tag = "7")]
+    pub protocol_max: u32,
+    #[prost(string, tag = "8")]
+    pub command_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RegisterResponse {
+    #[prost(string, tag = "1")]
+    pub error: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub revision: u64,
+    #[prost(uint64, tag = "3")]
+    pub lease_expiry_ms: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WorkerCapability {
+    #[prost(string, tag = "1")]
+    pub activity_name: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub activity_version: u32,
+    #[prost(string, tag = "3")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "4")]
+    pub codec_version: u32,
+    #[prost(string, tag = "5")]
+    pub input_schema_digest: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub output_schema_digest: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub contract_digest: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RenewSessionRequest {
+    #[prost(string, tag = "1")]
+    pub command_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub revision: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RenewSessionResponse {
+    #[prost(uint64, tag = "1")]
+    pub revision: u64,
+    #[prost(uint64, tag = "2")]
+    pub lease_expiry_ms: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchReadyRequest {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+    #[prost(uint64, tag = "3")]
+    pub cursor: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchReadyResponse {
+    #[prost(uint64, tag = "1")]
+    pub generation: u64,
+    #[prost(uint64, tag = "2")]
+    pub cursor: u64,
+    #[prost(bool, tag = "3")]
+    pub ready: bool,
+    #[prost(bool, tag = "4")]
+    pub resync: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClaimRequest {
@@ -204,6 +274,18 @@ pub struct Assignment {
     pub attempt_deadline_ms: u64,
     #[prost(string, tag = "12")]
     pub session_id: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "13")]
+    pub codec_version: u32,
+    #[prost(string, tag = "14")]
+    pub input_schema_digest: ::prost::alloc::string::String,
+    #[prost(string, tag = "15")]
+    pub output_schema_digest: ::prost::alloc::string::String,
+    #[prost(string, tag = "16")]
+    pub contract_digest: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "17")]
+    pub attempt: u32,
+    #[prost(string, tag = "18")]
+    pub scope_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClaimResponse {
@@ -250,6 +332,12 @@ pub struct ReportRequest {
     pub revision: u64,
     #[prost(bytes = "vec", tag = "7")]
     pub output_json: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "8")]
+    pub error_code: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub error_message: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub output_schema_digest: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReconcileRequest {
@@ -269,6 +357,12 @@ pub struct ReconcileRequest {
     pub generation: u64,
     #[prost(uint64, tag = "8")]
     pub revision: u64,
+    #[prost(string, tag = "9")]
+    pub output_schema_digest: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub error_code: ::prost::alloc::string::String,
+    #[prost(string, tag = "11")]
+    pub error_message: ::prost::alloc::string::String,
 }
 /// Generated client implementations.
 pub mod raft_client {
@@ -1856,7 +1950,10 @@ pub mod worker_client {
         pub async fn register(
             &mut self,
             request: impl tonic::IntoRequest<super::RegisterRequest>,
-        ) -> std::result::Result<tonic::Response<super::Ack>, tonic::Status> {
+        ) -> std::result::Result<
+            tonic::Response<super::RegisterResponse>,
+            tonic::Status,
+        > {
             self.inner
                 .ready()
                 .await
@@ -1872,6 +1969,54 @@ pub mod worker_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("graphrun.v1.Worker", "Register"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn renew_session(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RenewSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RenewSessionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/graphrun.v1.Worker/RenewSession",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("graphrun.v1.Worker", "RenewSession"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn watch_ready(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WatchReadyRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::WatchReadyResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/graphrun.v1.Worker/WatchReady",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("graphrun.v1.Worker", "WatchReady"));
             self.inner.unary(req, path, codec).await
         }
         pub async fn claim(
@@ -1969,7 +2114,24 @@ pub mod worker_server {
         async fn register(
             &self,
             request: tonic::Request<super::RegisterRequest>,
-        ) -> std::result::Result<tonic::Response<super::Ack>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::RegisterResponse>,
+            tonic::Status,
+        >;
+        async fn renew_session(
+            &self,
+            request: tonic::Request<super::RenewSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RenewSessionResponse>,
+            tonic::Status,
+        >;
+        async fn watch_ready(
+            &self,
+            request: tonic::Request<super::WatchReadyRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::WatchReadyResponse>,
+            tonic::Status,
+        >;
         async fn claim(
             &self,
             request: tonic::Request<super::ClaimRequest>,
@@ -2068,7 +2230,7 @@ pub mod worker_server {
                     struct RegisterSvc<T: Worker>(pub Arc<T>);
                     impl<T: Worker> tonic::server::UnaryService<super::RegisterRequest>
                     for RegisterSvc<T> {
-                        type Response = super::Ack;
+                        type Response = super::RegisterResponse;
                         type Future = BoxFuture<
                             tonic::Response<Self::Response>,
                             tonic::Status,
@@ -2091,6 +2253,94 @@ pub mod worker_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RegisterSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/graphrun.v1.Worker/RenewSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct RenewSessionSvc<T: Worker>(pub Arc<T>);
+                    impl<
+                        T: Worker,
+                    > tonic::server::UnaryService<super::RenewSessionRequest>
+                    for RenewSessionSvc<T> {
+                        type Response = super::RenewSessionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RenewSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Worker>::renew_session(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RenewSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/graphrun.v1.Worker/WatchReady" => {
+                    #[allow(non_camel_case_types)]
+                    struct WatchReadySvc<T: Worker>(pub Arc<T>);
+                    impl<T: Worker> tonic::server::UnaryService<super::WatchReadyRequest>
+                    for WatchReadySvc<T> {
+                        type Response = super::WatchReadyResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WatchReadyRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Worker>::watch_ready(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WatchReadySvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -915,93 +915,17 @@ impl Engine {
         )
     }
 
+    #[cfg(test)]
     pub async fn run_worker(endpoint: String, tls: crate::tls::TlsMaterial) -> Result<()> {
-        crate::tls::install_provider();
-        let session = crate::ids::WorkerSessionId::generate();
-        let channel = tonic::transport::Channel::from_shared(endpoint)
-            .map_err(|err| Error::invalid(err.to_string()))?
-            .tls_config(crate::rpc::client_tls(&tls)?)
-            .map_err(|err| Error::invalid(err.to_string()))?
-            .connect()
+        let catalog = Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))?;
+        crate::worker::Worker::builder(endpoint, tls, catalog)
+            .fixture_handlers()
+            .open()
+            .await?
+            .run()
             .await
-            .map_err(|err| Error::invalid(err.to_string()))?;
-        let mut client = crate::generated::worker_client::WorkerClient::new(channel);
-        let reg = client
-            .register(crate::generated::RegisterRequest {
-                session_id: session.to_hex(),
-                activities: vec!["*".to_owned()],
-                capacity: crate::limits::CLAIM_BATCH,
-            })
-            .await
-            .map_err(|err| Error::invalid(err.to_string()))?;
-        if !reg.into_inner().error.is_empty() {
-            return Err(Error::invalid("worker register failed"));
-        }
-        loop {
-            let claimed = client
-                .claim(crate::generated::ClaimRequest {
-                    command_id: CommandId::generate().to_hex(),
-                    session_id: session.to_hex(),
-                    capacity: crate::limits::CLAIM_BATCH,
-                })
-                .await
-                .map_err(|err| Error::invalid(err.to_string()))?
-                .into_inner();
-            if !claimed.error.is_empty() || claimed.assignments.is_empty() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            for assignment in claimed.assignments {
-                let input: Value =
-                    serde_json::from_slice(&assignment.input_json).unwrap_or(Value::Null);
-                if assignment.role.contains("reconcil") {
-                    let outcome = builtin_reconcile(
-                        &assignment.activity_name,
-                        &input,
-                        Some(assignment.effect_key.as_str()),
-                    );
-                    let tag = match outcome.0 {
-                        crate::domain::ReconcileOutcome::Applied => "applied",
-                        crate::domain::ReconcileOutcome::NotApplied => "not_applied",
-                        crate::domain::ReconcileOutcome::Unknown => "unknown",
-                    };
-                    let _ = client
-                        .reconcile(crate::generated::ReconcileRequest {
-                            command_id: CommandId::generate().to_hex(),
-                            session_id: session.to_hex(),
-                            run_id: assignment.run_id,
-                            activation_id: assignment.activation_id,
-                            outcome: tag.to_owned(),
-                            output_json: outcome
-                                .1
-                                .map(|value| serde_json::to_vec(&value).unwrap_or_default())
-                                .unwrap_or_default(),
-                            generation: assignment.generation,
-                            revision: assignment.revision,
-                        })
-                        .await;
-                    continue;
-                }
-                let Ok(output) = dispatch_handler(
-                    &assignment.activity_name,
-                    &input,
-                    Some(&assignment.effect_key),
-                ) else {
-                    continue;
-                };
-                let _ = client
-                    .report(crate::generated::ReportRequest {
-                        command_id: CommandId::generate().to_hex(),
-                        session_id: session.to_hex(),
-                        run_id: assignment.run_id,
-                        activation_id: assignment.activation_id,
-                        generation: assignment.generation,
-                        revision: assignment.revision,
-                        output_json: serde_json::to_vec(&output).unwrap_or_default(),
-                    })
-                    .await;
-            }
-        }
     }
 
     pub fn is_leader(&self) -> bool {
@@ -2182,7 +2106,11 @@ async fn worker_loop(
         let mut did_work = false;
         let state = storage.query_state().await;
         let events = state.commands.get(&claim.id).cloned().unwrap_or_default();
-        for assignment in crate::domain::assignments_from(&events) {
+        let Ok(assignments) = crate::domain::assignments_from(&state, &events) else {
+            tracing::error!("committed local claim has an unavailable assignment");
+            continue;
+        };
+        for assignment in assignments {
             let Some(session) = state.sessions.get(&assignment.session) else {
                 tracing::error!(session = %assignment.session, "committed assignment has no worker session");
                 break;

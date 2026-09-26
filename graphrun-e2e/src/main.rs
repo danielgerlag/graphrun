@@ -1825,6 +1825,26 @@ fn run_cli_timeout(cli: &Path, args: &[&str], timeout: Duration) -> (bool, Strin
     }
 }
 
+fn issue_test_node(
+    ca: &graphrun::CertificateAuthority,
+    id: u64,
+) -> graphrun::Result<graphrun::TlsMaterial> {
+    use graphrun::tls::{ClusterId, PeerRole, PrincipalId, PrincipalIdentity, issue_principal};
+    use sha2::Digest;
+    let cluster = ClusterId::parse(hex::encode(&sha2::Sha256::digest(ca.pem.as_bytes())[..16]))?;
+    let identity = PrincipalIdentity::new(
+        cluster,
+        PrincipalId::parse(format!("node-{id}"))?,
+        [
+            PeerRole::Member,
+            PeerRole::Worker,
+            PeerRole::Client,
+            PeerRole::Admin,
+        ],
+    )?;
+    issue_principal(ca, &identity, &format!("node-{id}.graphrun.local"))
+}
+
 fn unused_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -2528,9 +2548,9 @@ fn boot_three(artifacts: &Path, row: &MatrixRow, workers: usize) -> Result<LiveC
     let _ = fs::create_dir_all(&dir);
     let ca = graphrun::generate_ca().map_err(|err| err.to_string())?;
     let materials = [
-        graphrun::issue_node(&ca, 1).map_err(|err| err.to_string())?,
-        graphrun::issue_node(&ca, 2).map_err(|err| err.to_string())?,
-        graphrun::issue_node(&ca, 3).map_err(|err| err.to_string())?,
+        issue_test_node(&ca, 1).map_err(|err| err.to_string())?,
+        issue_test_node(&ca, 2).map_err(|err| err.to_string())?,
+        issue_test_node(&ca, 3).map_err(|err| err.to_string())?,
     ];
     let ca_path = dir.join("ca.pem");
     fs::write(&ca_path, &ca.pem).map_err(|err| err.to_string())?;
@@ -3644,7 +3664,7 @@ fn forged_worker_process(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
         Ok(ca) => ca,
         Err(err) => return fail(row, "generate_ca", err.to_string()),
     };
-    let tls = match graphrun::issue_node(&ca, 1) {
+    let tls = match issue_test_node(&ca, 1) {
         Ok(tls) => tls,
         Err(err) => return fail(row, "issue_node", err.to_string()),
     };
@@ -3744,11 +3764,25 @@ fn forged_worker_process(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
                 .map_err(|err| err.to_string())?;
             let mut client = graphrun::generated::worker_client::WorkerClient::new(channel);
             let session = graphrun::ids::WorkerSessionId::generate();
+            let catalog = graphrun::Catalog::from_json(include_bytes!(
+                "../../docs/specs/v1/examples/activity-catalog.json"
+            ))
+            .map_err(|err| err.to_string())?;
+            let capability = graphrun::worker_contract::capability_for(
+                &catalog,
+                &graphrun::ids::ActivityKey::new("inventory.reserve", 1),
+                graphrun::ids::ExecutionRole::Forward,
+            )
+            .map_err(|err| err.to_string())?;
             let _ = client
                 .register(graphrun::generated::RegisterRequest {
                     session_id: session.to_hex(),
-                    activities: vec!["*".to_owned()],
                     capacity: 8,
+                    capabilities: vec![capability.to_wire()],
+                    principal_id: "node-1".to_owned(),
+                    protocol_min: 1,
+                    protocol_max: 1,
+                    command_id: graphrun::ids::CommandId::generate().to_hex(),
                 })
                 .await
                 .map_err(|err| err.to_string())?;
@@ -3785,6 +3819,8 @@ fn forged_worker_process(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
                         "reservation_id": "forged"
                     }))
                     .unwrap_or_default(),
+                    output_schema_digest: assignment.output_schema_digest.clone(),
+                    ..Default::default()
                 })
                 .await
                 .map_err(|err| err.to_string())?
@@ -3805,6 +3841,8 @@ fn forged_worker_process(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
                     generation: assignment.generation,
                     revision: assignment.revision,
                     output_json: serde_json::to_vec(&output).unwrap_or_default(),
+                    output_schema_digest: assignment.output_schema_digest,
+                    ..Default::default()
                 })
                 .await
                 .map_err(|err| err.to_string())?
@@ -4584,8 +4622,26 @@ fn fixture_worker(
                 return ExitCode::from(2);
             }
         };
-        match graphrun::Engine::run_worker(endpoint, tls).await {
-            Ok(()) => ExitCode::SUCCESS,
+        let result = graphrun::Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ));
+        let result = match result {
+            Ok(catalog) => {
+                graphrun::Worker::builder(endpoint, tls, catalog)
+                    .fixture_handlers()
+                    .open()
+                    .await
+            }
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(worker) => match worker.run().await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::from(2)
+                }
+            },
             Err(err) => {
                 eprintln!("{err}");
                 ExitCode::from(2)

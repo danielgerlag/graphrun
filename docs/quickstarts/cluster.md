@@ -28,8 +28,8 @@ nodes:
 ```
 
 - `Engine::member` — storage replica. Activity execution is opt-in.
-- `Engine::run_worker` — claims ready activities over gRPC/mTLS. Does not open a data directory.
-- Certificates: `graphrun::generate_ca` and `graphrun::tls::issue_principal`.
+- `Worker::builder(endpoint, worker_tls, catalog)` — claims exact versioned roles over gRPC/mTLS. Does not open a data directory. See [the worker example](worker.md).
+- Certificates: `graphrun::generate_ca` and `graphrun::tls::issue_principal` with a `worker` URI SAN for workers. `issue_node` creates multi-role fixture certificates; use explicit roles for applications.
 - Membership changes go through the leader (`cluster join` / `promote` / `remove`).
 
 Join a new id as a learner first. Wait until it has caught up. Then promote it. Remove one voter at a time so two healthy voters remain.

@@ -17,6 +17,7 @@ Register application code with `Engine::builder(dir).activity("name", |input: T|
 - Unregistered catalog activities fail at `start` with `activity.unregistered`. They do not echo input.
 - `Engine::local(dir)` is a convenience that enables built-in **fixture** handlers (`counter.increment`, `inventory.reserve`, …) for samples and tests.
 - Production code should use `Engine::builder` and register the handlers it needs.
+- Independent worker processes use `Worker::builder(endpoint, worker_tls, catalog)` with exact versioned handlers. Remote workers do not run fixture handlers.
 
 ## Where to read
 
@@ -41,3 +42,4 @@ cargo run -p graphrun-samples --bin 01-hello-world
 - `Catalog::from_json`, `activity_v1`
 - `workflow`, `region`, `payload!`
 - Optional binary crate `graphrun-cli` for inspect/signal/backup against `--local-dir`
+- `Worker::builder`, `WorkerBuilder::activity`, `blocking`, `compensation`, `reconciler`, `open`, `Worker::run_until`

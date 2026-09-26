@@ -1,7 +1,7 @@
 use crate::catalog::Catalog;
 use crate::cluster::ClusterNetwork;
 use crate::compiler::compile_yaml;
-use crate::domain::{Command, CommandBody, assignments_from};
+use crate::domain::{Command, CommandBody, DomainEvent, assignments_from, worker_has_ready};
 use crate::error::ErrorKind;
 use crate::generated::client_server::{Client, ClientServer};
 use crate::generated::raft_server::{Raft as RaftSvc, RaftServer};
@@ -11,8 +11,9 @@ use crate::generated::{
     ClockHealthRequest, ClockHealthResponse, CommandResultRequest, CommandResultResponse,
     HistoryRequest, HistoryResponse, InspectRequest, InspectResponse, ListRequest, ListResponse,
     PublishCatalogRequest, PublishDefinitionRequest, ReconcileRequest, RegisterRequest,
-    RenewRequest, RenewResponse, ReplayRequest, ReplayResponse, ReportRequest, SignalRequest,
-    StartRequest, StartResponse,
+    RegisterResponse, RenewRequest, RenewResponse, RenewSessionRequest, RenewSessionResponse,
+    ReplayRequest, ReplayResponse, ReportRequest, SignalRequest, StartRequest, StartResponse,
+    WatchReadyRequest, WatchReadyResponse,
 };
 use crate::ids::{
     ActivationId, CommandId, EventId, LeaseRevision, OwnerGeneration, RunId, WorkerSessionId,
@@ -20,6 +21,7 @@ use crate::ids::{
 use crate::storage::{StorageHandle, TypeConfig};
 use crate::tls::TlsMaterial;
 use crate::value::Value;
+use crate::worker_contract::{WorkerCapability, role_name};
 use crate::write::{
     admit_unapplied, inspect_view, linearizable_read, now, write_raft, write_raft_response,
 };
@@ -179,6 +181,37 @@ impl GraphServices {
         receipt.ensure_applied().map_err(status_error)?;
         Ok(receipt)
     }
+
+    async fn worker_session<T>(
+        &self,
+        request: &Request<T>,
+        session: WorkerSessionId,
+    ) -> Result<(), Status> {
+        let peer = self.verified_peer(request)?;
+        peer.require_role(crate::tls::PeerRole::Worker)
+            .map_err(status_error)?;
+        self.require_leader()?;
+        let metrics = self.raft.metrics().borrow().clone();
+        let state = self.storage.query_state().await;
+        let current = state.sessions.get(&session).ok_or_else(|| {
+            if metrics.last_log_index.unwrap_or(0)
+                > metrics.last_applied.map(|id| id.index).unwrap_or(0)
+            {
+                Status::unavailable("worker session apply is pending")
+            } else {
+                Status::unauthenticated("unknown worker session")
+            }
+        })?;
+        if current.principal_id.is_empty() || current.principal_id != peer.principal_id().as_str() {
+            return Err(Status::permission_denied(
+                "worker session belongs to another principal",
+            ));
+        }
+        if now().as_millis() >= current.expires_ms {
+            return Err(Status::failed_precondition("worker session expired"));
+        }
+        Ok(())
+    }
 }
 
 fn status_error(err: crate::error::Error) -> Status {
@@ -203,6 +236,23 @@ fn receipt_response(
         result_json: serde_json::to_vec(receipt)
             .map_err(|err| Status::internal(err.to_string()))?,
     })
+}
+
+fn worker_duplicate(
+    state: &crate::domain::State,
+    id: CommandId,
+    body: &CommandBody,
+) -> Result<bool, Status> {
+    if !state.commands.contains_key(&id) {
+        return Ok(false);
+    }
+    let actual = crate::domain::worker_request_digest(body).map_err(status_error)?;
+    if state.worker_command_digests.get(&id).map(String::as_str) != actual.as_deref() {
+        return Err(Status::already_exists(
+            "worker command ID reused with different request",
+        ));
+    }
+    Ok(true)
 }
 
 #[tonic::async_trait]
@@ -620,37 +670,183 @@ impl Client for GraphServices {
 
 #[tonic::async_trait]
 impl WorkerSvc for GraphServices {
-    async fn register(&self, request: Request<RegisterRequest>) -> Result<Response<Ack>, Status> {
-        self.authenticated_context(&request, crate::tls::PeerRole::Worker)?;
+    async fn register(
+        &self,
+        request: Request<RegisterRequest>,
+    ) -> Result<Response<RegisterResponse>, Status> {
+        let peer = self.verified_peer(&request)?;
+        peer.require_role(crate::tls::PeerRole::Worker)
+            .map_err(status_error)?;
         self.require_leader()?;
         let req = request.into_inner();
+        if req.principal_id != peer.principal_id().as_str() {
+            return Err(Status::permission_denied(
+                "worker principal does not match signed certificate",
+            ));
+        }
+        let capabilities: Vec<WorkerCapability> = req
+            .capabilities
+            .into_iter()
+            .map(WorkerCapability::from_wire)
+            .collect::<crate::error::Result<_>>()
+            .map_err(status_error)?;
         let session =
             WorkerSessionId::from_hex(&req.session_id).map_err(Status::invalid_argument)?;
-        ack(write_raft(
+        let id = parse_publication_command_id(&req.command_id)?;
+        write_raft(
             &self.raft,
             &self.storage,
             Command {
-                id: CommandId::generate(),
+                id,
                 time: now(),
-                body: CommandBody::RegisterSession {
+                body: CommandBody::RegisterWorker {
                     session,
-                    activities: req.activities,
+                    principal_id: peer.principal_id().as_str().to_owned(),
+                    capabilities,
                     capacity: req.capacity,
+                    protocol_min: req.protocol_min,
+                    protocol_max: req.protocol_max,
                 },
             },
         )
-        .await)
+        .await
+        .map_err(status_error)?;
+        let state = self.storage.query_state().await;
+        let events = state
+            .commands
+            .get(&id)
+            .ok_or_else(|| Status::internal("registration receipt unavailable"))?;
+        let expiry = events
+            .iter()
+            .find_map(|event| {
+                if let DomainEvent::WorkerRegistered {
+                    session: registered,
+                    expires_ms,
+                    ..
+                } = event
+                {
+                    (*registered == session).then_some(*expires_ms)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| Status::failed_precondition("registration not applied"))?;
+        Ok(Response::new(RegisterResponse {
+            error: String::new(),
+            revision: 1,
+            lease_expiry_ms: expiry,
+        }))
+    }
+
+    async fn renew_session(
+        &self,
+        request: Request<RenewSessionRequest>,
+    ) -> Result<Response<RenewSessionResponse>, Status> {
+        let session = WorkerSessionId::from_hex(&request.get_ref().session_id)
+            .map_err(Status::invalid_argument)?;
+        self.worker_session(&request, session).await?;
+        let req = request.into_inner();
+        let id = parse_publication_command_id(&req.command_id)?;
+        write_raft(
+            &self.raft,
+            &self.storage,
+            Command {
+                id,
+                time: now(),
+                body: CommandBody::RenewWorkerSession {
+                    session,
+                    revision: LeaseRevision::new(req.revision),
+                },
+            },
+        )
+        .await
+        .map_err(status_error)?;
+        let state = self.storage.query_state().await;
+        let events = state
+            .commands
+            .get(&id)
+            .ok_or_else(|| Status::internal("session renewal receipt unavailable"))?;
+        let (revision, lease_expiry_ms) = events
+            .iter()
+            .find_map(|event| {
+                if let DomainEvent::WorkerSessionRenewed {
+                    revision,
+                    expires_ms,
+                    ..
+                } = event
+                {
+                    Some((revision.get(), *expires_ms))
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| Status::failed_precondition("session renewal not applied"))?;
+        let worker = state
+            .sessions
+            .get(&session)
+            .ok_or_else(|| Status::failed_precondition("session retired"))?;
+        if worker.revision != revision
+            || worker.expires_ms != lease_expiry_ms
+            || now().as_millis() >= lease_expiry_ms
+        {
+            return Err(Status::failed_precondition(
+                "cached session renewal is no longer current",
+            ));
+        }
+        Ok(Response::new(RenewSessionResponse {
+            revision,
+            lease_expiry_ms,
+        }))
+    }
+
+    async fn watch_ready(
+        &self,
+        request: Request<WatchReadyRequest>,
+    ) -> Result<Response<WatchReadyResponse>, Status> {
+        let session = WorkerSessionId::from_hex(&request.get_ref().session_id)
+            .map_err(Status::invalid_argument)?;
+        self.worker_session(&request, session).await?;
+        let req = request.into_inner();
+        let mut metrics = self.raft.metrics();
+        let previous = (req.generation, req.cursor);
+        loop {
+            let observed = metrics.borrow().clone();
+            let generation = observed.current_term;
+            let cursor = observed.last_applied.map(|id| id.index).unwrap_or(0);
+            let state = self.storage.query_state().await;
+            let ready = worker_has_ready(&state, session, now()).map_err(status_error)?;
+            let resync =
+                req.generation != 0 && (generation != req.generation || cursor != req.cursor);
+            if ready || resync || (generation, cursor) != previous {
+                return Ok(Response::new(WatchReadyResponse {
+                    generation,
+                    cursor,
+                    ready,
+                    resync,
+                }));
+            }
+            if tokio::time::timeout(std::time::Duration::from_secs(15), metrics.changed())
+                .await
+                .is_err()
+            {
+                return Ok(Response::new(WatchReadyResponse {
+                    generation,
+                    cursor,
+                    ready: false,
+                    resync: false,
+                }));
+            }
+        }
     }
 
     async fn claim(
         &self,
         request: Request<ClaimRequest>,
     ) -> Result<Response<ClaimResponse>, Status> {
-        self.authenticated_context(&request, crate::tls::PeerRole::Worker)?;
-        self.require_leader()?;
+        let session = WorkerSessionId::from_hex(&request.get_ref().session_id)
+            .map_err(Status::invalid_argument)?;
+        self.worker_session(&request, session).await?;
         let req = request.into_inner();
-        let session =
-            WorkerSessionId::from_hex(&req.session_id).map_err(Status::invalid_argument)?;
         let command = Command {
             id: parse_command_id(&req.command_id)?,
             time: now(),
@@ -659,38 +855,42 @@ impl WorkerSvc for GraphServices {
                 capacity: req.capacity,
             },
         };
-        if let Err(err) = write_raft(&self.raft, &self.storage, command.clone()).await {
-            if matches!(
-                err.kind,
-                ErrorKind::Unavailable | ErrorKind::DeadlineExceeded
-            ) {
-                return Err(status_error(err));
-            }
-            return Ok(Response::new(ClaimResponse {
-                assignments: Vec::new(),
-                error: err.to_string(),
-            }));
-        }
+        write_raft(&self.raft, &self.storage, command.clone())
+            .await
+            .map_err(status_error)?;
         self.notify.notify_one();
         let state = self.storage.query_state().await;
-        let events = state.commands.get(&command.id).cloned().unwrap_or_default();
-        let assignments = assignments_from(&events)
+        let events = state
+            .commands
+            .get(&command.id)
+            .ok_or_else(|| Status::internal("claim receipt unavailable"))?;
+        let assignments = assignments_from(&state, events)
+            .map_err(status_error)?
             .into_iter()
-            .map(|item| crate::generated::Assignment {
-                run_id: item.run.to_hex(),
-                activation_id: item.activation.to_hex(),
-                activity_name: item.activity_name,
-                activity_version: item.activity_version,
-                input_json: serde_json::to_vec(&item.input).unwrap_or_default(),
-                role: format!("{:?}", item.role).to_lowercase(),
-                effect_key: item.effect_key.to_hex(),
-                generation: item.generation.get(),
-                revision: item.revision.get(),
-                lease_expiry_ms: item.lease_expiry_ms,
-                attempt_deadline_ms: item.attempt_deadline_ms,
-                session_id: item.session.to_hex(),
+            .map(|item| -> Result<crate::generated::Assignment, Status> {
+                Ok(crate::generated::Assignment {
+                    run_id: item.run.to_hex(),
+                    activation_id: item.activation.to_hex(),
+                    activity_name: item.activity_name,
+                    activity_version: item.activity_version,
+                    input_json: serde_json::to_vec(&item.input)
+                        .map_err(|err| Status::internal(err.to_string()))?,
+                    role: role_name(item.role).to_owned(),
+                    effect_key: item.effect_key.to_hex(),
+                    generation: item.generation.get(),
+                    revision: item.revision.get(),
+                    lease_expiry_ms: item.lease_expiry_ms,
+                    attempt_deadline_ms: item.attempt_deadline_ms,
+                    session_id: item.session.to_hex(),
+                    codec_version: item.capability.codec_version,
+                    input_schema_digest: item.capability.input_schema_digest,
+                    output_schema_digest: item.capability.output_schema_digest,
+                    contract_digest: item.capability.contract_digest,
+                    attempt: item.attempt,
+                    scope_id: item.scope.to_hex(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Response::new(ClaimResponse {
             assignments,
             error: String::new(),
@@ -701,11 +901,10 @@ impl WorkerSvc for GraphServices {
         &self,
         request: Request<RenewRequest>,
     ) -> Result<Response<RenewResponse>, Status> {
-        self.authenticated_context(&request, crate::tls::PeerRole::Worker)?;
-        self.require_leader()?;
+        let session = WorkerSessionId::from_hex(&request.get_ref().session_id)
+            .map_err(Status::invalid_argument)?;
+        self.worker_session(&request, session).await?;
         let req = request.into_inner();
-        let session =
-            WorkerSessionId::from_hex(&req.session_id).map_err(Status::invalid_argument)?;
         let activation =
             ActivationId::from_hex(&req.activation_id).map_err(Status::invalid_argument)?;
         let command = Command {
@@ -721,16 +920,44 @@ impl WorkerSvc for GraphServices {
         match write_raft(&self.raft, &self.storage, command.clone()).await {
             Ok(()) => {
                 let state = self.storage.query_state().await;
-                let claim = state
+                let events = state
+                    .commands
+                    .get(&command.id)
+                    .ok_or_else(|| Status::internal("claim renewal receipt unavailable"))?;
+                let claim = events
+                    .iter()
+                    .find_map(|event| {
+                        if let DomainEvent::ClaimRenewed {
+                            revision,
+                            lease_expiry_ms,
+                            ..
+                        } = event
+                        {
+                            Some((revision.get(), *lease_expiry_ms))
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| Status::failed_precondition("claim renewal not applied"))?;
+                let current = state
                     .activations
                     .get(&activation)
-                    .and_then(|act| act.claim.clone());
+                    .and_then(|act| act.claim.as_ref())
+                    .ok_or_else(|| Status::failed_precondition("claim is no longer current"))?;
+                if current.session != session
+                    || current.generation != OwnerGeneration::new(req.generation)
+                    || current.revision.get() != claim.0
+                    || current.lease_expiry_ms != claim.1
+                    || now().as_millis() >= current.lease_expiry_ms
+                    || now().as_millis() >= current.attempt_deadline_ms
+                {
+                    return Err(Status::failed_precondition(
+                        "cached claim renewal is no longer current",
+                    ));
+                }
                 Ok(Response::new(RenewResponse {
-                    revision: claim
-                        .as_ref()
-                        .map(|c| c.revision.get())
-                        .unwrap_or(req.revision),
-                    lease_expiry_ms: claim.as_ref().map(|c| c.lease_expiry_ms).unwrap_or(0),
+                    revision: claim.0,
+                    lease_expiry_ms: claim.1,
                     error: String::new(),
                 }))
             }
@@ -751,27 +978,86 @@ impl WorkerSvc for GraphServices {
     }
 
     async fn report(&self, request: Request<ReportRequest>) -> Result<Response<Ack>, Status> {
-        self.authenticated_context(&request, crate::tls::PeerRole::Worker)?;
-        self.require_leader()?;
+        let session = WorkerSessionId::from_hex(&request.get_ref().session_id)
+            .map_err(Status::invalid_argument)?;
+        self.worker_session(&request, session).await?;
         let req = request.into_inner();
-        let output: Value = serde_json::from_slice(&req.output_json)
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let run = parse_run(&req.run_id)?;
+        let activation =
+            ActivationId::from_hex(&req.activation_id).map_err(Status::invalid_argument)?;
+        if req.error_code.is_empty() && req.output_json.is_empty() {
+            return Err(Status::invalid_argument(
+                "report requires output or a typed error",
+            ));
+        }
+        if !req.error_code.is_empty()
+            && (!req.output_json.is_empty() || req.error_message.is_empty())
+        {
+            return Err(Status::invalid_argument(
+                "error report requires a message and no output",
+            ));
+        }
+        let result = if req.error_code.is_empty() {
+            crate::domain::WorkerResult::Success {
+                output: serde_json::from_slice(&req.output_json)
+                    .map_err(|err| Status::invalid_argument(err.to_string()))?,
+            }
+        } else {
+            crate::domain::WorkerResult::Error {
+                code: req.error_code,
+                message: req.error_message,
+            }
+        };
+        let body = CommandBody::ReportWorker {
+            run,
+            activation,
+            session,
+            generation: OwnerGeneration::new(req.generation),
+            revision: LeaseRevision::new(req.revision),
+            schema_digest: req.output_schema_digest.clone(),
+            result,
+        };
+        let id = parse_publication_command_id(&req.command_id)?;
+        let state = self.storage.query_state().await;
+        if worker_duplicate(&state, id, &body)? {
+            return ack(Ok(()));
+        }
+        let act = state
+            .activations
+            .get(&activation)
+            .ok_or_else(|| Status::not_found("unknown activation"))?;
+        if act.run != run {
+            return Err(Status::failed_precondition(
+                "activation belongs to another run",
+            ));
+        }
+        let (name, version, _) = crate::domain::activity_key(&state, activation)
+            .ok_or_else(|| Status::failed_precondition("claimed activity unavailable"))?;
+        let role = act
+            .claim
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("no claim"))?
+            .role;
+        let capability = crate::worker_contract::capability_for(
+            &state
+                .runs
+                .get(&run)
+                .ok_or_else(|| Status::not_found("unknown run"))?
+                .catalog,
+            &crate::ids::ActivityKey::new(name, version),
+            role,
+        )
+        .map_err(status_error)?;
+        if req.output_schema_digest != capability.output_schema_digest {
+            return Err(Status::failed_precondition("output schema digest mismatch"));
+        }
         ack(write_raft(
             &self.raft,
             &self.storage,
             Command {
-                id: parse_command_id(&req.command_id)?,
+                id,
                 time: now(),
-                body: CommandBody::ReportAssigned {
-                    run: parse_run(&req.run_id)?,
-                    activation: ActivationId::from_hex(&req.activation_id)
-                        .map_err(Status::invalid_argument)?,
-                    output,
-                    session: WorkerSessionId::from_hex(&req.session_id)
-                        .map_err(Status::invalid_argument)?,
-                    generation: OwnerGeneration::new(req.generation),
-                    revision: LeaseRevision::new(req.revision),
-                },
+                body,
             },
         )
         .await
@@ -779,8 +1065,9 @@ impl WorkerSvc for GraphServices {
     }
 
     async fn reconcile(&self, request: Request<ReconcileRequest>) -> Result<Response<Ack>, Status> {
-        self.authenticated_context(&request, crate::tls::PeerRole::Worker)?;
-        self.require_leader()?;
+        let session = WorkerSessionId::from_hex(&request.get_ref().session_id)
+            .map_err(Status::invalid_argument)?;
+        self.worker_session(&request, session).await?;
         let req = request.into_inner();
         let outcome = match req.outcome.as_str() {
             "applied" => crate::domain::ReconcileOutcome::Applied,
@@ -796,23 +1083,67 @@ impl WorkerSvc for GraphServices {
                     .map_err(|err| Status::invalid_argument(err.to_string()))?,
             )
         };
+        if !req.error_code.is_empty()
+            && (outcome != crate::domain::ReconcileOutcome::Unknown
+                || !req.output_json.is_empty()
+                || req.error_message.is_empty())
+        {
+            return Err(Status::invalid_argument(
+                "reconciliation failure requires unknown outcome, code and message",
+            ));
+        }
+        if req.error_code.is_empty() && !req.error_message.is_empty() {
+            return Err(Status::invalid_argument(
+                "reconciliation message without code",
+            ));
+        }
+        let run = parse_run(&req.run_id)?;
+        let activation =
+            ActivationId::from_hex(&req.activation_id).map_err(Status::invalid_argument)?;
+        let result = if req.error_code.is_empty() {
+            crate::domain::WorkerProbe::Observed { outcome, output }
+        } else {
+            crate::domain::WorkerProbe::Error {
+                code: req.error_code,
+                message: req.error_message,
+            }
+        };
+        let body = CommandBody::ReconcileWorker {
+            run,
+            activation,
+            session,
+            generation: OwnerGeneration::new(req.generation),
+            revision: LeaseRevision::new(req.revision),
+            schema_digest: req.output_schema_digest.clone(),
+            result,
+        };
+        let id = parse_publication_command_id(&req.command_id)?;
+        let state = self.storage.query_state().await;
+        if worker_duplicate(&state, id, &body)? {
+            return ack(Ok(()));
+        }
+        let (name, version, _) = crate::domain::activity_key(&state, activation)
+            .ok_or_else(|| Status::failed_precondition("reconciliation contract unavailable"))?;
+        let capability = crate::worker_contract::capability_for(
+            &state
+                .runs
+                .get(&run)
+                .ok_or_else(|| Status::not_found("unknown run"))?
+                .catalog,
+            &crate::ids::ActivityKey::new(name, version),
+            crate::ids::ExecutionRole::Reconciliation,
+        )
+        .map_err(status_error)?;
+        if req.output_schema_digest != capability.output_schema_digest {
+            return Err(Status::failed_precondition("output schema digest mismatch"));
+        }
         ack(write_raft(
             &self.raft,
             &self.storage,
             Command {
-                id: parse_command_id(&req.command_id)?,
+                id,
                 time: now(),
-                body: CommandBody::Reconcile {
-                    run: parse_run(&req.run_id)?,
-                    activation: ActivationId::from_hex(&req.activation_id)
-                        .map_err(Status::invalid_argument)?,
-                    session: WorkerSessionId::from_hex(&req.session_id)
-                        .map_err(Status::invalid_argument)?,
-                    generation: OwnerGeneration::new(req.generation),
-                    revision: LeaseRevision::new(req.revision),
-                    outcome,
-                    output,
-                },
+                body,
             },
         )
         .await

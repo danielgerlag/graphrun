@@ -229,7 +229,7 @@ impl Catalog {
         }
     }
 
-    fn schema_json(&self, schema: &SchemaRef) -> Result<serde_json::Value> {
+    pub(crate) fn schema_json(&self, schema: &SchemaRef) -> Result<serde_json::Value> {
         match schema {
             SchemaRef::Named { key } => self
                 .schemas

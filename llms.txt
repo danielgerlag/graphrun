@@ -23,9 +23,14 @@ Crate: https://crates.io/crates/graphrun
 - Example (order): https://github.com/danielgerlag/graphrun/blob/main/graphrun/examples/order.rs
 - Samples: https://github.com/danielgerlag/graphrun/tree/main/samples
 - How-tos: https://github.com/danielgerlag/graphrun/tree/main/docs/quickstarts
+- Independent worker how-to: https://github.com/danielgerlag/graphrun/blob/main/docs/quickstarts/worker.md
+- Worker protocol reference: https://github.com/danielgerlag/graphrun/blob/main/docs/worker-protocol.md
+- Remote worker example: https://github.com/danielgerlag/graphrun/blob/main/graphrun/examples/remote_worker.rs
 
 ## Handlers
 
 `Engine::builder(dir).activity("name", handler)?.open()`. Unregistered names fail (`activity.unregistered`). `Engine::local` enables sample fixtures only.
+
+`Worker::builder(endpoint, worker_tls, catalog)` runs application handlers in an independent process with signed worker identity and exact pinned contract matching.
 
 Do not use docs/specs/v1 as a getting-started guide.

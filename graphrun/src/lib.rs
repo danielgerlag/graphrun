@@ -40,6 +40,8 @@ pub mod storage;
 pub mod time;
 pub mod tls;
 pub mod value;
+pub mod worker;
+pub mod worker_contract;
 #[doc(hidden)]
 pub mod write;
 pub mod yaml;
@@ -66,3 +68,5 @@ pub use ir::Definition;
 pub use schema::{DurablePayload, SchemaRef};
 pub use tls::{CertificateAuthority, TlsMaterial, generate_ca, issue_node};
 pub use value::Value;
+pub use worker::{ActivityError, HandlerContext, Observed, Worker, WorkerBuilder};
+pub use worker_contract::WorkerCapability;

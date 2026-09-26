@@ -191,7 +191,7 @@ principal text is not authority. The local socket remains owner-only.
 
 ## Cluster
 
-After a local run works: `Engine::member` is a storage replica, `Engine::run_worker` claims activities over gRPC/mTLS. Same write path as local. [Cluster how-to](https://github.com/danielgerlag/graphrun/blob/main/docs/quickstarts/cluster.md).
+After a local run works, `Engine::member` hosts storage without running handlers. An independent process uses `Worker::builder(endpoint, tls, catalog)` to register its application handlers, claim exact pinned contracts, and report results over gRPC/mTLS. It opens no replica or data directory. Fixture handlers are confined to tests and the explicitly enabled `fixture-worker` feature used by the non-published verification driver. [Worker how-to](https://github.com/danielgerlag/graphrun/blob/main/docs/quickstarts/worker.md) and [cluster how-to](https://github.com/danielgerlag/graphrun/blob/main/docs/quickstarts/cluster.md).
 
 ## Limits
 

@@ -138,8 +138,53 @@ service Client {
 
 message RegisterRequest {
   string session_id = 1;
-  repeated string activities = 2;
+  reserved 2;
   uint32 capacity = 3;
+  repeated WorkerCapability capabilities = 4;
+  string principal_id = 5;
+  uint32 protocol_min = 6;
+  uint32 protocol_max = 7;
+  string command_id = 8;
+}
+
+message RegisterResponse {
+  string error = 1;
+  uint64 revision = 2;
+  uint64 lease_expiry_ms = 3;
+}
+
+message WorkerCapability {
+  string activity_name = 1;
+  uint32 activity_version = 2;
+  string role = 3;
+  uint32 codec_version = 4;
+  string input_schema_digest = 5;
+  string output_schema_digest = 6;
+  string contract_digest = 7;
+}
+
+message RenewSessionRequest {
+  string command_id = 1;
+  string session_id = 2;
+  uint64 revision = 3;
+}
+
+message RenewSessionResponse {
+  uint64 revision = 1;
+  uint64 lease_expiry_ms = 2;
+}
+
+message WatchReadyRequest {
+  string session_id = 1;
+  uint64 generation = 2;
+  uint64 cursor = 3;
+}
+
+message WatchReadyResponse {
+  uint64 generation = 1;
+  uint64 cursor = 2;
+  bool ready = 3;
+  bool resync = 4;
 }
 
 message ClaimRequest {
@@ -161,6 +206,12 @@ message Assignment {
   uint64 lease_expiry_ms = 10;
   uint64 attempt_deadline_ms = 11;
   string session_id = 12;
+  uint32 codec_version = 13;
+  string input_schema_digest = 14;
+  string output_schema_digest = 15;
+  string contract_digest = 16;
+  uint32 attempt = 17;
+  string scope_id = 18;
 }
 
 message ClaimResponse {
@@ -190,6 +241,9 @@ message ReportRequest {
   uint64 generation = 5;
   uint64 revision = 6;
   bytes output_json = 7;
+  string error_code = 8;
+  string error_message = 9;
+  string output_schema_digest = 10;
 }
 
 message ReconcileRequest {
@@ -201,10 +255,15 @@ message ReconcileRequest {
   bytes output_json = 6;
   uint64 generation = 7;
   uint64 revision = 8;
+  string output_schema_digest = 9;
+  string error_code = 10;
+  string error_message = 11;
 }
 
 service Worker {
-  rpc Register(RegisterRequest) returns (Ack);
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc RenewSession(RenewSessionRequest) returns (RenewSessionResponse);
+  rpc WatchReady(WatchReadyRequest) returns (WatchReadyResponse);
   rpc Claim(ClaimRequest) returns (ClaimResponse);
   rpc Renew(RenewRequest) returns (RenewResponse);
   rpc Report(ReportRequest) returns (Ack);

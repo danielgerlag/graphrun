@@ -877,6 +877,7 @@ version = "0.1.3"
 dependencies = [
  "clap",
  "graphrun",
+ "hex",
  "serde",
  "serde_json",
  "sha2",

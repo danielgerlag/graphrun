@@ -309,8 +309,7 @@ mod tests {
         client_client::ClientClient, raft_client::RaftClient,
     };
     use crate::tls::{
-        ClusterId, PeerRole, PrincipalId, PrincipalIdentity, generate_ca, issue_node,
-        issue_principal,
+        ClusterId, PeerRole, PrincipalId, PrincipalIdentity, generate_ca, issue_principal,
     };
     use crate::value::Value;
     use std::time::Duration;
@@ -321,6 +320,65 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap()
+    }
+
+    fn issue_node(
+        ca: &crate::tls::CertificateAuthority,
+        id: u64,
+    ) -> crate::Result<crate::tls::TlsMaterial> {
+        use sha2::Digest;
+        let cluster =
+            ClusterId::parse(hex::encode(&sha2::Sha256::digest(ca.pem.as_bytes())[..16]))?;
+        let identity = PrincipalIdentity::new(
+            cluster,
+            PrincipalId::parse(format!("node-{id}"))?,
+            [
+                PeerRole::Member,
+                PeerRole::Worker,
+                PeerRole::Client,
+                PeerRole::Admin,
+            ],
+        )?;
+        issue_principal(ca, &identity, &format!("node-{id}.graphrun.local"))
+    }
+
+    fn register_worker(
+        session: crate::ids::WorkerSessionId,
+        catalog: &Catalog,
+    ) -> crate::generated::RegisterRequest {
+        let mut capabilities = Vec::new();
+        for key in catalog.activities.keys() {
+            for role in [
+                crate::ids::ExecutionRole::Forward,
+                crate::ids::ExecutionRole::Compensation,
+            ] {
+                capabilities.push(
+                    crate::worker_contract::capability_for(catalog, key, role)
+                        .unwrap()
+                        .to_wire(),
+                );
+            }
+        }
+        for key in catalog.reconcilers.keys() {
+            capabilities.push(
+                crate::worker_contract::capability_for(
+                    catalog,
+                    key,
+                    crate::ids::ExecutionRole::Reconciliation,
+                )
+                .unwrap()
+                .to_wire(),
+            );
+        }
+        crate::generated::RegisterRequest {
+            session_id: session.to_hex(),
+            capacity: 8,
+            capabilities,
+            principal_id: "node-1".to_owned(),
+            protocol_min: 1,
+            protocol_max: 1,
+            command_id: crate::ids::CommandId::generate().to_hex(),
+        }
     }
 
     async fn three_voters(
@@ -1437,11 +1495,7 @@ mod tests {
         let mut client = worker_rpc(addr, &tls).await;
         let session = crate::ids::WorkerSessionId::generate();
         let _ = client
-            .register(crate::generated::RegisterRequest {
-                session_id: session.to_hex(),
-                activities: vec!["*".to_owned()],
-                capacity: 8,
-            })
+            .register(register_worker(session, &catalog))
             .await
             .unwrap();
         let claimed = loop {
@@ -1481,6 +1535,8 @@ mod tests {
                     .collect(),
                 ))
                 .unwrap(),
+                output_schema_digest: assignment.output_schema_digest.clone(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1499,6 +1555,8 @@ mod tests {
                 generation: assignment.generation,
                 revision: assignment.revision,
                 output_json: serde_json::to_vec(&Value::Null).unwrap(),
+                output_schema_digest: assignment.output_schema_digest.clone(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1513,28 +1571,31 @@ mod tests {
             state.runs.get(&run).unwrap().status,
             crate::domain::RunStatus::Active
         ));
+        let valid_report = crate::generated::ReportRequest {
+            command_id: crate::ids::CommandId::generate().to_hex(),
+            session_id: session.to_hex(),
+            run_id: assignment.run_id.clone(),
+            activation_id: assignment.activation_id.clone(),
+            generation: assignment.generation,
+            revision: assignment.revision,
+            output_json: serde_json::to_vec(&Value::Object(
+                [
+                    ("order_id".to_owned(), Value::String("o1".to_owned())),
+                    ("amount".to_owned(), Value::Int(1000)),
+                    (
+                        "reservation_id".to_owned(),
+                        Value::String("res-1".to_owned()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ))
+            .unwrap(),
+            output_schema_digest: assignment.output_schema_digest.clone(),
+            ..Default::default()
+        };
         let accepted = client
-            .report(crate::generated::ReportRequest {
-                command_id: crate::ids::CommandId::generate().to_hex(),
-                session_id: session.to_hex(),
-                run_id: assignment.run_id.clone(),
-                activation_id: assignment.activation_id.clone(),
-                generation: assignment.generation,
-                revision: assignment.revision,
-                output_json: serde_json::to_vec(&Value::Object(
-                    [
-                        ("order_id".to_owned(), Value::String("o1".to_owned())),
-                        ("amount".to_owned(), Value::Int(1000)),
-                        (
-                            "reservation_id".to_owned(),
-                            Value::String("res-1".to_owned()),
-                        ),
-                    ]
-                    .into_iter()
-                    .collect(),
-                ))
-                .unwrap(),
-            })
+            .report(valid_report.clone())
             .await
             .unwrap()
             .into_inner();
@@ -1542,6 +1603,27 @@ mod tests {
             accepted.error.is_empty(),
             "valid result must apply: {}",
             accepted.error
+        );
+        assert!(
+            client
+                .report(valid_report.clone())
+                .await
+                .unwrap()
+                .into_inner()
+                .error
+                .is_empty()
+        );
+        let mut schema_conflict = valid_report.clone();
+        schema_conflict.output_schema_digest = "f".repeat(64);
+        assert_eq!(
+            client.report(schema_conflict).await.unwrap_err().code(),
+            tonic::Code::AlreadyExists,
+        );
+        let mut conflict = valid_report;
+        conflict.output_json = serde_json::to_vec(&Value::Null).unwrap();
+        assert_eq!(
+            client.report(conflict).await.unwrap_err().code(),
+            tonic::Code::AlreadyExists,
         );
         let worker = tokio::spawn(Engine::run_worker(format!("https://{addr}"), tls));
         let output = engine
@@ -1976,13 +2058,9 @@ nodes:
             .await
             .unwrap();
         let mut client = worker_rpc(addr, &tls).await;
-        let session = crate::ids::WorkerSessionId::generate();
+        let mut session = crate::ids::WorkerSessionId::generate();
         let _ = client
-            .register(crate::generated::RegisterRequest {
-                session_id: session.to_hex(),
-                activities: vec!["*".to_owned()],
-                capacity: 8,
-            })
+            .register(register_worker(session, &catalog))
             .await
             .unwrap();
         let mut claimed = Vec::new();
@@ -2018,12 +2096,9 @@ nodes:
         assert_eq!(first_row.physical, 1);
         assert_eq!(first_row.output, first);
         tokio::time::sleep(crate::policy::SESSION_LEASE + Duration::from_secs(1)).await;
+        session = crate::ids::WorkerSessionId::generate();
         let _ = client
-            .register(crate::generated::RegisterRequest {
-                session_id: session.to_hex(),
-                activities: vec!["*".to_owned()],
-                capacity: 8,
-            })
+            .register(register_worker(session, &catalog))
             .await
             .unwrap();
         let mut second = Vec::new();
@@ -2069,6 +2144,8 @@ nodes:
                 generation: lost2.generation,
                 revision: lost2.revision,
                 output_json: serde_json::to_vec(&second_out).unwrap(),
+                output_schema_digest: lost2.output_schema_digest.clone(),
+                ..Default::default()
             })
             .await;
         fn send_recon(
@@ -2088,6 +2165,8 @@ nodes:
                     .unwrap_or_default(),
                 generation: assignment.generation,
                 revision: assignment.revision,
+                output_schema_digest: assignment.output_schema_digest.clone(),
+                ..Default::default()
             }
         }
         let applied_a = second
