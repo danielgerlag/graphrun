@@ -115,6 +115,10 @@ pub enum DomainEvent {
         wait: WaitId,
         event_id: EventId,
     },
+    EventExpired {
+        run: RunId,
+        event_id: EventId,
+    },
     ReservationReleased {
         wait: WaitId,
         event_id: EventId,
@@ -161,6 +165,9 @@ pub enum DomainEvent {
     ClaimGranted {
         run: RunId,
         activation: ActivationId,
+        handler: String,
+        handler_version: u32,
+        input: Value,
         session: WorkerSessionId,
         generation: OwnerGeneration,
         revision: LeaseRevision,
@@ -323,6 +330,9 @@ pub enum CommandBody {
     AbandonCompensation {
         run: RunId,
         reason: String,
+    },
+    PruneHistory {
+        limit: u32,
     },
 }
 
@@ -543,6 +553,18 @@ pub struct State {
     #[serde(default)]
     pub history: HashMap<RunId, Vec<DomainEvent>>,
     #[serde(default)]
+    pub history_records: HashMap<RunId, Vec<crate::history::HistoryEntry>>,
+    #[serde(default)]
+    pub history_dependencies: HashMap<RunId, crate::history::RequiredArtifacts>,
+    #[serde(default)]
+    pub checkpoints: HashMap<RunId, crate::history::RunCheckpoint>,
+    #[serde(default)]
+    pub terminal_summaries: HashMap<RunId, crate::history::TerminalSummary>,
+    #[serde(default)]
+    pub signal_tombstones: HashMap<String, crate::history::SignalTombstone>,
+    #[serde(default)]
+    pub command_times: HashMap<CommandId, u64>,
+    #[serde(default)]
     pub obligations: Vec<Obligation>,
     #[serde(default)]
     pub saga_errors: HashMap<ActivationId, FailError>,
@@ -577,6 +599,9 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
     match &command.body {
         CommandBody::Publication { .. } => {
             Err(Error::invalid("publication requires replicated apply"))
+        }
+        CommandBody::PruneHistory { .. } => {
+            Err(Error::invalid("retention requires replicated apply"))
         }
         CommandBody::Start {
             run,
@@ -1211,9 +1236,19 @@ fn decide_claim(
                 .as_ref()
                 .map(|claim| claim.effect_key)
                 .unwrap_or_else(|| EffectKey::from_bytes(ids.next_bytes()));
+            let (handler, handler_version, input) =
+                activity_key(state, activation).ok_or_else(|| {
+                    Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        "claimed activity input or pinned handler is unavailable",
+                    )
+                })?;
             events.push(DomainEvent::ClaimGranted {
                 run: *run,
                 activation,
+                handler,
+                handler_version,
+                input,
                 session,
                 generation: OwnerGeneration::new(
                     state.next_generation.saturating_add(u64::from(granted) + 1),
@@ -1665,19 +1700,27 @@ fn decide_signal(
     time: EngineTime,
     ids: &mut IdGen,
 ) -> Result<Decision> {
+    if let Some(existing) =
+        state
+            .signal_tombstones
+            .get(&format!("{}:{}", run.to_hex(), event_id.to_hex()))
+    {
+        if existing.signal == signal
+            && existing.key == key
+            && existing.payload
+                == crate::history::ArtifactRef::capture("graphrun.signal-payload/v1", &payload)?
+        {
+            return Ok(Decision { events: Vec::new() });
+        }
+        return Err(Error::new(
+            crate::error::ErrorKind::AlreadyExists,
+            "event id payload conflict",
+        ));
+    }
     let run_state = state
         .runs
         .get(&run)
         .ok_or_else(|| Error::invalid("unknown run"))?;
-    if matches!(
-        run_state.status,
-        RunStatus::Succeeded { .. } | RunStatus::Failed { .. }
-    ) {
-        return Err(Error::invalid("run is terminal"));
-    }
-    if !run_state.definition.signals.contains_key(signal) {
-        return Err(Error::invalid(format!("unknown signal {signal}")));
-    }
     if let Some(existing) = state.inbox.iter().find(|entry| entry.event_id == event_id) {
         if existing.signal == signal && existing.key == key && existing.payload == payload {
             return Ok(Decision { events: Vec::new() });
@@ -1686,6 +1729,15 @@ fn decide_signal(
             crate::error::ErrorKind::AlreadyExists,
             "event id payload conflict",
         ));
+    }
+    if matches!(
+        run_state.status,
+        RunStatus::Succeeded { .. } | RunStatus::Failed { .. }
+    ) {
+        return Err(Error::invalid("run is terminal"));
+    }
+    if !run_state.definition.signals.contains_key(signal) {
+        return Err(Error::invalid(format!("unknown signal {signal}")));
     }
     let buffered = state
         .inbox
@@ -1711,8 +1763,12 @@ fn decide_signal(
     }
     let sequence = run_state.next_sequence.get();
     let accepted_ms = time.as_millis();
-    let expires_ms = accepted_ms
-        .saturating_add(crate::policy::UNRESERVED_EVENT_DAYS.saturating_mul(24 * 60 * 60 * 1000));
+    let expires_ms = accepted_ms.saturating_add(
+        run_state
+            .policy
+            .unreserved_event_days
+            .saturating_mul(24 * 60 * 60 * 1000),
+    );
     let mut events = vec![DomainEvent::EventAccepted {
         run,
         event_id,
@@ -1858,7 +1914,7 @@ fn decide_progress(
         let Some(next) = next_progress(&working, run, time, ids)? else {
             break;
         };
-        apply_events(&mut working, &next);
+        apply_events(&mut working, &next)?;
         events.extend(next);
     }
     Ok(Decision { events })
@@ -3135,17 +3191,36 @@ fn eval_duration_ms(binding: &Binding, ctx: &EvalCtx) -> Result<u64> {
     }
 }
 
-pub fn apply_events(state: &mut State, events: &[DomainEvent]) {
-    for event in events {
-        if let Some(run) = event_run(event) {
-            state.history.entry(run).or_default().push(event.clone());
-        }
-        evolve(state, event);
-    }
+pub fn apply_events(state: &mut State, events: &[DomainEvent]) -> Result<()> {
+    apply_events_with_cause(state, events, None, None, EngineTime::from_millis(0))
 }
 
-fn event_run(event: &DomainEvent) -> Option<RunId> {
-    Some(match event {
+pub fn apply_events_with_cause(
+    state: &mut State,
+    events: &[DomainEvent],
+    command_id: Option<CommandId>,
+    principal_id: Option<&str>,
+    time: EngineTime,
+) -> Result<()> {
+    for event in events {
+        let run = event_owner(state, event)?;
+        evolve(state, event);
+        if let Some(run) = run {
+            crate::history::append(
+                state,
+                run,
+                event,
+                command_id,
+                principal_id,
+                time.as_millis(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn event_owner(state: &State, event: &DomainEvent) -> Result<Option<RunId>> {
+    let owner = match event {
         DomainEvent::RunAdmitted { run, .. }
         | DomainEvent::ScopeOpened { run, .. }
         | DomainEvent::ScopeCompleted { run, .. }
@@ -3159,6 +3234,7 @@ fn event_run(event: &DomainEvent) -> Option<RunId> {
         | DomainEvent::WaitSatisfied { run, .. }
         | DomainEvent::WaitTimedOut { run, .. }
         | DomainEvent::EventAccepted { run, .. }
+        | DomainEvent::EventExpired { run, .. }
         | DomainEvent::ObligationRegistered { run, .. }
         | DomainEvent::ObligationBlocked { run, .. }
         | DomainEvent::CompensationStarted { run, .. }
@@ -3170,16 +3246,42 @@ fn event_run(event: &DomainEvent) -> Option<RunId> {
         | DomainEvent::InterventionRequired { run, .. }
         | DomainEvent::AbortIntent { run, .. }
         | DomainEvent::CompensationAbandoned { run, .. } => *run,
-        DomainEvent::ObligationTransferred { .. }
-        | DomainEvent::SessionRegistered { .. }
-        | DomainEvent::ClaimRenewed { .. }
-        | DomainEvent::ClaimCleared { .. }
-        | DomainEvent::EventReserved { .. }
-        | DomainEvent::ReservationReleased { .. }
-        | DomainEvent::RecoveryAuthorized { .. } => {
-            return None;
+        DomainEvent::ObligationTransferred { forward, .. } => state
+            .obligations
+            .iter()
+            .find(|item| item.forward == *forward)
+            .map(|item| item.run)
+            .ok_or_else(|| {
+                Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "transferred obligation has no run",
+                )
+            })?,
+        DomainEvent::ClaimRenewed { activation, .. } | DomainEvent::ClaimCleared { activation } => {
+            state
+                .activations
+                .get(activation)
+                .map(|act| act.run)
+                .ok_or_else(|| {
+                    Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        "claim lifecycle event has no activation",
+                    )
+                })?
         }
-    })
+        DomainEvent::EventReserved { wait, .. } | DomainEvent::ReservationReleased { wait, .. } => {
+            state.waits.get(wait).map(|wait| wait.run).ok_or_else(|| {
+                Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "signal reservation has no wait",
+                )
+            })?
+        }
+        DomainEvent::SessionRegistered { .. } | DomainEvent::RecoveryAuthorized { .. } => {
+            return Ok(None);
+        }
+    };
+    Ok(Some(owner))
 }
 
 pub fn evolve(state: &mut State, event: &DomainEvent) {
@@ -3454,6 +3556,9 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             if let Some(run_state) = state.runs.get_mut(run) {
                 run_state.next_sequence = RunSequence::new(sequence + 1);
             }
+        }
+        DomainEvent::EventExpired { event_id, .. } => {
+            state.inbox.retain(|entry| entry.event_id != *event_id);
         }
         DomainEvent::ObligationRegistered {
             run,
@@ -3754,8 +3859,18 @@ pub fn start_run(
         },
     );
     let decision = decide(state, &command)?;
-    apply_events(state, &decision.events);
+    apply_events_with_cause(
+        state,
+        &decision.events,
+        Some(command.id),
+        None,
+        command.time,
+    )?;
     state.commands.insert(command.id, decision.events.clone());
+    state
+        .command_times
+        .insert(command.id, command.time.as_millis());
+    crate::history::checkpoint_after_command(state, *run, command.time)?;
     Ok(decision.events)
 }
 
@@ -3764,13 +3879,19 @@ pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEv
         return Ok(events.clone());
     }
     let decision = decide(state, &command)?;
-    apply_events(state, &decision.events);
+    apply_events_with_cause(
+        state,
+        &decision.events,
+        Some(command.id),
+        None,
+        command.time,
+    )?;
     for event in &decision.events {
         if matches!(
             event,
             DomainEvent::RunSucceeded { .. } | DomainEvent::RunFailed { .. }
         ) {
-            if let Some(run) = event_run(event) {
+            if let Some(run) = event_owner(state, event)? {
                 if let Some(run_state) = state.runs.get_mut(&run) {
                     run_state.terminal_ms = command.time.as_millis();
                 }
@@ -3778,10 +3899,32 @@ pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEv
         }
     }
     state.commands.insert(command.id, decision.events.clone());
+    state
+        .command_times
+        .insert(command.id, command.time.as_millis());
+    let mut affected = std::collections::HashSet::new();
+    for event in &decision.events {
+        if let Some(run) = event_owner(state, event)? {
+            affected.insert(run);
+        }
+    }
+    for run in affected {
+        crate::history::checkpoint_after_command(state, run, command.time)?;
+    }
     Ok(decision.events)
 }
 
 pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainEvent>> {
+    if let CommandBody::PruneHistory { limit } = &command.body {
+        if *limit == 0 || *limit > 1024 {
+            return Err(Error::invalid("retention batch must be 1..=1024"));
+        }
+        let mut provisional = state.clone();
+        let events =
+            crate::history::prune(&mut provisional, command.id, command.time, *limit as usize)?;
+        *state = provisional;
+        return Ok(events);
+    }
     if let CommandBody::Publication { key, operation } = &command.body {
         if key.command_id != command.id || key.cluster_id.is_empty() || key.principal_id.is_empty()
         {
@@ -3877,13 +4020,16 @@ pub fn ready_activations(state: &State, run: RunId) -> Vec<ActivationId> {
         .collect()
 }
 
-pub fn assignments_from(state: &State, events: &[DomainEvent]) -> Vec<AssignmentView> {
+pub fn assignments_from(events: &[DomainEvent]) -> Vec<AssignmentView> {
     events
         .iter()
         .filter_map(|event| match event {
             DomainEvent::ClaimGranted {
                 run,
                 activation,
+                handler,
+                handler_version,
+                input,
                 session,
                 generation,
                 revision,
@@ -3891,23 +4037,20 @@ pub fn assignments_from(state: &State, events: &[DomainEvent]) -> Vec<Assignment
                 attempt_deadline_ms,
                 effect_key,
                 role,
-            } => {
-                let (name, version, input) = activity_key(state, *activation)?;
-                Some(AssignmentView {
-                    run: *run,
-                    activation: *activation,
-                    activity_name: name,
-                    activity_version: version,
-                    input,
-                    role: *role,
-                    effect_key: *effect_key,
-                    generation: *generation,
-                    revision: *revision,
-                    lease_expiry_ms: *lease_expiry_ms,
-                    attempt_deadline_ms: *attempt_deadline_ms,
-                    session: *session,
-                })
-            }
+            } => Some(AssignmentView {
+                run: *run,
+                activation: *activation,
+                activity_name: handler.clone(),
+                activity_version: *handler_version,
+                input: input.clone(),
+                role: *role,
+                effect_key: *effect_key,
+                generation: *generation,
+                revision: *revision,
+                lease_expiry_ms: *lease_expiry_ms,
+                attempt_deadline_ms: *attempt_deadline_ms,
+                session: *session,
+            }),
             _ => None,
         })
         .collect()
@@ -4054,7 +4197,7 @@ pub fn reconstruct(
             published: None,
         },
     );
-    apply_events(&mut state, events);
+    apply_events(&mut state, events)?;
     Ok(state)
 }
 

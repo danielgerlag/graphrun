@@ -111,11 +111,33 @@ pub struct ListResponse {
 pub struct HistoryRequest {
     #[prost(string, tag = "1")]
     pub run_id: ::prost::alloc::string::String,
+    /// Exclusive per-run sequence cursor; zero begins at the retained floor.
+    #[prost(uint64, tag = "2")]
+    pub after_sequence: u64,
+    /// Zero selects the default of 100; maximum 1000.
+    #[prost(uint32, tag = "3")]
+    pub page_size: u32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HistoryResponse {
+    /// JSON HistoryPage, including retained_from, retained_through and next_cursor.
     #[prost(bytes = "vec", tag = "1")]
     pub events_json: ::prost::alloc::vec::Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub error: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReplayRequest {
+    #[prost(string, tag = "1")]
+    pub run_id: ::prost::alloc::string::String,
+    /// Inclusive per-run sequence, required and nonzero.
+    #[prost(uint64, tag = "2")]
+    pub through_sequence: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ReplayResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub view_json: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, tag = "2")]
     pub error: ::prost::alloc::string::String,
 }
@@ -940,6 +962,26 @@ pub mod client_client {
                 .insert(GrpcMethod::new("graphrun.v1.Client", "History"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn replay(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReplayRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReplayResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/graphrun.v1.Client/Replay",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("graphrun.v1.Client", "Replay"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1000,6 +1042,10 @@ pub mod client_server {
             &self,
             request: tonic::Request<super::HistoryRequest>,
         ) -> std::result::Result<tonic::Response<super::HistoryResponse>, tonic::Status>;
+        async fn replay(
+            &self,
+            request: tonic::Request<super::ReplayRequest>,
+        ) -> std::result::Result<tonic::Response<super::ReplayResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct ClientServer<T> {
@@ -1455,6 +1501,49 @@ pub mod client_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = HistorySvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/graphrun.v1.Client/Replay" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReplaySvc<T: Client>(pub Arc<T>);
+                    impl<T: Client> tonic::server::UnaryService<super::ReplayRequest>
+                    for ReplaySvc<T> {
+                        type Response = super::ReplayResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReplayRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Client>::replay(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReplaySvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

@@ -9,8 +9,8 @@ use crate::generated::{
     Ack, Blob, CancelRequest, ClaimRequest, ClaimResponse, CommandResultRequest,
     CommandResultResponse, HistoryRequest, HistoryResponse, InspectRequest, InspectResponse,
     ListRequest, ListResponse, PublishCatalogRequest, PublishDefinitionRequest, ReconcileRequest,
-    RegisterRequest, RenewRequest, RenewResponse, ReportRequest, SignalRequest, StartRequest,
-    StartResponse,
+    RegisterRequest, RenewRequest, RenewResponse, ReplayRequest, ReplayResponse, ReportRequest,
+    SignalRequest, StartRequest, StartResponse,
 };
 use crate::ids::{
     ActivationId, CommandId, EventId, LeaseRevision, OwnerGeneration, RunId, WorkerSessionId,
@@ -400,6 +400,13 @@ impl Client for GraphServices {
     ) -> Result<Response<InspectResponse>, Status> {
         let run = parse_run(&request.into_inner().run_id)?;
         let state = self.storage.query_state().await;
+        if let Some(summary) = state.terminal_summaries.get(&run) {
+            return Ok(Response::new(InspectResponse {
+                view_json: serde_json::to_vec(&crate::history::summary_view(summary))
+                    .map_err(|err| Status::internal(err.to_string()))?,
+                error: String::new(),
+            }));
+        }
         let Some(run_state) = state.runs.get(&run) else {
             return Ok(Response::new(InspectResponse {
                 view_json: Vec::new(),
@@ -430,6 +437,13 @@ impl Client for GraphServices {
                 })
             })
             .collect();
+        let mut runs = runs;
+        runs.extend(
+            state
+                .terminal_summaries
+                .values()
+                .map(crate::history::summary_view),
+        );
         Ok(Response::new(ListResponse {
             runs_json: serde_json::to_vec(&runs).unwrap_or_default(),
         }))
@@ -439,18 +453,40 @@ impl Client for GraphServices {
         &self,
         request: Request<HistoryRequest>,
     ) -> Result<Response<HistoryResponse>, Status> {
-        let run = parse_run(&request.into_inner().run_id)?;
+        self.query_context(&request)?;
+        let req = request.into_inner();
+        let run = parse_run(&req.run_id)?;
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|err| Status::unavailable(err.to_string()))?;
         let state = self.storage.query_state().await;
-        if let Some(run_state) = state.runs.get(&run) {
-            if let Some(pinned) = &run_state.published {
-                pinned
-                    .verify(&run_state.definition, &run_state.catalog)
-                    .map_err(status_error)?;
-            }
-        }
-        let events = crate::domain::run_events(&state, run);
+        let page = crate::history::page(&state, run, req.after_sequence, req.page_size, now())
+            .map_err(status_error)?;
         Ok(Response::new(HistoryResponse {
-            events_json: serde_json::to_vec(events).unwrap_or_default(),
+            events_json: serde_json::to_vec(&page)
+                .map_err(|err| Status::internal(err.to_string()))?,
+            error: String::new(),
+        }))
+    }
+
+    async fn replay(
+        &self,
+        request: Request<ReplayRequest>,
+    ) -> Result<Response<ReplayResponse>, Status> {
+        self.query_context(&request)?;
+        let req = request.into_inner();
+        let run = parse_run(&req.run_id)?;
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|err| Status::unavailable(err.to_string()))?;
+        let state = self.storage.query_state().await;
+        let projection = crate::history::reconstruct_at(&state, run, req.through_sequence, now())
+            .map_err(status_error)?;
+        Ok(Response::new(ReplayResponse {
+            view_json: serde_json::to_vec(&inspect_view(&projection, run))
+                .map_err(|err| Status::internal(err.to_string()))?,
             error: String::new(),
         }))
     }
@@ -501,7 +537,7 @@ impl WorkerSvc for GraphServices {
         self.notify.notify_one();
         let state = self.storage.query_state().await;
         let events = state.commands.get(&command.id).cloned().unwrap_or_default();
-        let assignments = assignments_from(&state, &events)
+        let assignments = assignments_from(&events)
             .into_iter()
             .map(|item| crate::generated::Assignment {
                 run_id: item.run.to_hex(),

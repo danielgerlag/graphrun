@@ -1,9 +1,7 @@
 use crate::catalog::{Catalog, ExecutionKind};
 use crate::cluster::{ClusterNetwork, MemberConfig};
 use crate::compiler::compile_yaml;
-use crate::domain::{
-    Command, CommandBody, RunStatus, State, active_runs, reconstruct, run_events, run_output,
-};
+use crate::domain::{Command, CommandBody, RunStatus, State, active_runs, run_output};
 use crate::error::{Error, ErrorKind, Result};
 use crate::handlers::Handlers;
 use crate::ids::{CommandId, EventId, RunId};
@@ -172,6 +170,14 @@ pub enum ControlRequest {
     List,
     History {
         run: String,
+        #[serde(default)]
+        after_sequence: u64,
+        #[serde(default)]
+        page_size: u32,
+    },
+    Replay {
+        run: String,
+        through_sequence: u64,
     },
     Snapshot,
     Health,
@@ -751,7 +757,17 @@ impl Engine {
     }
 
     pub async fn inspect_json(&self, run: RunId) -> Result<serde_json::Value> {
-        let state = self.inspect(run).await?;
+        let state = self.storage.query_state().await;
+        if let Some(summary) = state.terminal_summaries.get(&run) {
+            return Ok(crate::history::summary_view(summary));
+        }
+        let run_state = state
+            .runs
+            .get(&run)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "unknown run"))?;
+        if let Some(pinned) = &run_state.published {
+            pinned.verify(&run_state.definition, &run_state.catalog)?;
+        }
         Ok(inspect_view(&state, run))
     }
 
@@ -784,12 +800,59 @@ impl Engine {
                 })
             })
             .collect();
+        let mut runs = runs;
+        runs.extend(
+            state
+                .terminal_summaries
+                .values()
+                .map(crate::history::summary_view),
+        );
         serde_json::json!({ "runs": runs })
     }
 
     pub async fn history(&self, run: RunId) -> Result<Vec<crate::domain::DomainEvent>> {
-        let state = self.inspect(run).await?;
-        Ok(crate::domain::history_or_unavailable(&state, run, now())?.to_vec())
+        let state = history_state(&self.raft, &self.storage).await?;
+        let mut after = 0;
+        let mut events = Vec::new();
+        loop {
+            let page =
+                crate::history::page(&state, run, after, crate::history::MAX_PAGE_LIMIT, now())?;
+            if page.unavailable {
+                return Err(Error::new(
+                    ErrorKind::Unavailable,
+                    "history range is unavailable",
+                ));
+            }
+            events.extend(page.events.into_iter().map(|entry| entry.event));
+            match page.next_cursor {
+                Some(cursor) => after = cursor,
+                None => return Ok(events),
+            }
+        }
+    }
+
+    pub async fn history_page(
+        &self,
+        run: RunId,
+        after: u64,
+        limit: u32,
+    ) -> Result<crate::history::HistoryPage> {
+        crate::history::page(
+            &history_state(&self.raft, &self.storage).await?,
+            run,
+            after,
+            limit,
+            now(),
+        )
+    }
+
+    pub async fn reconstruct_at(&self, run: RunId, through: u64) -> Result<State> {
+        crate::history::reconstruct_at(
+            &history_state(&self.raft, &self.storage).await?,
+            run,
+            through,
+            now(),
+        )
     }
 
     pub async fn run_worker(endpoint: String, tls: crate::tls::TlsMaterial) -> Result<()> {
@@ -1166,21 +1229,28 @@ impl Drop for Engine {
 pub fn replay(data_dir: impl AsRef<Path>) -> Result<State> {
     let db_path = data_dir.as_ref().join("member.redb");
     let state = load_domain_readonly(&db_path)?;
+    for run in state.runs.keys() {
+        if !state.history.contains_key(run) {
+            return Err(Error::new(
+                ErrorKind::Unavailable,
+                format!("missing retained history for run {}", run.to_hex()),
+            ));
+        }
+    }
     for (run, events) in &state.history {
         let Some(run_state) = state.runs.get(run) else {
-            continue;
+            return Err(Error::new(
+                ErrorKind::Unavailable,
+                format!("history has no retained run {}", run.to_hex()),
+            ));
         };
         if let Some(pinned) = &run_state.published {
             pinned.verify(&run_state.definition, &run_state.catalog)?;
         }
-        let rebuilt = reconstruct(
-            run_state.definition.clone(),
-            run_state.catalog.clone(),
-            events,
-        )?;
+        let rebuilt = crate::history::reconstruct_at(&state, *run, events.len() as u64, now())?;
         let live = run_output(&state, *run);
         let replayed = run_output(&rebuilt, *run);
-        if live != replayed {
+        if live != replayed || run_state.status != rebuilt.runs[run].status {
             return Err(Error::invalid(format!(
                 "replay mismatch for run {}",
                 run.to_hex()
@@ -1188,6 +1258,13 @@ pub fn replay(data_dir: impl AsRef<Path>) -> Result<State> {
         }
     }
     Ok(state)
+}
+
+async fn history_state(raft: &Raft<TypeConfig>, storage: &StorageHandle) -> Result<State> {
+    raft.ensure_linearizable()
+        .await
+        .map_err(|err| Error::new(ErrorKind::Unavailable, err.to_string()))?;
+    Ok(storage.query_state().await)
 }
 
 pub async fn connect_control(
@@ -1569,6 +1646,13 @@ async fn dispatch_control(
         ControlRequest::Inspect { run } => match RunId::from_hex(&run) {
             Ok(run) => {
                 let state = storage.query_state().await;
+                if let Some(summary) = state.terminal_summaries.get(&run) {
+                    return ControlResponse {
+                        ok: true,
+                        error: None,
+                        body: crate::history::summary_view(summary),
+                    };
+                }
                 state
                     .runs
                     .get(&run)
@@ -1582,27 +1666,30 @@ async fn dispatch_control(
             }
             Err(err) => Err(Error::invalid(err)),
         },
-        ControlRequest::History { run } => match RunId::from_hex(&run) {
-            Ok(run) => {
-                let state = storage.query_state().await;
-                let verified = state
-                    .runs
-                    .get(&run)
-                    .and_then(|run_state| {
-                        run_state
-                            .published
-                            .as_ref()
-                            .map(|pinned| (pinned, run_state))
-                    })
-                    .map(|(pinned, run_state)| {
-                        pinned.verify(&run_state.definition, &run_state.catalog)
-                    })
-                    .unwrap_or(Ok(()));
-                verified.and_then(|_| {
-                    serde_json::to_value(run_events(&state, run))
-                        .map_err(|err| Error::invalid(err.to_string()))
+        ControlRequest::History {
+            run,
+            after_sequence,
+            page_size,
+        } => match RunId::from_hex(&run) {
+            Ok(run) => match history_state(raft, storage).await {
+                Ok(state) => crate::history::page(&state, run, after_sequence, page_size, now())
+                    .and_then(|page| {
+                        serde_json::to_value(page).map_err(|err| Error::invalid(err.to_string()))
+                    }),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(Error::invalid(err)),
+        },
+        ControlRequest::Replay {
+            run,
+            through_sequence,
+        } => match RunId::from_hex(&run) {
+            Ok(run) => history_state(raft, storage)
+                .await
+                .and_then(|state| {
+                    crate::history::reconstruct_at(&state, run, through_sequence, now())
                 })
-            }
+                .map(|projection| inspect_view(&projection, run)),
             Err(err) => Err(Error::invalid(err)),
         },
         ControlRequest::Snapshot => raft
@@ -1846,10 +1933,26 @@ async fn snapshot_controller(raft: Raft<TypeConfig>, _storage: StorageHandle) {
 }
 
 async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc<Notify>) {
+    let mut last_cleanup = tokio::time::Instant::now() - Duration::from_secs(5);
     loop {
         tokio::select! {
             _ = notify.notified() => {}
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        if last_cleanup.elapsed() >= Duration::from_secs(5) {
+            if write_raft(
+                &raft,
+                Command {
+                    id: CommandId::generate(),
+                    time: now(),
+                    body: CommandBody::PruneHistory { limit: 512 },
+                },
+            )
+            .await
+            .is_ok()
+            {
+                last_cleanup = tokio::time::Instant::now();
+            }
         }
         let state = storage.query_state().await;
         for run in active_runs(&state) {
@@ -1919,7 +2022,7 @@ async fn worker_loop(
         let mut did_work = false;
         let state = storage.query_state().await;
         let events = state.commands.get(&claim.id).cloned().unwrap_or_default();
-        for assignment in crate::domain::assignments_from(&state, &events) {
+        for assignment in crate::domain::assignments_from(&events) {
             let blocking = state
                 .runs
                 .get(&assignment.run)

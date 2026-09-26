@@ -84,10 +84,26 @@ message ListResponse {
 
 message HistoryRequest {
   string run_id = 1;
+  // Exclusive per-run sequence cursor; zero begins at the retained floor.
+  uint64 after_sequence = 2;
+  // Zero selects the default of 100; maximum 1000.
+  uint32 page_size = 3;
 }
 
 message HistoryResponse {
+  // JSON HistoryPage, including retained_from, retained_through and next_cursor.
   bytes events_json = 1;
+  string error = 2;
+}
+
+message ReplayRequest {
+  string run_id = 1;
+  // Inclusive per-run sequence, required and nonzero.
+  uint64 through_sequence = 2;
+}
+
+message ReplayResponse {
+  bytes view_json = 1;
   string error = 2;
 }
 
@@ -101,6 +117,7 @@ service Client {
   rpc Inspect(InspectRequest) returns (InspectResponse);
   rpc List(ListRequest) returns (ListResponse);
   rpc History(HistoryRequest) returns (HistoryResponse);
+  rpc Replay(ReplayRequest) returns (ReplayResponse);
 }
 
 message RegisterRequest {

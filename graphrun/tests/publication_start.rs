@@ -591,6 +591,11 @@ async fn committed_command_result_survives_leader_change() {
         )
         .await
         .unwrap();
+    let original_page = original.history_page(run, 0, 100).await.unwrap();
+    let original_projection = original
+        .reconstruct_at(run, original_page.retained_through)
+        .await
+        .unwrap();
     original.shutdown().await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
     let leader = loop {
@@ -629,6 +634,28 @@ async fn committed_command_result_survives_leader_change() {
         run
     );
     let state = leader.inspect(run).await.unwrap();
+    let elected_page = leader.history_page(run, 0, 100).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&elected_page).unwrap(),
+        serde_json::to_value(&original_page).unwrap()
+    );
+    let elected_projection = leader
+        .reconstruct_at(run, elected_page.retained_through)
+        .await
+        .unwrap();
+    assert_eq!(
+        graphrun::history::projection_view(&elected_projection, run),
+        graphrun::history::projection_view(&original_projection, run)
+    );
+    let nonleader = if follower2.is_leader() {
+        &follower3
+    } else {
+        &follower2
+    };
+    assert_eq!(
+        nonleader.history_page(run, 0, 100).await.unwrap_err().kind,
+        ErrorKind::Unavailable
+    );
     assert_eq!(state.runs.len(), 1);
     assert_eq!(
         state.history[&run]
@@ -749,6 +776,48 @@ async fn signed_principal_publishes_and_starts_over_grpc_with_scoped_receipts() 
         .start_published_with_command("external_worker_echo", None, "same", &input(1), id)
         .await
         .unwrap();
+    let remote_page = client.history_page(first, 0, 2).await.unwrap();
+    let local_page = engine.history_page(first, 0, 2).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&remote_page).unwrap(),
+        serde_json::to_value(&local_page).unwrap()
+    );
+    let remote_view = client
+        .reconstruct_at(first, remote_page.retained_through)
+        .await
+        .unwrap();
+    let local_projection = engine
+        .reconstruct_at(first, remote_page.retained_through)
+        .await
+        .unwrap();
+    assert_eq!(
+        remote_view,
+        graphrun::history::projection_view(&local_projection, first)
+    );
+    let socket_page = graphrun::connect_control(
+        directory.0.join("member/control.sock"),
+        graphrun::ControlRequest::History {
+            run: first.to_hex(),
+            after_sequence: 0,
+            page_size: 2,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(socket_page.ok);
+    assert_eq!(socket_page.body, serde_json::to_value(remote_page).unwrap());
+    assert_eq!(
+        client
+            .history_page(graphrun::RunId::from_bytes([1; 16]), 0, 2)
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::NotFound
+    );
+    assert_eq!(
+        client.reconstruct_at(first, 0).await.unwrap_err().kind,
+        ErrorKind::InvalidArgument
+    );
     assert_eq!(
         client
             .start_published_with_command("external_worker_echo", None, "same", &input(1), id)

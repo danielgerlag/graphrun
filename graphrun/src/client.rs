@@ -3,7 +3,7 @@ use crate::error::{Error, Result};
 use crate::generated::client_client::ClientClient;
 use crate::generated::{
     CancelRequest, CommandResultRequest, HistoryRequest, InspectRequest, ListRequest,
-    PublishCatalogRequest, PublishDefinitionRequest, SignalRequest, StartRequest,
+    PublishCatalogRequest, PublishDefinitionRequest, ReplayRequest, SignalRequest, StartRequest,
 };
 use crate::ids::{CommandId, EventId, RunId};
 use crate::rpc::client_tls;
@@ -370,18 +370,65 @@ impl GrpcClient {
     }
 
     pub async fn history(&mut self, run: RunId) -> Result<serde_json::Value> {
+        let mut after = 0;
+        let mut events = Vec::new();
+        loop {
+            let page = self
+                .history_page(run, after, crate::history::MAX_PAGE_LIMIT)
+                .await?;
+            if page.unavailable {
+                return Err(Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "history range is unavailable",
+                ));
+            }
+            events.extend(page.events.into_iter().map(|entry| entry.event));
+            match page.next_cursor {
+                Some(cursor) => after = cursor,
+                None => {
+                    return serde_json::to_value(events)
+                        .map_err(|err| Error::invalid(err.to_string()));
+                }
+            }
+        }
+    }
+
+    pub async fn history_page(
+        &mut self,
+        run: RunId,
+        after: u64,
+        limit: u32,
+    ) -> Result<crate::history::HistoryPage> {
         let resp = self
             .inner
             .history(HistoryRequest {
                 run_id: run.to_hex(),
+                after_sequence: after,
+                page_size: limit,
             })
             .await
-            .map_err(|err| Error::invalid(err.to_string()))?
+            .map_err(Self::map_status)?
             .into_inner();
         if !resp.error.is_empty() {
             return Err(Error::invalid(resp.error));
         }
         serde_json::from_slice(&resp.events_json).map_err(|err| Error::invalid(err.to_string()))
+    }
+
+    pub async fn reconstruct_at(&mut self, run: RunId, through: u64) -> Result<serde_json::Value> {
+        let resp = self
+            .inner
+            .replay(ReplayRequest {
+                run_id: run.to_hex(),
+                through_sequence: through,
+            })
+            .await
+            .map_err(Self::map_status)?
+            .into_inner();
+        if !resp.error.is_empty() {
+            return Err(Error::invalid(resp.error));
+        }
+        serde_json::from_slice(&resp.view_json).map_err(|err| Error::invalid(err.to_string()))
     }
 }
 

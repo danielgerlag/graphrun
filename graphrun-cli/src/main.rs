@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use graphrun::ids::CommandId;
+use graphrun::storage::load_domain_readonly;
 use graphrun::{
     Catalog, ControlRequest, Engine, EventId, GrpcClient, RunId, TlsMaterial, Value, compile_yaml,
     connect_control, replay,
@@ -120,6 +121,10 @@ enum Commands {
     History {
         #[arg(long)]
         run: String,
+        #[arg(long, default_value_t = 0)]
+        after_sequence: u64,
+        #[arg(long, default_value_t = 100)]
+        page_size: u32,
         #[command(flatten)]
         connect: ConnectArgs,
     },
@@ -127,7 +132,9 @@ enum Commands {
         #[arg(long)]
         run: Option<String>,
         #[arg(long)]
-        local_dir: PathBuf,
+        through_sequence: Option<u64>,
+        #[command(flatten)]
+        connect: ConnectArgs,
     },
     Resolve {
         #[arg(long)]
@@ -401,34 +408,109 @@ async fn run() -> Result<(), String> {
             println!("{body}");
             Ok(())
         }
-        Commands::History { run, connect } => {
+        Commands::History {
+            run,
+            after_sequence,
+            page_size,
+            connect,
+        } => {
             if let Some(mut client) = grpc_client(&connect).await? {
                 let view = client
-                    .history(RunId::from_hex(&run)?)
+                    .history_page(RunId::from_hex(&run)?, after_sequence, page_size)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::to_value(view).map_err(|err| err.to_string())?
+                );
+                return Ok(());
+            }
+            let local_dir = require_local(connect.local_dir)?;
+            let body = dispatch(
+                &local_dir,
+                ControlRequest::History {
+                    run,
+                    after_sequence,
+                    page_size,
+                },
+                false,
+            )
+            .await?;
+            println!("{body}");
+            Ok(())
+        }
+        Commands::Replay {
+            run,
+            through_sequence,
+            connect,
+        } => {
+            if let Some(mut client) = grpc_client(&connect).await? {
+                let run = RunId::from_hex(
+                    &run.ok_or_else(|| "remote replay requires --run".to_owned())?,
+                )?;
+                let through = match through_sequence {
+                    Some(through) => through,
+                    None => {
+                        client
+                            .history_page(run, 0, 1)
+                            .await
+                            .map_err(|err| err.to_string())?
+                            .retained_through
+                    }
+                };
+                let view = client
+                    .reconstruct_at(run, through)
                     .await
                     .map_err(|err| err.to_string())?;
                 println!("{view}");
                 return Ok(());
             }
             let local_dir = require_local(connect.local_dir)?;
-            let body = dispatch(&local_dir, ControlRequest::History { run }, false).await?;
-            println!("{body}");
-            Ok(())
-        }
-        Commands::Replay { run, local_dir } => {
-            let state = replay(&local_dir).map_err(|err| err.to_string())?;
             if let Some(run) = run {
                 let id = RunId::from_hex(&run)?;
-                let events = graphrun::run_events(&state, id);
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "run": run,
-                        "events": events,
-                        "output": graphrun::run_output(&state, id),
-                    })
-                );
+                if local_dir.join("control.sock").exists() {
+                    let through = match through_sequence {
+                        Some(through) => through,
+                        None => {
+                            let page = dispatch(
+                                &local_dir,
+                                ControlRequest::History {
+                                    run: run.clone(),
+                                    after_sequence: 0,
+                                    page_size: 1,
+                                },
+                                false,
+                            )
+                            .await?;
+                            page["retained_through"]
+                                .as_u64()
+                                .ok_or_else(|| "missing retained history boundary".to_owned())?
+                        }
+                    };
+                    let body = dispatch(
+                        &local_dir,
+                        ControlRequest::Replay {
+                            run,
+                            through_sequence: through,
+                        },
+                        false,
+                    )
+                    .await?;
+                    println!("{body}");
+                } else {
+                    let state = load_domain_readonly(local_dir.join("member.redb"))
+                        .map_err(|err| err.to_string())?;
+                    let through = through_sequence
+                        .unwrap_or_else(|| graphrun::run_events(&state, id).len() as u64);
+                    let view = graphrun::history::replay_view(&state, id, through, read_time()?)
+                        .map_err(|err| err.to_string())?;
+                    println!("{view}");
+                }
             } else {
+                if through_sequence.is_some() {
+                    return Err("--through-sequence requires --run".to_owned());
+                }
+                let state = replay(&local_dir).map_err(|err| err.to_string())?;
                 println!(
                     "{}",
                     serde_json::json!({
@@ -759,6 +841,14 @@ fn load_value(path: &PathBuf) -> Result<Value, String> {
     serde_json::from_str(&text).map_err(|err| err.to_string())
 }
 
+fn read_time() -> Result<graphrun::time::EngineTime, String> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|err| err.to_string())?
+        .as_millis() as u64;
+    Ok(graphrun::time::EngineTime::from_millis(millis))
+}
+
 fn validate(definition: &PathBuf, catalog: &PathBuf) -> Result<String, String> {
     let catalog = load_catalog(catalog)?;
     let text = std::fs::read_to_string(definition).map_err(|err| err.to_string())?;
@@ -823,13 +913,44 @@ async fn dispatch(
             })?;
         return response_body(resp);
     }
+    match &req {
+        ControlRequest::History {
+            run,
+            after_sequence,
+            page_size,
+        } => {
+            let state = load_domain_readonly(local_dir.join("member.redb"))
+                .map_err(|err| err.to_string())?;
+            let page = graphrun::history::page(
+                &state,
+                RunId::from_hex(run)?,
+                *after_sequence,
+                *page_size,
+                read_time()?,
+            )
+            .map_err(|err| err.to_string())?;
+            return serde_json::to_value(page).map_err(|err| err.to_string());
+        }
+        ControlRequest::Replay {
+            run,
+            through_sequence,
+        } => {
+            let state = load_domain_readonly(local_dir.join("member.redb"))
+                .map_err(|err| err.to_string())?;
+            return graphrun::history::replay_view(
+                &state,
+                RunId::from_hex(run)?,
+                *through_sequence,
+                read_time()?,
+            )
+            .map_err(|err| err.to_string());
+        }
+        _ => {}
+    }
     if !start_if_needed
         && matches!(
             req,
-            ControlRequest::Inspect { .. }
-                | ControlRequest::List
-                | ControlRequest::History { .. }
-                | ControlRequest::Health
+            ControlRequest::Inspect { .. } | ControlRequest::List | ControlRequest::Health
         )
     {
         let engine = Engine::local(local_dir)
@@ -844,11 +965,6 @@ async fn dispatch(
                     .map_err(|err| err.to_string())?
             }
             ControlRequest::List => engine.list().await,
-            ControlRequest::History { run } => {
-                let id = RunId::from_hex(&run)?;
-                let events = engine.history(id).await.map_err(|err| err.to_string())?;
-                serde_json::to_value(events).map_err(|err| err.to_string())?
-            }
             ControlRequest::Health => engine.health().await,
             _ => unreachable!(),
         };

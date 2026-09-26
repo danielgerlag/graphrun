@@ -677,11 +677,11 @@ fn apply_entries(
                     reply.command_result = Some(receipt);
                 }
             } else {
-                match domain::commit_command(&mut next_domain, req.command.clone()) {
+                let mut candidate = next_domain.clone();
+                match domain::commit_command(&mut candidate, req.command.clone()) {
                     Ok(events) => {
-                        if !events.is_empty() {
-                            domain_changed = true;
-                        }
+                        next_domain = candidate;
+                        domain_changed = true;
                         reply.run_id = events.iter().find_map(|event| match event {
                             domain::DomainEvent::RunAdmitted { run, .. } => Some(*run),
                             _ => None,
@@ -1216,6 +1216,118 @@ mod tests {
         assert_eq!(loaded_again.history, domain.history);
         let resurrected = get_logs(&db, 1, 3).unwrap();
         assert!(resurrected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_history_cleanup_survives_restart_after_log_purge() {
+        use crate::domain::{CommandBody, RunStatus};
+        use crate::ids::{CommandId, RunId};
+        use crate::time::EngineTime;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let catalog = crate::catalog::Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let definition = crate::compiler::compile_yaml(
+            "\
+dsl: graphrun/v1
+id: persisted_history
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {literal: null}
+",
+            &catalog,
+        )
+        .unwrap();
+        let run = RunId::from_bytes([7; 16]);
+        let entry = |index, time_ms, body| Entry::<TypeConfig> {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(RaftRequest {
+                command: Command {
+                    id: CommandId::from_bytes([index as u8; 16]),
+                    time: EngineTime::from_millis(time_ms),
+                    body,
+                },
+            }),
+        };
+        let start = entry(
+            1,
+            1,
+            CommandBody::Start {
+                run,
+                definition: Box::new(definition),
+                catalog: Box::new(catalog),
+                input: crate::value::Value::Null,
+            },
+        );
+        let progress = entry(2, 2, CommandBody::Progress { run });
+        append_logs(&db, &[start.clone(), progress.clone()]).unwrap();
+        let mut applied = None;
+        let mut membership = StoredMembership::new(None, Membership::new(vec![], None));
+        let mut state = State::default();
+        let responses = apply_entries(
+            &db,
+            &mut applied,
+            &mut membership,
+            &mut state,
+            vec![start, progress],
+        )
+        .unwrap();
+        assert!(responses.iter().all(|reply| reply.error.is_none()));
+        assert!(matches!(
+            state.runs[&run].status,
+            RunStatus::Succeeded { .. }
+        ));
+        let through = state.history[&run].len() as u64;
+        assert_eq!(state.checkpoints[&run].through_run_sequence, through);
+        purge_logs(
+            &db,
+            2,
+            &LogId::new(openraft::CommittedLeaderId::new(1, 1), 2),
+        )
+        .unwrap();
+        assert!(get_logs(&db, 1, 3).unwrap().is_empty());
+        assert_eq!(
+            crate::history::page(&state, run, 0, 100, EngineTime::from_millis(3))
+                .unwrap()
+                .retained_through,
+            through
+        );
+
+        let expiry = entry(
+            3,
+            2 + 30 * 24 * 60 * 60 * 1000,
+            CommandBody::PruneHistory { limit: 128 },
+        );
+        let response =
+            apply_entries(&db, &mut applied, &mut membership, &mut state, vec![expiry]).unwrap();
+        assert!(response[0].error.is_none());
+        assert!(!state.runs.contains_key(&run));
+        drop(db);
+
+        let (handle, thread) = StorageHandle::open(&path).unwrap();
+        let restored = handle.query_state().await;
+        let page = crate::history::page(
+            &restored,
+            run,
+            0,
+            100,
+            EngineTime::from_millis(2 + 30 * 24 * 60 * 60 * 1000),
+        )
+        .unwrap();
+        assert!(page.unavailable);
+        assert_eq!(page.unavailable_range.unwrap().last, through);
+        handle.shutdown();
+        thread.join().unwrap();
     }
 
     #[test]

@@ -680,7 +680,13 @@ fn apply_operation(
                 },
             );
             let decision = domain::decide(&provisional, &start)?;
-            domain::apply_events(&mut provisional, &decision.events);
+            domain::apply_events_with_cause(
+                &mut provisional,
+                &decision.events,
+                Some(command.id),
+                Some(&key.principal_id),
+                command.time,
+            )?;
             let mut progress_hasher = Sha256::new();
             progress_hasher.update(b"graphrun-start-progress/v1\0");
             progress_hasher.update(hash);

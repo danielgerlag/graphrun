@@ -24,6 +24,7 @@ pub mod flow;
 #[doc(hidden)]
 pub mod generated;
 pub mod handlers;
+pub mod history;
 pub mod ids;
 pub mod ir;
 pub mod limits;
@@ -58,6 +59,7 @@ pub use engine::{
 pub use error::{Error, ErrorKind, Result};
 pub use flow::{region, workflow};
 pub use handlers::Handlers;
+pub use history::{HistoryPage, RecordedEvent, reconstruct_at};
 pub use ids::{EventId, RunId};
 pub use ir::Definition;
 pub use schema::{DurablePayload, SchemaRef};
