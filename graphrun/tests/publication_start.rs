@@ -924,6 +924,10 @@ async fn signed_principal_publishes_and_starts_over_grpc_with_scoped_receipts() 
             .kind,
         ErrorKind::PermissionDenied
     );
+    assert_eq!(
+        admin_client.command_result(id).await.unwrap_err().kind,
+        ErrorKind::PermissionDenied
+    );
 
     let other = PrincipalIdentity::new(
         cluster_id,

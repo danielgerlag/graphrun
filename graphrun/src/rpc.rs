@@ -96,12 +96,7 @@ impl GraphServices {
         &self,
         request: &Request<T>,
     ) -> Result<crate::publication::AuthContext, Status> {
-        let peer = self.verified_peer(request)?;
-        if !peer.roles().any(|role| role == crate::tls::PeerRole::Admin) {
-            peer.require_role(crate::tls::PeerRole::Client)
-                .map_err(status_error)?;
-        }
-        Ok(crate::publication::AuthContext::verified_peer(&peer))
+        self.authenticated_context(request, crate::tls::PeerRole::Client)
     }
 
     async fn member_context<T>(&self, request: &Request<T>, sender_id: u64) -> Result<(), Status> {
