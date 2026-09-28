@@ -1547,7 +1547,15 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
         ),
         "EVT-004" => from_test(evidence, row, "domain::tests::reserved_event_survives_ttl"),
         "EVT-006" => from_test(evidence, row, "domain::tests::inbox_quota_is_explicit"),
-        "EVT-007" => from_test(evidence, row, "domain::tests::reserved_event_survives_ttl"),
+        "EVT-007" => from_tests(
+            evidence,
+            row,
+            &[
+                "domain::tests::reserved_event_survives_ttl",
+                "domain::tests::unreserved_expired_event_does_not_satisfy_wait",
+                "engine::tests::reserved_signal_survives_restart_and_expired_cleanup",
+            ],
+        ),
         "EVT-008" => from_test(evidence, row, "domain::tests::cancel_releases_reservation"),
         "EVT-005" => all_of(
             row,

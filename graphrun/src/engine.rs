@@ -3607,6 +3607,118 @@ nodes:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reserved_signal_survives_restart_and_expired_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::local(dir.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/events.yaml"),
+                &catalog(),
+                Value::Object(BTreeMap::from([(
+                    "key".to_owned(),
+                    Value::String("k1".to_owned()),
+                )])),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if engine
+                .inspect(run)
+                .await
+                .unwrap()
+                .waits
+                .values()
+                .any(|wait| wait.pending)
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "wait did not open");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let scheduler = engine.scheduler.as_mut().expect("local scheduler");
+        scheduler.abort();
+        assert!(scheduler.await.unwrap_err().is_cancelled());
+        let event_id = EventId::generate();
+        engine
+            .signal(
+                run,
+                event_id,
+                "approval",
+                "k1",
+                Value::Object(BTreeMap::from([("approved".to_owned(), Value::Bool(true))])),
+            )
+            .await
+            .unwrap();
+        let accepted = engine.inspect(run).await.unwrap();
+        let reserved = accepted
+            .inbox
+            .iter()
+            .find(|entry| entry.event_id == event_id)
+            .unwrap();
+        assert!(reserved.reserved_wait.is_some());
+        assert!(!reserved.consumed);
+        let expires_ms = reserved.expires_ms;
+        assert!(expires_ms > reserved.accepted_ms);
+        engine.shutdown().await.unwrap();
+
+        let mut persisted = load_domain_readonly(dir.path().join("member.redb")).unwrap();
+        let retained = persisted
+            .inbox
+            .iter()
+            .find(|entry| entry.event_id == event_id)
+            .unwrap();
+        assert_eq!(retained.reserved_wait, reserved.reserved_wait);
+        assert_eq!(retained.expires_ms, expires_ms);
+        let time = crate::time::EngineTime::from_millis(expires_ms + 1);
+        crate::history::prune(&mut persisted, CommandId::generate(), time, 512).unwrap();
+        assert!(
+            persisted
+                .inbox
+                .iter()
+                .any(|entry| entry.event_id == event_id && entry.reserved_wait.is_some())
+        );
+        crate::domain::apply_command(
+            &mut persisted,
+            Command {
+                id: CommandId::generate(),
+                time,
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            run_output(&persisted, run)
+                .unwrap()
+                .pointer("/approved")
+                .unwrap(),
+            &Value::Bool(true)
+        );
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let output = engine
+            .wait_terminal(run, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(output.pointer("/approved").unwrap(), &Value::Bool(true));
+        let events = engine.history(run).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, crate::domain::DomainEvent::EventReserved { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, crate::domain::DomainEvent::WaitSatisfied { .. }))
+                .count(),
+            1
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timed_out_wait_releases_its_activation_for_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::local(dir.path()).await.unwrap();
