@@ -4104,6 +4104,14 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             if let Some(wait_state) = state.waits.get_mut(wait) {
                 wait_state.pending = false;
             }
+            if let Some(activation) = state
+                .waits
+                .get(wait)
+                .map(|wait_state| wait_state.activation)
+                && let Some(act) = state.activations.get_mut(&activation)
+            {
+                act.status = ActivationStatus::Succeeded;
+            }
         }
         DomainEvent::EventAccepted {
             event_id,

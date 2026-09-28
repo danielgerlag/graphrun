@@ -53,6 +53,14 @@ Compile-fail cases must include wrong activity input type, wrong loop-body carry
 
 String JSON pointers and dynamic bindings must fail through a clear build-time error where static Rust cannot prove them. Do not claim such cases are compile-time checked.
 
+The Rust builder captures a compensator's retryable codes from its catalog
+contract when it attaches the default compensation policy. An explicit
+typed retry policy and attempt timeout must normalize to the same IR as
+equivalent YAML. `E2E-001` runs all ten sample binaries in the fresh
+verification invocation, retains each binary SHA-256 and execution log,
+and combines their YAML/Rust IR and outcome checks with production-CLI YAML
+execution.
+
 Before implementing the whole engine, build a compilable API prototype sufficient to compile these cases. Correct incidental signatures if necessary without dropping capabilities or using public `Any`, unchecked casts, or runtime workflow closures.
 
 Include the finite-wait shared-tail fixture from the builder specification. Both success and nonterminal timeout paths must be constructible. Using the wait's success-only payload on its timeout path must fail build-time availability analysis.
@@ -170,6 +178,8 @@ cargo run --locked -p graphrun-e2e -- smoke-saga-settlement \
 	--cli target/release/graphrun --artifacts target/saga-smoke
 cargo run --locked -p graphrun-e2e -- smoke-security \
 	--cli target/release/graphrun --artifacts target/security-smoke
+cargo run --locked -p graphrun-e2e -- smoke-application \
+	--cli target/release/graphrun --artifacts target/application-smoke
 ```
 
 These commands do not produce a matrix report. `verify` must run all cases in

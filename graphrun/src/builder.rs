@@ -7,7 +7,10 @@ use crate::ir::{
     ChooseCase, Compensation, ConsumeFrom, DSL, Definition, Digest, FORMAT_VERSION, FailError,
     Node, ParallelBranch, Region as IrRegion, RegionPath, SignalDecl,
 };
-use crate::policy::{COMPENSATION_ATTEMPT_TIMEOUT, FORWARD_ATTEMPT_TIMEOUT, RetryPolicy};
+use crate::policy::{
+    COMPENSATION_ATTEMPT_TIMEOUT, FORWARD_ATTEMPT_TIMEOUT, MAX_ATTEMPT_TIMEOUT,
+    MIN_ATTEMPT_TIMEOUT, RetryPolicy,
+};
 use crate::schema::{DurablePayload, SchemaRef};
 use crate::time::duration_to_millis;
 use crate::value::Value;
@@ -45,6 +48,7 @@ struct ScopeId(u64);
 
 pub struct ActivityRef<I, O> {
     key: ActivityKey,
+    retryable_codes: Vec<String>,
     _i: PhantomData<fn() -> I>,
     _o: PhantomData<fn() -> O>,
 }
@@ -61,6 +65,7 @@ impl<I: DurablePayload, O: DurablePayload> ActivityRef<I, O> {
         }
         Ok(Self {
             key,
+            retryable_codes: contract.retryable_codes(),
             _i: PhantomData,
             _o: PhantomData,
         })
@@ -559,6 +564,21 @@ impl<I: DurablePayload> RegionBuilder<I> {
         U: DurablePayload,
     {
         self.graph.attach_compensation(node, compensator)
+    }
+
+    pub fn compensate_with_retry<O, U>(
+        &mut self,
+        node: &NodeRef<O>,
+        compensator: &ActivityRef<O, U>,
+        retry: RetryPolicy,
+        timeout: Duration,
+    ) -> Result<()>
+    where
+        O: DurablePayload,
+        U: DurablePayload,
+    {
+        self.graph
+            .attach_compensation_with_retry(node, compensator, retry, timeout)
     }
 
     pub fn parallel2<A, B, IA, IB>(
@@ -1134,7 +1154,44 @@ impl<I: DurablePayload> RegionGraphBuilder<I> {
                 activity: compensator.key.clone(),
                 input: Binding::from_ref(crate::binding::Reference::ForwardOutput),
                 timeout_ms: Some(duration_to_millis(COMPENSATION_ATTEMPT_TIMEOUT)?),
-                retry: None,
+                retry: Some(RetryPolicy::compensation_default(
+                    compensator.retryable_codes.clone(),
+                )),
+            },
+        )
+    }
+
+    pub fn attach_compensation_with_retry<O, U>(
+        &mut self,
+        node: &NodeRef<O>,
+        compensator: &ActivityRef<O, U>,
+        retry: RetryPolicy,
+        timeout: Duration,
+    ) -> Result<()>
+    where
+        O: DurablePayload,
+        U: DurablePayload,
+    {
+        retry.validate()?;
+        if retry
+            .errors
+            .iter()
+            .any(|code| !compensator.retryable_codes.contains(code))
+        {
+            return Err(Error::invalid(
+                "compensation retry lists terminal or unknown code",
+            ));
+        }
+        if !(MIN_ATTEMPT_TIMEOUT..=MAX_ATTEMPT_TIMEOUT).contains(&timeout) {
+            return Err(Error::invalid("compensation timeout is out of range"));
+        }
+        self.set_compensation(
+            &node.key,
+            Compensation::Activity {
+                activity: compensator.key.clone(),
+                input: Binding::from_ref(crate::binding::Reference::ForwardOutput),
+                timeout_ms: Some(duration_to_millis(timeout)?),
+                retry: Some(retry),
             },
         )
     }
