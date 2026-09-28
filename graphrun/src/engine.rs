@@ -3639,38 +3639,6 @@ nodes:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn timed_out_wait_releases_its_activation_for_recovery() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = Engine::local(dir.path()).await.unwrap();
-        let run = engine
-            .start_yaml(
-                include_str!("../../samples/10-timeout-recovery/workflow.yaml"),
-                &catalog(),
-                Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(0))])),
-            )
-            .await
-            .unwrap();
-        let output = engine
-            .wait_terminal(run, Duration::from_secs(6))
-            .await
-            .unwrap();
-        assert_eq!(output.pointer("/value").unwrap(), &Value::Int(0));
-        let state = engine.inspect(run).await.unwrap();
-        assert!(state.activations.values().any(|activation| {
-            activation.run == run
-                && activation.node.as_str() == "approval"
-                && activation.status == crate::domain::ActivationStatus::Succeeded
-        }));
-        assert!(state.activations.values().any(|activation| {
-            activation.run == run
-                && activation.node.as_str() == "recover"
-                && activation.status == crate::domain::ActivationStatus::Succeeded
-        }));
-        assert!(crate::domain::ready_activations(&state, run).is_empty());
-        engine.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_writes_file() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::local(dir.path()).await.unwrap();

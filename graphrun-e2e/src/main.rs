@@ -5656,10 +5656,42 @@ fn artifact_export(
     if hash_file(&dir.join("member.redb"))? != before {
         return Err("backup/replay wrote the source redb".into());
     }
-    let exported: serde_json::Value = serde_json::from_slice(
-        &fs::read(export_dir.join("domain.json")).map_err(|err| err.to_string())?,
-    )
-    .map_err(|err| format!("backup domain JSON: {err}"))?;
+    let manifest_path = export_dir.join("manifest.json");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).map_err(|err| err.to_string())?)
+            .map_err(|err| format!("backup manifest JSON: {err}"))?;
+    let snapshot_name = manifest["snapshot"]
+        .as_str()
+        .ok_or("v3 backup has no snapshot filename")?;
+    if manifest["format"] != "graphrun.backup/v3"
+        || !snapshot_name.starts_with("application-")
+        || !snapshot_name.ends_with(".snap")
+        || Path::new(snapshot_name).components().count() != 1
+    {
+        return Err(format!(
+            "backup did not publish a v3 application snapshot: {manifest}"
+        ));
+    }
+    let snapshot_path = export_dir.join(snapshot_name);
+    let manifest_before = hash_file(&manifest_path)?;
+    let snapshot_before = hash_file(&snapshot_path)?;
+    let state = graphrun::Engine::read_backup(&export_dir)
+        .map_err(|err| format!("validated v3 backup read: {err}"))?;
+    if hash_file(&manifest_path)? != manifest_before
+        || hash_file(&snapshot_path)? != snapshot_before
+        || hash_file(&dir.join("member.redb"))? != before
+    {
+        return Err("read-only v3 backup validation changed the backup or source member".into());
+    }
+    if state.current_cluster_id != cluster || !state.artifact_origins.contains(cluster) {
+        return Err("v3 backup lost the source cluster's artifact authority".into());
+    }
+    let exported = serde_json::to_value(state).map_err(|err| err.to_string())?;
+    observations.push(format!(
+        "v3 backup manifest={} snapshot={} sha256={snapshot_before}; Engine::read_backup validated without writes",
+        manifest_path.display(),
+        snapshot_path.display()
+    ));
     let original_catalog =
         graphrun::Catalog::from_json(&fs::read(catalog()).map_err(|err| err.to_string())?)
             .map_err(|err| err.to_string())?;
@@ -5764,6 +5796,8 @@ fn artifact_verify_export(
     let policy = &state["policy"];
     if definition["id"] != "artifact_proof"
         || definition["version"] != version
+        || definition["input_schema"]["key"] != "counter/v1"
+        || definition["output_schema"]["key"] != "counter/v1"
         || state["published"]["catalog_version"] != 1
         || state["published"]["definition_digest"] != receipt["outcome"]["digest"]
         || state["published"]["policy_format"] != "graphrun.run-policy/v1"
@@ -5878,6 +5912,8 @@ fn artifact_verify_export(
         if page[i]["event"] != *event
             || page[i]["sequence"] != record["sequence"]
             || page[i]["payload"] != record["payload"]
+            || page[i]["input_ref"] != record["input_ref"]
+            || page[i]["output_ref"] != record["output_ref"]
             || record["run"] != *run
             || record["sequence"] != (i + 1) as u64
             || record["format"] != "graphrun.run-event/v1"
@@ -5896,6 +5932,39 @@ fn artifact_verify_export(
             &mut observations,
             &mut missing,
         )?;
+        let (input, output) = match event["kind"].as_str() {
+            Some("run_admitted") => (Some(&event["input"]), None),
+            Some("claim_granted") if event["handler"] == "counter.increment" => {
+                (Some(&event["input"]), None)
+            }
+            Some("leaf_succeeded" | "run_succeeded") => (None, Some(&event["output"])),
+            Some(_) => (None, None),
+            None => return Err(format!("event {} has no type", i + 1)),
+        };
+        for (name, value, reference) in [
+            ("input", input, &record["input_ref"]),
+            ("output", output, &record["output_ref"]),
+        ] {
+            match value {
+                Some(value) if !reference.is_null() => artifact_reference(
+                    reference,
+                    "counter/v1",
+                    value,
+                    cluster,
+                    &format!("event {} {name}", i + 1),
+                    &mut observations,
+                    &mut missing,
+                )?,
+                Some(_) => missing.push(format!("event {} lacks separate {name} reference", i + 1)),
+                None if !reference.is_null() => {
+                    return Err(format!(
+                        "event {} has an unexpected {name} reference",
+                        i + 1
+                    ));
+                }
+                None => {}
+            }
+        }
     }
     if events
         .first()
@@ -5906,36 +5975,18 @@ fn artifact_verify_export(
     {
         return Err("retained input/output event payloads differ from run".into());
     }
-    for (label, reference, schema, value) in [
-        (
-            "accepted input",
-            &state["input_artifact"],
-            "graphrun.input/v1",
-            &state["input"],
-        ),
-        (
-            "accepted output",
-            &state["output_artifact"],
-            "graphrun.output/v1",
-            &events
-                .iter()
-                .find(|event| event["kind"] == "run_succeeded")
-                .ok_or("no output event")?["output"],
-        ),
-    ] {
-        if reference.is_null() {
-            missing.push(format!("{label}: no retained payload artifact reference"));
-        } else {
-            artifact_reference(
-                reference,
-                schema,
-                value,
-                cluster,
-                label,
-                &mut observations,
-                &mut missing,
-            )?;
-        }
+    let accepted_input = records
+        .first()
+        .ok_or("retained run has no admission record")?["input_ref"]["sha256"]
+        .as_str()
+        .ok_or("accepted input has no artifact digest")?;
+    let accepted_output = records
+        .last()
+        .ok_or("retained run has no completion record")?["output_ref"]["sha256"]
+        .as_str()
+        .ok_or("accepted output has no artifact digest")?;
+    if accepted_input == accepted_output {
+        return Err("accepted input and output incorrectly share one artifact identity".into());
     }
     if !missing.is_empty() {
         return Err(format!(
@@ -5945,6 +5996,167 @@ fn artifact_verify_export(
         ));
     }
     Ok(observations)
+}
+
+#[derive(Debug)]
+struct FramedProofSnapshot {
+    header: Vec<u8>,
+    frame_sizes: Vec<usize>,
+    payload: Vec<u8>,
+}
+
+fn proof_take<'a>(bytes: &'a [u8], offset: &mut usize, length: usize) -> Result<&'a [u8], String> {
+    let end = offset
+        .checked_add(length)
+        .ok_or("snapshot offset overflow")?;
+    let part = bytes
+        .get(*offset..end)
+        .ok_or("snapshot frame is truncated")?;
+    *offset = end;
+    Ok(part)
+}
+
+fn proof_read_snapshot(bytes: &[u8]) -> Result<FramedProofSnapshot, String> {
+    const MAGIC: &[u8] = b"graphrun.snapshot/v1\0";
+    const MAX_FRAME: usize = 1024 * 1024;
+    const MAX_PROOF: usize = 16 * MAX_FRAME;
+    let mut offset = 0;
+    if proof_take(bytes, &mut offset, MAGIC.len())? != MAGIC {
+        return Err("backup has unsupported snapshot framing".into());
+    }
+    let manifest_size = u32::from_le_bytes(
+        proof_take(bytes, &mut offset, 4)?
+            .try_into()
+            .map_err(|_| "snapshot manifest length is invalid")?,
+    ) as usize;
+    if manifest_size == 0 || manifest_size > MAX_FRAME {
+        return Err("snapshot manifest exceeds proof framing limit".into());
+    }
+    proof_take(bytes, &mut offset, manifest_size)?;
+    let header = bytes[..offset].to_vec();
+    let mut digest = Sha256::new();
+    digest.update(&header);
+    let mut frame_sizes = Vec::new();
+    let mut payload = Vec::new();
+    loop {
+        let length = proof_take(bytes, &mut offset, 4)?;
+        digest.update(length);
+        let size = u32::from_le_bytes(
+            length
+                .try_into()
+                .map_err(|_| "snapshot frame length is invalid")?,
+        ) as usize;
+        if size == 0 {
+            break;
+        }
+        if size > MAX_FRAME || payload.len().saturating_add(size) > MAX_PROOF {
+            return Err("snapshot is too large for the retained-definition proof".into());
+        }
+        let frame = proof_take(bytes, &mut offset, size)?;
+        let checksum = proof_take(bytes, &mut offset, 32)?;
+        if Sha256::digest(frame).as_slice() != checksum {
+            return Err("original backup has an invalid frame checksum".into());
+        }
+        digest.update(frame);
+        digest.update(checksum);
+        frame_sizes.push(size);
+        payload.extend_from_slice(frame);
+    }
+    let footer = proof_take(bytes, &mut offset, 32)?;
+    if offset != bytes.len() || digest.finalize().as_slice() != footer {
+        return Err("original backup has an invalid footer or trailing data".into());
+    }
+    Ok(FramedProofSnapshot {
+        header,
+        frame_sizes,
+        payload,
+    })
+}
+
+fn artifact_rechecksum_corrupt_definition(
+    export: &Path,
+    corrupt_dir: &Path,
+    run: &str,
+) -> Result<(String, String), String> {
+    let manifest_path = export.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?;
+    let old_name = manifest["snapshot"]
+        .as_str()
+        .ok_or("v3 backup lacks snapshot filename")?;
+    if manifest["format"] != "graphrun.backup/v3"
+        || Path::new(old_name).components().count() != 1
+        || old_name.contains(['/', '\\', ':'])
+    {
+        return Err(format!(
+            "unsupported backup manifest for semantic corruption: {manifest}"
+        ));
+    }
+    let original =
+        proof_read_snapshot(&fs::read(export.join(old_name)).map_err(|err| err.to_string())?)?;
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&original.payload).map_err(|err| err.to_string())?;
+    let old_digest = state["history_dependencies"][run]["definition"]["sha256"]
+        .as_str()
+        .filter(|digest| digest.len() == 64)
+        .ok_or("v3 backup lacks the retained definition digest")?;
+    let changed = format!(
+        "{}{}",
+        if old_digest.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        },
+        &old_digest[1..]
+    );
+    state["history_dependencies"][run]["definition"]["sha256"] =
+        serde_json::Value::String(changed.clone());
+    let payload = serde_json::to_vec(&state).map_err(|err| err.to_string())?;
+    if payload.len() != original.payload.len() {
+        return Err("semantic corruption changed snapshot payload length".into());
+    }
+    let mut rewritten = original.header;
+    let mut digest = Sha256::new();
+    digest.update(&rewritten);
+    let mut offset = 0;
+    for size in original.frame_sizes {
+        let length = (size as u32).to_le_bytes();
+        let frame = proof_take(&payload, &mut offset, size)?;
+        let checksum = Sha256::digest(frame);
+        rewritten.extend_from_slice(&length);
+        rewritten.extend_from_slice(frame);
+        rewritten.extend_from_slice(&checksum);
+        digest.update(length);
+        digest.update(frame);
+        digest.update(checksum);
+    }
+    if offset != payload.len() {
+        return Err("semantic corruption did not cover all snapshot frames".into());
+    }
+    let end = 0u32.to_le_bytes();
+    rewritten.extend_from_slice(&end);
+    digest.update(end);
+    let footer = digest.finalize();
+    rewritten.extend_from_slice(&footer);
+    let digest_hex = hex::encode(footer);
+    let snapshot_name = format!("application-{digest_hex}.snap");
+    manifest["snapshot"] = serde_json::Value::String(snapshot_name.clone());
+    manifest["sha256"] = serde_json::Value::String(digest_hex);
+    fs::create_dir_all(corrupt_dir).map_err(|err| err.to_string())?;
+    let snapshot_path = corrupt_dir.join(snapshot_name);
+    fs::write(&snapshot_path, rewritten).map_err(|err| err.to_string())?;
+    fs::write(
+        corrupt_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+    if proof_read_snapshot(&fs::read(&snapshot_path).map_err(|err| err.to_string())?)?.payload
+        != payload
+    {
+        return Err("rewritten snapshot did not retain valid frame checksums".into());
+    }
+    Ok((snapshot_path.display().to_string(), changed))
 }
 
 fn artifact_reject_corrupt_restore(
@@ -5982,7 +6194,7 @@ fn artifact_reject_corrupt_restore(
     }
     let run_id = graphrun::RunId::from_hex(run).map_err(|err| err.to_string())?;
     let rt = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
-    let (page, view) = rt.block_on(async {
+    let (page, view, restored_state) = rt.block_on(async {
         let engine = graphrun::Engine::local(&healthy_dest)
             .await
             .map_err(|err| format!("open untouched restore: {err}"))?;
@@ -5995,7 +6207,11 @@ fn artifact_reject_corrupt_restore(
                 .inspect_json(run_id)
                 .await
                 .map_err(|err| format!("restored run: {err}"))?;
-            Ok::<_, String>((page, view))
+            let state = engine
+                .inspect(run_id)
+                .await
+                .map_err(|err| format!("restored retained records: {err}"))?;
+            Ok::<_, String>((page, view, state))
         }
         .await;
         engine
@@ -6008,38 +6224,59 @@ fn artifact_reject_corrupt_restore(
         || page.events.is_empty()
         || view["status"] != "succeeded"
         || view["output"]["value"] != 4
+        || restored_state.current_cluster_id != restored_cluster
+        || !restored_state.artifact_origins.contains(original_cluster)
     {
         return Err(format!(
-            "untouched backup lost accepted run/history: view={view} page={page:?}"
+            "untouched backup lost accepted run, history, or artifact authority: view={view} page={page:?}"
         ));
     }
+    let retained = restored_state
+        .history_dependencies
+        .get(&run_id)
+        .ok_or("untouched restore lacks retained definition")?;
+    let restored_input = page
+        .events
+        .first()
+        .and_then(|event| event.record.input_ref.as_ref())
+        .ok_or("untouched restore lacks separate accepted input")?;
+    let restored_output = page
+        .events
+        .last()
+        .and_then(|event| event.record.output_ref.as_ref())
+        .ok_or("untouched restore lacks separate accepted output")?;
+    if retained.definition.cluster_id != original_cluster
+        || restored_input.cluster_id != original_cluster
+        || restored_output.cluster_id != original_cluster
+        || restored_input.sha256 == restored_output.sha256
+    {
+        return Err("restore changed retained artifact origins or aliased accepted I/O".into());
+    }
     observations.push(format!(
-        "untouched backup restored run {run} under new cluster {restored_cluster}"
+        "untouched backup restored run {run} under new cluster {restored_cluster}; definition and distinct input/output digests retain original cluster {original_cluster}"
     ));
 
-    let mut domain: serde_json::Value = serde_json::from_slice(
-        &fs::read(export.join("domain.json")).map_err(|err| err.to_string())?,
-    )
-    .map_err(|err| err.to_string())?;
-    let corrupted = domain["history_dependencies"][run]["definition"]["sha256"]
-        .as_str()
-        .ok_or("export has no retained definition SHA-256")?
-        .to_owned();
-    domain["history_dependencies"][run]["definition"]["sha256"] = serde_json::Value::String(
-        if corrupted.starts_with('0') { "1" } else { "0" }.to_owned() + &corrupted[1..],
-    );
     let corrupt_dir = parent.join("corrupt-export");
-    fs::create_dir_all(&corrupt_dir).map_err(|err| err.to_string())?;
-    fs::copy(
-        export.join("manifest.json"),
-        corrupt_dir.join("manifest.json"),
-    )
-    .map_err(|err| err.to_string())?;
-    fs::write(
-        corrupt_dir.join("domain.json"),
-        serde_json::to_vec(&domain).map_err(|err| err.to_string())?,
-    )
-    .map_err(|err| err.to_string())?;
+    let (corrupt_snapshot, corrupted) =
+        artifact_rechecksum_corrupt_definition(export, &corrupt_dir, run)?;
+    observations.push(format!(
+        "corrupt v3 snapshot with valid frame and footer checksums: {corrupt_snapshot}; retained definition sha256={corrupted}"
+    ));
+    let read_error = match graphrun::Engine::read_backup(&corrupt_dir) {
+        Ok(_) => {
+            return Err(
+                "validated reader accepted rechecksummed retained-definition corruption".into(),
+            );
+        }
+        Err(err) => err,
+    };
+    if read_error.kind != graphrun::ErrorKind::FailedPrecondition
+        || !artifact_retained_definition_rejection(&read_error.message)
+    {
+        return Err(format!(
+            "validated reader rejected the semantic corruption for the wrong reason: {read_error}"
+        ));
+    }
     let dest = parent.join("corrupt-restored");
     let restore = [
         "restore".into(),
@@ -6056,37 +6293,9 @@ fn artifact_reject_corrupt_restore(
     observations.push(format!(
         "corrupt retained artifact restore: success={ok}; stdout={out:?}; stderr={corrupt_error:?}"
     ));
-    let corrupt_accepted = ok;
-    let missing = parent.join("missing-export");
-    fs::create_dir_all(&missing).map_err(|err| err.to_string())?;
-    fs::copy(export.join("manifest.json"), missing.join("manifest.json"))
-        .map_err(|err| err.to_string())?;
-    let absent = [
-        "restore".into(),
-        "--from".into(),
-        missing.display().to_string(),
-        "--local-dir".into(),
-        parent.join("missing-restored").display().to_string(),
-        "--confirm".into(),
-        "--reason".into(),
-        "artifact-integrity-probe".into(),
-    ];
-    let refs: Vec<&str> = absent.iter().map(String::as_str).collect();
-    let (ok, out, err) = run_cli_timeout(cli, &refs, Duration::from_secs(12));
-    observations.push(format!(
-        "missing domain restore: success={ok}; stdout={out:?}; stderr={err:?}"
-    ));
-    if ok || !err.contains("No such file or directory") {
+    if ok || !artifact_retained_definition_rejection(&corrupt_error) {
         return Err(format!(
-            "restore did not reject missing export: {out} {err}"
-        ));
-    }
-    if corrupt_accepted {
-        return Err("restore accepted corrupt export (retained definition SHA-256 changed)".into());
-    }
-    if !artifact_retained_definition_rejection(&corrupt_error) {
-        return Err(format!(
-            "corrupt export was rejected for a reason other than retained artifact integrity: {corrupt_error}"
+            "restore did not reject the rechecksummed retained definition: {out} {corrupt_error}"
         ));
     }
     if dest.exists()
@@ -6097,6 +6306,50 @@ fn artifact_reject_corrupt_restore(
     {
         return Err("corrupt restore wrote destination before artifact validation".into());
     }
+    let missing = parent.join("missing-export");
+    fs::create_dir_all(&missing).map_err(|err| err.to_string())?;
+    fs::copy(export.join("manifest.json"), missing.join("manifest.json"))
+        .map_err(|err| err.to_string())?;
+    let absent_read = match graphrun::Engine::read_backup(&missing) {
+        Ok(_) => {
+            return Err("validated reader accepted a backup without its named snapshot".into());
+        }
+        Err(err) => err,
+    };
+    if absent_read.kind != graphrun::ErrorKind::FailedPrecondition {
+        return Err(format!(
+            "missing snapshot was not rejected before restore: {absent_read}"
+        ));
+    }
+    let missing_dest = parent.join("missing-restored");
+    let absent = [
+        "restore".into(),
+        "--from".into(),
+        missing.display().to_string(),
+        "--local-dir".into(),
+        missing_dest.display().to_string(),
+        "--confirm".into(),
+        "--reason".into(),
+        "artifact-integrity-probe".into(),
+    ];
+    let refs: Vec<&str> = absent.iter().map(String::as_str).collect();
+    let (ok, out, err) = run_cli_timeout(cli, &refs, Duration::from_secs(12));
+    observations.push(format!(
+        "missing named v3 snapshot: read={absent_read}; restore success={ok}; stdout={out:?}; stderr={err:?}"
+    ));
+    if ok
+        || missing_dest.exists()
+            && fs::read_dir(&missing_dest)
+                .map_err(|err| err.to_string())?
+                .next()
+                .is_some()
+    {
+        return Err(format!(
+            "restore accepted missing snapshot or wrote a destination: {out} {err}"
+        ));
+    }
+    graphrun::Engine::read_backup(export)
+        .map_err(|err| format!("semantic corruption altered the untouched backup: {err}"))?;
     Ok(())
 }
 
@@ -8938,6 +9191,38 @@ mod tests {
         assert!(!artifact_retained_definition_rejection(
             "FailedPrecondition: backup manifest checksum mismatch"
         ));
+    }
+
+    #[test]
+    fn proof_snapshot_parser_rejects_frame_and_footer_corruption() {
+        let payload = br#"{"history_dependencies":{}}"#;
+        let mut bytes = b"graphrun.snapshot/v1\0".to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(0);
+        let frame_start = bytes.len() + 4;
+        let checksum = Sha256::digest(payload);
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(&checksum);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let footer = Sha256::digest(&bytes);
+        bytes.extend_from_slice(&footer);
+        assert_eq!(proof_read_snapshot(&bytes).unwrap().payload, payload);
+
+        let mut corrupt_frame = bytes.clone();
+        corrupt_frame[frame_start] ^= 1;
+        assert!(
+            proof_read_snapshot(&corrupt_frame)
+                .unwrap_err()
+                .contains("frame checksum")
+        );
+        let mut corrupt_footer = bytes;
+        *corrupt_footer.last_mut().unwrap() ^= 1;
+        assert!(
+            proof_read_snapshot(&corrupt_footer)
+                .unwrap_err()
+                .contains("footer")
+        );
     }
 
     #[test]
