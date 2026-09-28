@@ -80,7 +80,7 @@ impl ClusterNetwork {
 
     #[cfg(feature = "format-proof")]
     pub async fn proof_probe(&self, target: u64, kind: &str, endpoint: &str) -> io::Result<String> {
-        let mut peer = PeerClient {
+        let peer = PeerClient {
             target,
             peer: self.peers.lock().unwrap().get(&target).cloned(),
             expected_endpoint: endpoint.to_owned(),
@@ -88,35 +88,52 @@ impl ClusterNetwork {
             local_tls: self.local_tls.clone(),
         };
         let vote = openraft::Vote::new_committed(1_000_000, self.local_id);
-        let result = match kind {
-            "vote" => {
-                peer.call(
-                    kind,
-                    VoteRequest {
-                        vote,
-                        last_log_id: None,
-                    },
-                )
-                .await
-            }
-            "append" => {
-                peer.call(
-                    kind,
-                    AppendEntriesRequest::<TypeConfig> {
-                        vote,
-                        prev_log_id: None,
-                        entries: Vec::new(),
-                        leader_commit: None,
-                    },
-                )
-                .await
-            }
+        let json = match kind {
+            "vote" => serde_json::to_vec(&VoteRequest {
+                vote,
+                last_log_id: None,
+            }),
+            "append" => serde_json::to_vec(&AppendEntriesRequest::<TypeConfig> {
+                vote,
+                prev_log_id: None,
+                entries: Vec::new(),
+                leader_commit: None,
+            }),
             _ => return Err(io::Error::other("unknown proof RPC kind")),
+        }
+        .map_err(io::Error::other)?;
+        let mut request = tonic::Request::new(Blob {
+            json,
+            sender_id: self.local_id,
+        });
+        request.metadata_mut().insert(
+            crate::format_proof::WRITER_HEADER,
+            crate::format_proof::WRITER_CAPABILITY
+                .to_string()
+                .parse()
+                .expect("proof writer version is ASCII"),
+        );
+        let mut client = peer.client().await?;
+        let result = match kind {
+            "vote" => client.vote(request).await,
+            "append" => client.append_entries(request).await,
+            _ => unreachable!("kind checked before encoding"),
         };
         match result {
-            Err(err) if err.to_string().contains("FailedPrecondition") => Ok(err.to_string()),
-            Err(err) => Err(io::Error::other(format!(
-                "proof {kind} got no format rejection: {err}"
+            Err(status)
+                if status.code() == tonic::Code::FailedPrecondition
+                    && status.message().contains("member writer capability") =>
+            {
+                Ok(format!(
+                    "code={:?} message={}",
+                    status.code(),
+                    status.message()
+                ))
+            }
+            Err(status) => Err(io::Error::other(format!(
+                "proof {kind} got no format rejection: code={:?} message={}",
+                status.code(),
+                status.message()
             ))),
             Ok(_) => Err(io::Error::other(format!(
                 "unsafe: old writer {kind} accepted after activation"
