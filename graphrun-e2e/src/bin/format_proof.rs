@@ -500,18 +500,28 @@ async fn run(cluster: &mut ProofCluster, bridge: &Path, writer: &Path) -> Result
             status["command_recorded"] == false,
         )?;
     }
+    let committed_index = cluster.status(leader, None).await?["applied"]
+        .as_u64()
+        .ok_or("new leader has no applied position after rejecting legacy entry")?;
     fs::remove_file(cluster.member_dir(1).join("partition.marker"))
         .map_err(|err| err.to_string())?;
     let joined = cluster
         .wait_status(1, Some(&receipt_id), |value| {
-            value["writer_format"] == 5 && value["state"] == "Follower"
+            value["writer_format"] == 5
+                && value["state"] == "Follower"
+                && value["leader"] == json!(leader)
+                && value["applied"]
+                    .as_u64()
+                    .is_some_and(|id| id >= committed_index)
         })
         .await?;
     cluster.assert(
         "old leader catches up",
-        "bridge applies format 5 but cannot write it",
+        "bridge applies through the rejected legacy entry, follows the new leader, and cannot write format 5",
         joined.clone(),
-        joined["binary_writer_capability"] == 4 && joined["cached_receipt"] == true,
+        joined["binary_writer_capability"] == 4
+            && joined["cached_receipt"] == true
+            && joined["applied"].as_u64().is_some_and(|id| id >= committed_index),
     )?;
 
     let election = cluster.control(1, ControlRequest::ProofElect).await?;
