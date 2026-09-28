@@ -13,6 +13,8 @@ path = "src/main.rs"
 [features]
 default = []
 fault-injection = ["graphrun/fault-injection"]
+format-proof = ["graphrun/format-proof"]
+format-proof-new = ["format-proof", "graphrun/format-proof-new"]
 
 [dependencies]
 clap.workspace = true

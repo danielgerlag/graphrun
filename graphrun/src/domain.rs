@@ -274,6 +274,8 @@ pub enum ScopeRole {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CommandBody {
+    #[cfg(feature = "format-proof")]
+    ProofActivateWriter,
     /// Replicated provenance minted at a verified ingress, not decoded from a client request.
     Authenticated {
         principal_id: String,
@@ -761,6 +763,10 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
     }
     let mut ids = IdGen::new(command.id);
     match &command.body {
+        #[cfg(feature = "format-proof")]
+        CommandBody::ProofActivateWriter => Err(Error::invalid(
+            "proof activation requires the ordered Raft apply",
+        )),
         CommandBody::Authenticated { .. } => Err(Error::invalid(
             "authenticated cause requires replicated apply",
         )),

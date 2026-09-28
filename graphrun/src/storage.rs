@@ -51,6 +51,8 @@ openraft::declare_raft_types!(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RaftRequest {
     pub command: Command,
+    #[cfg(feature = "format-proof")]
+    pub proof_writer_format: u16,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -113,7 +115,8 @@ impl StoreManifest {
     fn validate(&self) -> Result<()> {
         if self.format != "graphrun.member-store/v4"
             || self.reader_floor > 4
-            || self.writer_format != 4
+            || (self.writer_format != 4
+                && !(cfg!(feature = "format-proof") && self.writer_format == 5))
             || self.active_generation == 0
             || self.domain_format != "graphrun.domain/v1"
             || self.state_record_format != record_store::FORMAT
@@ -333,6 +336,8 @@ enum Req {
     QueryState(oneshot::Sender<State>),
     ScheduleView(oneshot::Sender<std::result::Result<ScheduleView, StoErr>>),
     QueryWatermark(oneshot::Sender<u64>),
+    #[cfg(feature = "format-proof")]
+    ProofWriterFormat(oneshot::Sender<std::result::Result<u16, StoErr>>),
     BindIdentity(
         String,
         u64,
@@ -406,6 +411,8 @@ impl StorageHandle {
                 ));
             }
             let store_manifest = verified_store_manifest(&db)?;
+            #[cfg(feature = "format-proof")]
+            crate::format_proof::ensure_local_writer(store_manifest.writer_format)?;
             let state =
                 load_app_generation(&db, store_manifest.active_generation).map_err(|err| {
                     Error::new(
@@ -716,6 +723,18 @@ impl StorageHandle {
             .await
             .expect("storage thread stopped during state query");
         rx.await.expect("storage thread dropped state query")
+    }
+
+    #[cfg(feature = "format-proof")]
+    pub async fn proof_writer_format(&self) -> Result<u16> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Req::ProofWriterFormat(tx))
+            .await
+            .map_err(|_| Error::new(crate::error::ErrorKind::Unavailable, "storage stopped"))?;
+        rx.await
+            .map_err(|_| Error::new(crate::error::ErrorKind::Unavailable, "storage dropped"))?
+            .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))
     }
 
     pub async fn install_domain(&self, state: State) -> Result<()> {
@@ -1656,6 +1675,14 @@ fn storage_thread(
             }
             Req::QueryWatermark(tx) => {
                 let _ = tx.send(domain.engine_time_watermark_ms);
+            }
+            #[cfg(feature = "format-proof")]
+            Req::ProofWriterFormat(tx) => {
+                let _ = tx.send(
+                    verified_store_manifest(db.as_ref())
+                        .map(|manifest| manifest.writer_format)
+                        .map_err(|err| sto_err(ErrorVerb::Read, err)),
+                );
             }
             Req::BindIdentity(cluster_id, member_id, tx) => {
                 let result = if snapshot_building {
@@ -4144,58 +4171,85 @@ fn apply_one_entry(
     let mut publication = None;
     let mut prune = false;
     let mut prune_selection = None;
+    #[cfg(feature = "format-proof")]
+    let mut proof_manifest =
+        verified_store_manifest(db).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    #[cfg(feature = "format-proof")]
+    let mut proof_activation = false;
     if let EntryPayload::Normal(req) = &entry.payload {
         let body = match &req.command.body {
             domain::CommandBody::Authenticated { body, .. } => body.as_ref(),
             body => body,
         };
-        prune = matches!(body, domain::CommandBody::PruneHistory { .. });
-        if let domain::CommandBody::PruneHistory { limit } = body
-            && !domain.commands.contains_key(&req.command.id)
-            && *limit > 0
-            && *limit <= 1024
+        #[cfg(feature = "format-proof")]
+        let mut proof_handled = false;
+        #[cfg(not(feature = "format-proof"))]
+        let proof_handled = false;
+        #[cfg(feature = "format-proof")]
         {
-            prune_selection = Some(select_prune_records(
-                domain,
-                req.command
-                    .time
-                    .as_millis()
-                    .max(domain.engine_time_watermark_ms),
-                *limit as usize,
-            )?);
-        }
-        if let domain::CommandBody::Publication { key, operation } = &req.command.body {
-            if key.command_id != req.command.id
-                || key.cluster_id.is_empty()
-                || key.principal_id.is_empty()
-            {
-                reply.error = Some("invalid authenticated command identity".to_owned());
-                reply.error_kind = Some(crate::error::ErrorKind::InvalidArgument);
-            } else {
-                publication = Some((key, operation));
-                let mut command = req.command.clone();
-                let first_submission = !domain.command_results.contains_key(&key.storage_key());
-                let retained_start = match operation {
-                    crate::publication::PublicationOperation::Start {
-                        workflow,
-                        start_key,
-                        ..
-                    } => domain
-                        .start_keys
-                        .get(workflow)
-                        .is_some_and(|keys| keys.contains_key(start_key)),
-                    _ => false,
-                };
-                if first_submission {
-                    command.time = crate::time::EngineTime::from_millis(
-                        domain
-                            .engine_time_watermark_ms
-                            .max(command.time.as_millis()),
-                    );
-                    domain.engine_time_watermark_ms = command.time.as_millis();
+            if req.proof_writer_format < proof_manifest.writer_format {
+                reply.error_kind = Some(crate::error::ErrorKind::FailedPrecondition);
+                reply.error = Some("old proof writer entry rejected at committed apply".to_owned());
+                proof_handled = true;
+            } else if matches!(body, domain::CommandBody::ProofActivateWriter) {
+                if req.proof_writer_format != 5 {
+                    reply.error_kind = Some(crate::error::ErrorKind::FailedPrecondition);
+                    reply.error = Some("proof activation requires a new writer".to_owned());
+                } else {
+                    proof_activation = true;
                 }
-                let receipt =
-                    match crate::publication::apply_replicated(domain, &command, key, operation) {
+                proof_handled = true;
+            }
+        }
+        if !proof_handled {
+            prune = matches!(body, domain::CommandBody::PruneHistory { .. });
+            if let domain::CommandBody::PruneHistory { limit } = body
+                && !domain.commands.contains_key(&req.command.id)
+                && *limit > 0
+                && *limit <= 1024
+            {
+                prune_selection = Some(select_prune_records(
+                    domain,
+                    req.command
+                        .time
+                        .as_millis()
+                        .max(domain.engine_time_watermark_ms),
+                    *limit as usize,
+                )?);
+            }
+            if let domain::CommandBody::Publication { key, operation } = &req.command.body {
+                if key.command_id != req.command.id
+                    || key.cluster_id.is_empty()
+                    || key.principal_id.is_empty()
+                {
+                    reply.error = Some("invalid authenticated command identity".to_owned());
+                    reply.error_kind = Some(crate::error::ErrorKind::InvalidArgument);
+                } else {
+                    publication = Some((key, operation));
+                    let mut command = req.command.clone();
+                    let first_submission = !domain.command_results.contains_key(&key.storage_key());
+                    let retained_start = match operation {
+                        crate::publication::PublicationOperation::Start {
+                            workflow,
+                            start_key,
+                            ..
+                        } => domain
+                            .start_keys
+                            .get(workflow)
+                            .is_some_and(|keys| keys.contains_key(start_key)),
+                        _ => false,
+                    };
+                    if first_submission {
+                        command.time = crate::time::EngineTime::from_millis(
+                            domain
+                                .engine_time_watermark_ms
+                                .max(command.time.as_millis()),
+                        );
+                        domain.engine_time_watermark_ms = command.time.as_millis();
+                    }
+                    let receipt = match crate::publication::apply_replicated(
+                        domain, &command, key, operation,
+                    ) {
                         Ok(receipt) => receipt,
                         Err(_) => {
                             *domain = load_app_generation(db, generation)?;
@@ -4210,69 +4264,70 @@ fn apply_one_entry(
                             receipt
                         }
                     };
-                if let Ok(run) = receipt.applied_run() {
-                    if first_submission
-                        && !retained_start
-                        && matches!(
-                            operation,
-                            crate::publication::PublicationOperation::Start { .. }
-                        )
-                    {
-                        let (expected, _, progress_id) =
-                            crate::publication::published_start_ids(key);
-                        if expected != run
-                            || !domain.runs.contains_key(&run)
-                            || !domain.commands.contains_key(&progress_id)
-                        {
-                            return Err(sto_err(
-                                ErrorVerb::Read,
-                                "new published start is missing its run or internal receipt",
-                            ));
-                        }
-                        affected.insert(run, Some(true));
-                        events = domain.history.get(&run).cloned().ok_or_else(|| {
-                            sto_err(
-                                ErrorVerb::Read,
-                                "new published start has no retained history",
+                    if let Ok(run) = receipt.applied_run() {
+                        if first_submission
+                            && !retained_start
+                            && matches!(
+                                operation,
+                                crate::publication::PublicationOperation::Start { .. }
                             )
-                        })?;
-                        command_id = Some(progress_id);
-                    }
-                }
-                if let Err(err) = receipt.ensure_applied() {
-                    reply.error_kind = Some(err.kind);
-                    reply.error = Some(err.to_string());
-                }
-                reply.command_result = Some(receipt);
-            }
-        } else {
-            match domain::commit_command(domain, req.command.clone()) {
-                Ok(applied) => {
-                    events = applied;
-                    command_id = Some(match &req.command.body {
-                        domain::CommandBody::Authenticated { principal_id, .. } => {
-                            domain::authenticated_command_id(principal_id, req.command.id)
-                                .map_err(|err| sto_err(ErrorVerb::Write, err))?
-                        }
-                        _ => req.command.id,
-                    });
-                    if let domain::CommandBody::Progress { run } = body {
-                        affected.insert(*run, Some(!events.is_empty()));
-                    }
-                    if matches!(body, domain::CommandBody::AcknowledgeRecovery { .. }) {
-                        for run in domain::active_runs(domain) {
+                        {
+                            let (expected, _, progress_id) =
+                                crate::publication::published_start_ids(key);
+                            if expected != run
+                                || !domain.runs.contains_key(&run)
+                                || !domain.commands.contains_key(&progress_id)
+                            {
+                                return Err(sto_err(
+                                    ErrorVerb::Read,
+                                    "new published start is missing its run or internal receipt",
+                                ));
+                            }
                             affected.insert(run, Some(true));
+                            events = domain.history.get(&run).cloned().ok_or_else(|| {
+                                sto_err(
+                                    ErrorVerb::Read,
+                                    "new published start has no retained history",
+                                )
+                            })?;
+                            command_id = Some(progress_id);
                         }
                     }
-                    reply.run_id = events.iter().find_map(|event| match event {
-                        domain::DomainEvent::RunAdmitted { run, .. } => Some(*run),
-                        _ => None,
-                    });
+                    if let Err(err) = receipt.ensure_applied() {
+                        reply.error_kind = Some(err.kind);
+                        reply.error = Some(err.to_string());
+                    }
+                    reply.command_result = Some(receipt);
                 }
-                Err(err) => {
-                    reply.error_kind = Some(err.kind);
-                    reply.error = Some(err.to_string());
-                    *domain = load_app_generation(db, generation)?;
+            } else {
+                match domain::commit_command(domain, req.command.clone()) {
+                    Ok(applied) => {
+                        events = applied;
+                        command_id = Some(match &req.command.body {
+                            domain::CommandBody::Authenticated { principal_id, .. } => {
+                                domain::authenticated_command_id(principal_id, req.command.id)
+                                    .map_err(|err| sto_err(ErrorVerb::Write, err))?
+                            }
+                            _ => req.command.id,
+                        });
+                        if let domain::CommandBody::Progress { run } = body {
+                            affected.insert(*run, Some(!events.is_empty()));
+                        }
+                        if matches!(body, domain::CommandBody::AcknowledgeRecovery { .. }) {
+                            for run in domain::active_runs(domain) {
+                                affected.insert(run, Some(true));
+                            }
+                        }
+                        reply.run_id = events.iter().find_map(|event| match event {
+                            domain::DomainEvent::RunAdmitted { run, .. } => Some(*run),
+                            _ => None,
+                        });
+                    }
+                    Err(err) => {
+                        reply.error_kind = Some(err.kind);
+                        reply.error = Some(err.to_string());
+                        *domain = load_app_generation(db, generation)?;
+                    }
                 }
             }
         }
@@ -4327,6 +4382,14 @@ fn apply_one_entry(
             let bytes =
                 serde_json::to_vec(membership).map_err(|err| sto_err(ErrorVerb::Write, err))?;
             meta.insert("membership", bytes.as_slice())
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        }
+        #[cfg(feature = "format-proof")]
+        if proof_activation {
+            proof_manifest.writer_format = 5;
+            let bytes = serde_json::to_vec(&proof_manifest)
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            meta.insert("store_manifest", bytes.as_slice())
                 .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         }
     }

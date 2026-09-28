@@ -22,6 +22,9 @@ pub mod domain;
 pub mod engine;
 pub mod error;
 pub mod flow;
+#[cfg(feature = "format-proof")]
+#[doc(hidden)]
+pub mod format_proof;
 #[doc(hidden)]
 pub mod generated;
 pub mod handlers;

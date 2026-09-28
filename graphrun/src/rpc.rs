@@ -162,6 +162,10 @@ impl GraphServices {
 
     async fn member_context<T>(&self, request: &Request<T>, sender_id: u64) -> Result<(), Status> {
         let peer = self.verified_peer(request)?;
+        #[cfg(feature = "format-proof")]
+        if crate::format_proof::partitioned() {
+            return Err(Status::unavailable("proof member network partition"));
+        }
         let member_id =
             crate::tls::PrincipalId::parse(sender_id.to_string()).map_err(status_error)?;
         peer.require_member_identity(&self.publication_cluster, &member_id)
@@ -356,6 +360,8 @@ impl RaftSvc for GraphServices {
     async fn append_entries(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
         self.member_context(&request, request.get_ref().sender_id)
             .await?;
+        #[cfg(feature = "format-proof")]
+        crate::format_proof::verify_member_writer(&self.storage, &request).await?;
         let slots = if request.get_ref().json.len() <= 4 * 1024 {
             self.control_decode_slots.clone()
         } else {
@@ -413,6 +419,8 @@ impl RaftSvc for GraphServices {
     async fn vote(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
         self.member_context(&request, request.get_ref().sender_id)
             .await?;
+        #[cfg(feature = "format-proof")]
+        crate::format_proof::verify_member_writer(&self.storage, &request).await?;
         let _decode = self
             .control_decode_slots
             .clone()
@@ -440,6 +448,8 @@ impl RaftSvc for GraphServices {
     async fn install_snapshot(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
         self.member_context(&request, request.get_ref().sender_id)
             .await?;
+        #[cfg(feature = "format-proof")]
+        crate::format_proof::verify_member_writer(&self.storage, &request).await?;
         if request.get_ref().json.len() > 8 * 1024 * 1024 {
             return Err(Status::resource_exhausted(
                 "Raft snapshot chunk exceeds the 8 MiB envelope",
@@ -493,6 +503,8 @@ impl RaftSvc for GraphServices {
     ) -> Result<Response<ElectionResponse>, Status> {
         self.member_context(&request, request.get_ref().sender_id)
             .await?;
+        #[cfg(feature = "format-proof")]
+        crate::format_proof::verify_member_writer(&self.storage, &request).await?;
         let req = request.into_inner();
         self.validate_election_request(&req).await?;
         let proof = self

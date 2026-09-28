@@ -78,6 +78,52 @@ impl ClusterNetwork {
             .map(|(addr, tls)| (*addr, tls.server_name.clone()))
     }
 
+    #[cfg(feature = "format-proof")]
+    pub async fn proof_probe(&self, target: u64, kind: &str, endpoint: &str) -> io::Result<String> {
+        let mut peer = PeerClient {
+            target,
+            peer: self.peers.lock().unwrap().get(&target).cloned(),
+            expected_endpoint: endpoint.to_owned(),
+            local_id: self.local_id,
+            local_tls: self.local_tls.clone(),
+        };
+        let vote = openraft::Vote::new_committed(1_000_000, self.local_id);
+        let result = match kind {
+            "vote" => {
+                peer.call(
+                    kind,
+                    VoteRequest {
+                        vote,
+                        last_log_id: None,
+                    },
+                )
+                .await
+            }
+            "append" => {
+                peer.call(
+                    kind,
+                    AppendEntriesRequest::<TypeConfig> {
+                        vote,
+                        prev_log_id: None,
+                        entries: Vec::new(),
+                        leader_commit: None,
+                    },
+                )
+                .await
+            }
+            _ => return Err(io::Error::other("unknown proof RPC kind")),
+        };
+        match result {
+            Err(err) if err.to_string().contains("FailedPrecondition") => Ok(err.to_string()),
+            Err(err) => Err(io::Error::other(format!(
+                "proof {kind} got no format rejection: {err}"
+            ))),
+            Ok(_) => Err(io::Error::other(format!(
+                "unsafe: old writer {kind} accepted after activation"
+            ))),
+        }
+    }
+
     pub async fn probe_clock(&self, target: u64, committed_endpoint: &str) -> io::Result<()> {
         let peer = self.peers.lock().unwrap().get(&target).cloned();
         let Some((addr, _)) = &peer else {
@@ -151,15 +197,26 @@ impl ClusterNetwork {
             local_tls: self.local_tls.clone(),
         };
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let request = tonic::Request::new(ElectionRequest {
+                sender_id: self.local_id,
+                expected_term: evidence.expected_term,
+                membership_index: evidence.membership_index,
+                min_applied_index: evidence.min_applied_index,
+                min_last_log_index: evidence.min_last_log_index,
+            });
+            #[cfg(feature = "format-proof")]
+            let mut request = request;
+            #[cfg(feature = "format-proof")]
+            request.metadata_mut().insert(
+                crate::format_proof::WRITER_HEADER,
+                crate::format_proof::WRITER_CAPABILITY
+                    .to_string()
+                    .parse()
+                    .expect("proof writer version is ASCII"),
+            );
             peer.client()
                 .await?
-                .request_election(ElectionRequest {
-                    sender_id: self.local_id,
-                    expected_term: evidence.expected_term,
-                    membership_index: evidence.membership_index,
-                    min_applied_index: evidence.min_applied_index,
-                    min_last_log_index: evidence.min_last_log_index,
-                })
+                .request_election(request)
                 .await
                 .map_err(io::Error::other)
         })
@@ -298,15 +355,30 @@ impl PeerClient {
     }
 
     async fn call(&mut self, kind: &str, rpc: impl serde::Serialize) -> std::io::Result<Vec<u8>> {
+        #[cfg(feature = "format-proof")]
+        if crate::format_proof::partitioned() {
+            return Err(io::Error::other("proof member network partition"));
+        }
         let mut client = self.client().await?;
         let blob = Blob {
             json: serde_json::to_vec(&rpc).map_err(io::Error::other)?,
             sender_id: self.local_id,
         };
+        let request = tonic::Request::new(blob);
+        #[cfg(feature = "format-proof")]
+        let mut request = request;
+        #[cfg(feature = "format-proof")]
+        request.metadata_mut().insert(
+            crate::format_proof::WRITER_HEADER,
+            crate::format_proof::WRITER_CAPABILITY
+                .to_string()
+                .parse()
+                .expect("proof writer version is ASCII"),
+        );
         let resp = match kind {
-            "append" => client.append_entries(blob).await,
-            "vote" => client.vote(blob).await,
-            "snapshot" => client.install_snapshot(blob).await,
+            "append" => client.append_entries(request).await,
+            "vote" => client.vote(request).await,
+            "snapshot" => client.install_snapshot(request).await,
             _ => return Err(io::Error::other("unknown raft rpc")),
         }
         .map_err(|err| io::Error::other(err.to_string()))?;

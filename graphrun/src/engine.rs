@@ -155,6 +155,24 @@ pub struct LocalBuilder {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ControlRequest {
+    #[cfg(feature = "format-proof")]
+    ProofStatus {
+        command_id: Option<String>,
+    },
+    #[cfg(feature = "format-proof")]
+    ProofActivate,
+    #[cfg(feature = "format-proof")]
+    ProofElect,
+    #[cfg(feature = "format-proof")]
+    ProofPropose {
+        command_id: String,
+        direct: bool,
+    },
+    #[cfg(feature = "format-proof")]
+    ProofProbe {
+        target: u64,
+        kind: String,
+    },
     PublishCatalog {
         version: u32,
         catalog: Catalog,
@@ -1836,6 +1854,132 @@ async fn dispatch_control(
             },
             Err(err) => Err(Error::invalid(err)),
         },
+        #[cfg(feature = "format-proof")]
+        ControlRequest::ProofStatus { command_id } => {
+            let parsed = command_id
+                .as_deref()
+                .map(CommandId::from_hex)
+                .transpose()
+                .map_err(Error::invalid);
+            match parsed {
+                Err(err) => Err(err),
+                Ok(parsed) => {
+                    let metrics = raft.metrics().borrow().clone();
+                    let active = storage.proof_writer_format().await;
+                    let (cached, recorded) = if let Some(id) = parsed {
+                        let state = storage.query_state().await;
+                        (
+                            Some(
+                                state
+                                    .command_results
+                                    .contains_key(&auth.key(id).storage_key()),
+                            ),
+                            Some(state.commands.contains_key(&id)),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let quorum =
+                        tokio::time::timeout(Duration::from_secs(2), raft.ensure_linearizable())
+                            .await
+                            .is_ok_and(|result| result.is_ok());
+                    active.map(|active| {
+                        serde_json::json!({
+                            "node_id": metrics.id,
+                            "state": format!("{:?}", metrics.state),
+                            "leader": metrics.current_leader,
+                            "term": metrics.current_term,
+                            "applied": metrics.last_applied.map(|id| id.index),
+                            "last_log": metrics.last_log_index,
+                            "writer_format": active,
+                            "binary_writer_capability": crate::format_proof::WRITER_CAPABILITY,
+                            "cached_receipt": cached,
+                            "command_recorded": recorded,
+                            "quorum": quorum,
+                        })
+                    })
+                }
+            }
+        }
+        #[cfg(feature = "format-proof")]
+        ControlRequest::ProofActivate => write_raft_response(
+            raft,
+            storage,
+            Command {
+                id: CommandId::generate(),
+                time: now(),
+                body: CommandBody::ProofActivateWriter,
+            },
+        )
+        .await
+        .and_then(|reply| {
+            reply.error.map_or(Ok(()), |error| {
+                Err(Error::new(
+                    reply.error_kind.unwrap_or(ErrorKind::FailedPrecondition),
+                    error,
+                ))
+            })
+        })
+        .map(|_| serde_json::json!({"activated": true})),
+        #[cfg(feature = "format-proof")]
+        ControlRequest::ProofElect => raft
+            .trigger()
+            .elect()
+            .await
+            .map_err(|err| Error::new(ErrorKind::Unavailable, err.to_string()))
+            .map(|_| serde_json::json!({"triggered": true})),
+        #[cfg(feature = "format-proof")]
+        ControlRequest::ProofPropose { command_id, direct } => {
+            match CommandId::from_hex(&command_id) {
+                Err(err) => Err(Error::invalid(err)),
+                Ok(id) => {
+                    let command = Command {
+                        id,
+                        time: now(),
+                        body: CommandBody::PruneHistory { limit: 1 },
+                    };
+                    let result = if direct {
+                        raft.client_write(crate::storage::RaftRequest {
+                            command,
+                            proof_writer_format: crate::format_proof::WRITER_CAPABILITY,
+                        })
+                        .await
+                        .map(|response| response.data)
+                        .map_err(|err| Error::new(ErrorKind::Unavailable, err.to_string()))
+                    } else {
+                        write_raft_response(raft, storage, command).await
+                    };
+                    result
+                        .and_then(|reply| {
+                            reply.error.map_or(Ok(()), |error| {
+                                Err(Error::new(
+                                    reply.error_kind.unwrap_or(ErrorKind::FailedPrecondition),
+                                    error,
+                                ))
+                            })
+                        })
+                        .map(|_| serde_json::json!({"committed": true, "direct": direct}))
+                }
+            }
+        }
+        #[cfg(feature = "format-proof")]
+        ControlRequest::ProofProbe { target, kind } => {
+            let roster = storage.applied_members().await;
+            match (cluster_net, roster) {
+                (None, _) => Err(Error::invalid("proof needs a clustered member")),
+                (_, Err(err)) => Err(err),
+                (Some(net), Ok(roster)) => match roster.get(&target) {
+                    None => Err(Error::invalid("proof peer is not in the committed roster")),
+                    Some(endpoint) => net
+                        .proof_probe(target, &kind, endpoint)
+                        .await
+                        .map(|rejection| {
+                            serde_json::json!({"rejected": true, "kind": kind, "reason": rejection})
+                        })
+                        .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string())),
+                },
+            }
+        }
         ControlRequest::Health => {
             let metrics = raft.metrics().borrow().clone();
             let state = storage.query_state().await;

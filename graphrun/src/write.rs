@@ -48,9 +48,13 @@ pub(crate) async fn write_raft_response(
             ),
         ));
     }
+    #[cfg(feature = "format-proof")]
+    crate::format_proof::ensure_local_writer(storage.proof_writer_format().await?)?;
     storage.clock().authorize(storage, raft).await?;
     let encoded = serde_json::to_vec(&RaftRequest {
         command: command.clone(),
+        #[cfg(feature = "format-proof")]
+        proof_writer_format: crate::format_proof::WRITER_CAPABILITY,
     })
     .map_err(|err| Error::invalid(format!("command encoding failed: {err}")))?;
     if encoded.len() > crate::limits::PUBLIC_COMMAND_ENVELOPE {
@@ -72,7 +76,11 @@ pub(crate) async fn write_raft_response(
         _ => format!("command={}", command.id),
     };
     let resp = raft
-        .client_write(RaftRequest { command })
+        .client_write(RaftRequest {
+            command,
+            #[cfg(feature = "format-proof")]
+            proof_writer_format: crate::format_proof::WRITER_CAPABILITY,
+        })
         .await
         .map_err(|err| {
             Error::new(
