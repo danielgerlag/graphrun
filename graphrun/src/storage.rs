@@ -94,9 +94,9 @@ struct StoreManifest {
 impl StoreManifest {
     fn new() -> Self {
         Self {
-            format: "graphrun.member-store/v3".to_owned(),
-            reader_floor: 3,
-            writer_format: 3,
+            format: "graphrun.member-store/v4".to_owned(),
+            reader_floor: 4,
+            writer_format: 4,
             active_generation: 1,
             cluster_id: None,
             member_id: None,
@@ -111,9 +111,9 @@ impl StoreManifest {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.format != "graphrun.member-store/v3"
-            || self.reader_floor > 3
-            || self.writer_format != 3
+        if self.format != "graphrun.member-store/v4"
+            || self.reader_floor > 4
+            || self.writer_format != 4
             || self.active_generation == 0
             || self.domain_format != "graphrun.domain/v1"
             || self.state_record_format != record_store::FORMAT
@@ -336,6 +336,7 @@ enum Req {
     ),
     SetClockFault(bool, oneshot::Sender<std::result::Result<(), StoErr>>),
     InstallDomain(Box<State>, oneshot::Sender<std::result::Result<(), StoErr>>),
+    Reap,
     Shutdown,
 }
 
@@ -1307,9 +1308,16 @@ fn storage_thread(
     let mut snapshot_builder: Option<JoinHandle<()>> = None;
     schedule_watch.send_replace(schedule_revision);
     let _ = ready.send(Ok(()));
-    while let Some(req) = deferred.pop_front().or_else(|| rx.blocking_recv()) {
+    while let Some(req) = deferred.pop_front().or_else(|| {
+        if app_gc_pending {
+            Some(rx.try_recv().unwrap_or(Req::Reap))
+        } else {
+            rx.blocking_recv()
+        }
+    }) {
         match req {
             Req::Shutdown => break,
+            Req::Reap => {}
             Req::SaveVote(vote, tx) => {
                 let _ = tx.send(put_json(&db, "vote", &vote));
             }
@@ -1359,6 +1367,14 @@ fn storage_thread(
                 );
             }
             Req::Apply(entries, tx) => {
+                let prune = entries.iter().any(|entry| {
+                    matches!(
+                        &entry.payload,
+                        EntryPayload::Normal(req)
+                            if matches!(&req.command.body,
+                                domain::CommandBody::PruneHistory { .. })
+                    )
+                });
                 let previous_revision = schedule_revision;
                 let res = apply_entries(
                     &db,
@@ -1368,7 +1384,11 @@ fn storage_thread(
                     &mut schedule_revision,
                     entries,
                 );
+                if let Err(err) = &res {
+                    tracing::error!(%err, "storage apply failed");
+                }
                 if res.is_ok() {
+                    app_gc_pending |= prune;
                     watermark.store(domain.engine_time_watermark_ms, Ordering::SeqCst);
                     if schedule_revision != previous_revision {
                         schedule_watch.send_replace(schedule_revision);
@@ -1582,10 +1602,12 @@ fn storage_thread(
             }
         }
         if app_gc_pending {
-            match gc_inactive_app_rows(&db) {
+            match gc_retired_app_rows(&db)
+                .and_then(|retired| gc_inactive_app_rows(&db).map(|inactive| retired || inactive))
+            {
                 Ok(more) => app_gc_pending = more,
                 Err(err) => {
-                    tracing::error!(%err, "inactive application generation cleanup failed");
+                    tracing::error!(%err, "application generation cleanup failed");
                     break;
                 }
             }
@@ -1862,6 +1884,7 @@ fn load_app_generation<D: ReadableDatabase>(
     let table = txn
         .open_table(APP_ROWS)
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let retired = retired_record_visibility(&table, generation)?;
     let prefix = format!("{generation:016x}/");
     let mut rows = Vec::new();
     for record in table
@@ -1872,11 +1895,41 @@ fn load_app_generation<D: ReadableDatabase>(
         if !key.value().starts_with(&prefix) {
             break;
         }
+        if record_store::hidden_retired_physical(key.value(), &retired) {
+            continue;
+        }
         rows.push((key.value().to_owned(), value.value().to_vec()));
     }
     let logical =
         record_store::restore_records(rows).map_err(|err| sto_err(ErrorVerb::Read, err))?;
     record_store::decode(logical, generation).map_err(|err| sto_err(ErrorVerb::Read, err))
+}
+
+fn retired_record_visibility(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    generation: u64,
+) -> std::result::Result<BTreeMap<crate::ids::RunId, bool>, StoErr> {
+    let prefix = format!("{generation:016x}/global/retired_runs/map/");
+    let mut retired = BTreeMap::new();
+    for record in table
+        .range(prefix.as_str()..)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+    {
+        let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        if !key.value().starts_with(&prefix) {
+            break;
+        }
+        let run = record_store::is_retired_marker(key.value(), value.value(), generation)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+            .ok_or_else(|| sto_err(ErrorVerb::Read, "invalid retired marker index"))?;
+        let summary = record_store::run_map_key(generation, run, "terminal_summaries");
+        let retained = table
+            .get(summary.as_str())
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+            .is_some();
+        retired.insert(run, retained);
+    }
+    Ok(retired)
 }
 
 #[cfg(test)]
@@ -1891,6 +1944,7 @@ fn load_app_run<D: ReadableDatabase>(
     let table = txn
         .open_table(APP_ROWS)
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let retired = retired_record_visibility(&table, generation)?;
     let prefixes = [
         format!("{generation:016x}/global/"),
         format!("{generation:016x}/run-{}/", run.to_hex()),
@@ -1904,6 +1958,9 @@ fn load_app_run<D: ReadableDatabase>(
             let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
             if !key.value().starts_with(prefix) {
                 break;
+            }
+            if record_store::hidden_retired_physical(key.value(), &retired) {
+                continue;
             }
             rows.push((key.value().to_owned(), value.value().to_vec()));
         }
@@ -1979,10 +2036,570 @@ fn write_app_delta(
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
     let next = record_store::encode(after, generation, revision.max(1))
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    write_record_delta(txn, &previous, &next)
+}
+
+fn collect_app_prefix(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    prefix: &str,
+    rows: &mut Vec<(String, Vec<u8>)>,
+) -> std::result::Result<(), StoErr> {
+    for record in table
+        .range(prefix..)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+    {
+        let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        if !key.value().starts_with(prefix) {
+            break;
+        }
+        rows.push((key.value().to_owned(), value.value().to_vec()));
+    }
+    Ok(())
+}
+
+fn last_history_sequence(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    generation: u64,
+    run: crate::ids::RunId,
+    field: &str,
+) -> std::result::Result<u64, StoErr> {
+    let prefix = format!("{generation:016x}/run-{}/{field}/sequence/", run.to_hex());
+    let end = format!("{prefix}~");
+    let Some(record) = table
+        .range(prefix.as_str()..end.as_str())
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        .next_back()
+    else {
+        return Ok(0);
+    };
+    let (key, _) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    record_store::history_sequence(key.value()).map_err(|err| sto_err(ErrorVerb::Read, err))
+}
+
+struct AppliedRecordView {
+    rows: BTreeMap<String, Vec<u8>>,
+    history_from: BTreeMap<crate::ids::RunId, u64>,
+}
+
+fn read_applied_records(
+    txn: &redb::WriteTransaction,
+    generation: u64,
+    runs: &std::collections::BTreeSet<crate::ids::RunId>,
+    command_id: Option<crate::ids::CommandId>,
+    sessions: &std::collections::BTreeSet<crate::ids::WorkerSessionId>,
+) -> std::result::Result<AppliedRecordView, StoErr> {
+    let table = txn
+        .open_table(APP_ROWS)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let mut physical = Vec::new();
+    let mut history_from = BTreeMap::new();
+    for run in runs {
+        for field in record_store::run_record_fields() {
+            collect_app_prefix(
+                &table,
+                &format!("{generation:016x}/run-{}/{field}/", run.to_hex()),
+                &mut physical,
+            )?;
+        }
+        let events = last_history_sequence(&table, generation, *run, "history")?;
+        let records = last_history_sequence(&table, generation, *run, "history_records")?;
+        if events != records {
+            return Err(sto_err(
+                ErrorVerb::Read,
+                "stored history and provenance sequences differ",
+            ));
+        }
+        history_from.insert(*run, events);
+    }
+    for field in [
+        "current_cluster_id",
+        "artifact_origins",
+        "engine_time_watermark_ms",
+        "next_generation",
+        "fair_cursor",
+        "recovery",
+        "inbox_order",
+        "obligations_order",
+    ] {
+        if table
+            .get(record_store::scalar_key(generation, field).as_str())
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+            .is_none()
+        {
+            return Err(sto_err(
+                ErrorVerb::Read,
+                format!("required {field} application record is missing"),
+            ));
+        }
+        collect_app_prefix(
+            &table,
+            &format!("{generation:016x}/global/{field}/scalar/"),
+            &mut physical,
+        )?;
+    }
+    if let Some(id) = command_id {
+        for field in [
+            "commands",
+            "command_actors",
+            "command_external_ids",
+            "authenticated_request_digests",
+            "legacy_start_digests",
+            "worker_command_digests",
+            "command_times",
+        ] {
+            let key = record_store::map_key(generation, field, &id.to_hex());
+            if let Some(stored) = stored_app_record(&table, &key)? {
+                physical.push((key, stored.value));
+            }
+        }
+    }
+    for session in sessions {
+        let key = record_store::map_key(generation, "sessions", &session.to_hex());
+        if let Some(stored) = stored_app_record(&table, &key)? {
+            physical.push((key, stored.value));
+        }
+    }
+    Ok(AppliedRecordView {
+        rows: record_store::restore_records(physical)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?,
+        history_from,
+    })
+}
+
+fn write_applied_delta(
+    txn: &redb::WriteTransaction,
+    state: &State,
+    generation: u64,
+    revision: u64,
+    runs: &std::collections::BTreeSet<crate::ids::RunId>,
+    events: &[domain::DomainEvent],
+    command_id: Option<crate::ids::CommandId>,
+    sessions: &std::collections::BTreeSet<crate::ids::WorkerSessionId>,
+) -> std::result::Result<State, StoErr> {
+    {
+        let table = txn
+            .open_table(APP_ROWS)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        for run in runs {
+            if state.runs.contains_key(run)
+                && table
+                    .get(record_store::retired_key(generation, *run).as_str())
+                    .map_err(|err| sto_err(ErrorVerb::Read, err))?
+                    .is_some()
+            {
+                return Err(sto_err(
+                    ErrorVerb::Write,
+                    "retired run identity cannot be reused before bounded cleanup",
+                ));
+            }
+        }
+    }
+    let previous = read_applied_records(txn, generation, runs, command_id, sessions)?;
+    let (next, selected) = record_store::encode_applied(
+        state,
+        generation,
+        revision,
+        runs,
+        events,
+        command_id,
+        sessions,
+        &previous.rows,
+        &previous.history_from,
+    )
+    .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    write_record_delta(txn, &previous.rows, &next)?;
+    Ok(selected)
+}
+
+fn retain_nested_item<T: serde::Serialize>(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    previous: &mut BTreeMap<String, Vec<u8>>,
+    next: &mut BTreeMap<String, Vec<u8>>,
+    generation: u64,
+    revision: u64,
+    run: Option<crate::ids::RunId>,
+    field: &str,
+    group: &str,
+    child: &str,
+    value: Option<&T>,
+) -> std::result::Result<(), StoErr> {
+    let key = record_store::nested_key(generation, run, field, group, child);
+    if let Some(stored) = stored_app_record(table, &key)? {
+        previous.insert(key.clone(), stored.value);
+    }
+    if let Some(value) = value {
+        let value = serde_json::to_value(value).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let (encoded, bytes) = record_store::encode_nested_value(
+            generation, revision, run, field, group, child, value,
+        )
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        next.insert(encoded, bytes);
+    }
+    Ok(())
+}
+
+fn write_publication_delta(
+    txn: &redb::WriteTransaction,
+    domain: &State,
+    key: &crate::publication::CommandKey,
+    operation: &crate::publication::PublicationOperation,
+    generation: u64,
+    revision: u64,
+) -> std::result::Result<(), StoErr> {
+    let table = txn
+        .open_table(APP_ROWS)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let mut previous = BTreeMap::new();
+    let mut next = BTreeMap::new();
+    let receipt_key = key.storage_key();
+    let receipt = domain
+        .command_results
+        .get(&receipt_key)
+        .ok_or_else(|| sto_err(ErrorVerb::Read, "publication receipt missing after apply"))?;
+    retain_map_item(
+        &table,
+        &mut previous,
+        &mut next,
+        generation,
+        revision,
+        None,
+        "command_results",
+        &receipt_key,
+        Some(receipt),
+    )?;
+    match operation {
+        crate::publication::PublicationOperation::Catalog { version, .. } => {
+            retain_map_item(
+                &table,
+                &mut previous,
+                &mut next,
+                generation,
+                revision,
+                None,
+                "published_catalogs",
+                &version.to_string(),
+                domain.published_catalogs.get(version),
+            )?;
+        }
+        crate::publication::PublicationOperation::Definition { definition, .. } => {
+            retain_nested_item(
+                &table,
+                &mut previous,
+                &mut next,
+                generation,
+                revision,
+                None,
+                "published_definitions",
+                &definition.id,
+                &definition.version.to_string(),
+                domain
+                    .published_definitions
+                    .get(&definition.id)
+                    .and_then(|versions| versions.get(&definition.version)),
+            )?;
+        }
+        crate::publication::PublicationOperation::Start {
+            workflow,
+            start_key,
+            ..
+        } => {
+            if let Some(start) = domain
+                .start_keys
+                .get(workflow)
+                .and_then(|keys| keys.get(start_key))
+            {
+                retain_nested_item(
+                    &table,
+                    &mut previous,
+                    &mut next,
+                    generation,
+                    revision,
+                    Some(start.run),
+                    "start_keys",
+                    workflow,
+                    start_key,
+                    Some(start),
+                )?;
+            }
+        }
+    }
+    drop(table);
+    write_record_delta(txn, &previous, &next)
+}
+
+#[derive(Default)]
+struct PruneSelection {
+    command_ids: Vec<crate::ids::CommandId>,
+    result_keys: Vec<String>,
+    inbox: Vec<(crate::ids::RunId, crate::ids::EventId)>,
+    runs: Vec<crate::ids::RunId>,
+    summaries: Vec<crate::ids::RunId>,
+}
+
+fn select_prune_records(
+    state: &State,
+    time_ms: u64,
+    limit: usize,
+) -> std::result::Result<PruneSelection, StoErr> {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+    let inbox_ids = crate::history::earliest_due(
+        state.inbox.iter().filter_map(|entry| {
+            (entry.expires_ms != 0
+                && time_ms >= entry.expires_ms
+                && (entry.consumed || entry.reserved_wait.is_none()))
+            .then_some((entry.expires_ms, (entry.run, entry.event_id)))
+        }),
+        limit,
+    );
+    let mut inbox = Vec::new();
+    for (run_id, id) in inbox_ids {
+        let entry = state
+            .inbox
+            .iter()
+            .find(|entry| entry.run == run_id && entry.event_id == id)
+            .ok_or_else(|| sto_err(ErrorVerb::Read, "selected inbox entry disappeared"))?;
+        let run = entry
+            .run
+            .ok_or_else(|| sto_err(ErrorVerb::Read, "retained inbox entry has no run"))?;
+        inbox.push((run, id));
+    }
+    Ok(PruneSelection {
+        result_keys: crate::history::earliest_due(
+            state.command_results.iter().filter_map(|(key, result)| {
+                let due = result.recorded_ms.saturating_add(DAY_MS);
+                (time_ms >= due).then(|| (due, key.clone()))
+            }),
+            limit,
+        ),
+        command_ids: crate::history::earliest_due(
+            state.command_times.iter().filter_map(|(id, recorded)| {
+                let due = recorded.saturating_add(DAY_MS);
+                (time_ms >= due).then_some((due, *id))
+            }),
+            limit,
+        ),
+        inbox,
+        runs: crate::history::earliest_due(
+            state.runs.values().filter_map(|run| {
+                let due = run
+                    .terminal_ms
+                    .saturating_add(run.policy.terminal_history_days.saturating_mul(DAY_MS));
+                (!matches!(run.status, domain::RunStatus::Active)
+                    && run.terminal_ms != 0
+                    && time_ms >= due)
+                    .then_some((due, run.id))
+            }),
+            limit,
+        ),
+        summaries: crate::history::earliest_due(
+            state
+                .terminal_summaries
+                .values()
+                .filter(|summary| time_ms >= summary.expires_ms)
+                .map(|summary| (summary.expires_ms, summary.run)),
+            limit,
+        ),
+    })
+}
+
+fn retain_map_item<T: serde::Serialize>(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    previous: &mut BTreeMap<String, Vec<u8>>,
+    next: &mut BTreeMap<String, Vec<u8>>,
+    generation: u64,
+    revision: u64,
+    run: Option<crate::ids::RunId>,
+    field: &str,
+    key: &str,
+    value: Option<&T>,
+) -> std::result::Result<(), StoErr> {
+    let full_key = match run {
+        Some(run) => record_store::run_map_key(generation, run, field),
+        None => record_store::map_key(generation, field, key),
+    };
+    if let Some(stored) = stored_app_record(table, &full_key)? {
+        previous.insert(full_key.clone(), stored.value);
+    }
+    if let Some(value) = value {
+        let value = serde_json::to_value(value).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let (encoded_key, encoded) =
+            record_store::encode_value(generation, revision, run, field, "map", key, value)
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        if encoded_key != full_key {
+            return Err(sto_err(
+                ErrorVerb::Write,
+                "record key differs from retained identity",
+            ));
+        }
+        next.insert(full_key, encoded);
+    }
+    Ok(())
+}
+
+fn write_prune_delta(
+    txn: &redb::WriteTransaction,
+    domain: &State,
+    selection: &PruneSelection,
+    generation: u64,
+    revision: u64,
+) -> std::result::Result<bool, StoErr> {
+    let table = txn
+        .open_table(APP_ROWS)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let mut previous = BTreeMap::new();
+    let mut next = BTreeMap::new();
+    for id in &selection.command_ids {
+        let key = id.to_hex();
+        retain_map_item(
+            &table,
+            &mut previous,
+            &mut next,
+            generation,
+            revision,
+            None,
+            "commands",
+            &key,
+            domain.commands.get(id),
+        )?;
+        retain_map_item(
+            &table,
+            &mut previous,
+            &mut next,
+            generation,
+            revision,
+            None,
+            "command_times",
+            &key,
+            domain.command_times.get(id),
+        )?;
+        retain_map_item(
+            &table,
+            &mut previous,
+            &mut next,
+            generation,
+            revision,
+            None,
+            "command_actors",
+            &key,
+            domain.command_actors.get(id),
+        )?;
+        retain_map_item(
+            &table,
+            &mut previous,
+            &mut next,
+            generation,
+            revision,
+            None,
+            "command_external_ids",
+            &key,
+            domain.command_external_ids.get(id),
+        )?;
+        retain_map_item(
+            &table,
+            &mut previous,
+            &mut next,
+            generation,
+            revision,
+            None,
+            "authenticated_request_digests",
+            &key,
+            domain.authenticated_request_digests.get(id),
+        )?;
+        retain_map_item(
+            &table,
+            &mut previous,
+            &mut next,
+            generation,
+            revision,
+            None,
+            "legacy_start_digests",
+            &key,
+            domain.legacy_start_digests.get(id),
+        )?;
+        retain_map_item(
+            &table,
+            &mut previous,
+            &mut next,
+            generation,
+            revision,
+            None,
+            "worker_command_digests",
+            &key,
+            domain.worker_command_digests.get(id),
+        )?;
+    }
+    for key in &selection.result_keys {
+        retain_map_item(
+            &table,
+            &mut previous,
+            &mut next,
+            generation,
+            revision,
+            None,
+            "command_results",
+            key,
+            domain.command_results.get(key),
+        )?;
+    }
+    for (run, id) in &selection.inbox {
+        let key = record_store::run_list_key(generation, *run, "inbox", &id.to_hex());
+        if let Some(stored) = stored_app_record(&table, &key)? {
+            previous.insert(key.clone(), stored.value.clone());
+            if domain
+                .inbox
+                .iter()
+                .any(|entry| entry.run == Some(*run) && entry.event_id == *id)
+            {
+                next.insert(key, stored.value);
+            }
+        }
+    }
+    let mut retired = false;
+    for run in selection.runs.iter().chain(&selection.summaries) {
+        if !domain.runs.contains_key(run) {
+            let marker = record_store::retired_key(generation, *run);
+            if let Some(stored) = stored_app_record(&table, &marker)? {
+                previous.insert(marker.clone(), stored.value.clone());
+                next.insert(marker, stored.value);
+            } else if selection.runs.contains(run) {
+                let (key, value) = record_store::retired_marker(generation, revision, *run)
+                    .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+                next.insert(key, value);
+                retired = true;
+            } else {
+                return Err(sto_err(
+                    ErrorVerb::Read,
+                    "expired summary has no retired run marker",
+                ));
+            }
+        }
+        let key = run.to_hex();
+        retain_map_item(
+            &table,
+            &mut previous,
+            &mut next,
+            generation,
+            revision,
+            Some(*run),
+            "terminal_summaries",
+            &key,
+            domain.terminal_summaries.get(run),
+        )?;
+    }
+    drop(table);
+    write_record_delta(txn, &previous, &next)?;
+    Ok(retired)
+}
+
+fn write_record_delta(
+    txn: &redb::WriteTransaction,
+    previous: &BTreeMap<String, Vec<u8>>,
+    next: &BTreeMap<String, Vec<u8>>,
+) -> std::result::Result<(), StoErr> {
     let mut table = txn
         .open_table(APP_ROWS)
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-    for (key, old) in &previous {
+    for (key, old) in previous {
         if !next.contains_key(key) {
             let stored = stored_app_record(&table, key)?
                 .ok_or_else(|| sto_err(ErrorVerb::Read, "required application record missing"))?;
@@ -2001,7 +2618,7 @@ fn write_app_delta(
             }
         }
     }
-    for (key, value) in &next {
+    for (key, value) in next {
         if let Some(old) = previous.get(key) {
             if record_store::same_value(old, value).map_err(|err| sto_err(ErrorVerb::Read, err))? {
                 continue;
@@ -2026,7 +2643,7 @@ fn write_app_delta(
                 ));
             }
         }
-        let framed = record_store::frame_records(std::iter::once((key.clone(), value.clone())))
+        let framed = record_store::frame_records(std::iter::once((key.to_owned(), value.to_vec())))
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         for (physical_key, bytes) in framed {
             table
@@ -2309,6 +2926,113 @@ fn gc_inactive_app_rows(db: &Database) -> std::result::Result<bool, StoErr> {
     Ok(more)
 }
 
+fn gc_retired_app_rows(db: &Database) -> std::result::Result<bool, StoErr> {
+    let generation = verified_store_manifest(db)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        .active_generation;
+    let txn = begin_immediate(db)?;
+    let mut table = txn
+        .open_table(APP_ROWS)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let markers = format!("{generation:016x}/global/retired_runs/map/");
+    let mut remove = Vec::new();
+    let mut remove_marker = None;
+    let mut bytes = 0usize;
+    for record in table
+        .range(markers.as_str()..)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+    {
+        let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        if !key.value().starts_with(&markers) {
+            break;
+        }
+        let Some(run) = record_store::is_retired_marker(key.value(), value.value(), generation)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        else {
+            return Err(sto_err(ErrorVerb::Read, "invalid retired run index"));
+        };
+        let summary = record_store::run_map_key(generation, run, "terminal_summaries");
+        let retained = table
+            .get(summary.as_str())
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+            .is_some();
+        let prefix = format!("{generation:016x}/run-{}/", run.to_hex());
+        for row in table
+            .range(prefix.as_str()..)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        {
+            let (row_key, row_value) = row.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+            if !row_key.value().starts_with(&prefix) {
+                break;
+            }
+            if retained && (row_key.value() == summary || row_key.value().contains("/start_keys/"))
+            {
+                continue;
+            }
+            let size = row_key.value().len() + row_value.value().len();
+            if !select_gc_key(&mut remove, &mut bytes, row_key.value().to_owned(), size) {
+                break;
+            }
+        }
+        if !remove.is_empty() {
+            break;
+        }
+        if !retained {
+            remove_marker = Some(key.value().to_owned());
+            break;
+        }
+    }
+    for key in &remove {
+        table
+            .remove(key.as_str())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    }
+    if let Some(key) = &remove_marker {
+        table
+            .remove(key.as_str())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    }
+    drop(table);
+    if !remove.is_empty() || remove_marker.is_some() {
+        commit_immediate(txn)?;
+        after_persist("after-retired-generation-cleanup")?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+enum RetentionUpdate {
+    Candidate(Option<u64>),
+    Rebuild(Option<u64>),
+}
+
+fn retention_candidate(
+    state: &State,
+    events: &[domain::DomainEvent],
+    command_id: Option<crate::ids::CommandId>,
+    receipt: Option<&crate::publication::CommandResult>,
+) -> Option<u64> {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+    let command = command_id
+        .and_then(|id| state.command_times.get(&id))
+        .map(|ms| ms.saturating_add(DAY_MS));
+    let receipt = receipt.map(|value| value.recorded_ms.saturating_add(DAY_MS));
+    let events = events.iter().filter_map(|event| match event {
+        domain::DomainEvent::EventAccepted { expires_ms, .. } if *expires_ms != 0 => {
+            Some(*expires_ms)
+        }
+        domain::DomainEvent::RunSucceeded { run, .. }
+        | domain::DomainEvent::RunFailed { run, .. } => state.runs.get(run).and_then(|run| {
+            (run.terminal_ms != 0).then(|| {
+                run.terminal_ms
+                    .saturating_add(run.policy.terminal_history_days.saturating_mul(DAY_MS))
+            })
+        }),
+        _ => None,
+    });
+    command.into_iter().chain(receipt).chain(events).min()
+}
+
 fn update_schedule(
     txn: &redb::WriteTransaction,
     state: &State,
@@ -2317,6 +3041,7 @@ fn update_schedule(
     generation: u64,
     applied_index: u64,
     now_ms: u64,
+    retention_update: RetentionUpdate,
 ) -> std::result::Result<Option<u64>, StoErr> {
     let mut changed = false;
     {
@@ -2375,7 +3100,12 @@ fn update_schedule(
             .ok_or_else(|| sto_err(ErrorVerb::Read, "missing schedule retention"))?;
         serde_json::from_slice(value.value()).map_err(|err| sto_err(ErrorVerb::Read, err))?
     };
-    let retention = retention_deadline(state);
+    let retention = match retention_update {
+        RetentionUpdate::Candidate(candidate) => {
+            previous_retention.into_iter().chain(candidate).min()
+        }
+        RetentionUpdate::Rebuild(value) => value,
+    };
     if retention != previous_retention {
         changed = true;
         let bytes = serde_json::to_vec(&retention).map_err(|err| sto_err(ErrorVerb::Write, err))?;
@@ -2433,6 +3163,7 @@ fn replace_schedule(
         generation,
         applied_index,
         state.engine_time_watermark_ms,
+        RetentionUpdate::Rebuild(retention_deadline(state)),
     )?;
     if revision.is_none() {
         let revision = current_revision
@@ -3220,126 +3951,222 @@ fn apply_entries(
     entries: Vec<EntryT>,
 ) -> std::result::Result<Vec<RaftResponse>, StoErr> {
     let mut replies = Vec::new();
-    let previous_applied = *last_applied;
-    let mut next_applied = previous_applied;
-    let mut next_membership = last_membership.clone();
-    let mut next_domain = domain.clone();
-    let mut membership_changed = false;
-    let mut affected = BTreeMap::<crate::ids::RunId, Option<bool>>::new();
-    let mut applied_bytes = 0u64;
-    for entry in entries {
-        if matches!(&entry.payload, EntryPayload::Normal(_))
-            && next_domain.current_cluster_id.is_empty()
-        {
-            return Err(sto_err(
-                ErrorVerb::Write,
-                "member artifact origin is unbound; open through Engine",
-            ));
-        }
-        if entry.get_log_id().index > previous_applied.map_or(0, |id| id.index) {
-            let encoded =
-                serde_json::to_vec(&entry).map_err(|err| sto_err(ErrorVerb::Write, err))?;
-            applied_bytes = applied_bytes
-                .checked_add(encoded.len() as u64)
-                .ok_or_else(|| sto_err(ErrorVerb::Write, "applied byte counter overflow"))?;
-        }
-        next_applied = Some(*entry.get_log_id());
-        if let Some(membership) = openraft::entry::RaftPayload::get_membership(&entry.payload) {
-            next_membership = StoredMembership::new(Some(*entry.get_log_id()), membership.clone());
-            membership_changed = true;
-        }
-        let mut reply = RaftResponse::default();
-        if let EntryPayload::Normal(req) = &entry.payload {
-            if let domain::CommandBody::Publication { key, operation } = &req.command.body {
-                if key.command_id != req.command.id
-                    || key.cluster_id.is_empty()
-                    || key.principal_id.is_empty()
-                {
-                    reply.error = Some("invalid authenticated command identity".to_owned());
-                    reply.error_kind = Some(crate::error::ErrorKind::InvalidArgument);
-                } else {
-                    let mut command = req.command.clone();
-                    if !next_domain.command_results.contains_key(&key.storage_key()) {
-                        command.time = crate::time::EngineTime::from_millis(
-                            next_domain
-                                .engine_time_watermark_ms
-                                .max(command.time.as_millis()),
-                        );
-                        next_domain.engine_time_watermark_ms = command.time.as_millis();
-                    }
-                    let receipt =
-                        crate::publication::apply(&mut next_domain, &command, key, operation);
-                    if let Ok(run) = receipt.applied_run() {
-                        affected.insert(run, Some(true));
-                    }
-                    if let Err(err) = receipt.ensure_applied() {
-                        reply.error_kind = Some(err.kind);
-                        reply.error = Some(err.to_string());
-                    }
-                    reply.command_result = Some(receipt);
-                }
-            } else {
-                let mut candidate = next_domain.clone();
-                match domain::commit_command(&mut candidate, req.command.clone()) {
-                    Ok(events) => {
-                        if let domain::CommandBody::Progress { run } = &req.command.body {
-                            affected.insert(*run, Some(!events.is_empty()));
-                        }
-                        for event in &events {
-                            if let Some(run) = domain::event_owner(&candidate, event)
-                                .map_err(|err| sto_err(ErrorVerb::Read, err))?
-                            {
-                                let progress = !matches!(
-                                    event,
-                                    domain::DomainEvent::ClaimGranted { .. }
-                                        | domain::DomainEvent::ClaimRenewed { .. }
-                                );
-                                affected
-                                    .entry(run)
-                                    .and_modify(|existing| {
-                                        if progress {
-                                            *existing = Some(true);
-                                        }
-                                    })
-                                    .or_insert(progress.then_some(true));
-                            }
-                        }
-                        let acknowledged = match &req.command.body {
-                            domain::CommandBody::AcknowledgeRecovery { .. } => true,
-                            domain::CommandBody::Authenticated { body, .. } => matches!(
-                                body.as_ref(),
-                                domain::CommandBody::AcknowledgeRecovery { .. }
-                            ),
-                            _ => false,
-                        };
-                        if acknowledged {
-                            for run in domain::active_runs(&candidate) {
-                                affected.insert(run, Some(true));
-                            }
-                        }
-                        next_domain = candidate;
-                        reply.run_id = events.iter().find_map(|event| match event {
-                            domain::DomainEvent::RunAdmitted { run, .. } => Some(*run),
-                            _ => None,
-                        });
-                    }
-                    Err(err) => {
-                        reply.error_kind = Some(err.kind);
-                        reply.error = Some(err.to_string());
-                    }
-                }
-            }
-        }
-        replies.push(reply);
-    }
-    let mut snapshot_progress = read_snapshot_progress(db)?;
-    snapshot_progress.applied_bytes = snapshot_progress
-        .applied_bytes
-        .checked_add(applied_bytes)
-        .ok_or_else(|| sto_err(ErrorVerb::Write, "applied byte counter overflow"))?;
     let generation = verified_store_manifest(db)
         .map_err(|err| sto_err(ErrorVerb::Read, err))?
         .active_generation;
+    for entry in entries {
+        match apply_one_entry(
+            db,
+            last_applied,
+            last_membership,
+            domain,
+            schedule_revision,
+            generation,
+            entry,
+        ) {
+            Ok(reply) => replies.push(reply),
+            Err(err) => {
+                if !COMMIT_UNCERTAIN.with(|uncertain| uncertain.get()) {
+                    *domain = load_app_generation(db, generation)?;
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(replies)
+}
+
+fn apply_one_entry(
+    db: &Database,
+    last_applied: &mut Option<LogIdT>,
+    last_membership: &mut MembershipT,
+    domain: &mut State,
+    schedule_revision: &mut u64,
+    generation: u64,
+    entry: EntryT,
+) -> std::result::Result<RaftResponse, StoErr> {
+    if matches!(&entry.payload, EntryPayload::Normal(_)) && domain.current_cluster_id.is_empty() {
+        return Err(sto_err(
+            ErrorVerb::Write,
+            "member artifact origin is unbound; open through Engine",
+        ));
+    }
+    let previous_applied = *last_applied;
+    let next_applied = Some(*entry.get_log_id());
+    let mut snapshot_progress = read_snapshot_progress(db)?;
+    if entry.get_log_id().index > previous_applied.map_or(0, |id| id.index) {
+        let bytes = serde_json::to_vec(&entry).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        snapshot_progress.applied_bytes = snapshot_progress
+            .applied_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| sto_err(ErrorVerb::Write, "applied byte counter overflow"))?;
+    }
+    let membership = openraft::entry::RaftPayload::get_membership(&entry.payload)
+        .map(|value| StoredMembership::new(next_applied, value.clone()));
+    let mut reply = RaftResponse::default();
+    let mut affected = BTreeMap::<crate::ids::RunId, Option<bool>>::new();
+    let mut events = Vec::new();
+    let mut command_id = None;
+    let mut sessions = std::collections::BTreeSet::new();
+    let mut publication = None;
+    let mut prune = false;
+    let mut prune_selection = None;
+    if let EntryPayload::Normal(req) = &entry.payload {
+        let body = match &req.command.body {
+            domain::CommandBody::Authenticated { body, .. } => body.as_ref(),
+            body => body,
+        };
+        prune = matches!(body, domain::CommandBody::PruneHistory { .. });
+        if let domain::CommandBody::PruneHistory { limit } = body
+            && !domain.commands.contains_key(&req.command.id)
+            && *limit > 0
+            && *limit <= 1024
+        {
+            prune_selection = Some(select_prune_records(
+                domain,
+                req.command
+                    .time
+                    .as_millis()
+                    .max(domain.engine_time_watermark_ms),
+                *limit as usize,
+            )?);
+        }
+        if let domain::CommandBody::Publication { key, operation } = &req.command.body {
+            if key.command_id != req.command.id
+                || key.cluster_id.is_empty()
+                || key.principal_id.is_empty()
+            {
+                reply.error = Some("invalid authenticated command identity".to_owned());
+                reply.error_kind = Some(crate::error::ErrorKind::InvalidArgument);
+            } else {
+                publication = Some((key, operation));
+                let mut command = req.command.clone();
+                let first_submission = !domain.command_results.contains_key(&key.storage_key());
+                if first_submission {
+                    command.time = crate::time::EngineTime::from_millis(
+                        domain
+                            .engine_time_watermark_ms
+                            .max(command.time.as_millis()),
+                    );
+                    domain.engine_time_watermark_ms = command.time.as_millis();
+                }
+                let receipt =
+                    match crate::publication::apply_replicated(domain, &command, key, operation) {
+                        Ok(receipt) => receipt,
+                        Err(_) => {
+                            *domain = load_app_generation(db, generation)?;
+                            let receipt =
+                                crate::publication::apply(domain, &command, key, operation);
+                            if receipt.ensure_applied().is_ok() {
+                                return Err(sto_err(
+                                    ErrorVerb::Write,
+                                    "publication replay changed an in-place rejection",
+                                ));
+                            }
+                            receipt
+                        }
+                    };
+                if let Ok(run) = receipt.applied_run() {
+                    if !domain.runs.contains_key(&run) {
+                        return Err(sto_err(
+                            ErrorVerb::Read,
+                            "published start receipt has no retained run",
+                        ));
+                    }
+                    affected.insert(run, Some(true));
+                    if first_submission
+                        && matches!(
+                            operation,
+                            crate::publication::PublicationOperation::Start { .. }
+                        )
+                    {
+                        let (expected, _, progress_id) =
+                            crate::publication::published_start_ids(key);
+                        if expected == run {
+                            if !domain.commands.contains_key(&progress_id) {
+                                return Err(sto_err(
+                                    ErrorVerb::Read,
+                                    "published start is missing its internal progress receipt",
+                                ));
+                            }
+                            events = domain.history.get(&run).cloned().ok_or_else(|| {
+                                sto_err(ErrorVerb::Read, "published start has no retained history")
+                            })?;
+                            command_id = Some(progress_id);
+                        }
+                    }
+                }
+                if let Err(err) = receipt.ensure_applied() {
+                    reply.error_kind = Some(err.kind);
+                    reply.error = Some(err.to_string());
+                }
+                reply.command_result = Some(receipt);
+            }
+        } else {
+            match domain::commit_command(domain, req.command.clone()) {
+                Ok(applied) => {
+                    events = applied;
+                    command_id = Some(match &req.command.body {
+                        domain::CommandBody::Authenticated { principal_id, .. } => {
+                            domain::authenticated_command_id(principal_id, req.command.id)
+                                .map_err(|err| sto_err(ErrorVerb::Write, err))?
+                        }
+                        _ => req.command.id,
+                    });
+                    if let domain::CommandBody::Progress { run } = body {
+                        affected.insert(*run, Some(!events.is_empty()));
+                    }
+                    if matches!(body, domain::CommandBody::AcknowledgeRecovery { .. }) {
+                        for run in domain::active_runs(domain) {
+                            affected.insert(run, Some(true));
+                        }
+                    }
+                    reply.run_id = events.iter().find_map(|event| match event {
+                        domain::DomainEvent::RunAdmitted { run, .. } => Some(*run),
+                        _ => None,
+                    });
+                }
+                Err(err) => {
+                    reply.error_kind = Some(err.kind);
+                    reply.error = Some(err.to_string());
+                    *domain = load_app_generation(db, generation)?;
+                }
+            }
+        }
+        match body {
+            domain::CommandBody::RegisterSession { session, .. }
+            | domain::CommandBody::RenewLocalSession { session }
+            | domain::CommandBody::RegisterWorker { session, .. }
+            | domain::CommandBody::RenewWorkerSession { session, .. }
+            | domain::CommandBody::Claim { session, .. }
+            | domain::CommandBody::Renew { session, .. }
+            | domain::CommandBody::ReportAssigned { session, .. }
+            | domain::CommandBody::ReportWorker { session, .. }
+            | domain::CommandBody::Reconcile { session, .. }
+            | domain::CommandBody::ReconcileWorker { session, .. } => {
+                sessions.insert(*session);
+            }
+            _ => {}
+        }
+    }
+    for event in &events {
+        if let Some(run) =
+            domain::event_owner(domain, event).map_err(|err| sto_err(ErrorVerb::Read, err))?
+        {
+            let progress = !matches!(
+                event,
+                domain::DomainEvent::ClaimGranted { .. } | domain::DomainEvent::ClaimRenewed { .. }
+            );
+            affected
+                .entry(run)
+                .and_modify(|existing| {
+                    if progress {
+                        *existing = Some(true);
+                    }
+                })
+                .or_insert(progress.then_some(true));
+        }
+    }
     let txn = begin_immediate(db)?;
     {
         let mut meta = txn
@@ -3353,40 +4180,76 @@ fn apply_entries(
             serde_json::to_vec(&snapshot_progress).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         meta.insert("snapshot_progress", progress_bytes.as_slice())
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-        if membership_changed {
-            let membership = serde_json::to_vec(&next_membership)
-                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
-            meta.insert("membership", membership.as_slice())
+        if let Some(membership) = &membership {
+            let bytes =
+                serde_json::to_vec(membership).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            meta.insert("membership", bytes.as_slice())
                 .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         }
     }
     after_persist("after-applied-metadata")?;
-    let record_revision = next_applied
-        .map_or(0, |id| id.index)
+    let record_revision = entry
+        .get_log_id()
+        .index
         .checked_add(1)
         .ok_or_else(|| sto_err(ErrorVerb::Write, "record revision exhausted"))?;
-    write_app_delta(&txn, domain, &next_domain, generation, record_revision)?;
+    let visible_runs: std::collections::BTreeSet<_> = affected
+        .keys()
+        .filter(|run| domain.runs.contains_key(run))
+        .copied()
+        .collect();
+    let schedule_state = write_applied_delta(
+        &txn,
+        domain,
+        generation,
+        record_revision,
+        &visible_runs,
+        &events,
+        command_id,
+        &sessions,
+    )?;
+    if let Some((key, operation)) = publication {
+        write_publication_delta(&txn, domain, key, operation, generation, record_revision)?;
+    }
+    if prune
+        && reply.error.is_none()
+        && let Some(selection) = &prune_selection
+    {
+        write_prune_delta(&txn, domain, selection, generation, record_revision)?;
+        after_persist("after-retire-marker")?;
+    }
     after_persist("after-event-append")?;
     release_applied_credits(&txn, previous_applied, next_applied)?;
     let next_revision = update_schedule(
         &txn,
-        &next_domain,
+        &schedule_state,
         &affected,
         *schedule_revision,
         generation,
-        next_applied.map_or(0, |id| id.index),
-        next_domain.engine_time_watermark_ms,
+        entry.get_log_id().index,
+        domain.engine_time_watermark_ms,
+        if prune && reply.error.is_none() {
+            RetentionUpdate::Rebuild(retention_deadline(domain))
+        } else {
+            RetentionUpdate::Candidate(retention_candidate(
+                domain,
+                &events,
+                command_id,
+                reply.command_result.as_ref(),
+            ))
+        },
     )?;
     after_persist("after-domain-index")?;
     commit_immediate(txn)?;
     *last_applied = next_applied;
-    *last_membership = next_membership;
-    *domain = next_domain;
+    if let Some(value) = membership {
+        *last_membership = value;
+    }
     if let Some(revision) = next_revision {
         *schedule_revision = revision;
     }
     after_persist("after-apply")?;
-    Ok(replies)
+    Ok(reply)
 }
 
 fn build_snapshot(
@@ -3452,6 +4315,7 @@ fn build_snapshot(
     let app = txn
         .open_table(APP_ROWS)
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let retired = retired_record_visibility(&app, generation)?;
     let origins_key = record_store::scalar_key(generation, "artifact_origins");
     let origins = app
         .get(origins_key.as_str())
@@ -3471,6 +4335,9 @@ fn build_snapshot(
         let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
         if !key.value().starts_with(&prefix) {
             break;
+        }
+        if record_store::hidden_retired_physical(key.value(), &retired) {
+            continue;
         }
         let key_len = key.value().len();
         let value_len = value.value().len();
@@ -3535,6 +4402,9 @@ fn build_snapshot(
         let (key, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
         if !key.value().starts_with(&prefix) {
             break;
+        }
+        if record_store::hidden_retired_physical(key.value(), &retired) {
+            continue;
         }
         let key_bytes = key.value().as_bytes();
         let value_bytes = value.value();
@@ -4331,6 +5201,118 @@ nodes:
     }
 
     #[test]
+    fn retirement_cut_keeps_either_complete_old_or_new_applied_prefix() {
+        use crate::domain::CommandBody;
+        use crate::ids::{CommandId, RunId};
+        use crate::time::EngineTime;
+
+        let catalog = crate::Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let definition = crate::compile_yaml(
+            "\
+dsl: graphrun/v1
+id: retirement_cut
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {literal: null}
+",
+            &catalog,
+        )
+        .unwrap();
+        for (index, point) in ["after-retire-marker", "after-apply"]
+            .into_iter()
+            .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("member.redb");
+            let db = Database::create(&path).unwrap();
+            initialize_publication_store(&db).unwrap();
+            let mut state = bound_fixture(&db);
+            let before = state.clone();
+            let run = RunId::from_bytes([index as u8 + 70; 16]);
+            for (id, time, body) in [
+                (
+                    1,
+                    1,
+                    CommandBody::Start {
+                        run,
+                        definition: Box::new(definition.clone()),
+                        catalog: Box::new(catalog.clone()),
+                        input: crate::Value::Null,
+                    },
+                ),
+                (2, 2, CommandBody::Progress { run }),
+            ] {
+                domain::commit_command(
+                    &mut state,
+                    Command {
+                        id: CommandId::from_bytes([id; 16]),
+                        time: EngineTime::from_millis(time),
+                        body,
+                    },
+                )
+                .unwrap();
+            }
+            let txn = begin_immediate(&db).unwrap();
+            write_app_delta(&txn, &before, &state, 1, 3).unwrap();
+            commit_immediate(txn).unwrap();
+            let mut applied = None;
+            let mut membership = StoredMembership::new(None, Membership::new(vec![], None));
+            let mut revision = 0;
+            let entry = Entry::<TypeConfig> {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
+                payload: EntryPayload::Normal(RaftRequest {
+                    command: Command {
+                        id: CommandId::from_bytes([3; 16]),
+                        time: EngineTime::from_millis(2 + 30 * 24 * 60 * 60 * 1_000),
+                        body: CommandBody::PruneHistory { limit: 128 },
+                    },
+                }),
+            };
+            inject_cut(point);
+            let error = apply_entries(
+                &db,
+                &mut applied,
+                &mut membership,
+                &mut state,
+                &mut revision,
+                vec![entry],
+            )
+            .unwrap_err();
+            clear_cut();
+            assert!(error.to_string().contains(point));
+            let persisted: Option<LogIdT> = load_json(&db, "last_applied");
+            let visible = load_app_generation(&db, 1).unwrap();
+            let marker = record_store::retired_key(1, run);
+            let marker_present = db
+                .begin_read()
+                .unwrap()
+                .open_table(APP_ROWS)
+                .unwrap()
+                .get(marker.as_str())
+                .unwrap()
+                .is_some();
+            assert_eq!(persisted.is_some(), index == 1);
+            assert_eq!(marker_present, index == 1);
+            assert_eq!(visible.runs.contains_key(&run), index == 0);
+            assert_eq!(visible.terminal_summaries.contains_key(&run), index == 1);
+            COMMIT_UNCERTAIN.with(|uncertain| uncertain.set(false));
+            drop(db);
+            let db = Database::open(&path).unwrap();
+            let reopened = load_app_generation(&db, 1).unwrap();
+            assert_eq!(reopened.runs.contains_key(&run), index == 0);
+            assert_eq!(reopened.terminal_summaries.contains_key(&run), index == 1);
+        }
+    }
+
+    #[test]
     fn snapshot_install_cut_keeps_generation() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("member.redb");
@@ -4453,7 +5435,27 @@ nodes:
         let db = Database::create(&path).unwrap();
         initialize_publication_store(&db).unwrap();
         let mut manifest = StoreManifest::new();
-        manifest.reader_floor = 4;
+        manifest.reader_floor = 5;
+        put_json(&db, "store_manifest", &manifest).unwrap();
+        drop(db);
+        let original = std::fs::read(&path).unwrap();
+        let err = StorageHandle::open(&path).err().unwrap();
+        assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+        assert!(err.message.contains("version"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn old_positional_record_store_rejects_without_deleting_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let mut manifest = StoreManifest::new();
+        manifest.format = "graphrun.member-store/v3".to_owned();
+        manifest.reader_floor = 3;
+        manifest.writer_format = 3;
+        manifest.state_record_format = "graphrun.state-record/v1".to_owned();
         put_json(&db, "store_manifest", &manifest).unwrap();
         drop(db);
         let original = std::fs::read(&path).unwrap();
@@ -4914,6 +5916,135 @@ nodes:
         );
     }
 
+    #[test]
+    fn retired_run_is_invisible_through_bounded_gc_and_post_commit_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let run = crate::ids::RunId::from_bytes([91; 16]);
+        let summary = crate::history::TerminalSummary {
+            run,
+            workflow: "retired".to_owned(),
+            version: 1,
+            status: "succeeded".to_owned(),
+            terminal_ms: 1,
+            expires_ms: 100,
+            history_through: 4_100,
+        };
+        let txn = begin_immediate(&db).unwrap();
+        {
+            let mut table = txn.open_table(APP_ROWS).unwrap();
+            let (marker, bytes) = record_store::retired_marker(1, 2, run).unwrap();
+            table.insert(marker.as_str(), bytes.as_slice()).unwrap();
+            let (key, bytes) = record_store::encode_value(
+                1,
+                2,
+                Some(run),
+                "terminal_summaries",
+                "map",
+                &run.to_hex(),
+                serde_json::to_value(&summary).unwrap(),
+            )
+            .unwrap();
+            table.insert(key.as_str(), bytes.as_slice()).unwrap();
+            for index in 1..=4_100u64 {
+                let (key, value) = record_store::encode_value(
+                    1,
+                    1,
+                    Some(run),
+                    "history",
+                    "sequence",
+                    &format!("{index:020}"),
+                    serde_json::json!({"index": index}),
+                )
+                .unwrap();
+                table.insert(key.as_str(), value.as_slice()).unwrap();
+            }
+            let (key, value) = record_store::encode_value(
+                1,
+                1,
+                Some(run),
+                "history",
+                "sequence",
+                &format!("{:020}", 4_101),
+                serde_json::Value::String("x".repeat(5 * 1024 * 1024)),
+            )
+            .unwrap();
+            for (key, bytes) in record_store::frame_records(std::iter::once((key, value))).unwrap()
+            {
+                table.insert(key.as_str(), bytes.as_slice()).unwrap();
+            }
+        }
+        commit_immediate(txn).unwrap();
+        let visible = load_app_generation(&db, 1).unwrap();
+        assert!(!visible.history.contains_key(&run));
+        assert_eq!(visible.terminal_summaries[&run].history_through, 4_100);
+        inject_cut("after-retired-generation-cleanup");
+        assert!(
+            gc_retired_app_rows(&db)
+                .unwrap_err()
+                .to_string()
+                .contains("fault cut")
+        );
+        clear_cut();
+        COMMIT_UNCERTAIN.with(|uncertain| uncertain.set(false));
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(APP_ROWS).unwrap();
+        let prefix = format!("{:016x}/run-{}/history/", 1, run.to_hex());
+        let remaining = table
+            .range(prefix.as_str()..)
+            .unwrap()
+            .take_while(|record| {
+                record
+                    .as_ref()
+                    .is_ok_and(|(key, _)| key.value().starts_with(&prefix))
+            })
+            .count();
+        assert!(remaining > 4 && remaining < 16);
+        assert!(
+            table
+                .get(record_store::retired_key(1, run).as_str())
+                .unwrap()
+                .is_some()
+        );
+        drop(table);
+        drop(txn);
+        for batch in 0..8 {
+            if !gc_retired_app_rows(&db).unwrap() {
+                break;
+            }
+            assert_eq!(
+                load_app_generation(&db, 1).unwrap().terminal_summaries[&run].history_through,
+                4_100
+            );
+            if batch == 0 {
+                let snapshots = dir.path().join("snapshots");
+                let (snapshot, _) = build_snapshot(&db, &path, &snapshots, false).unwrap();
+                let (manifest, _) = verify_snapshot(&snapshot.snapshot.path).unwrap();
+                assert!(manifest.record_count < 32);
+            }
+        }
+        assert!(!gc_retired_app_rows(&db).unwrap());
+        assert_eq!(
+            load_app_generation(&db, 1).unwrap().terminal_summaries[&run].history_through,
+            4_100
+        );
+        let txn = begin_immediate(&db).unwrap();
+        txn.open_table(APP_ROWS)
+            .unwrap()
+            .remove(record_store::run_map_key(1, run, "terminal_summaries").as_str())
+            .unwrap();
+        commit_immediate(txn).unwrap();
+        assert!(gc_retired_app_rows(&db).unwrap());
+        assert!(!gc_retired_app_rows(&db).unwrap());
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        let visible = load_app_generation(&db, 1).unwrap();
+        assert!(!visible.history.contains_key(&run));
+        assert!(!visible.terminal_summaries.contains_key(&run));
+    }
+
     #[tokio::test]
     async fn committed_history_cleanup_survives_restart_after_log_purge() {
         use crate::domain::{CommandBody, RunStatus};
@@ -4946,6 +6077,7 @@ nodes:
         )
         .unwrap();
         let run = RunId::from_bytes([7; 16]);
+        let unrelated_run = RunId::from_bytes([8; 16]);
         let entry = |index, time_ms, body| Entry::<TypeConfig> {
             log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
             payload: EntryPayload::Normal(RaftRequest {
@@ -4961,13 +6093,27 @@ nodes:
             1,
             CommandBody::Start {
                 run,
+                definition: Box::new(definition.clone()),
+                catalog: Box::new(catalog.clone()),
+                input: crate::value::Value::Null,
+            },
+        );
+        let unrelated_start = entry(
+            2,
+            1,
+            CommandBody::Start {
+                run: unrelated_run,
                 definition: Box::new(definition),
                 catalog: Box::new(catalog),
                 input: crate::value::Value::Null,
             },
         );
-        let progress = entry(2, 2, CommandBody::Progress { run });
-        append_logs(&db, &[start.clone(), progress.clone()]).unwrap();
+        let progress = entry(3, 2, CommandBody::Progress { run });
+        append_logs(
+            &db,
+            &[start.clone(), unrelated_start.clone(), progress.clone()],
+        )
+        .unwrap();
         let mut applied = None;
         let mut membership = StoredMembership::new(None, Membership::new(vec![], None));
         let mut schedule_revision = 0;
@@ -4977,7 +6123,7 @@ nodes:
             &mut membership,
             &mut state,
             &mut schedule_revision,
-            vec![start, progress],
+            vec![start, unrelated_start, progress],
         )
         .unwrap();
         assert!(responses.iter().all(|reply| reply.error.is_none()));
@@ -4985,15 +6131,70 @@ nodes:
             state.runs[&run].status,
             RunStatus::Succeeded { .. }
         ));
+        assert!(matches!(
+            state.runs[&unrelated_run].status,
+            RunStatus::Active
+        ));
+        let before_lists = state.clone();
+        state.inbox = vec![
+            domain::InboxEntry {
+                event_id: crate::ids::EventId::from_bytes([11; 16]),
+                signal: "approval".to_owned(),
+                key: "old".to_owned(),
+                payload: crate::Value::Null,
+                sequence: 1,
+                reserved_wait: None,
+                consumed: false,
+                accepted_ms: 1,
+                expires_ms: 0,
+                run: Some(run),
+            },
+            domain::InboxEntry {
+                event_id: crate::ids::EventId::from_bytes([12; 16]),
+                signal: "approval".to_owned(),
+                key: "kept".to_owned(),
+                payload: crate::Value::Null,
+                sequence: 1,
+                reserved_wait: None,
+                consumed: false,
+                accepted_ms: 2,
+                expires_ms: 0,
+                run: Some(unrelated_run),
+            },
+        ];
+        state.obligations = [run, unrelated_run]
+            .into_iter()
+            .enumerate()
+            .map(|(i, run)| domain::Obligation {
+                run,
+                forward: crate::ids::ActivationId::from_bytes([i as u8 + 14; 16]),
+                owner: crate::ids::ActivationId::from_bytes([i as u8 + 14; 16]),
+                handler: "undo".to_owned(),
+                handler_version: 1,
+                input: crate::Value::Null,
+                status: domain::ObligationStatus::Open,
+            })
+            .collect();
+        let txn = begin_immediate(&db).unwrap();
+        write_app_delta(&txn, &before_lists, &state, 1, 4).unwrap();
+        commit_immediate(txn).unwrap();
+        let kept_inbox = serde_json::to_value(&state.inbox[1]).unwrap();
+        let kept_obligation = serde_json::to_value(&state.obligations[1]).unwrap();
+        let kept_history = serde_json::to_value(&state.history[&unrelated_run]).unwrap();
+        verify_app_mirror(&db, &state, 1).unwrap();
+        assert_eq!(
+            load_json::<_, Option<u64>>(&db, "schedule_retention").unwrap(),
+            retention_deadline(&state),
+        );
         let through = state.history[&run].len() as u64;
         assert_eq!(state.checkpoints[&run].through_run_sequence, through);
         purge_logs(
             &db,
-            2,
-            &LogId::new(openraft::CommittedLeaderId::new(1, 1), 2),
+            3,
+            &LogId::new(openraft::CommittedLeaderId::new(1, 1), 3),
         )
         .unwrap();
-        assert!(get_logs(&db, 1, 3).unwrap().is_empty());
+        assert!(get_logs(&db, 1, 4).unwrap().is_empty());
         assert_eq!(
             crate::history::page(&state, run, 0, 100, EngineTime::from_millis(3))
                 .unwrap()
@@ -5002,7 +6203,7 @@ nodes:
         );
 
         let expiry = entry(
-            3,
+            4,
             2 + 30 * 24 * 60 * 60 * 1000,
             CommandBody::PruneHistory { limit: 128 },
         );
@@ -5017,10 +6218,76 @@ nodes:
         .unwrap();
         assert!(response[0].error.is_none());
         assert!(!state.runs.contains_key(&run));
+        assert!(state.runs.contains_key(&unrelated_run));
+        assert_eq!(
+            serde_json::to_value(&state.inbox).unwrap(),
+            serde_json::json!([kept_inbox])
+        );
+        assert_eq!(
+            serde_json::to_value(&state.obligations).unwrap(),
+            serde_json::json!([kept_obligation])
+        );
+        assert_eq!(
+            serde_json::to_value(&state.history[&unrelated_run]).unwrap(),
+            kept_history
+        );
+        verify_app_mirror(&db, &state, 1).unwrap();
+        assert_eq!(
+            load_json::<_, Option<u64>>(&db, "schedule_retention").unwrap(),
+            retention_deadline(&state),
+        );
+        let snapshot_dir = dir.path().join("snapshots");
+        let (built, registry) = build_snapshot(&db, &path, &snapshot_dir, false).unwrap();
+        let receiver_dir = dir.path().join("receiver");
+        std::fs::create_dir_all(&receiver_dir).unwrap();
+        let receiver_path = receiver_dir.join("member.redb");
+        let receiver = Database::create(&receiver_path).unwrap();
+        initialize_publication_store(&receiver).unwrap();
+        let receiver_snapshots = receiver_dir.join("snapshots");
+        std::fs::create_dir_all(&receiver_snapshots).unwrap();
+        let received = receiver_snapshots.join("receiving-retention.snap.tmp");
+        std::fs::copy(&built.snapshot.path, &received).unwrap();
+        let mut receiver_applied = None;
+        let mut receiver_membership = StoredMembership::new(None, Membership::new(vec![], None));
+        let mut receiver_domain = State::default();
+        let mut receiver_registry = None;
+        let mut receiver_revision = 0;
+        install_snapshot(
+            &receiver,
+            &receiver_path,
+            &receiver_snapshots,
+            &mut receiver_applied,
+            &mut receiver_membership,
+            &mut receiver_domain,
+            &mut receiver_registry,
+            &mut receiver_revision,
+            registry.meta,
+            received,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(receiver_applied, applied);
+        assert_eq!(
+            serde_json::to_value(&receiver_domain.inbox).unwrap(),
+            serde_json::json!([kept_inbox])
+        );
+        assert_eq!(
+            serde_json::to_value(&receiver_domain.obligations).unwrap(),
+            serde_json::json!([kept_obligation])
+        );
+        assert_eq!(
+            serde_json::to_value(&receiver_domain.history[&unrelated_run]).unwrap(),
+            kept_history
+        );
+        assert!(!receiver_domain.history.contains_key(&run));
+        verify_app_mirror(&receiver, &receiver_domain, 2).unwrap();
+        drop(receiver);
         drop(db);
 
         let (handle, thread) = StorageHandle::open(&path).unwrap();
         let restored = handle.query_state().await;
+        assert!(restored.runs.contains_key(&unrelated_run));
         let page = crate::history::page(
             &restored,
             run,

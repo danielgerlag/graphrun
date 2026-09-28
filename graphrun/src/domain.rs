@@ -2342,7 +2342,11 @@ fn decide_signal(
         .runs
         .get(&run)
         .ok_or_else(|| Error::invalid("unknown run"))?;
-    if let Some(existing) = state.inbox.iter().find(|entry| entry.event_id == event_id) {
+    if let Some(existing) = state
+        .inbox
+        .iter()
+        .find(|entry| entry.run == Some(run) && entry.event_id == event_id)
+    {
         if existing.signal == signal && existing.key == key && existing.payload == payload {
             return Ok(Decision { events: Vec::new() });
         }
@@ -4157,7 +4161,12 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 act.status = ActivationStatus::Ready;
             }
         }
-        DomainEvent::WaitSatisfied { wait, event_id, .. } => {
+        DomainEvent::WaitSatisfied {
+            run,
+            wait,
+            event_id,
+            ..
+        } => {
             if let Some(wait_state) = state.waits.get_mut(wait) {
                 wait_state.pending = false;
             }
@@ -4169,7 +4178,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             if let Some(entry) = state
                 .inbox
                 .iter_mut()
-                .find(|entry| entry.event_id == *event_id)
+                .find(|entry| entry.run == Some(*run) && entry.event_id == *event_id)
             {
                 entry.consumed = true;
                 entry.reserved_wait = Some(*wait);
@@ -4207,8 +4216,10 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 run_state.next_sequence = RunSequence::new(sequence + 1);
             }
         }
-        DomainEvent::EventExpired { event_id, .. } => {
-            state.inbox.retain(|entry| entry.event_id != *event_id);
+        DomainEvent::EventExpired { run, event_id } => {
+            state
+                .inbox
+                .retain(|entry| entry.run != Some(*run) || entry.event_id != *event_id);
         }
         DomainEvent::ObligationRegistered {
             run,
@@ -4347,19 +4358,21 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             }
         }
         DomainEvent::EventReserved { wait, event_id } => {
+            let run = state.waits.get(wait).map(|entry| entry.run);
             if let Some(entry) = state
                 .inbox
                 .iter_mut()
-                .find(|entry| entry.event_id == *event_id)
+                .find(|entry| entry.run == run && entry.event_id == *event_id)
             {
                 entry.reserved_wait = Some(*wait);
             }
         }
-        DomainEvent::ReservationReleased { event_id, .. } => {
+        DomainEvent::ReservationReleased { wait, event_id } => {
+            let run = state.waits.get(wait).map(|entry| entry.run);
             if let Some(entry) = state
                 .inbox
                 .iter_mut()
-                .find(|entry| entry.event_id == *event_id)
+                .find(|entry| entry.run == run && entry.event_id == *event_id)
             {
                 entry.reserved_wait = None;
             }
@@ -4811,15 +4824,13 @@ pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainE
         }
         command.time =
             EngineTime::from_millis(command.time.as_millis().max(state.engine_time_watermark_ms));
-        let mut provisional = state.clone();
-        provisional.engine_time_watermark_ms = command.time.as_millis();
-        let events =
-            crate::history::prune(&mut provisional, command.id, command.time, *limit as usize)?;
-        provisional.commands.insert(command.id, events.clone());
-        provisional
+        crate::history::preflight_prune(state, command.time)?;
+        state.engine_time_watermark_ms = command.time.as_millis();
+        let events = crate::history::prune(state, command.id, command.time, *limit as usize)?;
+        state.commands.insert(command.id, events.clone());
+        state
             .command_times
             .insert(command.id, command.time.as_millis());
-        *state = provisional;
         return Ok(events);
     }
     if let CommandBody::Publication { key, operation } = &command.body {
@@ -7274,6 +7285,73 @@ nodes:
         .unwrap();
         let inbox_ids: Vec<_> = state.inbox.iter().map(|entry| entry.event_id).collect();
         assert_eq!(inbox_ids, vec![first, second]);
+    }
+
+    #[test]
+    fn signal_identity_and_expiry_are_scoped_to_the_run() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/events.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let runs = [RunId::from_bytes([35; 16]), RunId::from_bytes([36; 16])];
+        for run in runs {
+            start_run(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Start {
+                        run,
+                        definition: Box::new(definition.clone()),
+                        input: Value::Object(BTreeMap::from([(
+                            "key".to_owned(),
+                            Value::String("k1".to_owned()),
+                        )])),
+                        catalog: Box::new(catalog.clone()),
+                    },
+                },
+                definition.clone(),
+                catalog.clone(),
+            )
+            .unwrap();
+        }
+        let event_id = EventId::from_bytes([37; 16]);
+        for run in runs {
+            let events = apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(2),
+                    body: CommandBody::Signal {
+                        run,
+                        event_id,
+                        signal: "approval".to_owned(),
+                        key: "k1".to_owned(),
+                        payload: Value::Object(BTreeMap::from([(
+                            "approved".to_owned(),
+                            Value::Bool(true),
+                        )])),
+                    },
+                },
+            )
+            .unwrap();
+            assert!(events.iter().any(
+                |event| matches!(event, DomainEvent::EventAccepted { run: owner, .. } if *owner == run)
+            ));
+        }
+        assert_eq!(state.inbox.len(), 2);
+        evolve(
+            &mut state,
+            &DomainEvent::EventExpired {
+                run: runs[0],
+                event_id,
+            },
+        );
+        assert_eq!(state.inbox.len(), 1);
+        assert_eq!(state.inbox[0].run, Some(runs[1]));
     }
 
     #[test]

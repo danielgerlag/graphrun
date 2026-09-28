@@ -2951,6 +2951,94 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn published_start_persists_run_records_and_internal_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        engine.publish_catalog(1, catalog()).await.unwrap();
+        engine
+            .publish_definition_yaml(
+                "\
+dsl: graphrun/v1
+id: published_complete
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {literal: null}
+",
+                1,
+            )
+            .await
+            .unwrap();
+        let command_id = CommandId::generate();
+        let run = engine
+            .start_published_with_command(
+                "published_complete",
+                Some(1),
+                "order-1",
+                Value::Null,
+                command_id,
+            )
+            .await
+            .unwrap();
+        let (_, _, internal_id) =
+            crate::publication::published_start_ids(&engine.publication_auth.key(command_id));
+        let before = engine.storage.query_state().await;
+        assert!(!before.history[&run].is_empty());
+        assert!(before.scopes.values().any(|scope| scope.run == run));
+        engine.shutdown().await.unwrap();
+
+        let persisted =
+            crate::storage::load_domain_readonly(dir.path().join("member.redb")).unwrap();
+        assert_eq!(
+            serde_json::to_value((
+                &before.runs[&run],
+                &before.history[&run],
+                &before.history_records[&run],
+                &before.commands[&internal_id],
+                &before.command_times[&internal_id],
+            ))
+            .unwrap(),
+            serde_json::to_value((
+                &persisted.runs[&run],
+                &persisted.history[&run],
+                &persisted.history_records[&run],
+                &persisted.commands[&internal_id],
+                &persisted.command_times[&internal_id],
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            before
+                .scopes
+                .values()
+                .filter(|scope| scope.run == run)
+                .count(),
+            persisted
+                .scopes
+                .values()
+                .filter(|scope| scope.run == run)
+                .count()
+        );
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let retried = engine
+            .start_published_with_command(
+                "published_complete",
+                Some(1),
+                "order-1",
+                Value::Null,
+                command_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried, run);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_sequence_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = include_str!("../../docs/specs/v1/examples/sequence.yaml");
@@ -3150,7 +3238,20 @@ nodes:
             .await
             .unwrap();
         assert_eq!(output.pointer("/approved").unwrap(), &Value::Bool(true));
+        let before = engine.storage.query_state().await;
         engine.shutdown().await.unwrap();
+        let persisted =
+            crate::storage::load_domain_readonly(dir.path().join("member.redb")).unwrap();
+        assert_eq!(
+            serde_json::to_value((&before.inbox, &before.signal_tombstones, &before.waits))
+                .unwrap(),
+            serde_json::to_value((
+                &persisted.inbox,
+                &persisted.signal_tombstones,
+                &persisted.waits
+            ))
+            .unwrap(),
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3394,7 +3495,15 @@ nodes:
             })
             .collect();
         assert_eq!(handlers, ["payment.refund", "inventory.release"]);
+        let before = engine.storage.query_state().await;
         engine.shutdown().await.unwrap();
+        let persisted =
+            crate::storage::load_domain_readonly(dir.path().join("member.redb")).unwrap();
+        assert_eq!(
+            serde_json::to_value((&before.obligations, &before.history_records[&run])).unwrap(),
+            serde_json::to_value((&persisted.obligations, &persisted.history_records[&run]))
+                .unwrap()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

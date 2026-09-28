@@ -32,6 +32,24 @@ impl CommandKey {
     }
 }
 
+pub(crate) fn published_start_ids(key: &CommandKey) -> (RunId, CommandId, CommandId) {
+    let mut hasher = Sha256::new();
+    hasher.update(key.cluster_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(key.principal_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(key.command_id.as_bytes());
+    let hash = hasher.finalize();
+    let run = RunId::from_bytes(hash[..16].try_into().expect("16 bytes"));
+    let start = CommandId::from_bytes(hash[16..32].try_into().expect("16 bytes"));
+    let mut progress_hasher = Sha256::new();
+    progress_hasher.update(b"graphrun-start-progress/v1\0");
+    progress_hasher.update(hash);
+    let progress_hash = progress_hasher.finalize();
+    let progress = CommandId::from_bytes(progress_hash[..16].try_into().expect("16 bytes"));
+    (run, start, progress)
+}
+
 /// Only trusted transport authentication or the local owner socket may mint this
 /// context. It is never decoded from an application request or metadata header.
 #[derive(Clone, Debug)]
@@ -343,6 +361,26 @@ pub fn apply(
     key: &CommandKey,
     operation: &PublicationOperation,
 ) -> CommandResult {
+    apply_with_mode(state, command, key, operation, false)
+        .expect("transactional publication apply returns a receipt")
+}
+
+pub(crate) fn apply_replicated(
+    state: &mut State,
+    command: &Command,
+    key: &CommandKey,
+    operation: &PublicationOperation,
+) -> Result<CommandResult> {
+    apply_with_mode(state, command, key, operation, true)
+}
+
+fn apply_with_mode(
+    state: &mut State,
+    command: &Command,
+    key: &CommandKey,
+    operation: &PublicationOperation,
+    in_place_start: bool,
+) -> Result<CommandResult> {
     let (request_digest, request_bytes) = match canonical_bytes(operation, usize::MAX) {
         Ok(bytes) => (hex::encode(Sha256::digest(&bytes)), Ok(bytes)),
         Err(err) => {
@@ -361,9 +399,9 @@ pub fn apply(
     };
     if let Some(previous) = state.command_results.get(&key.storage_key()) {
         if previous.request_digest == request_digest && previous.format == RESULT_FORMAT {
-            return previous.clone();
+            return Ok(previous.clone());
         }
-        return CommandResult {
+        return Ok(CommandResult {
             format: RESULT_FORMAT.to_owned(),
             key: key.clone(),
             request_digest,
@@ -375,7 +413,7 @@ pub fn apply(
             },
             event_range: None,
             recorded_ms: command.time.as_millis(),
-        };
+        });
     }
     let result = match request_bytes {
         Err(err) => Err(err),
@@ -383,10 +421,11 @@ pub fn apply(
             ErrorKind::ResourceExhausted,
             "publication command exceeds envelope limit",
         )),
-        Ok(_) => apply_operation(state, command, key, operation),
+        Ok(_) => apply_operation(state, command, key, operation, in_place_start),
     };
     let (outcome, event_range) = match result {
         Ok((outcome, range)) => (outcome, range),
+        Err(err) if in_place_start => return Err(err),
         Err(err) => (
             Disposition::Rejected {
                 code: error_code(err.kind).to_owned(),
@@ -408,7 +447,7 @@ pub fn apply(
     state
         .command_results
         .insert(key.storage_key(), receipt.clone());
-    receipt
+    Ok(receipt)
 }
 
 fn apply_operation(
@@ -416,6 +455,7 @@ fn apply_operation(
     command: &Command,
     key: &CommandKey,
     operation: &PublicationOperation,
+    in_place_start: bool,
 ) -> Result<(Disposition, Option<EventRange>)> {
     match operation {
         PublicationOperation::Catalog { version, catalog } => {
@@ -628,14 +668,7 @@ fn apply_operation(
                     "execution suspended until recovery is acknowledged",
                 ));
             }
-            let mut hasher = Sha256::new();
-            hasher.update(key.cluster_id.as_bytes());
-            hasher.update([0]);
-            hasher.update(key.principal_id.as_bytes());
-            hasher.update([0]);
-            hasher.update(key.command_id.as_bytes());
-            let hash = hasher.finalize();
-            let run = RunId::from_bytes(hash[..16].try_into().expect("16 bytes"));
+            let (run, start_id, progress_id) = published_start_ids(key);
             if state.runs.contains_key(&run) {
                 return Err(Error::new(
                     ErrorKind::AlreadyExists,
@@ -652,7 +685,7 @@ fn apply_operation(
             };
             let catalog = catalog.catalog.clone();
             let start = Command {
-                id: CommandId::from_bytes(hash[16..32].try_into().expect("16 bytes")),
+                id: start_id,
                 time: command.time,
                 body: CommandBody::Start {
                     run,
@@ -661,7 +694,8 @@ fn apply_operation(
                     input: input.clone(),
                 },
             };
-            let mut provisional = state.clone();
+            let mut cloned = (!in_place_start).then(|| state.clone());
+            let provisional = cloned.as_mut().unwrap_or(state);
             // next_sequence tracks external inputs; history tracks every per-run event.
             let first = provisional
                 .history
@@ -684,22 +718,18 @@ fn apply_operation(
                     published: Some(pinned_identity),
                 },
             );
-            let decision = domain::decide(&provisional, &start)?;
+            let decision = domain::decide(provisional, &start)?;
             domain::apply_events_with_cause(
-                &mut provisional,
+                provisional,
                 &decision.events,
                 Some(command.id),
                 Some(&key.principal_id),
                 command.time,
             )?;
-            let mut progress_hasher = Sha256::new();
-            progress_hasher.update(b"graphrun-start-progress/v1\0");
-            progress_hasher.update(hash);
-            let progress_id = progress_hasher.finalize();
             domain::apply_command(
-                &mut provisional,
+                provisional,
                 Command {
-                    id: CommandId::from_bytes(progress_id[..16].try_into().expect("16 bytes")),
+                    id: progress_id,
                     time: command.time,
                     body: CommandBody::Progress { run },
                 },
@@ -727,7 +757,9 @@ fn apply_operation(
                         admitted_ms: command.time.as_millis(),
                     },
                 );
-            *state = provisional;
+            if let Some(provisional) = cloned {
+                *state = provisional;
+            }
             Ok((
                 Disposition::Applied {
                     run: Some(run),

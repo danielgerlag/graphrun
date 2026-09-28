@@ -692,6 +692,22 @@ pub fn checkpoint_after_command(state: &mut State, run: RunId, time: EngineTime)
     Ok(())
 }
 
+pub(crate) fn preflight_prune(state: &State, time: EngineTime) -> Result<()> {
+    if state.inbox.iter().any(|entry| {
+        entry.expires_ms != 0
+            && time.as_millis() >= entry.expires_ms
+            && !entry.consumed
+            && entry.reserved_wait.is_none()
+            && entry.run.is_none()
+    }) {
+        return Err(Error::new(
+            ErrorKind::FailedPrecondition,
+            "expiring input event has no run identity",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn prune(
     state: &mut State,
     command_id: CommandId,
@@ -734,15 +750,15 @@ pub(crate) fn prune(
             (entry.expires_ms != 0
                 && now >= entry.expires_ms
                 && (entry.consumed || entry.reserved_wait.is_none()))
-            .then_some((entry.expires_ms, entry.event_id))
+            .then_some((entry.expires_ms, (entry.run, entry.event_id)))
         }),
         remaining,
     );
-    for id in expired_inbox {
+    for (run_id, id) in expired_inbox {
         let entry = state
             .inbox
             .iter()
-            .find(|entry| entry.event_id == id)
+            .find(|entry| entry.run == run_id && entry.event_id == id)
             .expect("selected event");
         let run = entry.run;
         let consumed = entry.consumed;
@@ -770,7 +786,9 @@ pub(crate) fn prune(
             checkpoint_after_command(state, run, time)?;
             expired_events.push(event);
         } else {
-            state.inbox.retain(|entry| entry.event_id != id);
+            state
+                .inbox
+                .retain(|entry| entry.run != run_id || entry.event_id != id);
         }
         remaining -= 1;
     }
@@ -851,7 +869,10 @@ pub(crate) fn prune(
     Ok(expired_events)
 }
 
-fn earliest_due<K: Ord>(candidates: impl Iterator<Item = (u64, K)>, limit: usize) -> Vec<K> {
+pub(crate) fn earliest_due<K: Ord>(
+    candidates: impl Iterator<Item = (u64, K)>,
+    limit: usize,
+) -> Vec<K> {
     if limit == 0 {
         return Vec::new();
     }

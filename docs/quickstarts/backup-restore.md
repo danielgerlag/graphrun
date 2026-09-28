@@ -2,6 +2,8 @@
 
 Backups are logical domain snapshots, not a copy of `member.redb`. Restore always creates a new cluster identity and leaves execution suspended until you acknowledge it.
 
+The member store uses `graphrun.member-store/v4` and `graphrun.state-record/v2`. Older member stores fail to open without losing their files. The logical backup envelope remains `graphrun.backup/v3`.
+
 This is ops on a data directory, not a new graph. Any run you already started (for example [`samples/02-passing-data/workflow.yaml`](../../samples/02-passing-data/workflow.yaml)) is in that snapshot.
 
 Stop the engine first so the database is not open.
