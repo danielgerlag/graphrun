@@ -4702,4 +4702,101 @@ nodes:
         assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
         assert!(old_snapshot.exists());
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_rejects_unused_publications_with_valid_snapshot_checksums() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let positive = tempfile::tempdir().unwrap();
+        let engine = Engine::local(source.path()).await.unwrap();
+        engine.publish_catalog(1, catalog()).await.unwrap();
+        engine
+            .publish_definition_yaml(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                1,
+            )
+            .await
+            .unwrap();
+        engine.shutdown().await.unwrap();
+        Engine::backup(source.path(), backup.path()).unwrap();
+        let original = Engine::read_backup(backup.path()).unwrap();
+        assert!(original.runs.is_empty());
+        assert_eq!(original.published_catalogs.len(), 1);
+        assert_eq!(original.published_definitions["sequence"].len(), 1);
+        Engine::restore(backup.path(), positive.path(), "control").unwrap();
+        let opened = Engine::local(positive.path()).await.unwrap();
+        let restored = opened.storage.query_state().await;
+        assert_eq!(restored.published_catalogs.len(), 1);
+        assert_eq!(restored.published_definitions["sequence"].len(), 1);
+        opened.shutdown().await.unwrap();
+
+        let manifest_path = backup.path().join("manifest.json");
+        let mut manifest: LogicalBackupManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let original_snapshot = backup.path().join(&manifest.snapshot);
+        let (framing, _) = verify_snapshot(&original_snapshot).unwrap();
+        for variant in [
+            "catalog_digest",
+            "definition_digest",
+            "missing_catalog_version",
+        ] {
+            let mut retained = original.clone();
+            match variant {
+                "catalog_digest" => {
+                    retained.published_catalogs.get_mut(&1).unwrap().digest = "0".repeat(64)
+                }
+                "definition_digest" => {
+                    retained
+                        .published_definitions
+                        .get_mut("sequence")
+                        .unwrap()
+                        .get_mut(&1)
+                        .unwrap()
+                        .digest = "0".repeat(64)
+                }
+                "missing_catalog_version" => {
+                    retained
+                        .published_definitions
+                        .get_mut("sequence")
+                        .unwrap()
+                        .get_mut(&1)
+                        .unwrap()
+                        .catalog_version = 999
+                }
+                _ => unreachable!(),
+            }
+            let raw = serde_json::to_vec(&retained).unwrap();
+            let mut repaired = framing.clone();
+            repaired.payload_bytes = raw.len() as u64;
+            let stage = backup
+                .path()
+                .join(format!("application-{variant}.snap.tmp"));
+            let digest = write_snapshot(&mut raw.as_slice(), &stage, &repaired).unwrap();
+            manifest.snapshot = format!("application-{}.snap", hex::encode(digest));
+            manifest.sha256 = hex::encode(digest);
+            std::fs::rename(stage, backup.path().join(&manifest.snapshot)).unwrap();
+            std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert!(verify_snapshot(&backup.path().join(&manifest.snapshot)).is_ok());
+            let read_error = Engine::read_backup(backup.path()).unwrap_err();
+            assert_eq!(
+                read_error.kind,
+                ErrorKind::FailedPrecondition,
+                "{variant}: {read_error}"
+            );
+            assert!(
+                read_error.message.contains("published"),
+                "{variant} was rejected for the wrong reason: {read_error}"
+            );
+            let destination = tempfile::tempdir().unwrap();
+            let error = Engine::restore(backup.path(), destination.path(), "drill")
+                .expect_err("unused published artifact must be checked before restore");
+            assert_eq!(
+                error.kind,
+                ErrorKind::FailedPrecondition,
+                "{variant}: {error}"
+            );
+            assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+        }
+        assert!(original_snapshot.exists());
+    }
 }

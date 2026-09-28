@@ -234,7 +234,8 @@ pub(crate) fn hidden_retired_physical(key: &str, retired: &BTreeMap<RunId, bool>
             .and_then(|run| RunId::from_hex(run).ok())
             .and_then(|run| retired.get(&run))
             .is_some_and(|has_summary| {
-                pieces[2] != "terminal_summaries" && (pieces[2] != "start_keys" || !has_summary)
+                pieces[2] != "terminal_summaries"
+                    && (!matches!(pieces[2], "start_keys" | "signal_tombstones") || !has_summary)
             })
 }
 
@@ -884,7 +885,8 @@ fn hidden_retired_row(key: &str, retired: &BTreeSet<RunId>, summarized: &BTreeSe
             .is_some_and(|run| {
                 retired.contains(&run)
                     && pieces[2] != "terminal_summaries"
-                    && (pieces[2] != "start_keys" || !summarized.contains(&run))
+                    && (!matches!(pieces[2], "start_keys" | "signal_tombstones")
+                        || !summarized.contains(&run))
             })
 }
 
@@ -1247,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn retired_marker_hides_history_without_hiding_summary_or_other_run() {
+    fn retired_marker_hides_history_but_keeps_summary_and_signal_tombstone() {
         let retired = RunId::from_bytes([11; 16]);
         let active = RunId::from_bytes([12; 16]);
         let event = |run| DomainEvent::RunAdmitted {
@@ -1274,6 +1276,23 @@ mod tests {
                 history_through: 1,
             },
         );
+        let event_id = EventId::from_bytes([14; 16]);
+        let tombstone_key = format!("{}:{}", retired.to_hex(), event_id.to_hex());
+        state.signal_tombstones.insert(
+            tombstone_key.clone(),
+            crate::history::SignalTombstone {
+                run: retired,
+                event_id,
+                signal: "approved".to_owned(),
+                key: "order".to_owned(),
+                payload: crate::history::ArtifactRef::capture_in(
+                    "",
+                    "graphrun.signal-payload/v1",
+                    &crate::Value::Null,
+                )
+                .unwrap(),
+            },
+        );
         let mut rows = encode(&state, 1, 1).unwrap();
         let (key, marker) = retired_marker(1, 2, retired).unwrap();
         rows.insert(key, marker);
@@ -1281,6 +1300,7 @@ mod tests {
         assert!(!visible.history.contains_key(&retired));
         assert_eq!(visible.history[&active].len(), 1);
         assert_eq!(visible.terminal_summaries[&retired].history_through, 1);
+        assert!(visible.signal_tombstones.contains_key(&tombstone_key));
     }
 
     #[test]
