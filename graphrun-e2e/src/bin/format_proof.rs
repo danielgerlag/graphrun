@@ -283,8 +283,10 @@ fn binary_evidence(
     {
         return Err(format!("{role} needs a pinned 40-hex source revision"));
     }
-    let before = hash_file(path)?;
-    let output = Command::new(path)
+    let path = fs::canonicalize(path).map_err(|err| err.to_string())?;
+    let build_log = fs::canonicalize(build_log).map_err(|err| err.to_string())?;
+    let before = hash_file(&path)?;
+    let output = Command::new(&path)
         .arg("--version")
         .output()
         .map_err(|err| err.to_string())?;
@@ -301,9 +303,9 @@ fn binary_evidence(
         source_revision,
         version: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
         sha256_before: before,
-        sha256_after: hash_file(path)?,
+        sha256_after: hash_file(&path)?,
         build_log: build_log.display().to_string(),
-        build_log_sha256: hash_file(build_log)?,
+        build_log_sha256: hash_file(&build_log)?,
         features,
     })
 }
@@ -713,6 +715,10 @@ async fn main() {
     let args = Args::parse();
     let run_id = CommandId::generate().to_hex();
     let root = args.artifacts.join(&run_id);
+    let driver = std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .expect("proof driver executable path");
+    let driver_before = hash_file(&driver).expect("proof driver SHA-256");
     let mut cluster = match ProofCluster::new(root.clone()) {
         Ok(cluster) => cluster,
         Err(err) => {
@@ -762,6 +768,8 @@ async fn main() {
         integrity &= binary.sha256_before == binary.sha256_after;
     }
     let passed = outcome.is_ok() && integrity;
+    let driver_after = hash_file(&driver).expect("proof driver SHA-256 after run");
+    let passed = passed && driver_before == driver_after;
     let report = json!({
         "run_id": run_id,
         "status": if passed { "PASS" } else { "FAIL" },
@@ -769,6 +777,12 @@ async fn main() {
         "duration_ms": start.elapsed().as_millis(),
         "error": outcome.err(),
         "binary_integrity": integrity,
+        "driver": {
+            "path": driver.display().to_string(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "sha256_before": driver_before,
+            "sha256_after": driver_after,
+        },
         "binaries": binaries,
         "observations": std::mem::take(&mut cluster.observations),
         "member_logs": ["member-1-bridge.log", "member-2-new.log", "member-3-new.log", "member-1-restart.log"],

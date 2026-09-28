@@ -306,6 +306,10 @@ impl Service<Uri> for VerifiedMemberConnector {
 
 impl PeerClient {
     async fn client(&self) -> std::io::Result<RaftClient<Channel>> {
+        #[cfg(feature = "format-proof")]
+        if crate::format_proof::partitioned() {
+            return Err(io::Error::other("proof member network partition"));
+        }
         let Some((addr, tls)) = &self.peer else {
             return Err(io::Error::other(format!("unknown peer {}", self.target)));
         };
@@ -355,10 +359,6 @@ impl PeerClient {
     }
 
     async fn call(&mut self, kind: &str, rpc: impl serde::Serialize) -> std::io::Result<Vec<u8>> {
-        #[cfg(feature = "format-proof")]
-        if crate::format_proof::partitioned() {
-            return Err(io::Error::other("proof member network partition"));
-        }
         let mut client = self.client().await?;
         let blob = Blob {
             json: serde_json::to_vec(&rpc).map_err(io::Error::other)?,
