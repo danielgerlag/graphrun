@@ -169,6 +169,10 @@ pub enum ControlRequest {
         direct: bool,
     },
     #[cfg(feature = "format-proof")]
+    ProofLegacyEntry {
+        command_id: String,
+    },
+    #[cfg(feature = "format-proof")]
     ProofProbe {
         target: u64,
         kind: String,
@@ -1959,6 +1963,45 @@ async fn dispatch_control(
                             })
                         })
                         .map(|_| serde_json::json!({"committed": true, "direct": direct}))
+                }
+            }
+        }
+        #[cfg(feature = "format-proof")]
+        ControlRequest::ProofLegacyEntry { command_id } => {
+            if crate::format_proof::WRITER_CAPABILITY != 5 {
+                Err(Error::new(
+                    ErrorKind::FailedPrecondition,
+                    "only a new proof writer may exercise legacy-entry apply",
+                ))
+            } else {
+                match CommandId::from_hex(&command_id) {
+                    Err(err) => Err(Error::invalid(err)),
+                    Ok(id) => raft
+                        .client_write(crate::storage::RaftRequest {
+                            command: Command {
+                                id,
+                                time: now(),
+                                body: CommandBody::PruneHistory { limit: 1 },
+                            },
+                            proof_writer_format: 4,
+                        })
+                        .await
+                        .map_err(|err| Error::new(ErrorKind::Unavailable, err.to_string()))
+                        .and_then(|response| match response.data.error {
+                            Some(error)
+                                if response.data.error_kind
+                                    == Some(ErrorKind::FailedPrecondition) =>
+                            {
+                                Ok(serde_json::json!({
+                                    "entry_rejected": true,
+                                    "reason": error,
+                                }))
+                            }
+                            other => Err(Error::new(
+                                ErrorKind::FailedPrecondition,
+                                format!("legacy entry was not rejected at apply: {other:?}"),
+                            )),
+                        }),
                 }
             }
         }

@@ -10,6 +10,11 @@ description = "Graphrun verification driver and fixture processes"
 name = "graphrun-e2e"
 path = "src/main.rs"
 
+[[bin]]
+name = "graphrun-format-proof"
+path = "src/bin/format_proof.rs"
+required-features = ["format-proof-new"]
+
 [features]
 default = []
 fault-injection = ["graphrun/fault-injection"]
