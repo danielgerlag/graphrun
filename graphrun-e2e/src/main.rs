@@ -1798,7 +1798,10 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
         "GATE-002" => from_suite(
             row,
             &evidence.driver,
-            &["tests::status_and_certification_gate"],
+            &[
+                "tests::status_and_certification_gate",
+                "tests::incomplete_local_performance_measurement_fails_instead_of_blocking",
+            ],
         ),
         "GATE-003" => release_artifact_and_workers(cli, artifacts, row),
         "CONTRACT-003" => contract_worker_proof(cli, artifacts, row),
@@ -2925,7 +2928,23 @@ fn perf_command_compile(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseRe
     let compile512_us = pure_compile.elapsed().as_micros();
     let (cmds, p95_us, wall_ms, ready_ms) = match measure_progress_rate(artifacts) {
         Ok(rate) => rate,
-        Err(err) => return fail(row, "progress-rate measurement", err),
+        Err(err) => {
+            let path = artifacts.join("PERF-001-measure.txt");
+            if let Err(write_err) = fs::write(&path, format!("{err}\n")) {
+                return fail(
+                    row,
+                    "1000 committed starts measurement",
+                    format!("{err}; cannot preserve incomplete measurement: {write_err}"),
+                );
+            }
+            return finish(
+                row,
+                "FAIL",
+                "1000 committed starts measurement",
+                err,
+                vec![path],
+            );
+        }
     };
     let body = format!(
         "validate_cli_wall_ms={compile_ms} validate_512_cli_wall_ms={validate512_ms} compile_512_pure_us={compile512_us} local_start_wall_ms={local_ms} existing_store_ready_ms={ready_ms} committed_start_commands=1000 input_bytes=1024 local_commands_per_s={cmds:.1} local_p95_receipt_us={p95_us} local_wall_ms={wall_ms}"
@@ -2949,6 +2968,13 @@ fn perf_command_compile(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseRe
 }
 
 fn measure_progress_rate(artifacts: &Path) -> Result<(f64, u128, u128, u128), String> {
+    measure_progress_rate_with_limit(artifacts, Duration::from_secs(10 * 60))
+}
+
+fn measure_progress_rate_with_limit(
+    artifacts: &Path,
+    max_wall: Duration,
+) -> Result<(f64, u128, u128, u128), String> {
     let dir = artifacts.join("PERF-001-rate");
     fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
     let rt = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
@@ -2956,9 +2982,10 @@ fn measure_progress_rate(artifacts: &Path) -> Result<(f64, u128, u128, u128), St
         let engine = graphrun::Engine::local(&dir)
             .await
             .map_err(|err| err.to_string())?;
-        let mut catalog_json: serde_json::Value =
-            serde_json::from_slice(&fs::read(catalog()).map_err(|err| err.to_string())?)
-                .map_err(|err| err.to_string())?;
+        let mut catalog_json: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .map_err(|err| err.to_string())?;
         catalog_json["schemas"]["perf_text/v1"] =
             serde_json::json!({"type":"string","minLength":1024,"maxLength":1024});
         let catalog = graphrun::Catalog::from_json(
@@ -2972,12 +2999,40 @@ fn measure_progress_rate(artifacts: &Path) -> Result<(f64, u128, u128, u128), St
         const N: usize = 1_000;
         let mut samples = Vec::with_capacity(N);
         let wall = Instant::now();
-        for _ in 0..N {
+        for confirmed in 0..N {
+            let elapsed = wall.elapsed();
+            if elapsed >= max_wall {
+                engine.shutdown().await.map_err(|err| err.to_string())?;
+                return Err(format!(
+                    "incomplete: {confirmed} of {N} starts confirmed in {} ms; exceeded {} ms local measurement deadline; no throughput or p95 result",
+                    elapsed.as_millis(),
+                    max_wall.as_millis()
+                ));
+            }
             let one = Instant::now();
-            engine
-                .start(definition.clone(), catalog.clone(), input.clone())
-                .await
-                .map_err(|err| err.to_string())?;
+            match tokio::time::timeout(
+                max_wall - elapsed,
+                engine.start(definition.clone(), catalog.clone(), input.clone()),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    engine.shutdown().await.map_err(|err| err.to_string())?;
+                    return Err(format!(
+                        "incomplete: {confirmed} of {N} starts confirmed in {} ms; command failed: {err}",
+                        wall.elapsed().as_millis()
+                    ));
+                }
+                Err(_) => {
+                    engine.shutdown().await.map_err(|err| err.to_string())?;
+                    return Err(format!(
+                        "incomplete: {confirmed} of {N} starts confirmed in {} ms; in-flight command outcome unknown at {} ms deadline",
+                        wall.elapsed().as_millis(),
+                        max_wall.as_millis()
+                    ));
+                }
+            }
             samples.push(one.elapsed().as_micros());
         }
         let wall_ms = wall.elapsed().as_millis();
@@ -9524,6 +9579,23 @@ mod tests {
         measured.performance.as_mut().unwrap().measurements.clear();
         assert_eq!(
             verification_gate(&[measured], false),
+            (ExitCode::from(1), false)
+        );
+    }
+
+    #[test]
+    fn incomplete_local_performance_measurement_fails_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = measure_progress_rate_with_limit(dir.path(), Duration::ZERO).unwrap_err();
+        assert!(
+            err.contains("incomplete: 0 of 1000 starts confirmed"),
+            "{err}"
+        );
+        assert!(err.contains("no throughput or p95 result"), "{err}");
+        assert!(!dir.path().join("PERF-001-rate/control.sock").exists());
+        let result = fail(&row("PERF-001"), "1000 committed starts measurement", err);
+        assert_eq!(
+            verification_gate(&[result], false),
             (ExitCode::from(1), false)
         );
     }

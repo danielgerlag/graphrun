@@ -236,6 +236,9 @@ history paging, snapshot publication time and bytes, replay time, and store
 bytes. These values are
 not a three-host receipt benchmark or a complete snapshot-throughput claim.
 Do not infer SSD class or separate machines from three local processes.
+The local 1,000-command measurement has a ten-minute deadline. If it stops
+early, the case records the confirmed command count and elapsed time as
+`FAIL`; an incomplete workload is not a hardware `BLOCKED` result.
 
 Target local readiness below one second for an existing store with at most 10,000 events and 1 KiB payloads. Target compilation below 100 ms for a 512-node definition on the same reference machine class. Also report snapshot, replay, retained-history, and nested-control resource costs.
 
