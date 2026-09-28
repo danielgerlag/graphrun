@@ -9066,6 +9066,147 @@ nodes:
     }
 
     #[test]
+    fn default_compensation_retry_exhausts_without_claiming_rollback() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: default_compensation
+version: 1
+input_schema: order/v1
+output_schema: reserved_order/v1
+start: fulfill
+nodes:
+  fulfill:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: reserved_order/v1
+      start: reserve
+      nodes:
+        reserve:
+          kind: activity
+          activity: {name: inventory.reserve, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: inventory.release, version: 1}
+            input: {from: forward.output}
+          next: abort
+        abort:
+          kind: fail
+          error: {code: fixture.failed, message: force compensation}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.fulfill.output}
+"#;
+        let (mut state, run) = start_yaml(yaml, order_input());
+        for i in 0..16 {
+            apply(&mut state, 1 + i, CommandBody::Progress { run }).unwrap();
+            for activation in ready_activations(&state, run) {
+                if state.activations[&activation].role == ExecutionRole::Compensation {
+                    continue;
+                }
+                let Some((name, _, input)) = activity_key(&state, activation) else {
+                    continue;
+                };
+                apply(
+                    &mut state,
+                    1 + i,
+                    CommandBody::ReportLeaf {
+                        run,
+                        activation,
+                        output: handler(&name, &input),
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let activation = state
+            .activations
+            .values()
+            .find(|act| act.role == ExecutionRole::Compensation)
+            .expect("default compensation opens")
+            .id;
+        let Node::Saga { body, .. } = &state.runs[&run].definition.root.nodes["fulfill"] else {
+            panic!("expected saga");
+        };
+        let Node::Activity {
+            compensation:
+                Some(crate::ir::Compensation::Activity {
+                    retry: Some(policy),
+                    ..
+                }),
+            ..
+        } = &body.nodes["reserve"]
+        else {
+            panic!("expected captured compensation retry policy");
+        };
+        assert_eq!(policy.errors, ["inventory.release_unavailable"]);
+        assert_eq!(policy.max_attempts, 10);
+        let max_attempts = policy.max_attempts;
+        for attempt in 1..=max_attempts {
+            let session = WorkerSessionId::generate();
+            let time = u64::from(attempt) * 600_000;
+            apply(
+                &mut state,
+                time,
+                CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 1,
+                },
+            )
+            .unwrap();
+            let granted = apply(
+                &mut state,
+                time + 1,
+                CommandBody::Claim {
+                    session,
+                    capacity: 1,
+                },
+            )
+            .unwrap();
+            assert!(granted.iter().any(|event| matches!(
+                event,
+                DomainEvent::ClaimGranted {
+                    activation: current,
+                    attempt: claimed,
+                    role: ExecutionRole::Compensation,
+                    ..
+                } if *current == activation && *claimed == attempt
+            )));
+            let reported = apply(
+                &mut state,
+                time + 2,
+                CommandBody::ReportError {
+                    run,
+                    activation,
+                    code: "inventory.release_unavailable".to_owned(),
+                    message: "still unavailable".to_owned(),
+                },
+            )
+            .unwrap();
+            assert!(reported.iter().any(|event| matches!(
+                event,
+                DomainEvent::LeafFailed {
+                    retry,
+                    code,
+                    ..
+                } if *retry == (attempt < max_attempts) && code == "inventory.release_unavailable"
+            )));
+        }
+        assert!(matches!(
+            state.obligations[0].status,
+            ObligationStatus::Blocked { .. }
+        ));
+        assert!(!matches!(
+            state.runs[&run].status,
+            RunStatus::Succeeded { .. }
+        ));
+    }
+
+    #[test]
     fn irreversible_effect_fails_closed() {
         let yaml = r#"
 dsl: graphrun/v1
