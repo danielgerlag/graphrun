@@ -2,14 +2,20 @@ use crate::catalog::{Catalog, ExecutionKind};
 use crate::clock::ClockFaultState;
 use crate::cluster::{ClusterNetwork, ElectionEvidence, MemberConfig};
 use crate::compiler::compile_yaml;
-use crate::domain::{Command, CommandBody, RunStatus, State, active_runs, run_output};
+use crate::domain::{Command, CommandBody, RunStatus, State, run_output};
 use crate::error::{Error, ErrorKind, Result};
 use crate::handlers::{Handlers, LocalHandlerContext};
 use crate::ids::{CommandId, EventId, RunId};
 use crate::ir::Definition;
 use crate::limits;
 use crate::rpc::serve_grpc;
-use crate::storage::{LocalNetwork, StorageHandle, TypeConfig, load_domain_readonly};
+use crate::snapshot_framing::{
+    RemoveOnDrop, SnapshotManifest, copy_payload, verify_snapshot, write_snapshot,
+};
+use crate::storage::{
+    LocalNetwork, ScheduleWake, StorageHandle, TypeConfig, load_domain_readonly,
+    validate_history_store,
+};
 use crate::value::Value;
 use crate::write::{
     health_view, inspect_view, linearizable_read, now, write_raft, write_raft_response,
@@ -119,6 +125,25 @@ pub struct Engine {
     cluster_net: Option<ClusterNetwork>,
     handlers: Handlers,
     publication_auth: crate::publication::AuthContext,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LogicalBackupManifest {
+    format: String,
+    kind: String,
+    snapshot: String,
+    sha256: String,
+}
+
+fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// Build a local engine and register activity handlers before it opens.
@@ -338,8 +363,14 @@ impl LocalBuilder {
             Some((auth, _)) => auth,
             None => write_identity(&data_dir, None)?,
         };
+        let restoring = restored_domain.is_some();
         if let Some(domain) = restored_domain {
             storage.install_domain(domain).await?;
+        }
+        storage
+            .bind_identity(publication_auth.cluster_id().to_owned(), 1)
+            .await?;
+        if restoring {
             std::fs::remove_file(&restored_path).map_err(|err| Error::invalid(err.to_string()))?;
         }
         let log_store = storage.log_store();
@@ -350,6 +381,7 @@ impl LocalBuilder {
             election_timeout_min: 1000,
             election_timeout_max: 2000,
             max_payload_entries: 4,
+            snapshot_max_chunk_size: 1024 * 1024,
             snapshot_policy: SnapshotPolicy::Never,
             max_in_snapshot_log_to_keep: 1024,
             ..Config::default()
@@ -462,11 +494,14 @@ impl Engine {
         let cluster_id = hex::encode(&ca_digest[..16]);
         let db_path = data_dir.join("member.redb");
         let existing_identity = read_identity(&data_dir, Some(&cluster_id))?;
-        let (storage, storage_thread) = StorageHandle::open(&db_path)?;
+        let (storage, storage_thread) = StorageHandle::open_member(&db_path)?;
         let publication_auth = match existing_identity {
             Some((auth, _)) => auth,
             None => write_identity(&data_dir, Some(&cluster_id))?,
         };
+        storage
+            .bind_identity(publication_auth.cluster_id().to_owned(), config.node_id)
+            .await?;
         let log_store = storage.log_store();
         let state_machine = storage.state_machine();
         let raft_config = Config {
@@ -475,6 +510,7 @@ impl Engine {
             election_timeout_min: 1000,
             election_timeout_max: 2000,
             max_payload_entries: 4,
+            snapshot_max_chunk_size: 1024 * 1024,
             snapshot_policy: SnapshotPolicy::Never,
             max_in_snapshot_log_to_keep: 1024,
             ..Config::default()
@@ -889,6 +925,7 @@ impl Engine {
             clock_safe,
             self.storage.clock().fault_reason().await,
             quorum_safe,
+            self.storage.scheduler_stats(),
         )
     }
 
@@ -1089,35 +1126,184 @@ impl Engine {
     }
 
     pub fn backup(data_dir: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<()> {
+        let state = load_domain_readonly(data_dir.as_ref().join("member.redb"))?;
         let out = out.as_ref();
         std::fs::create_dir_all(out).map_err(|err| Error::invalid(err.to_string()))?;
-        let state = load_domain_readonly(data_dir.as_ref().join("member.redb"))?;
-        let body =
-            serde_json::to_vec_pretty(&state).map_err(|err| Error::invalid(err.to_string()))?;
-        std::fs::write(out.join("domain.json"), body)
+        let id = CommandId::generate().to_hex();
+        let raw_path = out.join(format!("domain-{id}.json.tmp"));
+        let mut raw = private_file(&raw_path).map_err(|err| Error::invalid(err.to_string()))?;
+        let _raw_cleanup = RemoveOnDrop(raw_path.clone());
+        serde_json::to_writer(&mut raw, &state).map_err(|err| Error::invalid(err.to_string()))?;
+        raw.sync_all()
             .map_err(|err| Error::invalid(err.to_string()))?;
-        let manifest = serde_json::json!({
-            "format": "graphrun.backup/v1",
-            "kind": "logical-domain",
-        });
-        std::fs::write(
-            out.join("manifest.json"),
-            serde_json::to_vec_pretty(&manifest).unwrap(),
+        let body_len = raw
+            .metadata()
+            .map_err(|err| Error::invalid(err.to_string()))?
+            .len();
+        drop(raw);
+        let snapshot_manifest = SnapshotManifest {
+            framing_version: 1,
+            generation: 0,
+            applied_json: b"null".to_vec(),
+            membership_json: b"null".to_vec(),
+            payload_bytes: body_len,
+            record_formats: vec![
+                "graphrun.domain/v1".to_owned(),
+                crate::history::EVENT_FORMAT.to_owned(),
+                crate::history::CHECKPOINT_FORMAT.to_owned(),
+                crate::publication::RESULT_FORMAT.to_owned(),
+                crate::record_store::FORMAT.to_owned(),
+                crate::record_store::FRAGMENT_FORMAT.to_owned(),
+            ],
+            record_count: 1,
+            artifact_origin_ids: state.artifact_origins.iter().cloned().collect(),
+        };
+        let stage_path = out.join(format!("application-{id}.snap.tmp"));
+        let digest = write_snapshot(
+            &mut std::fs::File::open(&raw_path).map_err(|err| Error::invalid(err.to_string()))?,
+            &stage_path,
+            &snapshot_manifest,
         )
         .map_err(|err| Error::invalid(err.to_string()))?;
+        let _stage_cleanup = RemoveOnDrop(stage_path.clone());
+        let snapshot_name = format!("application-{}.snap", hex::encode(digest));
+        let snapshot_path = out.join(&snapshot_name);
+        if snapshot_path.exists() {
+            let (_, previous) =
+                verify_snapshot(&snapshot_path).map_err(|err| Error::invalid(err.to_string()))?;
+            if previous != digest {
+                return Err(Error::new(
+                    ErrorKind::AlreadyExists,
+                    "backup artifact identity collides with different bytes",
+                ));
+            }
+        } else {
+            std::fs::rename(&stage_path, &snapshot_path)
+                .map_err(|err| Error::invalid(err.to_string()))?;
+        }
+        std::fs::File::open(out)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        let manifest = LogicalBackupManifest {
+            format: "graphrun.backup/v3".to_owned(),
+            kind: "logical-application".to_owned(),
+            snapshot: snapshot_name,
+            sha256: hex::encode(digest),
+        };
+        let manifest_stage = out.join(format!("manifest-{id}.json.tmp"));
+        let mut file =
+            private_file(&manifest_stage).map_err(|err| Error::invalid(err.to_string()))?;
+        let _manifest_cleanup = RemoveOnDrop(manifest_stage.clone());
+        serde_json::to_writer_pretty(&mut file, &manifest)
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        file.sync_all()
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        std::fs::rename(&manifest_stage, out.join("manifest.json"))
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        std::fs::File::open(out)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|err| Error::invalid(err.to_string()))?;
         Ok(())
+    }
+
+    /// Verify a logical backup without opening an engine or dispatching handlers.
+    pub fn read_backup(from: impl AsRef<Path>) -> Result<State> {
+        let from = from.as_ref();
+        let manifest: LogicalBackupManifest = serde_json::from_slice(
+            &std::fs::read(from.join("manifest.json"))
+                .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?,
+        )
+        .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        if manifest.format != "graphrun.backup/v3"
+            || manifest.kind != "logical-application"
+            || !manifest.snapshot.starts_with("application-")
+            || !manifest.snapshot.ends_with(".snap")
+            || Path::new(&manifest.snapshot).components().count() != 1
+            || manifest.snapshot.contains('/')
+            || manifest.snapshot.contains('\\')
+            || manifest.snapshot.contains(':')
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "unsupported backup manifest; source left untouched",
+            ));
+        }
+        let snapshot = from.join(&manifest.snapshot);
+        let (framing, digest) = verify_snapshot(&snapshot)
+            .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        let required = [
+            "graphrun.domain/v1",
+            crate::history::EVENT_FORMAT,
+            crate::history::CHECKPOINT_FORMAT,
+            crate::publication::RESULT_FORMAT,
+            crate::record_store::FORMAT,
+            crate::record_store::FRAGMENT_FORMAT,
+        ];
+        if manifest.sha256 != hex::encode(digest)
+            || framing.generation != 0
+            || framing.applied_json != b"null"
+            || framing.membership_json != b"null"
+            || framing.record_formats.len() != required.len()
+            || required
+                .iter()
+                .any(|format| !framing.record_formats.iter().any(|stored| stored == format))
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "backup digest, authority, or retained reader versions are unavailable",
+            ));
+        }
+        let raw_path = std::env::temp_dir().join(format!(
+            "graphrun-restore-{}.json.tmp",
+            CommandId::generate().to_hex()
+        ));
+        let mut raw = private_file(&raw_path).map_err(|err| Error::invalid(err.to_string()))?;
+        let _raw_cleanup = RemoveOnDrop(raw_path.clone());
+        copy_payload(&snapshot, &mut raw)
+            .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        raw.sync_all()
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        drop(raw);
+        let domain: State = serde_json::from_reader(
+            std::fs::File::open(&raw_path).map_err(|err| Error::invalid(err.to_string()))?,
+        )
+        .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        if framing.artifact_origin_ids
+            != domain.artifact_origins.iter().cloned().collect::<Vec<_>>()
+            || crate::ids::ClusterId::from_hex(&domain.current_cluster_id).is_err()
+            || !domain.artifact_origins.contains(&domain.current_cluster_id)
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "backup artifact origins differ from retained records",
+            ));
+        }
+        validate_history_store(&domain).map_err(|err| {
+            Error::new(
+                ErrorKind::FailedPrecondition,
+                format!("retained backup artifact is unavailable: {err}"),
+            )
+        })?;
+        Ok(domain)
     }
 
     pub fn restore(from: impl AsRef<Path>, dest: impl AsRef<Path>, reason: &str) -> Result<()> {
         if reason.is_empty() {
             return Err(Error::invalid("restore requires a reason"));
         }
-        let from = from.as_ref();
         let dest = dest.as_ref();
-        let bytes = std::fs::read(from.join("domain.json"))
-            .map_err(|err| Error::invalid(err.to_string()))?;
-        let mut domain: State =
-            serde_json::from_slice(&bytes).map_err(|err| Error::invalid(err.to_string()))?;
+        let mut domain = Self::read_backup(from)?;
+        if dest.exists()
+            && std::fs::read_dir(dest)
+                .map_err(|err| Error::invalid(err.to_string()))?
+                .next()
+                .is_some()
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "restore destination is not empty; directory left untouched",
+            ));
+        }
         domain.recovery = Some(crate::domain::RecoveryHold {
             reason: reason.to_owned(),
             authorized: false,
@@ -1143,16 +1329,23 @@ impl Engine {
             "cluster_id": crate::ids::ClusterId::generate().to_hex(),
             "restored": true,
         });
-        std::fs::write(
-            dest.join("identity.json"),
-            serde_json::to_vec_pretty(&identity).unwrap(),
-        )
-        .map_err(|err| Error::invalid(err.to_string()))?;
-        std::fs::write(
-            dest.join("restored-domain.json"),
-            serde_json::to_vec(&domain).unwrap(),
-        )
-        .map_err(|err| Error::invalid(err.to_string()))?;
+        let mut identity_file = private_file(&dest.join("identity.json"))
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        serde_json::to_writer_pretty(&mut identity_file, &identity)
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        identity_file
+            .sync_all()
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        let mut domain_file = private_file(&dest.join("restored-domain.json"))
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        serde_json::to_writer(&mut domain_file, &domain)
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        domain_file
+            .sync_all()
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        std::fs::File::open(dest)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|err| Error::invalid(err.to_string()))?;
         Ok(())
     }
 
@@ -1660,6 +1853,7 @@ async fn dispatch_control(
                 clock_safe,
                 storage.clock().fault_reason().await,
                 quorum_safe,
+                storage.scheduler_stats(),
             ))
         }
         ControlRequest::List => {
@@ -2006,11 +2200,12 @@ async fn publication_via_raft(
 async fn wait_via_raft(
     raft: &Raft<TypeConfig>,
     storage: &StorageHandle,
-    notify: &Notify,
+    _notify: &Notify,
     run: RunId,
     timeout: Duration,
 ) -> Result<Value> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut changes = storage.subscribe_schedule();
     loop {
         let state = storage.query_state().await;
         if let Some(output) = run_output(&state, run) {
@@ -2032,45 +2227,65 @@ async fn wait_via_raft(
                 "timed out waiting for run",
             ));
         }
-        let _ = write_raft(
-            raft,
-            storage,
-            Command {
-                id: CommandId::generate(),
-                time: now(),
-                body: CommandBody::Progress { run },
-            },
-        )
-        .await;
-        wake(notify);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::select! {
+            result = changes.changed() => result.map_err(|_| {
+                Error::new(ErrorKind::Unavailable, "storage schedule notifications stopped")
+            })?,
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(Error::new(ErrorKind::DeadlineExceeded, "timed out waiting for run"));
+            }
+        }
     }
 }
 
 pub const SNAPSHOT_ENTRY_THRESHOLD: u64 = 20_000;
+pub const SNAPSHOT_BYTE_THRESHOLD: u64 = 512 * 1024 * 1024;
 pub const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
-pub fn should_snapshot(applied: u64, last_snapshot: u64, since_snapshot: Duration) -> bool {
+pub fn should_snapshot(
+    applied: u64,
+    last_snapshot: u64,
+    applied_bytes_since_snapshot: u64,
+    since_snapshot: Duration,
+) -> bool {
     applied.saturating_sub(last_snapshot) >= SNAPSHOT_ENTRY_THRESHOLD
+        || applied_bytes_since_snapshot >= SNAPSHOT_BYTE_THRESHOLD
         || (since_snapshot >= SNAPSHOT_INTERVAL && applied > last_snapshot)
 }
 
-async fn snapshot_controller(raft: Raft<TypeConfig>, _storage: StorageHandle) {
-    let mut last_snapshot = 0u64;
-    let mut since_snapshot = tokio::time::Instant::now();
+async fn snapshot_controller(raft: Raft<TypeConfig>, storage: StorageHandle) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let applied = raft
-            .metrics()
-            .borrow()
-            .last_applied
-            .map(|id| id.index)
-            .unwrap_or(0);
-        if should_snapshot(applied, last_snapshot, since_snapshot.elapsed()) {
-            if raft.trigger().snapshot().await.is_ok() {
-                last_snapshot = applied;
-                since_snapshot = tokio::time::Instant::now();
+        let progress = match storage.snapshot_progress().await {
+            Ok(progress) => progress,
+            Err(error) => {
+                tracing::error!(%error, "snapshot controller cannot read durable progress");
+                return;
             }
+        };
+        let metrics = raft.metrics().borrow().clone();
+        if metrics.state != ServerState::Leader {
+            continue;
+        }
+        let applied = metrics.last_applied.map_or(0, |id| id.index);
+        let now_ms = match crate::time::wall_millis() {
+            Ok(now_ms) => now_ms,
+            Err(error) => {
+                tracing::error!(%error, "snapshot controller wall clock unavailable");
+                return;
+            }
+        };
+        let since = Duration::from_millis(now_ms.saturating_sub(progress.last_snapshot_ms));
+        if should_snapshot(
+            applied,
+            progress.last_snapshot_applied,
+            progress
+                .applied_bytes
+                .saturating_sub(progress.last_snapshot_bytes),
+            since,
+        ) && let Err(error) = raft.trigger().snapshot().await
+        {
+            tracing::warn!(%error, "snapshot threshold reached but build failed");
         }
     }
 }
@@ -2219,15 +2434,42 @@ async fn transfer_faulted_leader(
     }
 }
 
-async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc<Notify>) {
-    let mut last_cleanup = tokio::time::Instant::now() - Duration::from_secs(5);
+async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, _notify: Arc<Notify>) {
+    let mut changes = storage.subscribe_schedule();
+    let mut metrics = raft.metrics();
+    let mut leader_term = None;
     loop {
-        tokio::select! {
-            _ = notify.notified() => {}
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        let observed = metrics.borrow().clone();
+        if observed.state != ServerState::Leader {
+            leader_term = None;
+            if metrics.changed().await.is_err() {
+                return;
+            }
+            continue;
         }
-        if last_cleanup.elapsed() >= Duration::from_secs(5) {
-            if write_raft(
+        if leader_term != Some(observed.current_term) {
+            storage.record_schedule_wake(ScheduleWake::Leadership);
+            leader_term = Some(observed.current_term);
+        }
+        let view = match storage.schedule_view().await {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::error!(%error, "scheduler index unavailable");
+                return;
+            }
+        };
+        storage.observe_scheduler(view.revision);
+        let now_ms = match crate::time::wall_millis() {
+            Ok(now_ms) => now_ms,
+            Err(error) => {
+                tracing::error!(%error, "scheduler wall clock unavailable");
+                return;
+            }
+        };
+        let mut next_due = view.retention_ms;
+        if view.retention_ms.is_some_and(|at| at <= now_ms) {
+            storage.record_schedule_wake(ScheduleWake::Retention);
+            if let Err(error) = write_raft(
                 &raft,
                 &storage,
                 Command {
@@ -2237,23 +2479,79 @@ async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: 
                 },
             )
             .await
-            .is_ok()
             {
-                last_cleanup = tokio::time::Instant::now();
+                tracing::warn!(%error, "retention proposal deferred");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            continue;
+        }
+        let mut progressed = false;
+        for (run, row) in &view.runs {
+            if row.progress || row.deadline_ms.is_some_and(|at| at <= now_ms) {
+                if let Err(error) = write_raft(
+                    &raft,
+                    &storage,
+                    Command {
+                        id: CommandId::generate(),
+                        time: now(),
+                        body: CommandBody::Progress { run: *run },
+                    },
+                )
+                .await
+                {
+                    tracing::warn!(%run, %error, "run progression deferred");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                progressed = true;
+                break;
+            }
+            if let Some(at) = row.deadline_ms {
+                next_due = Some(next_due.map_or(at, |previous| previous.min(at)));
             }
         }
-        let state = storage.query_state().await;
-        for run in active_runs(&state) {
-            let _ = write_raft(
-                &raft,
-                &storage,
-                Command {
-                    id: CommandId::generate(),
-                    time: now(),
-                    body: CommandBody::Progress { run },
+        if progressed {
+            continue;
+        }
+        let mut deadline = next_due.map(|at| {
+            Box::pin(tokio::time::sleep(Duration::from_millis(
+                at.saturating_sub(now_ms),
+            )))
+        });
+        loop {
+            if *changes.borrow() != view.revision {
+                break;
+            }
+            tokio::select! {
+                change = changes.changed() => {
+                    if change.is_err() {
+                        return;
+                    }
+                    storage.record_schedule_wake(ScheduleWake::Applied);
+                    break;
+                }
+                change = metrics.changed() => {
+                    if change.is_err() {
+                        return;
+                    }
+                    let latest = metrics.borrow();
+                    if latest.state != ServerState::Leader
+                        || latest.current_term != observed.current_term
+                    {
+                        storage.record_schedule_wake(ScheduleWake::Leadership);
+                        break;
+                    }
+                }
+                _ = async {
+                    if let Some(timer) = deadline.as_mut() {
+                        timer.as_mut().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    storage.record_schedule_wake(ScheduleWake::Deadline);
+                    break;
                 },
-            )
-            .await;
+            }
         }
     }
 }
@@ -2300,6 +2598,10 @@ async fn worker_loop(
 ) {
     let session = crate::ids::WorkerSessionId::generate();
     let blocking_slots = Arc::new(Semaphore::new(limits::BLOCKING_POOL_DEFAULT as usize));
+    let mut changes = storage.subscribe_schedule();
+    let mut leadership = raft.metrics();
+    let mut renewal = tokio::time::interval(Duration::from_secs(5));
+    renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let _ = write_raft(
         &raft,
         &storage,
@@ -2316,9 +2618,116 @@ async fn worker_loop(
     )
     .await;
     loop {
-        tokio::select! {
-            _ = notify.notified() => {}
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        let observed = leadership.borrow().clone();
+        if observed.state != ServerState::Leader {
+            if leadership.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let view = match storage.schedule_view().await {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::error!(%error, "local worker schedule index unavailable");
+                return;
+            }
+        };
+        storage.observe_local_worker(view.revision);
+        let ready = if view.runs.iter().any(|(_, row)| row.ready) {
+            let state = storage.query_state().await;
+            if state
+                .sessions
+                .get(&session)
+                .is_none_or(|worker| now().as_millis() >= worker.expires_ms)
+            {
+                if let Err(error) = write_raft(
+                    &raft,
+                    &storage,
+                    Command {
+                        id: CommandId::generate(),
+                        time: now(),
+                        body: CommandBody::RegisterSession {
+                            session,
+                            activities: vec!["*".to_owned()],
+                            capacity: crate::limits::CLAIM_BATCH,
+                        },
+                    },
+                )
+                .await
+                {
+                    tracing::warn!(%error, "local worker registration deferred");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                continue;
+            } else {
+                match crate::domain::worker_has_ready(&state, session, now()) {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        tracing::error!(%error, "local worker readiness failed");
+                        return;
+                    }
+                }
+            }
+        } else {
+            false
+        };
+        if !ready {
+            loop {
+                if *changes.borrow() != view.revision {
+                    break;
+                }
+                tokio::select! {
+                    changed = changes.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        storage.record_schedule_wake(ScheduleWake::Worker);
+                        break;
+                    }
+                    changed = leadership.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        let latest = leadership.borrow();
+                        if latest.state != ServerState::Leader
+                            || latest.current_term != observed.current_term
+                        {
+                            storage.record_schedule_wake(ScheduleWake::Leadership);
+                            break;
+                        }
+                    }
+                    _ = renewal.tick() => {
+                        if let Err(error) = write_raft(
+                            &raft,
+                            &storage,
+                            Command {
+                                id: CommandId::generate(),
+                                time: now(),
+                                body: CommandBody::RenewLocalSession { session },
+                            },
+                        ).await {
+                            tracing::warn!(%error, "local worker renewal failed");
+                            match write_raft(
+                                &raft,
+                                &storage,
+                                Command {
+                                    id: CommandId::generate(),
+                                    time: now(),
+                                    body: CommandBody::RegisterSession {
+                                        session,
+                                        activities: vec!["*".to_owned()],
+                                        capacity: crate::limits::CLAIM_BATCH,
+                                    },
+                                },
+                            ).await {
+                                Ok(()) => break,
+                                Err(error) => tracing::warn!(%error, "local worker re-registration failed"),
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
         }
         let claim = Command {
             id: CommandId::generate(),
@@ -2355,6 +2764,7 @@ async fn worker_loop(
                 .authenticated_context(&auth),
             )
             .await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
         let mut did_work = false;
@@ -2822,6 +3232,94 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn published_start_persists_run_records_and_internal_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        engine.publish_catalog(1, catalog()).await.unwrap();
+        engine
+            .publish_definition_yaml(
+                "\
+dsl: graphrun/v1
+id: published_complete
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {literal: null}
+",
+                1,
+            )
+            .await
+            .unwrap();
+        let command_id = CommandId::generate();
+        let run = engine
+            .start_published_with_command(
+                "published_complete",
+                Some(1),
+                "order-1",
+                Value::Null,
+                command_id,
+            )
+            .await
+            .unwrap();
+        let (_, _, internal_id) =
+            crate::publication::published_start_ids(&engine.publication_auth.key(command_id));
+        let before = engine.storage.query_state().await;
+        assert!(!before.history[&run].is_empty());
+        assert!(before.scopes.values().any(|scope| scope.run == run));
+        engine.shutdown().await.unwrap();
+
+        let persisted =
+            crate::storage::load_domain_readonly(dir.path().join("member.redb")).unwrap();
+        assert_eq!(
+            serde_json::to_value((
+                &before.runs[&run],
+                &before.history[&run],
+                &before.history_records[&run],
+                &before.commands[&internal_id],
+                &before.command_times[&internal_id],
+            ))
+            .unwrap(),
+            serde_json::to_value((
+                &persisted.runs[&run],
+                &persisted.history[&run],
+                &persisted.history_records[&run],
+                &persisted.commands[&internal_id],
+                &persisted.command_times[&internal_id],
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            before
+                .scopes
+                .values()
+                .filter(|scope| scope.run == run)
+                .count(),
+            persisted
+                .scopes
+                .values()
+                .filter(|scope| scope.run == run)
+                .count()
+        );
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let retried = engine
+            .start_published_with_command(
+                "published_complete",
+                Some(1),
+                "order-1",
+                Value::Null,
+                command_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried, run);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_sequence_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
         let yaml = include_str!("../../docs/specs/v1/examples/sequence.yaml");
@@ -3021,6 +3519,122 @@ nodes:
             .await
             .unwrap();
         assert_eq!(output.pointer("/approved").unwrap(), &Value::Bool(true));
+        let before = engine.storage.query_state().await;
+        engine.shutdown().await.unwrap();
+        let persisted =
+            crate::storage::load_domain_readonly(dir.path().join("member.redb")).unwrap();
+        assert_eq!(
+            serde_json::to_value((&before.inbox, &before.signal_tombstones, &before.waits))
+                .unwrap(),
+            serde_json::to_value((
+                &persisted.inbox,
+                &persisted.signal_tombstones,
+                &persisted.waits
+            ))
+            .unwrap(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_wait_does_not_rescan_ready_index_on_local_renewal() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                r#"
+dsl: graphrun/v1
+id: waiting_without_deadline
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+signals:
+  continue: {schema: unit/v1}
+start: pause
+nodes:
+  pause:
+    kind: wait_signal
+    signal: continue
+    key: {literal: k1}
+    timeout: null
+    next: finish
+  finish:
+    kind: complete
+    output: {literal: null}
+"#,
+                &catalog(),
+                Value::Null,
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = engine.storage.query_state().await;
+            let view = engine.storage.schedule_view().await.unwrap();
+            if state.waits.values().any(|wait| wait.pending)
+                && view.runs.iter().any(|(id, row)| {
+                    *id == run && !row.progress && !row.ready && row.deadline_ms.is_none()
+                })
+                && engine.storage.scheduler_observed_revision() >= view.revision
+                && engine.storage.local_worker_observed_revision() >= view.revision
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "wait did not settle"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let before = engine.storage.schedule_discovery_reads();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(matches!(
+            engine.storage.query_state().await.runs[&run].status,
+            RunStatus::Active
+        ));
+        assert_eq!(engine.storage.schedule_discovery_reads(), before);
+        engine
+            .signal(run, EventId::generate(), "continue", "k1", Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .wait_terminal(run, Duration::from_secs(10))
+                .await
+                .unwrap(),
+            Value::Null
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_wait_releases_its_activation_for_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                include_str!("../../samples/10-timeout-recovery/workflow.yaml"),
+                &catalog(),
+                Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(0))])),
+            )
+            .await
+            .unwrap();
+        let output = engine
+            .wait_terminal(run, Duration::from_secs(6))
+            .await
+            .unwrap();
+        assert_eq!(output.pointer("/value").unwrap(), &Value::Int(0));
+        let state = engine.inspect(run).await.unwrap();
+        assert!(state.activations.values().any(|activation| {
+            activation.run == run
+                && activation.node.as_str() == "approval"
+                && activation.status == crate::domain::ActivationStatus::Succeeded
+        }));
+        assert!(state.activations.values().any(|activation| {
+            activation.run == run
+                && activation.node.as_str() == "recover"
+                && activation.status == crate::domain::ActivationStatus::Succeeded
+        }));
+        assert!(crate::domain::ready_activations(&state, run).is_empty());
         engine.shutdown().await.unwrap();
     }
 
@@ -3084,14 +3698,27 @@ nodes:
 
     #[test]
     fn snapshot_controller_threshold() {
-        assert!(!should_snapshot(10, 0, Duration::from_secs(1)));
+        assert!(!should_snapshot(10, 0, 0, Duration::from_secs(1)));
         assert!(should_snapshot(
             SNAPSHOT_ENTRY_THRESHOLD,
             0,
+            0,
             Duration::from_secs(1)
         ));
-        assert!(should_snapshot(5, 0, SNAPSHOT_INTERVAL));
-        assert!(!should_snapshot(0, 0, SNAPSHOT_INTERVAL));
+        assert!(should_snapshot(
+            5,
+            0,
+            SNAPSHOT_BYTE_THRESHOLD,
+            Duration::from_secs(1)
+        ));
+        assert!(!should_snapshot(
+            5,
+            0,
+            SNAPSHOT_BYTE_THRESHOLD - 1,
+            Duration::from_secs(1)
+        ));
+        assert!(should_snapshot(5, 0, 0, SNAPSHOT_INTERVAL));
+        assert!(!should_snapshot(0, 0, 0, SNAPSHOT_INTERVAL));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3212,7 +3839,15 @@ nodes:
             })
             .collect();
         assert_eq!(handlers, ["payment.refund", "inventory.release"]);
+        let before = engine.storage.query_state().await;
         engine.shutdown().await.unwrap();
+        let persisted =
+            crate::storage::load_domain_readonly(dir.path().join("member.redb")).unwrap();
+        assert_eq!(
+            serde_json::to_value((&before.obligations, &before.history_records[&run])).unwrap(),
+            serde_json::to_value((&persisted.obligations, &persisted.history_records[&run]))
+                .unwrap()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3771,5 +4406,220 @@ nodes:
         assert_eq!(err.kind, ErrorKind::FailedPrecondition);
         assert!(!db_path.exists());
         assert_eq!(std::fs::read(identity_path).unwrap(), identity);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_keeps_source_artifact_identity_and_uses_new_origin_for_signals() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let run = {
+            let engine = Engine::local(source.path()).await.unwrap();
+            let run = engine
+                .start_yaml(
+                    include_str!("../../docs/specs/v1/examples/events.yaml"),
+                    &catalog(),
+                    Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if engine
+                        .inspect(run)
+                        .await
+                        .unwrap()
+                        .waits
+                        .values()
+                        .any(|wait| wait.pending)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let state = engine.inspect(run).await.unwrap();
+            validate_history_store(&state).unwrap();
+            assert!(!state.current_cluster_id.is_empty());
+            assert!(
+                state.history_records[&run]
+                    .iter()
+                    .any(|record| record.input_ref.is_some())
+            );
+            assert!(
+                state.history_records[&run]
+                    .iter()
+                    .any(|record| record.output_ref.is_some())
+            );
+            let old_origin = state.current_cluster_id.clone();
+            let old_through = state.history_records[&run].last().unwrap().sequence;
+            let prior = serde_json::to_value(&state.history_records[&run]).unwrap();
+            engine.shutdown().await.unwrap();
+            Engine::backup(source.path(), backup.path()).unwrap();
+            let decoded = Engine::read_backup(backup.path()).unwrap();
+            assert_eq!(decoded.current_cluster_id, old_origin);
+            assert_eq!(
+                serde_json::to_value(&decoded.history_records[&run]).unwrap(),
+                prior
+            );
+            Engine::restore(backup.path(), destination.path(), "drill").unwrap();
+            let restored = Engine::local(destination.path()).await.unwrap();
+            let state = restored.inspect(run).await.unwrap();
+            assert_ne!(state.current_cluster_id, old_origin);
+            assert!(state.artifact_origins.contains(&old_origin));
+            assert!(state.artifact_origins.contains(&state.current_cluster_id));
+            assert_eq!(
+                serde_json::to_value(&state.history_records[&run]).unwrap(),
+                prior
+            );
+            assert_eq!(
+                restored
+                    .reconstruct_at(run, old_through)
+                    .await
+                    .unwrap()
+                    .current_cluster_id,
+                old_origin
+            );
+            restored
+                .acknowledge_recovery("operator verified restored effects")
+                .await
+                .unwrap();
+            restored
+                .signal(
+                    run,
+                    EventId::generate(),
+                    "approval",
+                    "k1",
+                    Value::Object(BTreeMap::from([("approved".to_owned(), Value::Bool(true))])),
+                )
+                .await
+                .unwrap();
+            restored
+                .wait_terminal(run, Duration::from_secs(10))
+                .await
+                .unwrap();
+            let finished = restored.inspect(run).await.unwrap();
+            let accepted = finished.history_records[&run]
+                .iter()
+                .zip(&finished.history[&run])
+                .find(|(_, event)| {
+                    matches!(event, crate::domain::DomainEvent::EventAccepted { .. })
+                })
+                .unwrap()
+                .0;
+            assert_eq!(
+                accepted.input_ref.as_ref().unwrap().cluster_id,
+                finished.current_cluster_id
+            );
+            assert_eq!(
+                restored
+                    .reconstruct_at(run, finished.history_records[&run].len() as u64)
+                    .await
+                    .unwrap()
+                    .current_cluster_id,
+                finished.current_cluster_id
+            );
+            validate_history_store(&finished).unwrap();
+            restored.shutdown().await.unwrap();
+            run
+        };
+        assert_ne!(run.as_bytes(), &[0; 16]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_rejects_corrupt_and_legacy_backups_without_writing_destination() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let engine = Engine::local(source.path()).await.unwrap();
+        engine.shutdown().await.unwrap();
+        Engine::backup(source.path(), backup.path()).unwrap();
+        let manifest: LogicalBackupManifest =
+            serde_json::from_slice(&std::fs::read(backup.path().join("manifest.json")).unwrap())
+                .unwrap();
+        let snapshot_path = backup.path().join(&manifest.snapshot);
+        let mut corrupt = std::fs::read(&snapshot_path).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(&snapshot_path, &corrupt).unwrap();
+        let error = Engine::restore(backup.path(), destination.path(), "recovery")
+            .expect_err("corrupt snapshot must be rejected");
+        assert_eq!(error.kind, ErrorKind::FailedPrecondition);
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), corrupt);
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+
+        for old in ["graphrun.backup/v1", "graphrun.backup/v2"] {
+            std::fs::write(
+                backup.path().join("manifest.json"),
+                format!(r#"{{"format":"{old}","kind":"logical-domain"}}"#),
+            )
+            .unwrap();
+            let error = Engine::restore(backup.path(), destination.path(), "recovery")
+                .expect_err("old backup format must be rejected");
+            assert_eq!(error.kind, ErrorKind::FailedPrecondition);
+            assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_rejects_retained_definition_corruption_with_valid_snapshot_checksums() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let engine = Engine::local(source.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                &catalog(),
+                order(),
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_terminal(run, Duration::from_secs(10))
+            .await
+            .unwrap();
+        engine.shutdown().await.unwrap();
+        Engine::backup(source.path(), backup.path()).unwrap();
+
+        let verified = Engine::read_backup(backup.path()).unwrap();
+        assert!(verified.runs.contains_key(&run));
+        assert!(!verified.history_records[&run].is_empty());
+        let manifest_path = backup.path().join("manifest.json");
+        let mut manifest: LogicalBackupManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let old_snapshot = backup.path().join(&manifest.snapshot);
+        let (mut framing, _) = verify_snapshot(&old_snapshot).unwrap();
+        let mut raw = Vec::new();
+        copy_payload(&old_snapshot, &mut raw).unwrap();
+        let mut retained: State = serde_json::from_slice(&raw).unwrap();
+        retained
+            .history_dependencies
+            .get_mut(&run)
+            .unwrap()
+            .definition
+            .sha256 = "0".repeat(64);
+        raw = serde_json::to_vec(&retained).unwrap();
+        framing.payload_bytes = raw.len() as u64;
+        let stage = backup.path().join("application-forged.snap.tmp");
+        let digest = write_snapshot(&mut raw.as_slice(), &stage, &framing).unwrap();
+        manifest.snapshot = format!("application-{}.snap", hex::encode(digest));
+        manifest.sha256 = hex::encode(digest);
+        std::fs::rename(stage, backup.path().join(&manifest.snapshot)).unwrap();
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(verify_snapshot(&backup.path().join(&manifest.snapshot)).is_ok());
+        let read_error = Engine::read_backup(backup.path()).unwrap_err();
+        assert_eq!(read_error.kind, ErrorKind::FailedPrecondition);
+        assert!(read_error.message.contains("retained backup artifact"));
+
+        let error = Engine::restore(backup.path(), destination.path(), "drill")
+            .expect_err("retained definition digest must be verified before restore");
+        assert_eq!(error.kind, ErrorKind::FailedPrecondition);
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+        assert!(old_snapshot.exists());
     }
 }

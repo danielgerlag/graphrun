@@ -2,6 +2,8 @@
 
 Backups are logical domain snapshots, not a copy of `member.redb`. Restore always creates a new cluster identity and leaves execution suspended until you acknowledge it.
 
+The member store uses `graphrun.member-store/v4` and `graphrun.state-record/v2`. Older member stores fail to open without losing their files. The logical backup envelope remains `graphrun.backup/v3`.
+
 This is ops on a data directory, not a new graph. Any run you already started (for example [`samples/02-passing-data/workflow.yaml`](../../samples/02-passing-data/workflow.yaml)) is in that snapshot.
 
 Stop the engine first so the database is not open.
@@ -12,7 +14,9 @@ graphrun backup \
 	--out ./graphrun-backup
 ```
 
-The directory contains `manifest.json` and `domain.json`.
+The directory contains `manifest.json` and a checksummed, framed `application-<digest>.snap`. Keep both files. Restore verifies the digest, original artifact cluster IDs, and every retained record version before it creates a new member directory. Older backups without artifact origins are rejected without changing the destination.
+
+To verify and inspect a backup without starting a member or calling an activity, use `graphrun::Engine::read_backup("./graphrun-backup")` from Rust. It returns the retained state only after the framing, artifact origins, and retained payload digests pass validation.
 
 ```sh
 graphrun restore \

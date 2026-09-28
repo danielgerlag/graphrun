@@ -10,4 +10,4 @@ REQ-DURABILITY	Atomic real redb OpenRaft command and event application	06-storag
 REQ-CLUSTER	Independent members workers and supported failure recovery	06-storage-and-consensus.md	STORE-007,STORE-008,CLUSTER-001,CLUSTER-002,CLUSTER-003,CLUSTER-004,CLUSTER-005,CLUSTER-006,SEC-001,CONTRACT-003
 REQ-LOCAL	Service-free durable local loop and inspection	07-api-and-operations.md	LOCAL-001,LOCAL-002,LOCAL-003
 REQ-REPLAY	Event-sourced history and pure read-only reconstruction	01-domain-model.md	REPLAY-001,REPLAY-002,REPLAY-003,REPLAY-004
-REQ-E2E	Real release-artifact end-to-end evidence and no silent skips	08-testing-and-verification.md	E2E-001,E2E-002,E2E-003,PERF-001,PERF-002,GATE-001,GATE-002
+REQ-E2E	Real release-artifact end-to-end evidence and no silent skips	08-testing-and-verification.md	E2E-001,E2E-002,E2E-003,PERF-001,PERF-002,GATE-001,GATE-002,GATE-003

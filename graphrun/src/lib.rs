@@ -32,9 +32,13 @@ pub mod limits;
 pub mod policy;
 pub mod provider;
 pub mod publication;
+mod record_store;
 #[doc(hidden)]
 pub mod rpc;
+mod schedule;
 pub mod schema;
+mod snapshot_framing;
+
 #[doc(hidden)]
 pub mod storage;
 pub mod time;
@@ -54,7 +58,7 @@ pub use catalog::Catalog;
 pub use client::GrpcClient;
 pub use cluster::MemberConfig;
 pub use compiler::compile_yaml;
-pub use domain::{State, reconstruct, run_events, run_output};
+pub use domain::{State, reconstruct_in, run_events, run_output};
 pub use engine::{
     ControlRequest, ControlResponse, Engine, LedgerEntry, LocalBuilder, connect_control,
     ledger_get, replay,
