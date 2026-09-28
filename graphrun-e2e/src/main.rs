@@ -2749,20 +2749,66 @@ fn cluster_is_quiescent(statuses: &[serde_json::Value]) -> bool {
         && statuses.iter().all(|status| {
             status["active_runs"] == 1
                 && status["pending_waits"] == 1
+                && status["clock_safe"] == true
                 && status["apply_lag"] == 0
+                && status["voters"] == serde_json::json!([1, 2, 3])
                 && status["schedule_revision"].as_u64() == Some(revision)
                 && status["ready_index_discovery_reads"].as_u64().is_some()
+                && status["last_applied"].as_u64().is_some()
+                && ["applied", "leadership", "deadline", "retention", "worker"]
+                    .iter()
+                    .all(|cause| status["scheduler_wake_causes"][cause].as_u64().is_some())
                 && (status["state"] == "Follower"
                     || (status["state"] == "Leader"
+                        && status["status"] == "ok"
+                        && status["quorum_safe"] == true
                         && status["scheduler_observed_revision"].as_u64() == Some(revision)))
         })
 }
 
+fn cluster_stayed_quiescent(before: &[serde_json::Value], after: &[serde_json::Value]) -> bool {
+    if !cluster_is_quiescent(before) || !cluster_is_quiescent(after) {
+        return false;
+    }
+    let Some(leader) = before.iter().position(|status| status["state"] == "Leader") else {
+        return false;
+    };
+    before[leader]["ready_index_discovery_reads"]
+        .as_u64()
+        .is_some_and(|reads| reads > 0)
+        && before.iter().zip(after).all(|(old, new)| {
+            old["state"] == new["state"]
+                && old["schedule_revision"] == new["schedule_revision"]
+                && old["ready_index_discovery_reads"] == new["ready_index_discovery_reads"]
+                && old["last_applied"]
+                    .as_u64()
+                    .zip(new["last_applied"].as_u64())
+                    .is_some_and(|(old, new)| new > old)
+                && ["applied", "leadership", "deadline", "retention", "worker"]
+                    .iter()
+                    .all(|cause| {
+                        old["scheduler_wake_causes"][cause]
+                            .as_u64()
+                            .zip(new["scheduler_wake_causes"][cause].as_u64())
+                            .is_some_and(|(old, new)| new >= old)
+                    })
+        })
+}
+
 fn e2e_no_ready_scan(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
-    let cluster = match boot_three(artifacts, row, 2) {
+    let mut cluster = match boot_three(artifacts, row, 2) {
         Ok(cluster) => cluster,
         Err(error) => return fail(row, "boot three voting members", error),
     };
+    let member_pids: HashSet<_> = cluster.members.iter().map(|member| member.0.id()).collect();
+    let worker_pids: HashSet<_> = cluster.workers.iter().map(|worker| worker.0.id()).collect();
+    if member_pids.len() != 3 || worker_pids.len() != 2 || !member_pids.is_disjoint(&worker_pids) {
+        return fail(
+            row,
+            "independent cluster actors",
+            "expected three voter PIDs and two separate worker PIDs",
+        );
+    }
     let definition = cluster.dir.join("quiescent-wait.yaml");
     if let Err(error) = fs::write(
         &definition,
@@ -2808,6 +2854,19 @@ nodes:
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    for worker in &mut cluster.workers {
+        match worker.0.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                return fail(
+                    row,
+                    "worker before quiescent interval",
+                    format!("worker {} exited {status}", worker.0.id()),
+                );
+            }
+            Err(err) => return fail(row, "worker before quiescent interval", err.to_string()),
+        }
+    }
     let started = Instant::now();
     std::thread::sleep(Duration::from_secs(60));
     let after: Vec<_> = match (0..3)
@@ -2818,14 +2877,21 @@ nodes:
         Err(error) => return fail(row, "three-member final health", error),
     };
     let elapsed = started.elapsed();
-    let stable = before.iter().zip(&after).all(|(old, new)| {
-        new["active_runs"] == 1
-            && new["pending_waits"] == 1
-            && old["ready_index_discovery_reads"] == new["ready_index_discovery_reads"]
-    });
+    let mut workers_alive = true;
+    for worker in &mut cluster.workers {
+        match worker.0.try_wait() {
+            Ok(None) => {}
+            Ok(Some(_)) => workers_alive = false,
+            Err(err) => return fail(row, "worker after quiescent interval", err.to_string()),
+        }
+    }
+    let stable = workers_alive && cluster_stayed_quiescent(&before, &after);
     let proof = serde_json::json!({
         "run": run,
         "elapsed_ms": elapsed.as_millis(),
+        "member_pids": member_pids,
+        "worker_pids": worker_pids,
+        "workers_alive": workers_alive,
         "before": before,
         "after": after,
     });
@@ -9406,12 +9472,24 @@ mod tests {
         let node = |state: &str, revision: u64, observed: u64, lag: u64| {
             serde_json::json!({
                 "state": state,
+                "status": if state == "Leader" { "ok" } else { "unavailable" },
+                "clock_safe": true,
+                "quorum_safe": state == "Leader",
+                "voters": [1, 2, 3],
                 "active_runs": 1,
                 "pending_waits": 1,
                 "ready_index_discovery_reads": 18,
                 "schedule_revision": revision,
                 "scheduler_observed_revision": observed,
                 "apply_lag": lag,
+                "last_applied": 8,
+                "scheduler_wake_causes": {
+                    "applied": 1,
+                    "leadership": 1,
+                    "deadline": 0,
+                    "retention": 0,
+                    "worker": 1
+                },
             })
         };
         let healthy = vec![
@@ -9429,9 +9507,38 @@ mod tests {
         wrong = healthy.clone();
         wrong[0]["scheduler_observed_revision"] = serde_json::json!(2);
         assert!(!cluster_is_quiescent(&wrong));
-        wrong = healthy;
+        wrong = healthy.clone();
         wrong[2]["state"] = serde_json::json!("Leader");
         assert!(!cluster_is_quiescent(&wrong));
+        wrong = healthy.clone();
+        wrong[0]["quorum_safe"] = serde_json::json!(false);
+        assert!(!cluster_is_quiescent(&wrong));
+        wrong = healthy.clone();
+        wrong[1]["voters"] = serde_json::json!([1, 2]);
+        assert!(!cluster_is_quiescent(&wrong));
+        wrong = healthy.clone();
+        wrong[0]["scheduler_wake_causes"]["applied"] = serde_json::Value::Null;
+        assert!(!cluster_is_quiescent(&wrong));
+
+        let mut after = healthy.clone();
+        for node in &mut after {
+            node["last_applied"] = serde_json::json!(32);
+        }
+        assert!(cluster_stayed_quiescent(&healthy, &after));
+        let mut unstable = after.clone();
+        unstable[0]["ready_index_discovery_reads"] = serde_json::json!(19);
+        assert!(!cluster_stayed_quiescent(&healthy, &unstable));
+        unstable = after.clone();
+        unstable[1]["last_applied"] = serde_json::json!(8);
+        assert!(!cluster_stayed_quiescent(&healthy, &unstable));
+        unstable = after.clone();
+        unstable[0]["schedule_revision"] = serde_json::json!(4);
+        assert!(!cluster_stayed_quiescent(&healthy, &unstable));
+        unstable = after.clone();
+        unstable[0]["scheduler_wake_causes"]["worker"] = serde_json::json!(0);
+        assert!(!cluster_stayed_quiescent(&healthy, &unstable));
+        unstable = healthy.clone();
+        assert!(!cluster_stayed_quiescent(&healthy, &unstable));
     }
 
     #[test]
