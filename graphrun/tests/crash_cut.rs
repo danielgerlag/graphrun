@@ -77,3 +77,92 @@ fn reopen_after_child_cut() {
         engine.shutdown().await.unwrap();
     });
 }
+
+#[test]
+fn reopen_after_owned_heavy_apply_interruption() {
+    if let Ok(dir) = std::env::var("GRAPHUN_HEAVY_CRASH_DIR") {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = PathBuf::from(dir);
+            let engine = Engine::local(&dir).await.unwrap();
+            let catalog = Catalog::from_json(include_bytes!(
+                "../../docs/specs/v1/examples/activity-catalog.json"
+            ))
+            .unwrap();
+            let run = engine
+                .start_yaml(
+                    include_str!("../../docs/specs/v1/examples/events.yaml"),
+                    &catalog,
+                    Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                )
+                .await
+                .unwrap();
+            for index in 1..=1_000 {
+                engine.commit_progress(run).await.unwrap();
+                if index == 200 {
+                    std::fs::write(dir.join("heavy-ready"), run.to_hex()).unwrap();
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let stderr = dir.path().join("heavy.stderr");
+    let mut child = Command::new(exe)
+        .arg("reopen_after_owned_heavy_apply_interruption")
+        .arg("--exact")
+        .env("GRAPHUN_HEAVY_CRASH_DIR", dir.path())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !dir.path().join("heavy-ready").exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "child exited {status} before heavy-apply barrier: {}",
+                std::fs::read_to_string(&stderr).unwrap_or_default()
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!(
+                "child did not reach heavy-apply barrier: {}",
+                std::fs::read_to_string(&stderr).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let run = graphrun::ids::RunId::from_hex(
+        std::fs::read_to_string(dir.path().join("heavy-ready"))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+    let killed_pid = child.id();
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "owned child {killed_pid} must be killed");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let engine = Engine::local(dir.path())
+            .await
+            .expect("member must reopen after heavy applied write interruption");
+        let state = engine.inspect(run).await.unwrap();
+        assert!(state.runs.contains_key(&run));
+        assert!(!state.history_records[&run].is_empty());
+        engine.shutdown().await.unwrap();
+    });
+}

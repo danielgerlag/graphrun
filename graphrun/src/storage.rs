@@ -376,9 +376,24 @@ impl StorageHandle {
         let mut clock_faulted = false;
         let mut initial_watermark = 0;
         if path.exists() {
-            let db = ReadOnlyDatabase::open(&path).map_err(|err| {
-                Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string())
-            })?;
+            let db = match ReadOnlyDatabase::open(&path) {
+                Ok(db) => db,
+                Err(redb::DatabaseError::RepairAborted) => {
+                    Self::repair_validated_store(&path, restoring)?;
+                    ReadOnlyDatabase::open(&path).map_err(|err| {
+                        Error::new(
+                            crate::error::ErrorKind::FailedPrecondition,
+                            format!("repaired member store cannot be read: {err}"),
+                        )
+                    })?
+                }
+                Err(err) => {
+                    return Err(Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        err.to_string(),
+                    ));
+                }
+            };
             let format: Option<String> = load_json(&db, "publication_start_format");
             if format.as_deref() != Some("graphrun.publication-store/v2") {
                 return Err(Error::new(
@@ -503,6 +518,53 @@ impl StorageHandle {
             Ok(Err(err)) => Err(Error::new(crate::error::ErrorKind::FailedPrecondition, err)),
             Err(_) => Err(Error::invalid("storage thread exited before opening")),
         }
+    }
+
+    fn repair_validated_store(path: &Path, restoring: bool) -> Result<()> {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| Error::invalid("member store has no file name"))?;
+        let copy = path.with_file_name(format!(
+            "{file_name}.repair-check-{}.tmp",
+            crate::ids::CommandId::generate().to_hex()
+        ));
+        let mut staged = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&copy)
+            .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))?;
+        let _cleanup = RemoveOnDrop(copy.clone());
+        std::io::copy(
+            &mut std::fs::File::open(path)
+                .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))?,
+            &mut staged,
+        )
+        .map_err(|err| Error::new(crate::error::ErrorKind::Unavailable, err.to_string()))?;
+        drop(staged);
+        let candidate = Database::open(&copy).map_err(|err| {
+            Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                format!("member store repair probe failed: {err}"),
+            )
+        })?;
+        let manifest = verified_store_manifest(&candidate)?;
+        let state = load_app_generation(&candidate, manifest.active_generation).map_err(|err| {
+            Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                format!("repaired application records unavailable: {err}"),
+            )
+        })?;
+        validate_history_store(&state)?;
+        validate_cluster_binding(&state, &manifest, restoring)?;
+        drop(candidate);
+        drop(Database::open(path).map_err(|err| {
+            Error::new(
+                crate::error::ErrorKind::Unavailable,
+                format!("validated member store cannot be repaired in place: {err}"),
+            )
+        })?);
+        Ok(())
     }
 
     pub fn log_store(&self) -> LogStore {
@@ -865,6 +927,71 @@ pub(crate) fn validate_history_store(state: &State) -> Result<()> {
         }
         Ok(())
     };
+    for (version, catalog) in &state.published_catalogs {
+        if *version == 0 {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "published catalog has invalid version",
+            ));
+        }
+        catalog.verify().map_err(|err| {
+            Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                format!("published catalog v{version} is unavailable: {err}"),
+            )
+        })?;
+        catalog.catalog.validate_for_publication().map_err(|err| {
+            Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                format!("published catalog v{version} has invalid contracts: {err}"),
+            )
+        })?;
+    }
+    for (workflow, versions) in &state.published_definitions {
+        for (version, published) in versions {
+            if published.definition.id != *workflow || published.definition.version != *version {
+                return Err(Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "published definition identity differs from its retained key",
+                ));
+            }
+            published.verify().map_err(|err| {
+                Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    format!("published definition {workflow}/v{version} is unavailable: {err}"),
+                )
+            })?;
+            let catalog = state
+                .published_catalogs
+                .get(&published.catalog_version)
+                .ok_or_else(|| {
+                    Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        format!(
+                            "published definition {workflow}/v{version} has no retained catalog"
+                        ),
+                    )
+                })?;
+            crate::compiler::validate_definition(&published.definition, &catalog.catalog)
+                .map_err(|err| {
+                    Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        format!(
+                            "published definition {workflow}/v{version} has invalid pinned schemas: {err}"
+                        ),
+                    )
+                })?;
+        }
+    }
+    for (key, receipt) in &state.command_results {
+        if key != &receipt.key.storage_key() {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "retained publication receipt identity differs from its key",
+            ));
+        }
+        receipt.ensure_format()?;
+    }
     for run in state.runs.keys() {
         let incompatible = || {
             Error::new(
@@ -2964,7 +3091,10 @@ fn gc_retired_app_rows(db: &Database) -> std::result::Result<bool, StoErr> {
             if !row_key.value().starts_with(&prefix) {
                 break;
             }
-            if retained && (row_key.value() == summary || row_key.value().contains("/start_keys/"))
+            if retained
+                && (row_key.value() == summary
+                    || row_key.value().contains("/start_keys/")
+                    || row_key.value().contains("/signal_tombstones/"))
             {
                 continue;
             }
@@ -4041,6 +4171,17 @@ fn apply_one_entry(
                 publication = Some((key, operation));
                 let mut command = req.command.clone();
                 let first_submission = !domain.command_results.contains_key(&key.storage_key());
+                let retained_start = match operation {
+                    crate::publication::PublicationOperation::Start {
+                        workflow,
+                        start_key,
+                        ..
+                    } => domain
+                        .start_keys
+                        .get(workflow)
+                        .is_some_and(|keys| keys.contains_key(start_key)),
+                    _ => false,
+                };
                 if first_submission {
                     command.time = crate::time::EngineTime::from_millis(
                         domain
@@ -4066,14 +4207,8 @@ fn apply_one_entry(
                         }
                     };
                 if let Ok(run) = receipt.applied_run() {
-                    if !domain.runs.contains_key(&run) {
-                        return Err(sto_err(
-                            ErrorVerb::Read,
-                            "published start receipt has no retained run",
-                        ));
-                    }
-                    affected.insert(run, Some(true));
                     if first_submission
+                        && !retained_start
                         && matches!(
                             operation,
                             crate::publication::PublicationOperation::Start { .. }
@@ -4081,18 +4216,23 @@ fn apply_one_entry(
                     {
                         let (expected, _, progress_id) =
                             crate::publication::published_start_ids(key);
-                        if expected == run {
-                            if !domain.commands.contains_key(&progress_id) {
-                                return Err(sto_err(
-                                    ErrorVerb::Read,
-                                    "published start is missing its internal progress receipt",
-                                ));
-                            }
-                            events = domain.history.get(&run).cloned().ok_or_else(|| {
-                                sto_err(ErrorVerb::Read, "published start has no retained history")
-                            })?;
-                            command_id = Some(progress_id);
+                        if expected != run
+                            || !domain.runs.contains_key(&run)
+                            || !domain.commands.contains_key(&progress_id)
+                        {
+                            return Err(sto_err(
+                                ErrorVerb::Read,
+                                "new published start is missing its run or internal receipt",
+                            ));
                         }
+                        affected.insert(run, Some(true));
+                        events = domain.history.get(&run).cloned().ok_or_else(|| {
+                            sto_err(
+                                ErrorVerb::Read,
+                                "new published start has no retained history",
+                            )
+                        })?;
+                        command_id = Some(progress_id);
                     }
                 }
                 if let Err(err) = receipt.ensure_applied() {
@@ -5438,6 +5578,10 @@ nodes:
         put_json(&db, "store_manifest", &manifest).unwrap();
         drop(db);
         let original = std::fs::read(&path).unwrap();
+        let probe = StorageHandle::repair_validated_store(&path, false).unwrap_err();
+        assert_eq!(probe.kind, crate::error::ErrorKind::FailedPrecondition);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         let err = StorageHandle::open(&path).err().unwrap();
         assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
         assert!(err.message.contains("version"));
@@ -5931,6 +6075,8 @@ nodes:
             expires_ms: 100,
             history_through: 4_100,
         };
+        let event_id = crate::ids::EventId::from_bytes([92; 16]);
+        let signal_key = format!("{}:{}", run.to_hex(), event_id.to_hex());
         let txn = begin_immediate(&db).unwrap();
         {
             let mut table = txn.open_table(APP_ROWS).unwrap();
@@ -5944,6 +6090,29 @@ nodes:
                 "map",
                 &run.to_hex(),
                 serde_json::to_value(&summary).unwrap(),
+            )
+            .unwrap();
+            table.insert(key.as_str(), bytes.as_slice()).unwrap();
+            let (key, bytes) = record_store::encode_value(
+                1,
+                2,
+                Some(run),
+                "signal_tombstones",
+                "map",
+                &signal_key,
+                serde_json::to_value(crate::history::SignalTombstone {
+                    run,
+                    event_id,
+                    signal: "approved".to_owned(),
+                    key: "order".to_owned(),
+                    payload: crate::history::ArtifactRef::capture_in(
+                        "",
+                        "graphrun.signal-payload/v1",
+                        &crate::Value::Null,
+                    )
+                    .unwrap(),
+                })
+                .unwrap(),
             )
             .unwrap();
             table.insert(key.as_str(), bytes.as_slice()).unwrap();
@@ -5979,6 +6148,7 @@ nodes:
         let visible = load_app_generation(&db, 1).unwrap();
         assert!(!visible.history.contains_key(&run));
         assert_eq!(visible.terminal_summaries[&run].history_through, 4_100);
+        assert!(visible.signal_tombstones.contains_key(&signal_key));
         inject_cut("after-retired-generation-cleanup");
         assert!(
             gc_retired_app_rows(&db)
@@ -6009,13 +6179,19 @@ nodes:
         );
         drop(table);
         drop(txn);
-        for batch in 0..8 {
+        for batch in 0..64 {
             if !gc_retired_app_rows(&db).unwrap() {
                 break;
             }
             assert_eq!(
                 load_app_generation(&db, 1).unwrap().terminal_summaries[&run].history_through,
                 4_100
+            );
+            assert!(
+                load_app_generation(&db, 1)
+                    .unwrap()
+                    .signal_tombstones
+                    .contains_key(&signal_key)
             );
             if batch == 0 {
                 let snapshots = dir.path().join("snapshots");
@@ -6036,12 +6212,20 @@ nodes:
             .unwrap();
         commit_immediate(txn).unwrap();
         assert!(gc_retired_app_rows(&db).unwrap());
+        assert!(
+            !load_app_generation(&db, 1)
+                .unwrap()
+                .signal_tombstones
+                .contains_key(&signal_key)
+        );
+        assert!(gc_retired_app_rows(&db).unwrap());
         assert!(!gc_retired_app_rows(&db).unwrap());
         drop(db);
         let db = Database::open(&path).unwrap();
         let visible = load_app_generation(&db, 1).unwrap();
         assert!(!visible.history.contains_key(&run));
         assert!(!visible.terminal_summaries.contains_key(&run));
+        assert!(!visible.signal_tombstones.contains_key(&signal_key));
     }
 
     #[test]
@@ -6347,6 +6531,250 @@ nodes:
         .unwrap();
         assert!(page.unavailable);
         assert_eq!(page.unavailable_range.unwrap().last, through);
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn published_start_key_retries_survive_receipt_and_history_expiry() {
+        use crate::domain::CommandBody;
+        use crate::ids::CommandId;
+        use crate::publication::{CommandKey, PublicationOperation};
+        use crate::time::EngineTime;
+
+        const DAY: u64 = 24 * 60 * 60 * 1_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let mut state = bound_fixture(&db);
+        let catalog = crate::Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))
+        .unwrap();
+        let definition = crate::compile_yaml(
+            "\
+dsl: graphrun/v1
+id: retained_key
+version: 1
+input_schema: counter/v1
+output_schema: unit/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {literal: null}
+",
+            &catalog,
+        )
+        .unwrap();
+        let input: crate::Value = serde_json::from_value(serde_json::json!({"value": 1})).unwrap();
+        let changed_input: crate::Value =
+            serde_json::from_value(serde_json::json!({"value": 2})).unwrap();
+        let mut applied = None;
+        let mut membership = StoredMembership::new(None, Membership::new(vec![], None));
+        let mut revision = 0;
+        let mut index = 0u64;
+        let publication = |id: u8, operation| CommandBody::Publication {
+            key: CommandKey {
+                cluster_id: TEST_CLUSTER_ID.to_owned(),
+                principal_id: "local-owner".to_owned(),
+                command_id: CommandId::from_bytes([id; 16]),
+            },
+            operation,
+        };
+        let start = |id, payload| {
+            publication(
+                id,
+                PublicationOperation::Start {
+                    workflow: "retained_key".to_owned(),
+                    version: Some(1),
+                    start_key: "shared".to_owned(),
+                    input: payload,
+                },
+            )
+        };
+        let run = {
+            let mut apply = |time, id: u8, body: CommandBody| {
+                index += 1;
+                let entry = Entry::<TypeConfig> {
+                    log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+                    payload: EntryPayload::Normal(RaftRequest {
+                        command: Command {
+                            id: CommandId::from_bytes([id; 16]),
+                            time: EngineTime::from_millis(time),
+                            body,
+                        },
+                    }),
+                };
+                apply_entries(
+                    &db,
+                    &mut applied,
+                    &mut membership,
+                    &mut state,
+                    &mut revision,
+                    vec![entry],
+                )
+                .unwrap()
+                .remove(0)
+            };
+            for (id, operation) in [
+                (
+                    1,
+                    PublicationOperation::Catalog {
+                        version: 1,
+                        catalog: catalog.clone(),
+                    },
+                ),
+                (
+                    2,
+                    PublicationOperation::Definition {
+                        definition: Box::new(definition),
+                        catalog_version: 1,
+                    },
+                ),
+            ] {
+                assert!(apply(1, id, publication(id, operation)).error.is_none());
+            }
+            let initial = apply(2, 3, start(3, input.clone()));
+            assert!(initial.error.is_none());
+            let run = initial.command_result.unwrap().applied_run().unwrap();
+            for (time, prune_id, retry_id) in [
+                (DAY + 20, 4, 3),
+                (30 * DAY + 20, 6, 5),
+                (89 * DAY + 20, 8, 7),
+            ] {
+                assert!(
+                    apply(time, prune_id, CommandBody::PruneHistory { limit: 128 })
+                        .error
+                        .is_none()
+                );
+                let retry = apply(time + 1, retry_id, start(retry_id, input.clone()));
+                assert!(retry.error.is_none(), "same key retry at {time}: {retry:?}");
+                assert_eq!(retry.command_result.unwrap().applied_run().unwrap(), run);
+                let fresh_id = prune_id + 10;
+                let fresh = apply(time + 2, fresh_id, start(fresh_id, input.clone()));
+                assert!(fresh.error.is_none(), "fresh ID at {time}: {fresh:?}");
+                assert_eq!(fresh.command_result.unwrap().applied_run().unwrap(), run);
+                let conflict_id = prune_id + 20;
+                let conflict = apply(
+                    time + 3,
+                    conflict_id,
+                    start(conflict_id, changed_input.clone()),
+                );
+                assert_eq!(
+                    conflict.error_kind,
+                    Some(crate::error::ErrorKind::AlreadyExists)
+                );
+            }
+            run
+        };
+        let stored = load_app_generation(&db, 1).unwrap();
+        assert!(!stored.runs.contains_key(&run));
+        assert!(stored.terminal_summaries.contains_key(&run));
+        assert_eq!(stored.start_keys["retained_key"]["shared"].run, run);
+        let snapshots = dir.path().join("snapshots");
+        let (built, registry) = build_snapshot(&db, &path, &snapshots, false).unwrap();
+        let receiver_dir = dir.path().join("receiver");
+        std::fs::create_dir_all(&receiver_dir).unwrap();
+        let receiver_path = receiver_dir.join("member.redb");
+        let receiver = Database::create(&receiver_path).unwrap();
+        initialize_publication_store(&receiver).unwrap();
+        let incoming_dir = receiver_dir.join("snapshots");
+        std::fs::create_dir_all(&incoming_dir).unwrap();
+        let incoming = incoming_dir.join("receiving-start-key.snap.tmp");
+        std::fs::copy(&built.snapshot.path, &incoming).unwrap();
+        let mut imported_applied = None;
+        let mut imported_membership = StoredMembership::new(None, Membership::new(vec![], None));
+        let mut imported_state = State::default();
+        let mut imported_registry = None;
+        let mut imported_revision = 0;
+        install_snapshot(
+            &receiver,
+            &receiver_path,
+            &incoming_dir,
+            &mut imported_applied,
+            &mut imported_membership,
+            &mut imported_state,
+            &mut imported_registry,
+            &mut imported_revision,
+            registry.meta,
+            incoming,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        let imported_retry = Entry::<TypeConfig> {
+            log_id: LogId::new(
+                openraft::CommittedLeaderId::new(1, 1),
+                imported_applied.unwrap().index + 1,
+            ),
+            payload: EntryPayload::Normal(RaftRequest {
+                command: Command {
+                    id: CommandId::from_bytes([40; 16]),
+                    time: EngineTime::from_millis(89 * DAY + 40),
+                    body: start(40, input.clone()),
+                },
+            }),
+        };
+        let imported_response = apply_entries(
+            &receiver,
+            &mut imported_applied,
+            &mut imported_membership,
+            &mut imported_state,
+            &mut imported_revision,
+            vec![imported_retry],
+        )
+        .unwrap();
+        assert_eq!(
+            imported_response[0]
+                .command_result
+                .as_ref()
+                .unwrap()
+                .applied_run()
+                .unwrap(),
+            run
+        );
+        verify_app_mirror(&receiver, &imported_state, 2).unwrap();
+        drop(receiver);
+        let mut next = |time, id: u8, body: CommandBody| {
+            index += 1;
+            apply_entries(
+                &db,
+                &mut applied,
+                &mut membership,
+                &mut state,
+                &mut revision,
+                vec![Entry::<TypeConfig> {
+                    log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+                    payload: EntryPayload::Normal(RaftRequest {
+                        command: Command {
+                            id: CommandId::from_bytes([id; 16]),
+                            time: EngineTime::from_millis(time),
+                            body,
+                        },
+                    }),
+                }],
+            )
+            .unwrap()
+            .remove(0)
+        };
+        assert!(
+            next(91 * DAY, 41, CommandBody::PruneHistory { limit: 128 })
+                .error
+                .is_none()
+        );
+        let after_window = next(91 * DAY + 1, 42, start(42, changed_input));
+        assert!(after_window.error.is_none());
+        assert_ne!(
+            after_window.command_result.unwrap().applied_run().unwrap(),
+            run
+        );
+        drop(db);
+        let (handle, thread) = StorageHandle::open(&path).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let restarted = runtime.block_on(handle.query_state());
+        assert_ne!(restarted.start_keys["retained_key"]["shared"].run, run);
         handle.shutdown();
         thread.join().unwrap();
     }
