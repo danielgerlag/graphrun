@@ -1604,10 +1604,14 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             row,
             "domain::tests::parallel_saga_compensates_after_join",
         ),
-        "SAGA-008" => from_test(
+        "SAGA-008" => from_tests(
             evidence,
             row,
-            "domain::tests::compensation_reported_error_policy",
+            &[
+                "domain::tests::compensation_reported_error_policy",
+                "domain::tests::default_compensation_retry_exhausts_without_claiming_rollback",
+                "domain::tests::operator_resolves_blocked_compensation",
+            ],
         ),
         "SAGA-009" => from_tests(
             evidence,
@@ -1633,10 +1637,13 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             row,
             "domain::tests::successful_saga_does_not_reopen_on_later_failure",
         ),
-        "SAGA-013" => from_test(
+        "SAGA-013" => from_tests(
             evidence,
             row,
-            "domain::tests::compensation_reported_error_policy",
+            &[
+                "domain::tests::compensation_reported_error_policy",
+                "domain::tests::default_compensation_retry_exhausts_without_claiming_rollback",
+            ],
         ),
         "SAGA-014" => from_test(
             evidence,
