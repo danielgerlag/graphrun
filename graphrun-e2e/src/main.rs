@@ -1453,7 +1453,14 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
         "LOOP-001" => all_of(
             row,
             vec![
-                local_start(cli, artifacts, row, "while.yaml", r#"{"value":0}"#, "3"),
+                local_start(
+                    cli,
+                    artifacts,
+                    row,
+                    "while.yaml",
+                    r#"{"value":0}"#,
+                    serde_json::json!({"value": 3}),
+                ),
                 local_start_in(
                     cli,
                     artifacts,
@@ -1461,18 +1468,25 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
                     "while-zero",
                     "while.yaml",
                     r#"{"value":5}"#,
-                    r#""value":5"#,
+                    serde_json::json!({"value": 5}),
                 ),
             ],
         ),
-        "LOOP-002" => local_start(cli, artifacts, row, "do-while.yaml", r#"{"value":0}"#, "3"),
+        "LOOP-002" => local_start(
+            cli,
+            artifacts,
+            row,
+            "do-while.yaml",
+            r#"{"value":0}"#,
+            serde_json::json!({"value": 3}),
+        ),
         "LOOP-003" => local_start(
             cli,
             artifacts,
             row,
             "repeat.yaml",
             r#"{"count":3,"counter":{"value":1}}"#,
-            "4",
+            serde_json::json!({"value": 4}),
         ),
         "LOOP-004" => from_test(evidence, row, "domain::tests::loop_limit_boundary"),
         "LOOP-005" => from_test(
@@ -1486,7 +1500,7 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             row,
             "foreach.yaml",
             r#"[{"value":3},{"value":1},{"value":3}]"#,
-            "4",
+            serde_json::json!([{"value": 4}, {"value": 2}, {"value": 4}]),
         ),
         "LOOP-007" => from_test(
             evidence,
@@ -1510,7 +1524,7 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             row,
             "parallel.yaml",
             r#"{"order_id":"o1","amount":1000}"#,
-            "100",
+            serde_json::json!([{"cents": 100}, {"cents": 500}]),
         ),
         "PAR-002" => from_test(evidence, row, "domain::tests::parallel_join_is_idempotent"),
         "PAR-003" => from_test(
@@ -1657,7 +1671,7 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             row,
             "sequence.yaml",
             r#"{"order_id":"o1","amount":1000}"#,
-            "pay-1",
+            serde_json::json!({"amount": 1000, "order_id": "o1", "payment_id": "pay-1"}),
         ),
         "ACT-002" => all_of(
             row,
@@ -1874,7 +1888,7 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             row,
             "sequence.yaml",
             r#"{"order_id":"o1","amount":1000}"#,
-            "pay-1",
+            serde_json::json!({"amount": 1000, "order_id": "o1", "payment_id": "pay-1"}),
         ),
         "LOCAL-002" => local_restart_wait(cli, artifacts, row),
         "LOCAL-003" => from_test(
@@ -1957,6 +1971,7 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
                     &evidence.driver,
                     &[
                         "tests::coverage_rejects_missing_duplicate_and_stale_cases",
+                        "tests::local_start_requires_exact_output_and_valid_run_identity",
                         "tests::sample_binary_evidence_rejects_missing_stale_and_wrong_outputs",
                         "tests::test_evidence_requires_executed_pass_and_successful_exit",
                     ],
@@ -2196,9 +2211,17 @@ fn local_start(
     row: &MatrixRow,
     yaml: &str,
     input: &str,
-    expect: &str,
+    expected: serde_json::Value,
 ) -> CaseResult {
-    local_start_in(cli, artifacts, row, "data", yaml, input, expect)
+    local_start_in(cli, artifacts, row, "data", yaml, input, expected)
+}
+
+fn local_start_matches(body: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    body["status"] == "succeeded"
+        && body.get("output") == Some(expected)
+        && body["run"]
+            .as_str()
+            .is_some_and(|run| graphrun::RunId::from_hex(run).is_ok())
 }
 
 fn local_start_in(
@@ -2208,28 +2231,35 @@ fn local_start_in(
     name: &str,
     yaml: &str,
     input: &str,
-    expect: &str,
+    expected: serde_json::Value,
 ) -> CaseResult {
     let dir = artifacts.join(format!("{}-{name}", row.id));
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::create_dir_all(&dir);
+    if dir.exists() {
+        return fail(
+            row,
+            "fresh local fixture",
+            format!("{} already exists", dir.display()),
+        );
+    }
+    if let Err(err) = fs::create_dir_all(&dir) {
+        return fail(row, "fresh local fixture", err.to_string());
+    }
     let input_path = dir.join("input.json");
-    let _ = fs::write(&input_path, input);
+    if let Err(err) = fs::write(&input_path, input) {
+        return fail(row, "local fixture input", err.to_string());
+    }
     let definition = examples().join(yaml);
     let output = Command::new(cli)
-        .args([
-            "start",
-            "--definition",
-            definition.to_str().unwrap(),
-            "--catalog",
-            catalog().to_str().unwrap(),
-            "--input",
-            input_path.to_str().unwrap(),
-            "--local-dir",
-            dir.to_str().unwrap(),
-            "--wait-ms",
-            "20000",
-        ])
+        .arg("start")
+        .arg("--definition")
+        .arg(&definition)
+        .arg("--catalog")
+        .arg(catalog())
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--local-dir")
+        .arg(&dir)
+        .args(["--wait-ms", "20000"])
         .output();
     match output {
         Ok(output) => {
@@ -2245,14 +2275,9 @@ fn local_start_in(
             }
             let body = serde_json::from_str::<serde_json::Value>(&stdout);
             let ok = output.status.success()
-                && body.as_ref().is_ok_and(|body| {
-                    body.get("status").and_then(serde_json::Value::as_str) == Some("succeeded")
-                        && (expect == "succeeded"
-                            || body
-                                .get("output")
-                                .and_then(|value| serde_json::to_string(value).ok())
-                                .is_some_and(|output| output.contains(expect)))
-                });
+                && body
+                    .as_ref()
+                    .is_ok_and(|body| local_start_matches(body, &expected));
             finish(
                 row,
                 if ok { "PASS" } else { "FAIL" },
@@ -2260,7 +2285,7 @@ fn local_start_in(
                 if ok {
                     stdout
                 } else {
-                    format!("{stdout}\n{stderr}")
+                    format!("expected output={expected}; actual={stdout}\n{stderr}")
                 },
                 vec![dir],
             )
@@ -2689,7 +2714,7 @@ fn replay_readonly(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult 
         row,
         "sequence.yaml",
         r#"{"order_id":"o1","amount":1000}"#,
-        "pay-1",
+        serde_json::json!({"amount": 1000, "order_id": "o1", "payment_id": "pay-1"}),
     );
     if started.status != "PASS" {
         return started;
@@ -2778,38 +2803,58 @@ fn e2e_all_yaml(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
         (
             "sequence.yaml",
             r#"{"order_id":"o1","amount":1000}"#,
-            "pay-1",
+            serde_json::json!({"amount": 1000, "order_id": "o1", "payment_id": "pay-1"}),
         ),
-        ("while.yaml", r#"{"value":0}"#, r#""value":3"#),
-        ("do-while.yaml", r#"{"value":0}"#, r#""value":3"#),
+        (
+            "while.yaml",
+            r#"{"value":0}"#,
+            serde_json::json!({"value": 3}),
+        ),
+        (
+            "do-while.yaml",
+            r#"{"value":0}"#,
+            serde_json::json!({"value": 3}),
+        ),
         (
             "repeat.yaml",
             r#"{"count":3,"counter":{"value":1}}"#,
-            r#""value":4"#,
+            serde_json::json!({"value": 4}),
         ),
         (
             "foreach.yaml",
             r#"[{"value":3},{"value":1},{"value":3}]"#,
-            r#""value":4"#,
+            serde_json::json!([{"value": 4}, {"value": 2}, {"value": 4}]),
         ),
         (
             "parallel.yaml",
             r#"{"order_id":"o1","amount":1000}"#,
-            r#""cents":100"#,
+            serde_json::json!([{"cents": 100}, {"cents": 500}]),
         ),
-        ("saga.yaml", r#"{"order_id":"o1","amount":1000}"#, "pay-1"),
-        ("timers.yaml", "null", "null"),
-        ("remote.yaml", r#"{"value":2}"#, r#""value":2"#),
+        (
+            "saga.yaml",
+            r#"{"order_id":"o1","amount":1000}"#,
+            serde_json::json!({"amount": 1000, "order_id": "o1", "payment_id": "pay-1"}),
+        ),
+        ("timers.yaml", "null", serde_json::Value::Null),
+        (
+            "remote.yaml",
+            r#"{"value":2}"#,
+            serde_json::json!({"value": 2}),
+        ),
         (
             "nested-controls.yaml",
             r#"[{"value":1},{"value":4}]"#,
-            r#""value":4"#,
+            serde_json::json!([[{"value": 4}, {"value": 3}], [{"value": 7}, {"value": 6}]]),
         ),
-        ("timeout-recovery.yaml", r#"{"value":1}"#, r#""value":1"#),
+        (
+            "timeout-recovery.yaml",
+            r#"{"value":1}"#,
+            serde_json::json!({"value": 1}),
+        ),
     ];
     let mut logs = Vec::new();
     let mut case_artifacts = Vec::new();
-    for (yaml, input, expect) in cases {
+    for (yaml, input, expected) in cases {
         let result = local_start_in(
             cli,
             artifacts,
@@ -2817,7 +2862,7 @@ fn e2e_all_yaml(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
             yaml.trim_end_matches(".yaml"),
             yaml,
             input,
-            expect,
+            expected,
         );
         logs.push(format!("{yaml}: {} {}", result.status, result.actual));
         case_artifacts.extend(result.artifacts.into_iter().map(PathBuf::from));
@@ -3135,7 +3180,7 @@ fn perf_command_compile(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseRe
         row,
         "sequence.yaml",
         r#"{"order_id":"o1","amount":1000}"#,
-        "pay-1",
+        serde_json::json!({"amount": 1000, "order_id": "o1", "payment_id": "pay-1"}),
     );
     let local_ms = start.elapsed().as_millis();
     if started_run.status != "PASS" {
@@ -3328,7 +3373,7 @@ fn perf_history_snapshot(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
         "nested",
         "nested-controls.yaml",
         r#"[{"value":1},{"value":4}]"#,
-        "succeeded",
+        serde_json::json!([[{"value": 4}, {"value": 3}], [{"value": 7}, {"value": 6}]]),
     );
     let nested_ms = nested_started.elapsed().as_millis();
     if nested.status != "PASS" {
@@ -3342,7 +3387,7 @@ fn perf_history_snapshot(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
         "parallel",
         "parallel.yaml",
         r#"{"order_id":"o1","amount":1000}"#,
-        "100",
+        serde_json::json!([{"cents": 100}, {"cents": 500}]),
     );
     let parallel_ms = parallel_started.elapsed().as_millis();
     if parallel.status != "PASS" {
@@ -9835,6 +9880,32 @@ mod tests {
         let mut missing = second;
         missing.artifacts = vec![run_dir.join("absent.log").display().to_string()];
         assert_eq!(enforce_case(&rows[1], missing, &run_dir).status, "FAIL");
+    }
+
+    #[test]
+    fn local_start_requires_exact_output_and_valid_run_identity() {
+        let expected = serde_json::json!({
+            "amount": 1000, "order_id": "o1", "payment_id": "pay-1"
+        });
+        let good = serde_json::json!({
+            "run": "a".repeat(32),
+            "status": "succeeded",
+            "output": expected,
+        });
+        assert!(local_start_matches(&good, &expected));
+
+        let mut wrong = good.clone();
+        wrong["output"] = serde_json::json!({
+            "expected": expected,
+            "payment_id": "pay-1",
+        });
+        assert!(!local_start_matches(&wrong, &expected));
+        wrong = good.clone();
+        wrong["run"] = serde_json::json!("not-a-run");
+        assert!(!local_start_matches(&wrong, &expected));
+        wrong = good;
+        wrong["status"] = serde_json::json!("active");
+        assert!(!local_start_matches(&wrong, &expected));
     }
 
     #[test]
