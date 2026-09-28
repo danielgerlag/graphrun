@@ -42,6 +42,7 @@ async fn run_success(
     catalog: Catalog,
     input: Value,
     event_id: EventId,
+    label: &str,
 ) -> graphrun::Result<(Value, bool)> {
     let run = engine.start(definition, catalog, input).await?;
     engine
@@ -53,7 +54,10 @@ async fn run_success(
             Value::Object(BTreeMap::from([("approved".to_owned(), Value::Bool(true))])),
         )
         .await?;
-    let output = engine.wait_terminal(run, Duration::from_secs(15)).await?;
+    let output = engine
+        .wait_terminal(run, Duration::from_secs(15))
+        .await
+        .map_err(|err| graphrun::Error::new(err.kind, format!("{label} run {run}: {err}")))?;
     let recovered = recover_succeeded(&engine.inspect(run).await?, run);
     Ok((output, recovered))
 }
@@ -63,9 +67,13 @@ async fn run_timeout(
     definition: graphrun::Definition,
     catalog: Catalog,
     input: Value,
+    label: &str,
 ) -> graphrun::Result<(Value, bool)> {
     let run = engine.start(definition, catalog, input).await?;
-    let output = engine.wait_terminal(run, Duration::from_secs(15)).await?;
+    let output = engine
+        .wait_terminal(run, Duration::from_secs(15))
+        .await
+        .map_err(|err| graphrun::Error::new(err.kind, format!("{label} run {run}: {err}")))?;
     let recovered = recover_succeeded(&engine.inspect(run).await?, run);
     Ok((output, recovered))
 }
@@ -85,6 +93,7 @@ async fn main() -> graphrun::Result<()> {
         catalog.clone(),
         input.clone(),
         EventId::from_hex("cccccccccccccccccccccccccccccccc").map_err(graphrun::Error::invalid)?,
+        "yaml success",
     )
     .await?;
     let (built_ok, built_ok_recovered) = run_success(
@@ -93,12 +102,19 @@ async fn main() -> graphrun::Result<()> {
         catalog.clone(),
         input.clone(),
         EventId::from_hex("dddddddddddddddddddddddddddddddd").map_err(graphrun::Error::invalid)?,
+        "builder success",
     )
     .await?;
-    let (yaml_timeout, yaml_timeout_recovered) =
-        run_timeout(local.engine(), yaml, catalog.clone(), input.clone()).await?;
+    let (yaml_timeout, yaml_timeout_recovered) = run_timeout(
+        local.engine(),
+        yaml,
+        catalog.clone(),
+        input.clone(),
+        "yaml timeout",
+    )
+    .await?;
     let (built_timeout, built_timeout_recovered) =
-        run_timeout(local.engine(), built, catalog, input).await?;
+        run_timeout(local.engine(), built, catalog, input, "builder timeout").await?;
     local.shutdown().await?;
     expect_value(&yaml_ok, &expected)?;
     expect_value(&built_ok, &expected)?;

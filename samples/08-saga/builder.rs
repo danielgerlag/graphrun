@@ -1,5 +1,5 @@
 use graphrun::{Catalog, Error, Value, payload, region, workflow};
-use graphrun_samples::{LocalEngine, pretty, to_value};
+use graphrun_samples::{LocalEngine, assert_same_ir, pretty, to_value};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -106,6 +106,7 @@ async fn main() -> graphrun::Result<()> {
     let catalog = Catalog::from_json(include_bytes!("catalog.json"))?;
     let yaml = graphrun::compile_yaml(YAML, &catalog)?;
     let built = build(&catalog)?;
+    assert_same_ir(&yaml, &built)?;
     let input = to_value(&Order {
         order_id: "o1".to_owned(),
         amount: 1000,

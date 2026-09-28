@@ -6,6 +6,7 @@ use graphrun::builder::{
 use graphrun::catalog::Catalog;
 use graphrun::compile_yaml;
 use graphrun::ir::Node;
+use graphrun::policy::{Backoff, RetryPolicy};
 use graphrun::schema::{DurablePayload, SchemaRef};
 use graphrun::{region, workflow};
 use serde::{Deserialize, Serialize};
@@ -249,6 +250,169 @@ fn saga_builder_compiles() {
     WorkflowBuilder::new("saga_order", 1, root)
         .build(&catalog)
         .unwrap();
+}
+
+#[test]
+fn explicit_compensation_policy_matches_yaml() {
+    let catalog = catalog();
+    let charge = catalog
+        .activity_v1::<ReservedOrder, Receipt>("payment.charge")
+        .unwrap();
+    let refund = catalog
+        .activity_v1::<Receipt, ()>("payment.refund")
+        .unwrap();
+    let retry = RetryPolicy {
+        errors: vec!["payment.refund_unavailable".to_owned()],
+        max_attempts: 3,
+        backoff: Backoff {
+            initial_ms: 1_000,
+            multiplier_millis: 2_000,
+            max_ms: 30_000,
+        },
+    };
+    let body = region::<ReservedOrder>()
+        .activity("charge", &charge)
+        .unwrap()
+        .compensate_with_retry(&refund, retry, Duration::from_secs(120))
+        .unwrap()
+        .finish()
+        .unwrap();
+    let built = workflow::<ReservedOrder>("custom_compensation")
+        .saga("saga", body)
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+    let yaml = compile_yaml(
+        r#"
+dsl: graphrun/v1
+id: custom_compensation
+version: 1
+input_schema: reserved_order/v1
+output_schema: receipt/v1
+start: saga
+nodes:
+  saga:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: reserved_order/v1
+      output_schema: receipt/v1
+      start: charge
+      nodes:
+        charge:
+          kind: activity
+          activity: {name: payment.charge, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: payment.refund, version: 1}
+            input: {from: forward.output}
+            timeout: "2m"
+            retry:
+              errors: [payment.refund_unavailable]
+              max_attempts: 3
+              backoff: {initial: "1s", multiplier: 2, max: "30s"}
+          next: done
+        done:
+          kind: complete
+          output: {from: nodes.charge.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.saga.output}
+"#,
+        &catalog,
+    )
+    .unwrap();
+    assert_eq!(execution_ir(&yaml), execution_ir(&built));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn docs_saga_yaml_and_typed_builder_match() {
+    let catalog = catalog();
+    let reserve = catalog
+        .activity_v1::<Order, ReservedOrder>("inventory.reserve")
+        .unwrap();
+    let release = catalog
+        .activity_v1::<ReservedOrder, ()>("inventory.release")
+        .unwrap();
+    let charge = catalog
+        .activity_v1::<ReservedOrder, Receipt>("payment.charge")
+        .unwrap();
+    let refund = catalog
+        .activity_v1::<Receipt, ()>("payment.refund")
+        .unwrap();
+    let abort = region::<Receipt>()
+        .fail("abort", "fixture.failed", "Failure after recorded payment.")
+        .unwrap();
+    let accept = region::<Receipt>().complete("accept").unwrap();
+    let body = region::<Order>()
+        .activity("reserve", &reserve)
+        .unwrap()
+        .compensate(&release)
+        .unwrap()
+        .activity("charge", &charge)
+        .unwrap()
+        .compensate_with_retry(
+            &refund,
+            RetryPolicy {
+                errors: vec!["payment.refund_unavailable".to_owned()],
+                max_attempts: 3,
+                backoff: Backoff {
+                    initial_ms: 1_000,
+                    multiplier_millis: 2_000,
+                    max_ms: 30_000,
+                },
+            },
+            Duration::from_secs(120),
+        )
+        .unwrap()
+        .choose("decide")
+        .when_true("force_failure", "/fail_after_payment", abort)
+        .otherwise(accept)
+        .unwrap()
+        .complete("done")
+        .unwrap();
+    let built = workflow::<Order>("compensating_fulfillment")
+        .saga("fulfill", body)
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+    let yaml = compile_yaml(
+        include_str!("../../docs/specs/v1/examples/saga.yaml"),
+        &catalog,
+    )
+    .unwrap();
+    assert_eq!(execution_ir(&yaml), execution_ir(&built));
+    let dir = tempfile::tempdir().unwrap();
+    let engine = graphrun::Engine::local(dir.path()).await.unwrap();
+    let input = graphrun::Value::from_json(serde_json::json!({
+        "order_id": "o1",
+        "amount": 1000,
+        "fail_after_payment": true
+    }))
+    .unwrap();
+    for definition in [yaml, built] {
+        let run = engine
+            .start(definition, catalog.clone(), input.clone())
+            .await
+            .unwrap();
+        let failure = engine
+            .wait_terminal(run, Duration::from_secs(15))
+            .await
+            .unwrap_err();
+        assert!(failure.message.contains("fixture.failed"), "{failure}");
+        let view = engine.inspect_json(run).await.unwrap();
+        assert_eq!(view["status"], "failed");
+        let obligations = view["obligations"].as_array().unwrap();
+        assert_eq!(obligations.len(), 2);
+        assert!(
+            obligations
+                .iter()
+                .all(|obligation| obligation["status"] == "compensated")
+        );
+    }
+    engine.shutdown().await.unwrap();
 }
 
 #[test]

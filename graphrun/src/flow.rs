@@ -12,6 +12,7 @@ use crate::builder::{
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::ir::Definition;
+use crate::policy::RetryPolicy;
 use crate::schema::DurablePayload;
 use crate::value::Value;
 use std::time::Duration;
@@ -108,6 +109,21 @@ impl<I: DurablePayload, Cur: DurablePayload> Sequence<I, Cur> {
             .as_ref()
             .ok_or_else(|| Error::invalid("compensate must follow an activity"))?;
         self.inner.compensate(node, activity)?;
+        Ok(self)
+    }
+
+    pub fn compensate_with_retry<U: DurablePayload>(
+        mut self,
+        activity: &ActivityRef<Cur, U>,
+        retry: RetryPolicy,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let node = self
+            .last_activity
+            .as_ref()
+            .ok_or_else(|| Error::invalid("compensate must follow an activity"))?;
+        self.inner
+            .compensate_with_retry(node, activity, retry, timeout)?;
         Ok(self)
     }
 
@@ -250,6 +266,18 @@ impl<I: DurablePayload, Cur: DurablePayload> Workflow<I, Cur> {
         Ok(Workflow {
             name: self.name,
             seq: self.seq.compensate(activity)?,
+        })
+    }
+
+    pub fn compensate_with_retry<U: DurablePayload>(
+        self,
+        activity: &ActivityRef<Cur, U>,
+        retry: RetryPolicy,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Ok(Workflow {
+            name: self.name,
+            seq: self.seq.compensate_with_retry(activity, retry, timeout)?,
         })
     }
 

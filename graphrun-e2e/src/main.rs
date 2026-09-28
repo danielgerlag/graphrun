@@ -78,6 +78,12 @@ enum Commands {
         #[arg(long)]
         artifacts: PathBuf,
     },
+    SmokeApplication {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
     ContractWorkerProof {
         #[arg(long)]
         cli: PathBuf,
@@ -187,6 +193,53 @@ struct RelatedBinary {
     run_id: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct SampleBinaryEvidence {
+    bin: String,
+    binary: PathBuf,
+    sha256_before: String,
+    sha256_after: String,
+    source_sha256: String,
+    run_id: String,
+    command: String,
+    expected: String,
+    stdout: String,
+    log: PathBuf,
+    elapsed_ms: u128,
+    success: bool,
+}
+
+const SAMPLE_CASES: [(&str, &str); 10] = [
+    ("01-hello-world", "hello-world {\"value\":2}"),
+    (
+        "02-passing-data",
+        "passing-data {\"amount\":1000,\"order_id\":\"o1\",\"payment_id\":\"pay-1\"}",
+    ),
+    ("03-events", "events {\"approved\":true}"),
+    (
+        "04-while",
+        "while from 0 -> {\"value\":3} ; from 5 -> {\"value\":5}",
+    ),
+    (
+        "05-foreach",
+        "foreach [{\"value\":4},{\"value\":2},{\"value\":4}]",
+    ),
+    (
+        "06-choice",
+        "choice value=1 -> {\"value\":2} ; value=7 -> {\"value\":7}",
+    ),
+    ("07-parallel", "parallel [{\"cents\":100},{\"cents\":500}]"),
+    (
+        "08-saga",
+        "yaml failed after payment; compensated=2\nbuilder failed after payment; compensated=2",
+    ),
+    ("09-repeat", "repeat {\"value\":4}"),
+    (
+        "10-timeout-recovery",
+        "timeout-recovery success {\"value\":0} ; timeout {\"value\":0}",
+    ),
+];
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 struct PerformanceEvidence {
     hardware: String,
@@ -220,6 +273,9 @@ fn main() -> ExitCode {
         }
         Commands::SmokeResourceCost { cli, artifacts } => {
             smoke_case(&cli, &artifacts, "PERF-002", perf_history_snapshot)
+        }
+        Commands::SmokeApplication { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "E2E-001", e2e_complete_application)
         }
         Commands::ContractWorkerProof { cli, artifacts } => {
             focused_contract_worker_proof(&cli, &artifacts)
@@ -852,6 +908,59 @@ fn validate_related_binaries(
     Ok(())
 }
 
+fn validate_sample_binaries(
+    result: &CaseResult,
+    run_dir: &Path,
+    context: &RunContext,
+) -> Result<(), String> {
+    validate_sample_binaries_at(result, run_dir, context, &sample_target_dir())
+}
+
+fn validate_sample_binaries_at(
+    result: &CaseResult,
+    run_dir: &Path,
+    context: &RunContext,
+    target_dir: &Path,
+) -> Result<(), String> {
+    let manifest = run_dir.join("E2E-001-samples").join("sample-binaries.json");
+    let entries: Vec<SampleBinaryEvidence> = serde_json::from_slice(
+        &fs::read(&manifest).map_err(|err| format!("sample manifest: {err}"))?,
+    )
+    .map_err(|err| format!("sample manifest: {err}"))?;
+    if entries.len() != SAMPLE_CASES.len() {
+        return Err(format!(
+            "E2E-001 requires {} sample binaries",
+            SAMPLE_CASES.len()
+        ));
+    }
+    let root = fs::canonicalize(run_dir).map_err(|err| err.to_string())?;
+    for (entry, (bin, expected)) in entries.iter().zip(SAMPLE_CASES) {
+        let target = target_dir.join(format!("{bin}{}", std::env::consts::EXE_SUFFIX));
+        let log = fs::canonicalize(&entry.log).map_err(|err| err.to_string())?;
+        if entry.bin != bin
+            || entry.run_id != context.run_id
+            || entry.source_sha256 != context.source_sha256
+            || entry.command != target.display().to_string()
+            || entry.binary != target
+            || !entry.success
+            || entry.sha256_before != entry.sha256_after
+            || entry.expected != expected
+            || entry.stdout.trim() != expected
+            || !log.starts_with(&root)
+            || !result
+                .artifacts
+                .iter()
+                .any(|artifact| fs::canonicalize(artifact).is_ok_and(|saved| saved == log))
+            || hash_file(&entry.binary)? != entry.sha256_after
+        {
+            return Err(format!(
+                "E2E-001 {bin} has stale, missing, or mismatched execution evidence"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_coverage(
     rows: &[MatrixRow],
     results: &[CaseResult],
@@ -908,6 +1017,9 @@ fn validate_coverage(
                 "{} has unexpected related binary records",
                 result.id
             ));
+        }
+        if result.status == "PASS" && result.id == "E2E-001" {
+            validate_sample_binaries(result, run_dir, context)?;
         }
         let path = run_dir.join(format!("{}.json", result.id));
         let bytes = fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))?;
@@ -1235,7 +1347,14 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             ],
         ),
         "API-002" => from_suite(row, &evidence.ui, &[]),
-        "API-003" => from_api_test(evidence, row, "yaml_and_builder_while_match"),
+        "API-003" => from_suite(
+            row,
+            &evidence.api,
+            &[
+                "yaml_and_builder_while_match",
+                "docs_saga_yaml_and_typed_builder_match",
+            ],
+        ),
         "API-004" => from_api_test(evidence, row, "field_path_and_cross_scope_errors"),
         "API-005" => from_api_test(
             evidence,
@@ -1654,13 +1773,7 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             row,
             "domain::tests::expired_history_range_is_unavailable",
         ),
-        "E2E-001" => all_of(
-            row,
-            vec![
-                e2e_all_yaml(cli, artifacts, row),
-                rust_builder_sequence(artifacts, row),
-            ],
-        ),
+        "E2E-001" => e2e_complete_application(cli, artifacts, row),
         "E2E-002" => e2e_no_ready_scan(cli, artifacts, row),
         "PERF-001" => perf_command_compile(cli, artifacts, row),
         "PERF-002" => perf_history_snapshot(cli, artifacts, row),
@@ -1669,6 +1782,7 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             &evidence.driver,
             &[
                 "tests::coverage_rejects_missing_duplicate_and_stale_cases",
+                "tests::sample_binary_evidence_rejects_missing_stale_and_wrong_outputs",
                 "tests::test_evidence_requires_executed_pass_and_successful_exit",
             ],
         ),
@@ -2434,6 +2548,17 @@ fn replay_readonly(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult 
         "graphrun replay --local-dir",
         stdout,
         vec![dir],
+    )
+}
+
+fn e2e_complete_application(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
+    all_of(
+        row,
+        vec![
+            e2e_all_yaml(cli, artifacts, row),
+            rust_builder_sequence(artifacts, row),
+            rust_samples_equivalent(artifacts, row),
+        ],
     )
 }
 
@@ -8061,6 +8186,128 @@ fn rust_builder_sequence(artifacts: &Path, row: &MatrixRow) -> CaseResult {
     }
 }
 
+fn sample_target_dir() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"))
+        .join("debug")
+}
+
+fn rust_samples_equivalent(artifacts: &Path, row: &MatrixRow) -> CaseResult {
+    let dir = artifacts.join(format!("{}-samples", row.id));
+    if let Err(err) = fs::create_dir_all(&dir) {
+        return fail(row, "same-run Rust sample evidence", err.to_string());
+    }
+    let source_sha256 = match source_fingerprint(artifacts) {
+        Ok(hash) => hash,
+        Err(err) => return fail(row, "sample source fingerprint", err),
+    };
+    let run_id = match artifacts.file_name().and_then(|name| name.to_str()) {
+        Some(run_id) => run_id,
+        None => {
+            return fail(
+                row,
+                "sample run identity",
+                "run directory has no UTF-8 name",
+            );
+        }
+    };
+    let build_command = "cargo build --locked -p graphrun-samples --bins";
+    let build = match Command::new("cargo")
+        .args(["build", "--locked", "-p", "graphrun-samples", "--bins"])
+        .output()
+    {
+        Ok(build) => build,
+        Err(err) => return fail(row, build_command, err.to_string()),
+    };
+    let build_log = dir.join("cargo-build.log");
+    if let Err(err) = fs::write(
+        &build_log,
+        [build.stdout.as_slice(), build.stderr.as_slice()].concat(),
+    ) {
+        return fail(row, build_command, format!("cannot write build log: {err}"));
+    }
+    if !build.status.success() {
+        return finish(
+            row,
+            "FAIL",
+            build_command,
+            format!(
+                "sample build exited {}; see {}",
+                build.status,
+                build_log.display()
+            ),
+            vec![dir, build_log],
+        );
+    }
+    let mut observations = Vec::new();
+    let mut failures = Vec::new();
+    let mut evidence = vec![dir.clone(), build_log];
+    for (bin, expected) in SAMPLE_CASES {
+        let binary = sample_target_dir().join(format!("{bin}{}", std::env::consts::EXE_SUFFIX));
+        let before = hash_file(&binary);
+        let started = Instant::now();
+        let (ok, stdout, stderr) = match &before {
+            Ok(_) => run_cli_timeout(&binary, &[], Duration::from_secs(45)),
+            Err(err) => (
+                false,
+                String::new(),
+                format!("sample binary unavailable: {err}"),
+            ),
+        };
+        let after = hash_file(&binary);
+        let log = dir.join(format!("{bin}.log"));
+        if let Err(err) = fs::write(&log, format!("{stdout}\n{stderr}")) {
+            return fail(row, "same-run Rust sample log", err.to_string());
+        }
+        evidence.push(log.clone());
+        let identical = before
+            .as_ref()
+            .is_ok_and(|digest| after.as_ref().is_ok_and(|actual| digest == actual));
+        if !ok || stdout.trim() != expected || !identical {
+            failures.push(format!(
+                "{bin}: expected {expected:?}, observed {:?}, exit success={ok}, binary stable={identical}; see {}",
+                stdout.trim(),
+                log.display(),
+            ));
+        }
+        observations.push(SampleBinaryEvidence {
+            bin: bin.to_owned(),
+            binary: binary.clone(),
+            sha256_before: before.unwrap_or_else(|err| format!("UNAVAILABLE: {err}")),
+            sha256_after: after.unwrap_or_else(|err| format!("UNAVAILABLE: {err}")),
+            source_sha256: source_sha256.clone(),
+            run_id: run_id.to_owned(),
+            command: binary.display().to_string(),
+            expected: expected.to_owned(),
+            stdout,
+            log,
+            elapsed_ms: started.elapsed().as_millis(),
+            success: ok,
+        });
+    }
+    let manifest = dir.join("sample-binaries.json");
+    if let Err(err) = serde_json::to_vec_pretty(&observations)
+        .map_err(|err| err.to_string())
+        .and_then(|bytes| fs::write(&manifest, bytes).map_err(|err| err.to_string()))
+    {
+        return fail(row, "same-run Rust sample manifest", err);
+    }
+    evidence.push(manifest);
+    finish(
+        row,
+        if failures.is_empty() { "PASS" } else { "FAIL" },
+        build_command,
+        if failures.is_empty() {
+            "ten current-source sample binaries matched YAML/Rust IR and exact expected outputs"
+                .to_owned()
+        } else {
+            failures.join("; ")
+        },
+        evidence,
+    )
+}
+
 fn disaster_restore_cli(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
     let dir = artifacts.join(format!("{}-cli", row.id));
     let _ = fs::remove_dir_all(&dir);
@@ -8825,6 +9072,73 @@ mod tests {
         let mut missing = second;
         missing.artifacts = vec![run_dir.join("absent.log").display().to_string()];
         assert_eq!(enforce_case(&rows[1], missing, &run_dir).status, "FAIL");
+    }
+
+    #[test]
+    fn sample_binary_evidence_rejects_missing_stale_and_wrong_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("run-current");
+        let samples = run_dir.join("E2E-001-samples");
+        let target = temp.path().join("debug");
+        fs::create_dir_all(&samples).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let context = context(&run_dir);
+        let mut case = passing_case(&row("E2E-001"), &run_dir, &context);
+        let manifest = samples.join("sample-binaries.json");
+        case.artifacts.push(manifest.display().to_string());
+        let mut entries: Vec<_> = SAMPLE_CASES
+            .iter()
+            .map(|(bin, expected)| {
+                let binary = target.join(format!("{bin}{}", std::env::consts::EXE_SUFFIX));
+                let log = samples.join(format!("{bin}.log"));
+                fs::write(&binary, bin).unwrap();
+                fs::write(&log, expected).unwrap();
+                case.artifacts.push(log.display().to_string());
+                SampleBinaryEvidence {
+                    bin: (*bin).to_owned(),
+                    binary: binary.clone(),
+                    sha256_before: hash_file(&binary).unwrap(),
+                    sha256_after: hash_file(&binary).unwrap(),
+                    source_sha256: context.source_sha256.clone(),
+                    run_id: context.run_id.clone(),
+                    command: binary.display().to_string(),
+                    expected: (*expected).to_owned(),
+                    stdout: (*expected).to_owned(),
+                    log,
+                    elapsed_ms: 1,
+                    success: true,
+                }
+            })
+            .collect();
+        let save = |entries: &[SampleBinaryEvidence]| {
+            fs::write(&manifest, serde_json::to_vec(entries).unwrap()).unwrap();
+        };
+        save(&entries);
+        assert!(validate_sample_binaries_at(&case, &run_dir, &context, &target).is_ok());
+
+        let last = entries.pop().unwrap();
+        save(&entries);
+        assert!(
+            validate_sample_binaries_at(&case, &run_dir, &context, &target)
+                .unwrap_err()
+                .contains("requires 10")
+        );
+        entries.push(last);
+        entries[0].stdout = "wrong output".to_owned();
+        save(&entries);
+        assert!(
+            validate_sample_binaries_at(&case, &run_dir, &context, &target)
+                .unwrap_err()
+                .contains("mismatched")
+        );
+        entries[0].stdout = entries[0].expected.clone();
+        save(&entries);
+        fs::write(&entries[0].binary, "changed after execution").unwrap();
+        assert!(
+            validate_sample_binaries_at(&case, &run_dir, &context, &target)
+                .unwrap_err()
+                .contains("stale")
+        );
     }
 
     #[cfg(unix)]
