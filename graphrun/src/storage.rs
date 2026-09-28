@@ -1308,7 +1308,7 @@ fn storage_thread(
     schedule_watch.send_replace(schedule_revision);
     let _ = ready.send(Ok(()));
     while let Some(req) = deferred.pop_front().or_else(|| {
-        if app_gc_pending {
+        if app_gc_pending || gc_pending || cleanup_pending {
             Some(rx.try_recv().unwrap_or(Req::Reap))
         } else {
             rx.blocking_recv()
@@ -6042,6 +6042,56 @@ nodes:
         let visible = load_app_generation(&db, 1).unwrap();
         assert!(!visible.history.contains_key(&run));
         assert!(!visible.terminal_summaries.contains_key(&run));
+    }
+
+    #[test]
+    fn storage_owner_finishes_retired_gc_without_new_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let run = crate::ids::RunId::from_bytes([93; 16]);
+        let txn = begin_immediate(&db).unwrap();
+        {
+            let mut table = txn.open_table(APP_ROWS).unwrap();
+            let (marker, value) = record_store::retired_marker(1, 1, run).unwrap();
+            table.insert(marker.as_str(), value.as_slice()).unwrap();
+            for index in 1..=4_100u64 {
+                let (key, value) = record_store::encode_value(
+                    1,
+                    1,
+                    Some(run),
+                    "history",
+                    "sequence",
+                    &format!("{index:020}"),
+                    serde_json::Value::from(index),
+                )
+                .unwrap();
+                table.insert(key.as_str(), value.as_slice()).unwrap();
+            }
+        }
+        commit_immediate(txn).unwrap();
+        drop(db);
+        let (handle, owner) = StorageHandle::open(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        handle.shutdown();
+        owner.join().unwrap();
+        let db = Database::open(&path).unwrap();
+        let table = db.begin_read().unwrap();
+        let rows = table.open_table(APP_ROWS).unwrap();
+        let prefix = format!("{:016x}/run-{}/", 1, run.to_hex());
+        assert!(
+            !rows
+                .range(prefix.as_str()..)
+                .unwrap()
+                .next()
+                .is_some_and(|row| row.unwrap().0.value().starts_with(&prefix))
+        );
+        assert!(
+            rows.get(record_store::retired_key(1, run).as_str())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
