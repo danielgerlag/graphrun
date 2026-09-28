@@ -2009,6 +2009,14 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             row,
             vec![
                 contract_artifact_proof(cli, artifacts, row),
+                from_tests(
+                    evidence,
+                    row,
+                    &[
+                        "engine::tests::restore_rejects_retained_definition_corruption_with_valid_snapshot_checksums",
+                        "engine::tests::restore_rejects_unused_publications_with_valid_snapshot_checksums",
+                    ],
+                ),
                 from_suite(
                     row,
                     &evidence.publication,
