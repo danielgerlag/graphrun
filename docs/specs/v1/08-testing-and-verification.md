@@ -129,7 +129,17 @@ Instrument all ready-index discovery reads and scheduler wake causes. Assert tha
 
 Consensus heartbeats, clock-health probes, active lease renewal, and known retention deadlines are separate categories. They must not re-enumerate workflow readiness as a side effect.
 
-`E2E-002` starts three voting members and two independent workers, then leaves a run active at an indefinite signal wait. The driver reads each member's `ready_index_discovery_reads`, `schedule_revision`, and `scheduler_wake_causes` through its local control socket after all members have applied the wait. It compares those readings after a full 60-second observation, while confirming that the run remains active with a pending wait. A completed local run is not evidence for this case.
+`E2E-002` starts three voting members and two independent workers, then leaves a
+run active at an indefinite signal wait. Before observing it, the driver
+requires caught-up voters, a healthy leader, live worker PIDs, and an
+observed scheduler revision. It reads each member's
+`ready_index_discovery_reads`, `schedule_revision`, and
+`scheduler_wake_causes` through its local control socket. After 60 seconds,
+the run must still have its pending wait, the workers must still be alive,
+the revisions must match, wake counters cannot reset, and no member's
+ready-index discovery reads may increase. Applied log progress confirms that
+the observation did not merely stop all activity. A completed local run
+cannot satisfy this case.
 
 ## Required commands
 
