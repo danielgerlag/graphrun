@@ -1238,6 +1238,10 @@ struct Evidence {
     api: TestSuite,
     ui: TestSuite,
     crash: TestSuite,
+    publication: TestSuite,
+    history: TestSuite,
+    signed: TestSuite,
+    worker: TestSuite,
     driver: TestSuite,
 }
 
@@ -1283,6 +1287,62 @@ fn collect_evidence(run_dir: &Path) -> Result<Evidence, String> {
                 "crash_cut",
                 "--features",
                 "fault-injection",
+                "--locked",
+                "--color",
+                "never",
+            ],
+        )?,
+        publication: TestSuite::run(
+            run_dir,
+            "publication",
+            &[
+                "test",
+                "-p",
+                "graphrun",
+                "--test",
+                "publication_start",
+                "--locked",
+                "--color",
+                "never",
+            ],
+        )?,
+        history: TestSuite::run(
+            run_dir,
+            "history",
+            &[
+                "test",
+                "-p",
+                "graphrun",
+                "--test",
+                "history_replay",
+                "--locked",
+                "--color",
+                "never",
+            ],
+        )?,
+        signed: TestSuite::run(
+            run_dir,
+            "signed",
+            &[
+                "test",
+                "-p",
+                "graphrun",
+                "--test",
+                "signed_history",
+                "--locked",
+                "--color",
+                "never",
+            ],
+        )?,
+        worker: TestSuite::run(
+            run_dir,
+            "worker",
+            &[
+                "test",
+                "-p",
+                "graphrun",
+                "--test",
+                "worker_sdk",
                 "--locked",
                 "--color",
                 "never",
@@ -1591,22 +1651,45 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             r#"{"order_id":"o1","amount":1000}"#,
             "pay-1",
         ),
-        "ACT-002" => from_test(
-            evidence,
+        "ACT-002" => all_of(
             row,
-            "engine::tests::blocking_cancel_does_not_prove_termination",
+            vec![
+                from_test(
+                    evidence,
+                    row,
+                    "engine::tests::blocking_cancel_does_not_prove_termination",
+                ),
+                from_suite(
+                    row,
+                    &evidence.worker,
+                    &["blocking_handler_renews_past_initial_lease"],
+                ),
+            ],
         ),
         "ACT-007" => from_test(
             evidence,
             row,
             "domain::tests::renewal_does_not_extend_attempt_deadline",
         ),
-        "ACT-004" => from_tests(
-            evidence,
+        "ACT-004" => all_of(
             row,
-            &[
-                "domain::tests::loop_retry_is_not_another_iteration",
-                "domain::tests::terminal_error_does_not_retry",
+            vec![
+                from_tests(
+                    evidence,
+                    row,
+                    &[
+                        "domain::tests::loop_retry_is_not_another_iteration",
+                        "domain::tests::terminal_error_does_not_retry",
+                    ],
+                ),
+                from_suite(
+                    row,
+                    &evidence.worker,
+                    &[
+                        "typed_error_retries_with_same_effect_identity",
+                        "lost_ack_after_committed_report_retries_exact_result",
+                    ],
+                ),
             ],
         ),
         "ACT-008" => from_test(
@@ -1633,10 +1716,25 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
                     row,
                     "cluster::tests::remote_recon_and_idempotent_effect",
                 ),
+                from_suite(
+                    row,
+                    &evidence.worker,
+                    &["remote_reconciler_records_all_three_outcomes"],
+                ),
                 provider_recon_outcomes(cli, artifacts, row),
             ],
         ),
-        "ACT-006" => provider_idempotent_effect(cli, artifacts, row),
+        "ACT-006" => all_of(
+            row,
+            vec![
+                from_suite(
+                    row,
+                    &evidence.worker,
+                    &["lost_result_retries_same_external_effect_key"],
+                ),
+                provider_idempotent_effect(cli, artifacts, row),
+            ],
+        ),
         "POLICY-001" => from_test(
             evidence,
             row,
@@ -1708,6 +1806,11 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
                     row,
                     "cluster::tests::leader_loss_does_not_reset_ready_work",
                 ),
+                from_suite(
+                    row,
+                    &evidence.worker,
+                    &["worker_keeps_assignment_across_leader_change"],
+                ),
                 cluster_leader_kill_keeps_result(cli, artifacts, row),
             ],
         ),
@@ -1733,7 +1836,18 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
                 cluster_quorum_loss(cli, artifacts, row),
             ],
         ),
-        "CLUSTER-004" => from_test(evidence, row, "cluster::tests::clock_rollback_fails_closed"),
+        "CLUSTER-004" => from_tests(
+            evidence,
+            row,
+            &[
+                "clock::tests::rollback_and_suspend_latch_fault_without_lowering_watermark",
+                "clock::tests::watchdog_gap_is_strictly_greater_than_two_seconds",
+                "cluster::tests::clock_rollback_fails_closed",
+                "cluster::tests::clock_fault_leaves_committed_state_and_a_healthy_voter_takes_over",
+                "cluster::tests::clock_fault_persists_until_admin_ack_after_healthy_window",
+                "cluster::tests::committed_voter_accepts_request_only_after_fresh_clock_quorum",
+            ],
+        ),
         "CLUSTER-006" => from_test(
             evidence,
             row,
@@ -1760,12 +1874,35 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             row,
             "engine::tests::second_local_owner_is_rejected",
         ),
-        "REPLAY-001" => from_test(
-            evidence,
+        "REPLAY-001" => all_of(
             row,
-            "domain::tests::reconstruct_matches_live_state",
+            vec![
+                from_test(
+                    evidence,
+                    row,
+                    "domain::tests::reconstruct_matches_live_state",
+                ),
+                from_suite(
+                    row,
+                    &evidence.history,
+                    &["pages_control_replay_and_restart_agree_without_dispatch"],
+                ),
+            ],
         ),
-        "REPLAY-002" => replay_readonly(cli, artifacts, row),
+        "REPLAY-002" => all_of(
+            row,
+            vec![
+                replay_readonly(cli, artifacts, row),
+                from_suite(
+                    row,
+                    &evidence.history,
+                    &[
+                        "as_of_wait_reservation_and_delivery_uses_recorded_signal_only",
+                        "as_of_compensation_is_not_reexecuted",
+                    ],
+                ),
+            ],
+        ),
         "REPLAY-004" => all_of(
             row,
             vec![
@@ -1775,24 +1912,51 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
                     row,
                     "engine::tests::snapshot_controller_fires_at_20000_entries",
                 ),
+                from_suite(
+                    row,
+                    &evidence.history,
+                    &["pages_control_replay_and_restart_agree_without_dispatch"],
+                ),
             ],
         ),
-        "REPLAY-003" => from_test(
-            evidence,
+        "REPLAY-003" => all_of(
             row,
-            "domain::tests::expired_history_range_is_unavailable",
+            vec![
+                from_test(
+                    evidence,
+                    row,
+                    "domain::tests::expired_history_range_is_unavailable",
+                ),
+                from_suite(
+                    row,
+                    &evidence.history,
+                    &[
+                        "committed_retention_keeps_tombstones_and_drops_typed_outputs",
+                        "missing_or_unknown_record_and_artifact_versions_fail_closed",
+                    ],
+                ),
+            ],
         ),
         "E2E-001" => e2e_complete_application(cli, artifacts, row),
         "E2E-002" => e2e_no_ready_scan(cli, artifacts, row),
         "PERF-001" => perf_command_compile(cli, artifacts, row),
         "PERF-002" => perf_history_snapshot(cli, artifacts, row),
-        "GATE-001" => from_suite(
+        "GATE-001" => all_of(
             row,
-            &evidence.driver,
-            &[
-                "tests::coverage_rejects_missing_duplicate_and_stale_cases",
-                "tests::sample_binary_evidence_rejects_missing_stale_and_wrong_outputs",
-                "tests::test_evidence_requires_executed_pass_and_successful_exit",
+            vec![
+                from_suite(
+                    row,
+                    &evidence.driver,
+                    &[
+                        "tests::coverage_rejects_missing_duplicate_and_stale_cases",
+                        "tests::sample_binary_evidence_rejects_missing_stale_and_wrong_outputs",
+                        "tests::test_evidence_requires_executed_pass_and_successful_exit",
+                    ],
+                ),
+                from_suite(row, &evidence.publication, &[]),
+                from_suite(row, &evidence.history, &[]),
+                from_suite(row, &evidence.signed, &[]),
+                from_suite(row, &evidence.worker, &[]),
             ],
         ),
         "GATE-002" => from_suite(
@@ -1804,8 +1968,35 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             ],
         ),
         "GATE-003" => release_artifact_and_workers(cli, artifacts, row),
-        "CONTRACT-003" => contract_worker_proof(cli, artifacts, row),
-        "CONTRACT-001" => contract_artifact_proof(cli, artifacts, row),
+        "CONTRACT-003" => all_of(
+            row,
+            vec![
+                contract_worker_proof(cli, artifacts, row),
+                from_suite(
+                    row,
+                    &evidence.signed,
+                    &[
+                        "signed_client_and_worker_causes_are_durable_and_not_spoofable",
+                        "signed_worker_receipts_are_scoped_and_reusable_after_restart",
+                    ],
+                ),
+            ],
+        ),
+        "CONTRACT-001" => all_of(
+            row,
+            vec![
+                contract_artifact_proof(cli, artifacts, row),
+                from_suite(
+                    row,
+                    &evidence.publication,
+                    &[
+                        "concurrent_immutable_publish_and_pinned_latest_survive_restart",
+                        "command_result_dedup_rejection_and_event_range_are_durable",
+                        "signed_principal_publishes_and_starts_over_grpc_with_scoped_receipts",
+                    ],
+                ),
+            ],
+        ),
         "CONTRACT-002" => fail(
             row,
             "contract acceptance",

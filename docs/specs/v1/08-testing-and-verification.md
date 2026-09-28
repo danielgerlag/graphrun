@@ -209,6 +209,11 @@ Each result records status, command/configuration, binary/version identifiers, d
 
 The final `verify` command must be self-contained. It runs the required test targets or collects their per-case evidence within the same fresh verification run. It must not infer unit/property/compile coverage from an unrelated earlier Cargo exit code.
 
+The driver runs `graphrun` library, API, compile-fail UI, fault-cut,
+publication, history, signed-history, and worker SDK tests, plus its own gate
+tests, in that invocation. `GATE-001` rejects a failed integration suite even
+when no other matrix row names its failing test.
+
 Give each test case its own evidence file and aggregate afterward. Bind
 evidence to a fresh run ID and current source/binary fingerprints. Require
 successful test processes and executed named tests, not matching log text
