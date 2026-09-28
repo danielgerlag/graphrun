@@ -164,6 +164,10 @@ enum Commands {
         #[arg(long)]
         local_dir: PathBuf,
     },
+    Compact {
+        #[arg(long)]
+        local_dir: PathBuf,
+    },
     Restore {
         #[arg(long)]
         from: PathBuf,
@@ -637,6 +641,23 @@ async fn run() -> Result<(), String> {
                 serde_json::json!({"status":"ok","from": local_dir.display().to_string()})
             );
             Ok(())
+        }
+        Commands::Compact { local_dir } => {
+            let outcome = graphrun::storage::compact_offline(local_dir.join("member.redb"))
+                .map_err(|err| err.to_string())?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": if outcome.complete { "ok" } else { "incomplete" },
+                    "passes": outcome.passes,
+                    "local_dir": local_dir.display().to_string(),
+                })
+            );
+            if outcome.complete {
+                Ok(())
+            } else {
+                Err("offline compaction stopped after 16 passes; rerun to finish".to_owned())
+            }
         }
         Commands::Restore {
             from,

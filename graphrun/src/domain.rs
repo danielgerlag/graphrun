@@ -324,6 +324,9 @@ pub enum CommandBody {
         activities: Vec<String>,
         capacity: u32,
     },
+    RenewLocalSession {
+        session: WorkerSessionId,
+    },
     RegisterWorker {
         session: WorkerSessionId,
         principal_id: String,
@@ -527,6 +530,8 @@ pub struct RunState {
     pub root: ScopeId,
     pub next_sequence: RunSequence,
     #[serde(default)]
+    pub next_ready_order: u64,
+    #[serde(default)]
     pub admitted_ms: u64,
     #[serde(default)]
     pub terminal_ms: u64,
@@ -574,6 +579,8 @@ pub struct ActivationState {
     pub claim: Option<ClaimState>,
     #[serde(default)]
     pub attempts: u32,
+    #[serde(default)]
+    pub ready_order: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -666,6 +673,10 @@ pub struct InboxEntry {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
+    pub current_cluster_id: String,
+    #[serde(default)]
+    pub artifact_origins: std::collections::BTreeSet<String>,
+    #[serde(default)]
     pub engine_time_watermark_ms: u64,
     pub runs: HashMap<RunId, RunState>,
     pub scopes: HashMap<ScopeId, ScopeState>,
@@ -718,6 +729,8 @@ pub struct State {
     pub sessions: HashMap<WorkerSessionId, WorkerSession>,
     #[serde(default)]
     pub next_generation: u64,
+    #[serde(default)]
+    pub fair_cursor: Option<RunId>,
     #[serde(default)]
     pub interventions: HashMap<ActivationId, String>,
     #[serde(default)]
@@ -824,6 +837,31 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             activities,
             capacity,
         } => decide_register(state, *session, activities, *capacity, command.time),
+        CommandBody::RenewLocalSession { session } => {
+            let worker = state.sessions.get(session).ok_or_else(|| {
+                Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "unknown local session",
+                )
+            })?;
+            if !worker.principal_id.is_empty() || command.time.as_millis() >= worker.expires_ms {
+                return Err(Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "local worker session expired or is not local",
+                ));
+            }
+            Ok(Decision {
+                events: vec![DomainEvent::SessionRegistered {
+                    session: *session,
+                    activities: worker.activities.clone(),
+                    capacity: worker.capacity,
+                    expires_ms: command
+                        .time
+                        .as_millis()
+                        .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64),
+                }],
+            })
+        }
         CommandBody::RegisterWorker {
             session,
             principal_id,
@@ -1633,7 +1671,7 @@ pub fn worker_has_ready(state: &State, session: WorkerSessionId, time: EngineTim
         .sessions
         .get(&session)
         .ok_or_else(|| Error::invalid("unknown worker session"))?;
-    if worker.principal_id.is_empty() || time.as_millis() >= worker.expires_ms {
+    if time.as_millis() >= worker.expires_ms {
         return Err(Error::new(
             crate::error::ErrorKind::FailedPrecondition,
             "worker session expired",
@@ -1717,6 +1755,11 @@ fn decide_claim(
         return Ok(Decision { events });
     }
     runs.sort();
+    if let Some(last) = state.fair_cursor {
+        let next = runs.partition_point(|run| *run <= last);
+        let offset = next % runs.len();
+        runs.rotate_left(offset);
+    }
     let mut granted_ids = Vec::new();
     while granted < cap {
         let mut progressed = false;
@@ -1725,7 +1768,10 @@ fn decide_claim(
                 break;
             }
             let mut ready = unclaimed_ready(state, *run, time);
-            ready.sort();
+            ready.sort_by_key(|id| {
+                let act = &state.activations[id];
+                (act.ready_order, *id)
+            });
             let mut selected = None;
             for id in ready {
                 if granted_ids.contains(&id) {
@@ -2279,7 +2325,11 @@ fn decide_signal(
         if existing.signal == signal
             && existing.key == key
             && existing.payload
-                == crate::history::ArtifactRef::capture("graphrun.signal-payload/v1", &payload)?
+                == crate::history::ArtifactRef::capture_in(
+                    &existing.payload.cluster_id,
+                    "graphrun.signal-payload/v1",
+                    &payload,
+                )?
         {
             return Ok(Decision { events: Vec::new() });
         }
@@ -2292,7 +2342,11 @@ fn decide_signal(
         .runs
         .get(&run)
         .ok_or_else(|| Error::invalid("unknown run"))?;
-    if let Some(existing) = state.inbox.iter().find(|entry| entry.event_id == event_id) {
+    if let Some(existing) = state
+        .inbox
+        .iter()
+        .find(|entry| entry.run == Some(run) && entry.event_id == event_id)
+    {
         if existing.signal == signal && existing.key == key && existing.payload == payload {
             return Ok(Decision { events: Vec::new() });
         }
@@ -2555,6 +2609,13 @@ fn next_progress(
                 }]));
             }
             Node::WaitUntil { at, next } => {
+                if state
+                    .waits
+                    .values()
+                    .any(|wait| wait.activation == act.id && wait.pending)
+                {
+                    continue;
+                }
                 let scope = state.scopes.get(&act.scope).unwrap();
                 let at = match eval_binding(at, &eval_ctx(state, scope))? {
                     Value::Int(v) if v >= 0 => v as u64,
@@ -2567,6 +2628,15 @@ fn next_progress(
                 if time.as_millis() >= at {
                     return Ok(Some(open_node(state, act.scope, next, ids)?));
                 }
+                return Ok(Some(vec![DomainEvent::WaitOpened {
+                    run,
+                    wait: ids.wait(),
+                    activation: act.id,
+                    signal: "__timer".to_owned(),
+                    key: act.id.to_hex(),
+                    deadline_ms: Some(at),
+                    consume_from: ConsumeFrom::AfterActivation,
+                }]));
             }
             Node::WaitSignal { .. } => {
                 if state
@@ -2744,8 +2814,9 @@ fn due_wait(
     let act = state.activations.get(&wait.activation).unwrap();
     if wait.signal == "__timer" {
         let region = region_for_scope(state, act.scope).unwrap();
-        let Node::Delay { next, .. } = region.nodes.get(act.node.as_str()).unwrap() else {
-            return Err(Error::invalid("timer wait is not a delay"));
+        let next = match region.nodes.get(act.node.as_str()) {
+            Some(Node::Delay { next, .. } | Node::WaitUntil { next, .. }) => next,
+            _ => return Err(Error::invalid("timer wait is not a delay or wait_until")),
         };
         let mut events = vec![DomainEvent::WaitTimedOut { run, wait: wait.id }];
         events.extend(open_node(state, act.scope, next, ids)?);
@@ -3775,6 +3846,9 @@ pub fn apply_events_with_cause(
 ) -> Result<()> {
     for event in events {
         let run = event_owner(state, event)?;
+        let io_refs = run
+            .map(|run| crate::history::io_references(state, run, event, &state.current_cluster_id))
+            .transpose()?;
         evolve(state, event);
         if let Some(run) = run {
             crate::history::append(
@@ -3784,13 +3858,14 @@ pub fn apply_events_with_cause(
                 command_id,
                 principal_id,
                 time.as_millis(),
+                io_refs.expect("run event has artifact references"),
             )?;
         }
     }
     Ok(())
 }
 
-fn event_owner(state: &State, event: &DomainEvent) -> Result<Option<RunId>> {
+pub(crate) fn event_owner(state: &State, event: &DomainEvent) -> Result<Option<RunId>> {
     let owner = match event {
         DomainEvent::RunAdmitted { run, .. }
         | DomainEvent::ScopeOpened { run, .. }
@@ -3972,6 +4047,9 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             // Nested bodies need the child region, not the root. Mark activity nodes Ready
             // by scanning the owning scope's region more carefully below.
             let ready = is_activity_node(state, *scope, node);
+            let run_state = state.runs.get_mut(run).expect("activation run missing");
+            run_state.next_ready_order = run_state.next_ready_order.saturating_add(1);
+            let ready_order = run_state.next_ready_order;
             state.activations.insert(
                 *activation,
                 ActivationState {
@@ -3987,6 +4065,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     role: ExecutionRole::Forward,
                     claim: None,
                     attempts: 0,
+                    ready_order,
                 },
             );
             if let Some(scope_state) = state.scopes.get_mut(scope) {
@@ -4082,7 +4161,12 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 act.status = ActivationStatus::Ready;
             }
         }
-        DomainEvent::WaitSatisfied { wait, event_id, .. } => {
+        DomainEvent::WaitSatisfied {
+            run,
+            wait,
+            event_id,
+            ..
+        } => {
             if let Some(wait_state) = state.waits.get_mut(wait) {
                 wait_state.pending = false;
             }
@@ -4094,7 +4178,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             if let Some(entry) = state
                 .inbox
                 .iter_mut()
-                .find(|entry| entry.event_id == *event_id)
+                .find(|entry| entry.run == Some(*run) && entry.event_id == *event_id)
             {
                 entry.consumed = true;
                 entry.reserved_wait = Some(*wait);
@@ -4140,8 +4224,10 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 run_state.next_sequence = RunSequence::new(sequence + 1);
             }
         }
-        DomainEvent::EventExpired { event_id, .. } => {
-            state.inbox.retain(|entry| entry.event_id != *event_id);
+        DomainEvent::EventExpired { run, event_id } => {
+            state
+                .inbox
+                .retain(|entry| entry.run != Some(*run) || entry.event_id != *event_id);
         }
         DomainEvent::ObligationRegistered {
             run,
@@ -4196,6 +4282,9 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 .map(|act| act.scope)
                 .or_else(|| state.scopes.values().find(|s| s.run == *run).map(|s| s.id));
             if let Some(scope) = scope {
+                let run_state = state.runs.get_mut(run).expect("compensation run missing");
+                run_state.next_ready_order = run_state.next_ready_order.saturating_add(1);
+                let ready_order = run_state.next_ready_order;
                 state.activations.insert(
                     *activation,
                     ActivationState {
@@ -4207,6 +4296,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                         role: ExecutionRole::Compensation,
                         claim: None,
                         attempts: 0,
+                        ready_order,
                     },
                 );
             }
@@ -4276,19 +4366,21 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             }
         }
         DomainEvent::EventReserved { wait, event_id } => {
+            let run = state.waits.get(wait).map(|entry| entry.run);
             if let Some(entry) = state
                 .inbox
                 .iter_mut()
-                .find(|entry| entry.event_id == *event_id)
+                .find(|entry| entry.run == run && entry.event_id == *event_id)
             {
                 entry.reserved_wait = Some(*wait);
             }
         }
-        DomainEvent::ReservationReleased { event_id, .. } => {
+        DomainEvent::ReservationReleased { wait, event_id } => {
+            let run = state.waits.get(wait).map(|entry| entry.run);
             if let Some(entry) = state
                 .inbox
                 .iter_mut()
-                .find(|entry| entry.event_id == *event_id)
+                .find(|entry| entry.run == run && entry.event_id == *event_id)
             {
                 entry.reserved_wait = None;
             }
@@ -4349,6 +4441,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             }
         }
         DomainEvent::ClaimGranted {
+            run,
             activation,
             session,
             generation,
@@ -4360,6 +4453,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             ..
         } => {
             state.next_generation = state.next_generation.saturating_add(1);
+            state.fair_cursor = Some(*run);
             if let Some(act) = state.activations.get_mut(activation) {
                 act.claim = Some(ClaimState {
                     session: *session,
@@ -4488,6 +4582,7 @@ pub fn start_run(
             status: RunStatus::Active,
             root: ScopeId::from_bytes([0; 16]),
             next_sequence: RunSequence::new(1),
+            next_ready_order: 0,
             admitted_ms: 0,
             terminal_ms: 0,
             published: None,
@@ -4737,15 +4832,13 @@ pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainE
         }
         command.time =
             EngineTime::from_millis(command.time.as_millis().max(state.engine_time_watermark_ms));
-        let mut provisional = state.clone();
-        provisional.engine_time_watermark_ms = command.time.as_millis();
-        let events =
-            crate::history::prune(&mut provisional, command.id, command.time, *limit as usize)?;
-        provisional.commands.insert(command.id, events.clone());
-        provisional
+        crate::history::preflight_prune(state, command.time)?;
+        state.engine_time_watermark_ms = command.time.as_millis();
+        let events = crate::history::prune(state, command.id, command.time, *limit as usize)?;
+        state.commands.insert(command.id, events.clone());
+        state
             .command_times
             .insert(command.id, command.time.as_millis());
-        *state = provisional;
         return Ok(events);
     }
     if let CommandBody::Publication { key, operation } = &command.body {
@@ -4814,6 +4907,7 @@ pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainE
                     status: RunStatus::Active,
                     root: ScopeId::from_bytes([0; 16]),
                     next_sequence: RunSequence::new(1),
+                    next_ready_order: 0,
                     admitted_ms: 0,
                     terminal_ms: 0,
                     published: None,
@@ -5047,7 +5141,8 @@ fn validate_leaf_output(state: &State, act: &ActivationState, output: &Value) ->
     run.catalog.validate_value(&contract.output_schema, output)
 }
 
-pub fn reconstruct(
+pub fn reconstruct_in(
+    cluster_id: &str,
     definition: Definition,
     catalog: Catalog,
     events: &[DomainEvent],
@@ -5062,7 +5157,13 @@ pub fn reconstruct(
     else {
         return Err(Error::invalid("history must start with run admission"));
     };
-    let mut state = State::default();
+    let mut state = State {
+        current_cluster_id: cluster_id.to_owned(),
+        ..State::default()
+    };
+    if !cluster_id.is_empty() {
+        state.artifact_origins.insert(cluster_id.to_owned());
+    }
     state.runs.insert(
         *run,
         RunState {
@@ -5074,6 +5175,7 @@ pub fn reconstruct(
             status: RunStatus::Active,
             root: *root,
             next_sequence: RunSequence::new(1),
+            next_ready_order: 0,
             admitted_ms: 0,
             terminal_ms: 0,
             published: None,
@@ -5514,6 +5616,72 @@ mod tests {
     }
 
     #[test]
+    fn wait_until_records_deadline_across_restart() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: absolute_wait
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: absolute
+nodes:
+  absolute:
+    kind: wait_until
+    at: {literal: 1010000}
+    next: finish
+  finish:
+    kind: complete
+    output: {literal: null}
+"#;
+        let catalog = catalog();
+        let definition = compile_yaml(yaml, &catalog).unwrap();
+        let run = RunId::generate();
+        let mut state = State::default();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1_000_000),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Null,
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        let progress = |state: &mut State, at| {
+            apply_command(
+                state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(at),
+                    body: CommandBody::Progress { run },
+                },
+            )
+            .unwrap();
+        };
+        progress(&mut state, 1_000_000);
+        let wait = state.waits.values().find(|wait| wait.pending).unwrap();
+        assert_eq!(wait.deadline_ms, Some(1_010_000));
+        progress(&mut state, 1_000_500);
+        assert_eq!(state.waits.len(), 1);
+        let mut restored: State =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        progress(&mut restored, 1_010_000);
+        assert!(matches!(
+            restored.runs[&run].status,
+            RunStatus::Succeeded {
+                output: Value::Null
+            }
+        ));
+        assert!(restored.waits.values().all(|wait| !wait.pending));
+    }
+
+    #[test]
     fn saga_success_path() {
         let output = drive(
             include_str!("../../docs/specs/v1/examples/saga.yaml"),
@@ -5657,7 +5825,8 @@ mod tests {
         );
         let run = *live.runs.keys().next().unwrap();
         let run_state = live.runs.get(&run).unwrap();
-        let rebuilt = reconstruct(
+        let rebuilt = reconstruct_in(
+            &live.current_cluster_id,
             run_state.definition.clone(),
             run_state.catalog.clone(),
             live.history.get(&run).unwrap(),
@@ -6173,7 +6342,8 @@ nodes:
             }
 
             let run_state = &state.runs[&run];
-            let rebuilt = reconstruct(
+            let rebuilt = reconstruct_in(
+                &state.current_cluster_id,
                 run_state.definition.clone(),
                 run_state.catalog.clone(),
                 &state.history[&run],
@@ -6803,7 +6973,8 @@ nodes:
             })
             .unwrap();
         assert_eq!(admitted, *policy);
-        let rebuilt = reconstruct(
+        let rebuilt = reconstruct_in(
+            &state.current_cluster_id,
             state.runs.get(&run).unwrap().definition.clone(),
             state.runs.get(&run).unwrap().catalog.clone(),
             state.history.get(&run).unwrap(),
@@ -7122,6 +7293,73 @@ nodes:
         .unwrap();
         let inbox_ids: Vec<_> = state.inbox.iter().map(|entry| entry.event_id).collect();
         assert_eq!(inbox_ids, vec![first, second]);
+    }
+
+    #[test]
+    fn signal_identity_and_expiry_are_scoped_to_the_run() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/events.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let runs = [RunId::from_bytes([35; 16]), RunId::from_bytes([36; 16])];
+        for run in runs {
+            start_run(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Start {
+                        run,
+                        definition: Box::new(definition.clone()),
+                        input: Value::Object(BTreeMap::from([(
+                            "key".to_owned(),
+                            Value::String("k1".to_owned()),
+                        )])),
+                        catalog: Box::new(catalog.clone()),
+                    },
+                },
+                definition.clone(),
+                catalog.clone(),
+            )
+            .unwrap();
+        }
+        let event_id = EventId::from_bytes([37; 16]);
+        for run in runs {
+            let events = apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(2),
+                    body: CommandBody::Signal {
+                        run,
+                        event_id,
+                        signal: "approval".to_owned(),
+                        key: "k1".to_owned(),
+                        payload: Value::Object(BTreeMap::from([(
+                            "approved".to_owned(),
+                            Value::Bool(true),
+                        )])),
+                    },
+                },
+            )
+            .unwrap();
+            assert!(events.iter().any(
+                |event| matches!(event, DomainEvent::EventAccepted { run: owner, .. } if *owner == run)
+            ));
+        }
+        assert_eq!(state.inbox.len(), 2);
+        evolve(
+            &mut state,
+            &DomainEvent::EventExpired {
+                run: runs[0],
+                event_id,
+            },
+        );
+        assert_eq!(state.inbox.len(), 1);
+        assert_eq!(state.inbox[0].run, Some(runs[1]));
     }
 
     #[test]
@@ -8136,6 +8374,99 @@ nodes:
         assert_eq!(claimed_runs.len(), 2);
         assert!(claimed_runs.contains(&runs[0]));
         assert!(claimed_runs.contains(&runs[1]));
+    }
+
+    #[test]
+    fn claim_rotation_and_within_run_fifo_survive_multiple_batches() {
+        let catalog = catalog();
+        let mut state = State::default();
+        let runs = [RunId::from_bytes([1; 16]), RunId::from_bytes([2; 16])];
+        for (run, yaml) in [
+            (
+                runs[0],
+                include_str!("../../docs/specs/v1/examples/parallel.yaml"),
+            ),
+            (
+                runs[1],
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            ),
+        ] {
+            let definition = compile_yaml(yaml, &catalog).unwrap();
+            start_run(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Start {
+                        run,
+                        definition: Box::new(definition.clone()),
+                        input: order_input(),
+                        catalog: Box::new(catalog.clone()),
+                    },
+                },
+                definition,
+                catalog.clone(),
+            )
+            .unwrap();
+            apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Progress { run },
+                },
+            )
+            .unwrap();
+        }
+        assert!(ready_activations(&state, runs[0]).len() >= 2);
+        let session = WorkerSessionId::generate();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        let mut chosen = Vec::new();
+        for time in 3..=5 {
+            let events = apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(time),
+                    body: CommandBody::Claim {
+                        session,
+                        capacity: 1,
+                    },
+                },
+            )
+            .unwrap();
+            let (run, activation) = events
+                .iter()
+                .find_map(|event| match event {
+                    DomainEvent::ClaimGranted {
+                        run, activation, ..
+                    } => Some((*run, *activation)),
+                    _ => None,
+                })
+                .expect("one ready activation per claim");
+            chosen.push(run);
+            if time == 3 {
+                let scope = &state.scopes[&state.activations[&activation].scope];
+                assert!(matches!(
+                    &scope.role,
+                    ScopeRole::ParallelBranch { name, .. } if name == "tax"
+                ));
+            }
+        }
+        assert_eq!(chosen, [runs[0], runs[1], runs[0]]);
+        assert_eq!(state.fair_cursor, Some(runs[0]));
     }
 
     fn order_input() -> Value {
@@ -9351,7 +9682,8 @@ nodes:
         let events =
             history_or_unavailable(&state, run, EngineTime::from_millis(terminal)).unwrap();
         assert!(!events.is_empty());
-        let rebuilt = reconstruct(
+        let rebuilt = reconstruct_in(
+            &state.current_cluster_id,
             state.runs.get(&run).unwrap().definition.clone(),
             state.runs.get(&run).unwrap().catalog.clone(),
             events,

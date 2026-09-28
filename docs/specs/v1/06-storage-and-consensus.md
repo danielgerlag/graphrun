@@ -60,6 +60,8 @@ An application snapshot MUST NOT replace the receiving member's identity, votes,
 
 Index updates are atomic with their source records. Queries and commands must not scan an entire history to find current ready work, outstanding children, matching waits, or uncompensated obligations.
 
+The current member store is `graphrun.member-store/v4` with `graphrun.state-record/v2` rows. Inbox rows use the run and event ID; obligation rows use the run and forward activation ID. Each row retains its insertion order independently of its key. A committed retired-run marker hides old run rows before bounded physical cleanup. The terminal summary and start-key tombstones remain visible until their own expiry. Readers skip hidden rows, including incomplete fragments left by interrupted cleanup. Older member stores fail to open without deleting their data. Logical backups retain the `graphrun.backup/v3` envelope.
+
 ## Memory and admission
 
 OpenRaft 0.9 can materialize complete apply ranges and has an unbounded internal state-machine channel. A bounded redb queue alone is not a memory bound.

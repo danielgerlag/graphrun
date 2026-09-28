@@ -135,6 +135,7 @@ How-tos:
 - [Inspect a stalled run](https://github.com/danielgerlag/graphrun/blob/main/docs/quickstarts/stalled-run.md)
 - [Compensate or abandon](https://github.com/danielgerlag/graphrun/blob/main/docs/quickstarts/compensation.md)
 - [Back up and restore](https://github.com/danielgerlag/graphrun/blob/main/docs/quickstarts/backup-restore.md)
+- [Compact an offline member](https://github.com/danielgerlag/graphrun/blob/main/docs/quickstarts/compact-store.md)
 - [Run a three-member cluster](https://github.com/danielgerlag/graphrun/blob/main/docs/quickstarts/cluster.md)
 
 ## Typed builder
