@@ -1343,6 +1343,8 @@ fn collect_evidence(run_dir: &Path) -> Result<Evidence, String> {
                 "graphrun",
                 "--test",
                 "worker_sdk",
+                "--features",
+                "fault-injection",
                 "--locked",
                 "--color",
                 "never",
@@ -2772,13 +2774,12 @@ fn replay_readonly(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult 
     };
     if replay.get("run").and_then(serde_json::Value::as_str) != Some(run.as_str())
         || replay
-            .get("events")
-            .and_then(serde_json::Value::as_array)
-            .is_none_or(|events| events.is_empty())
-        || !replay
-            .get("output")
-            .and_then(|output| serde_json::to_string(output).ok())
-            .is_some_and(|output| output.contains("pay-1"))
+            .get("event_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|count| count == 0)
+        || replay["status"] != "succeeded"
+        || replay["output"]
+            != serde_json::json!({"amount": 1000, "order_id": "o1", "payment_id": "pay-1"})
     {
         return fail(
             row,
@@ -4408,6 +4409,8 @@ async fn contract_worker_rpc_probes(
     provider_url: &str,
     observations: &mut Vec<String>,
 ) -> Result<String, String> {
+    use std::error::Error as _;
+
     use graphrun::generated::{ClaimRequest, RegisterRequest, ReportRequest};
     use graphrun::ids::{ActivityKey, CommandId, ExecutionRole, WorkerSessionId};
     use graphrun::tls::PeerRole;
@@ -4464,6 +4467,10 @@ async fn contract_worker_rpc_probes(
         Ok(mut client) => match client.register(valid_registration.clone()).await {
             Err(status)
                 if matches!(status.code(), Code::Unavailable | Code::Unauthenticated)
+                    || status.code() == Code::Cancelled
+                        && status
+                            .source()
+                            .is_some_and(|source| source.is::<tonic::transport::Error>())
                     || status.code() == Code::Unknown
                         && format!("{status:?}").contains("hyper::Error(Io") =>
             {
@@ -7007,17 +7014,31 @@ fn cluster_leader_kill_keeps_result(cli: &Path, artifacts: &Path, row: &MatrixRo
         return fail(row, "cluster inspect", err);
     }
     terminate(&mut cluster.members[2].0);
-    let body = cluster_inspect(cli, &cluster, 1, &run);
-    if body.contains("succeeded") && body.contains("pay-1") {
-        finish(
-            row,
-            "PASS",
-            "kill initializing leader; follower inspect keeps output",
-            body,
-            vec![cluster.dir.clone()],
-        )
-    } else {
-        fail(row, "inspect after leader kill", body)
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let body = cluster_inspect(cli, &cluster, 1, &run);
+        if serde_json::from_str::<serde_json::Value>(&body).is_ok_and(|view| {
+            view["run"] == run
+                && view["status"] == "succeeded"
+                && view["output"]
+                    == serde_json::json!({
+                        "amount": 1000,
+                        "order_id": "o1",
+                        "payment_id": "pay-1"
+                    })
+        }) {
+            return finish(
+                row,
+                "PASS",
+                "kill initializing leader; follower inspect keeps output",
+                body,
+                vec![cluster.dir.clone()],
+            );
+        }
+        if Instant::now() >= deadline {
+            return fail(row, "inspect after leader kill", body);
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -7985,7 +8006,7 @@ fn forged_worker_process(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
     };
     let done = Instant::now() + Duration::from_secs(20);
     loop {
-        let (_, body, _) = run_cli(
+        let (ok, body, error) = run_cli(
             cli,
             &[
                 "inspect",
@@ -8003,7 +8024,7 @@ fn forged_worker_process(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
                 &tls.server_name,
             ],
         );
-        if body.contains("succeeded") && body.contains("pay-1") {
+        if ok && body.contains("succeeded") && body.contains("pay-1") {
             return finish(
                 row,
                 "PASS",
@@ -8013,7 +8034,11 @@ fn forged_worker_process(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
             );
         }
         if Instant::now() >= done {
-            return fail(row, "valid report", body);
+            return fail(
+                row,
+                "valid report",
+                format!("stdout={body}; stderr={error}"),
+            );
         }
         std::thread::sleep(Duration::from_millis(200));
     }

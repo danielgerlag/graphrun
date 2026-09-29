@@ -154,8 +154,12 @@ cargo build --release --locked -p graphrun-cli
 cargo run --locked -p graphrun-e2e -- verify \
 	--cli target/release/graphrun \
 	--matrix docs/specs/v1/verification-matrix.tsv \
-	--artifacts target/e2e-artifacts
+	--artifacts /tmp/gr-e2e
 ```
+
+Use a short artifacts path on a native Unix filesystem: process tests create
+control sockets beneath each run directory, and long checkout paths can exceed
+the Unix socket limit. CI uploads evidence from `/tmp/gr-e2e` and `/tmp/gr-smoke`.
 
 For final release signoff add `--release-certification` to `verify`. The
 default verification mode still rejects any functional `FAIL`, `BLOCKED`, or
