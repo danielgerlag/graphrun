@@ -1007,7 +1007,7 @@ impl WorkerSvc for GraphServices {
                 }));
             }
             loop {
-                if *changes.borrow() != cursor {
+                if crate::storage::schedule_revision_changed(&mut changes, cursor) {
                     break;
                 }
                 tokio::select! {
