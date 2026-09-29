@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const CURRENT_READER: u16 = 5;
-pub const CURRENT_WRITER: u16 = 4;
+pub const CURRENT_WRITER: u16 = 5;
 pub const BASE_FORMAT: u16 = 4;
 pub const NEXT_FORMAT: u16 = 5;
 pub const PEER_WRITER_HEADER: &str = "graphrun-writer-format";
