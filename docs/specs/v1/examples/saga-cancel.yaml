@@ -1,0 +1,48 @@
+dsl: graphrun/v1
+id: cancellable_fulfillment
+version: 1
+input_schema: order/v1
+output_schema: receipt/v1
+signals:
+  continue: {schema: unit/v1}
+start: fulfill
+nodes:
+  fulfill:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: receipt/v1
+      start: reserve
+      nodes:
+        reserve:
+          kind: activity
+          activity: {name: inventory.reserve, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: inventory.release, version: 1}
+            input: {from: forward.output}
+          next: hold
+        hold:
+          kind: wait_signal
+          signal: continue
+          key: {literal: gate}
+          timeout: null
+          next: charge
+        charge:
+          kind: activity
+          activity: {name: payment.charge, version: 1}
+          input: {from: nodes.reserve.output}
+          compensation:
+            kind: activity
+            activity: {name: payment.refund, version: 1}
+            input: {from: forward.output}
+          next: done
+        done:
+          kind: complete
+          output: {from: nodes.charge.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.fulfill.output}

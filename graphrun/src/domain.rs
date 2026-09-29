@@ -99,6 +99,10 @@ pub enum DomainEvent {
         run: RunId,
         wait: WaitId,
     },
+    WaitCancelled {
+        run: RunId,
+        wait: WaitId,
+    },
     EventAccepted {
         run: RunId,
         event_id: EventId,
@@ -2200,23 +2204,6 @@ fn decide_cancel(state: &State, run: RunId, reason: &str, ids: &mut IdGen) -> Re
         code: "run.cancelled".to_owned(),
         message: reason.to_owned(),
     };
-    let mut events = Vec::new();
-    for wait in state
-        .waits
-        .values()
-        .filter(|wait| wait.run == run && wait.pending)
-    {
-        if let Some(entry) = state
-            .inbox
-            .iter()
-            .find(|entry| entry.reserved_wait == Some(wait.id) && !entry.consumed)
-        {
-            events.push(DomainEvent::ReservationReleased {
-                wait: wait.id,
-                event_id: entry.event_id,
-            });
-        }
-    }
     let sagas: Vec<ActivationId> = state
         .activations
         .values()
@@ -2237,14 +2224,41 @@ fn decide_cancel(state: &State, run: RunId, reason: &str, ids: &mut IdGen) -> Re
             .values()
             .find(|scope| scope.run == run && matches!(scope.role, ScopeRole::Root))
         {
-            events.extend(fail_scope(state, root.id, error)?);
+            return Ok(Decision {
+                events: fail_scope(state, root.id, error)?,
+            });
         }
-        return Ok(Decision { events });
+        return Err(Error::invalid("run has no root scope"));
     }
+    let mut events = close_pending_waits(state, run);
     for saga in sagas {
         events.extend(compensate_or_fail(state, saga, error.clone(), ids)?);
     }
     Ok(Decision { events })
+}
+
+fn close_pending_waits(state: &State, run: RunId) -> Vec<DomainEvent> {
+    let mut waits: Vec<_> = state
+        .waits
+        .values()
+        .filter(|wait| wait.run == run && wait.pending)
+        .collect();
+    waits.sort_by_key(|wait| wait.id);
+    let mut events = Vec::new();
+    for wait in waits {
+        if let Some(entry) = state
+            .inbox
+            .iter()
+            .find(|entry| entry.reserved_wait == Some(wait.id) && !entry.consumed)
+        {
+            events.push(DomainEvent::ReservationReleased {
+                wait: wait.id,
+                event_id: entry.event_id,
+            });
+        }
+        events.push(DomainEvent::WaitCancelled { run, wait: wait.id });
+    }
+    events
 }
 
 fn compensation_events(state: &State, act: &ActivationState, output: &Value) -> Vec<DomainEvent> {
@@ -3613,11 +3627,15 @@ fn fail_scope(state: &State, scope: ScopeId, error: FailError) -> Result<Vec<Dom
     if matches!(scope_state.status, ScopeStatus::Failed { .. }) {
         return Ok(Vec::new());
     }
-    let mut events = vec![DomainEvent::ScopeFailed {
+    let mut events = Vec::new();
+    if matches!(scope_state.role, ScopeRole::Root) {
+        events.extend(close_pending_waits(state, scope_state.run));
+    }
+    events.push(DomainEvent::ScopeFailed {
         run: scope_state.run,
         scope,
         error: error.clone(),
-    }];
+    });
     if matches!(scope_state.role, ScopeRole::Root) {
         events.push(DomainEvent::RunFailed {
             run: scope_state.run,
@@ -3879,6 +3897,7 @@ pub(crate) fn event_owner(state: &State, event: &DomainEvent) -> Result<Option<R
         | DomainEvent::WaitOpened { run, .. }
         | DomainEvent::WaitSatisfied { run, .. }
         | DomainEvent::WaitTimedOut { run, .. }
+        | DomainEvent::WaitCancelled { run, .. }
         | DomainEvent::EventAccepted { run, .. }
         | DomainEvent::EventExpired { run, .. }
         | DomainEvent::ObligationRegistered { run, .. }
@@ -4195,6 +4214,14 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 && let Some(act) = state.activations.get_mut(&activation)
             {
                 act.status = ActivationStatus::Succeeded;
+            }
+        }
+        DomainEvent::WaitCancelled { wait, .. } => {
+            if let Some(wait_state) = state.waits.get_mut(wait) {
+                wait_state.pending = false;
+                if let Some(act) = state.activations.get_mut(&wait_state.activation) {
+                    act.status = ActivationStatus::Failed;
+                }
             }
         }
         DomainEvent::EventAccepted {
@@ -4524,6 +4551,18 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 run_state.status = RunStatus::Failed {
                     error: error.clone(),
                 };
+            }
+            for scope in state.scopes.values_mut() {
+                if scope.run == *run && scope.status == ScopeStatus::Open {
+                    scope.status = ScopeStatus::Failed {
+                        error: error.clone(),
+                    };
+                }
+            }
+            for activation in state.activations.values_mut() {
+                if activation.run == *run && activation.status != ActivationStatus::Succeeded {
+                    activation.status = ActivationStatus::Failed;
+                }
             }
         }
         DomainEvent::RecoveryAuthorized { .. } => {
@@ -8190,6 +8229,7 @@ nodes:
         assert!(state.inbox[0].reserved_wait.is_none());
         assert_eq!(state.inbox[0].expires_ms, expiry);
         assert!(!state.inbox[0].consumed);
+        assert!(state.waits.values().all(|wait| !wait.pending));
     }
 
     #[test]

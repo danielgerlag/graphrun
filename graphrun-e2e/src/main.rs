@@ -60,6 +60,12 @@ enum Commands {
         #[arg(long)]
         artifacts: PathBuf,
     },
+    SmokeCancellation {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
     SmokeRelease {
         #[arg(long)]
         cli: PathBuf,
@@ -270,6 +276,9 @@ fn main() -> ExitCode {
         }
         Commands::SmokeSagaSettlement { cli, artifacts } => {
             smoke_case(&cli, &artifacts, "SAGA-007", provider_delayed_forward)
+        }
+        Commands::SmokeCancellation { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "SAGA-010", cancel_saga_cli)
         }
         Commands::SmokeRelease { cli, artifacts } => {
             smoke_case(&cli, &artifacts, "GATE-003", release_artifact_and_workers)
@@ -7566,23 +7575,29 @@ nodes:
 
 fn cancel_saga_cli(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
     let dir = artifacts.join(format!("{}-cancel", row.id));
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::create_dir_all(&dir);
+    if dir.exists()
+        && let Err(err) = fs::remove_dir_all(&dir)
+    {
+        return fail(row, "remove prior saga fixture", err.to_string());
+    }
+    if let Err(err) = fs::create_dir_all(&dir) {
+        return fail(row, "create saga fixture", err.to_string());
+    }
     let mut serve = match serve_local(cli, &dir) {
         Ok(serve) => serve,
         Err(err) => return fail(row, "graphrun serve", err),
     };
     let input = dir.join("input.json");
-    let _ = fs::write(
-        &input,
-        r#"{"order_id":"o1","amount":1000,"fail_after_payment":true}"#,
-    );
+    if let Err(err) = fs::write(&input, r#"{"order_id":"o1","amount":1000}"#) {
+        terminate(&mut serve.0);
+        return fail(row, "write saga input", err.to_string());
+    }
     let (ok, stdout, stderr) = run_cli(
         cli,
         &[
             "start",
             "--definition",
-            examples().join("saga.yaml").to_str().unwrap(),
+            examples().join("saga-cancel.yaml").to_str().unwrap(),
             "--catalog",
             catalog().to_str().unwrap(),
             "--input",
@@ -7596,15 +7611,19 @@ fn cancel_saga_cli(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult 
         terminate(&mut serve.0);
         return fail(row, "start saga", format!("{stdout}\n{stderr}"));
     }
-    let run = stdout
-        .split('"')
-        .skip_while(|part| *part != "run")
-        .nth(2)
-        .unwrap_or("")
-        .to_owned();
+    let run = match serde_json::from_str::<serde_json::Value>(&stdout)
+        .ok()
+        .and_then(|body| body["run"].as_str().map(str::to_owned))
+    {
+        Some(run) if graphrun::RunId::from_hex(&run).is_ok() => run,
+        _ => {
+            terminate(&mut serve.0);
+            return fail(row, "start saga", format!("invalid run ID: {stdout}"));
+        }
+    };
     let ready = Instant::now() + Duration::from_secs(10);
     loop {
-        let (_, body, _) = run_cli(
+        let (ok, body, stderr) = run_cli(
             cli,
             &[
                 "inspect",
@@ -7614,12 +7633,37 @@ fn cancel_saga_cli(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult 
                 dir.to_str().unwrap(),
             ],
         );
-        if body.contains("\"status\":\"open\"") || body.contains("\"status\":\"active\"") {
+        if !ok {
+            terminate(&mut serve.0);
+            return fail(row, "inspect saga", format!("{body}\n{stderr}"));
+        }
+        let view = match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(view) => view,
+            Err(err) => {
+                terminate(&mut serve.0);
+                return fail(row, "inspect saga", format!("{err}: {body}"));
+            }
+        };
+        if view["run"] == run
+            && view["status"] == "active"
+            && view["pending_waits"].as_array().is_some_and(|waits| {
+                waits.len() == 1 && waits[0]["signal"] == "continue" && waits[0]["key"] == "gate"
+            })
+            && view["obligations"].as_array().is_some_and(|obligations| {
+                obligations.len() == 1
+                    && obligations[0]["handler"] == "inventory.release"
+                    && obligations[0]["status"] == "open"
+            })
+        {
             break;
+        }
+        if view["status"] != "active" {
+            terminate(&mut serve.0);
+            return fail(row, "wait cancellable saga", body);
         }
         if Instant::now() >= ready {
             terminate(&mut serve.0);
-            return fail(row, "wait obligation", body);
+            return fail(row, "wait cancellable saga", body);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -7645,13 +7689,13 @@ fn cancel_saga_cli(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult 
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    if !cancel_ok && !cancel_log.contains("not active") {
+    if !cancel_ok {
         terminate(&mut serve.0);
         return fail(row, "cancel", cancel_log);
     }
     let done = Instant::now() + Duration::from_secs(15);
     loop {
-        let (_, body, _) = run_cli(
+        let (ok, body, stderr) = run_cli(
             cli,
             &[
                 "inspect",
@@ -7661,11 +7705,42 @@ fn cancel_saga_cli(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult 
                 dir.to_str().unwrap(),
             ],
         );
-        if body.contains("failed")
-            && (body.contains("compensated") || body.contains("run.cancelled"))
+        if !ok {
+            terminate(&mut serve.0);
+            return fail(row, "inspect after cancel", format!("{body}\n{stderr}"));
+        }
+        let view = match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(view) => view,
+            Err(err) => {
+                terminate(&mut serve.0);
+                return fail(row, "inspect after cancel", format!("{err}: {body}"));
+            }
+        };
+        if view["run"] == run
+            && view["status"] == "failed"
+            && view["error"]["code"] == "run.cancelled"
+            && view["error"]["message"] == "stop"
+            && view["pending_waits"] == serde_json::json!([])
+            && view["open_scopes"] == 0
+            && view["ready_leaves"] == 0
+            && view["obligations"].as_array().is_some_and(|obligations| {
+                obligations.len() == 1
+                    && obligations[0]["handler"] == "inventory.release"
+                    && obligations[0]["status"] == "compensated"
+            })
         {
             terminate(&mut serve.0);
-            return finish(row, "PASS", "graphrun cancel during saga", body, vec![dir]);
+            return finish(
+                row,
+                "PASS",
+                "graphrun cancel during saga",
+                format!("cancel={cancel_log}\ninspect={body}"),
+                vec![dir],
+            );
+        }
+        if view["status"] == "failed" && view["error"]["code"] != "run.cancelled" {
+            terminate(&mut serve.0);
+            return fail(row, "inspect after cancel", body);
         }
         if Instant::now() >= done {
             terminate(&mut serve.0);
