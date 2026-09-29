@@ -1792,20 +1792,33 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
                 from_suite(row, &evidence.crash, &[]),
             ],
         ),
-        "STORE-003" => from_test(
+        "STORE-003" => from_tests(
             evidence,
             row,
-            "storage::tests::apply_cut_does_not_mix_transactions",
+            &[
+                "storage::tests::apply_cut_does_not_mix_transactions",
+                "storage::tests::event_index_and_applied_metadata_cuts_leave_the_old_generation",
+                "storage::tests::retirement_cut_keeps_either_complete_old_or_new_applied_prefix",
+            ],
         ),
-        "STORE-004" => from_test(
+        "STORE-004" => from_tests(
             evidence,
             row,
-            "storage::tests::snapshot_install_cut_keeps_generation",
+            &[
+                "storage::tests::snapshot_install_cut_keeps_generation",
+                "storage::tests::snapshot_import_batches_are_bounded_before_generation_activation",
+                "storage::tests::corrupted_active_snapshot_rejects_reopen_without_fallback",
+                "storage::tests::snapshot_cleanup_is_bounded_and_preserves_active_file",
+            ],
         ),
-        "STORE-005" => from_test(
+        "STORE-005" => from_tests(
             evidence,
             row,
-            "storage::tests::purge_does_not_drop_domain_history",
+            &[
+                "storage::tests::purge_does_not_drop_domain_history",
+                "storage::tests::physical_log_gc_limits_each_transaction_to_4096_rows",
+                "storage::tests::committed_history_cleanup_survives_restart_after_log_purge",
+            ],
         ),
         "STORE-006" => from_tests(
             evidence,
@@ -1813,6 +1826,10 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
             &[
                 "storage::tests::unapplied_credits_bound_append_without_truncating_reads",
                 "write::tests::unapplied_credits_reject_above_limit",
+                "storage::tests::snapshot_admission_enforces_disk_reservation_policy",
+                "storage::tests::snapshot_byte_progress_survives_reopen",
+                "storage::tests::import_batch_services_queued_raft_log_write",
+                "engine::tests::snapshot_controller_fires_at_20000_entries",
             ],
         ),
         "STORE-007" => all_of(
