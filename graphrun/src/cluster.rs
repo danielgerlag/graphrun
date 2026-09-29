@@ -769,6 +769,50 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let mut caller = materials[0].clone();
+        caller.server_name = materials[1].server_name.clone();
+        let channel = tonic::transport::Channel::from_shared(format!("https://{}", addrs[1]))
+            .unwrap()
+            .tls_config(client_tls(&caller).unwrap())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut peer = RaftClient::new(channel);
+        let stale_vote = openraft::Vote::new_committed(100_000, 1);
+        let old_request = |rpc| {
+            let mut request = tonic::Request::new(Blob {
+                json: rpc,
+                sender_id: 1,
+            });
+            request.metadata_mut().insert(
+                crate::format_upgrade::PEER_WRITER_HEADER,
+                "4".parse().unwrap(),
+            );
+            request
+        };
+        let vote = VoteRequest {
+            vote: stale_vote,
+            last_log_id: None,
+        };
+        let err = peer
+            .vote(old_request(serde_json::to_vec(&vote).unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("member writer capability 4"));
+        let append = AppendEntriesRequest::<TypeConfig> {
+            vote: stale_vote,
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        };
+        let err = peer
+            .append_entries(old_request(serde_json::to_vec(&append).unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("member writer capability 4"));
         let learner_dir = tempfile::tempdir().unwrap();
         let learner_addr = unused_addr();
         let learner_tls = issue_node(&ca, 4).unwrap();
