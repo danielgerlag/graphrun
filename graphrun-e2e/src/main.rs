@@ -269,6 +269,8 @@ struct FormatRolloutExit {
     snapshot_dir: PathBuf,
 }
 
+const CONTRACT_TWO_BRIDGE_SOURCE: &str = "c5d7458442a13df8e8b1deac7ce6444b24261bc5";
+
 #[derive(Serialize, Deserialize)]
 struct SampleBinaryEvidence {
     bin: String,
@@ -948,7 +950,8 @@ fn validate_related_binaries(
                 .to_owned(),
         );
     }
-    if current.source_revision != context.source_sha256
+    if old.source_revision != CONTRACT_TWO_BRIDGE_SOURCE
+        || current.source_revision != context.source_sha256
         || old.source_revision == current.source_revision
         || current.sha256_before != context.cli_sha256
         || old.sha256_before == current.sha256_before
@@ -10765,11 +10768,7 @@ mod tests {
         let check = |case: &CaseResult| validate_related_binaries(case, &run_dir, &context);
         assert!(check(&case).unwrap_err().contains("requires both"));
         let current_revision = context.source_sha256.clone();
-        let old_revision = if current_revision == "a".repeat(40) {
-            "b".repeat(40)
-        } else {
-            "a".repeat(40)
-        };
+        let old_revision = CONTRACT_TWO_BRIDGE_SOURCE.to_owned();
         let old_build = run_dir.join("old-build.log");
         let current_build = run_dir.join("current-build.log");
         fs::write(&old_build, "Compiling graphrun v0.1.4\nFinished release\n").unwrap();
@@ -10840,8 +10839,8 @@ mod tests {
             .retain(|artifact| artifact != &old_build.display().to_string());
         assert!(check(&missing_build).unwrap_err().contains("stale"));
         let mut wrong_revision = case.clone();
-        wrong_revision.related_binaries[0].source_revision = "z".repeat(40);
-        assert!(check(&wrong_revision).unwrap_err().contains("stale"));
+        wrong_revision.related_binaries[0].source_revision = "a".repeat(40);
+        assert!(check(&wrong_revision).unwrap_err().contains("not distinct"));
         let mut shared_target = case.clone();
         shared_target.related_binaries[1].target_dir = old_target.display().to_string();
         assert!(
