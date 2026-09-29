@@ -1331,25 +1331,35 @@ fn validate_format_rollout_observations(report: &FormatRolloutReport) -> Result<
     {
         return Err("CONTRACT-002 reader roster lacks a v4/v5 and v2/v3 proof".to_owned());
     }
-    for (step, minimum_index) in [
-        ("mixed writer followers", before_index),
-        ("old reader applies new policy", active_index),
-        ("old reader applies v3 inbox update", active_index + 1),
+    for (step, minimum_index, wait_still_pending) in [
+        ("mixed writer followers", before_index, true),
+        ("old reader applies new policy", active_index, true),
+        (
+            "old reader applies v3 inbox update",
+            active_index + 1,
+            false,
+        ),
     ] {
         let health = observed(step);
         if health["state"] != "Follower"
             || health["last_applied"]
                 .as_u64()
                 .is_none_or(|index| index < minimum_index)
-            || health["pending_waits"] != 1
+            || (wait_still_pending && health["pending_waits"] != 1)
         {
             return Err(format!(
                 "CONTRACT-002 old reader did not catch up at {step}"
             ));
         }
     }
+    let old_update = observed("old reader applies v3 inbox update");
     if observed("new-format workflow progress")["status"] != "ok"
-        || observed("old reader applies v3 inbox update")["inbox_depth"] != 1
+        || old_update["inbox_depth"].as_u64().is_none()
+        || old_update["pending_waits"].as_u64().is_none()
+        || old_update["last_log"]
+            .as_u64()
+            .zip(old_update["last_applied"].as_u64())
+            .is_none_or(|(end, applied)| end < applied)
     {
         return Err("CONTRACT-002 post-v5 signal did not reach the old inbox".to_owned());
     }
@@ -1530,6 +1540,56 @@ fn validate_format_rollout_files(
             ));
         }
         stores.insert((n + 1) as u64, path);
+    }
+    let page = report
+        .observations
+        .iter()
+        .find(|observation| observation.step == "retained history page")
+        .ok_or("CONTRACT-002 has no retained signal history")?;
+    let accepted = page.actual["events"]
+        .as_array()
+        .and_then(|events| {
+            events.iter().find(|entry| {
+                entry["event"]["kind"] == "event_accepted"
+                    && entry["event"]["signal"] == "approval"
+                    && entry["event"]["key"] == "format-rollout"
+                    && entry["event"]["payload"] == serde_json::json!({"approved": true})
+            })
+        })
+        .and_then(|entry| entry["event"]["event_id"].as_str())
+        .ok_or("CONTRACT-002 history has no exact post-v5 signal identity")?;
+    let event_id = graphrun::EventId::from_hex(accepted)
+        .map_err(|err| format!("CONTRACT-002 invalid accepted event ID: {err}"))?;
+    for (member_id, store) in &stores {
+        let state = graphrun::engine::replay(
+            store
+                .parent()
+                .ok_or("CONTRACT-002 member store has no directory")?,
+        )
+        .map_err(|err| format!("CONTRACT-002 member {member_id} read-only replay: {err}"))?;
+        if state.history.get(&run).is_none_or(|events| {
+            !events.iter().any(|event| {
+                matches!(
+                    event,
+                    graphrun::domain::DomainEvent::EventAccepted {
+                        run: owner,
+                        event_id: accepted_id,
+                        signal,
+                        key,
+                        payload,
+                        ..
+                    } if *owner == run
+                        && *accepted_id == event_id
+                        && signal == "approval"
+                        && key == "format-rollout"
+                        && payload == &expected_output
+                )
+            })
+        }) {
+            return Err(format!(
+                "CONTRACT-002 member {member_id} did not durably apply the exact v5 signal"
+            ));
+        }
     }
     let snapshot = report
         .observations
@@ -11360,7 +11420,7 @@ mod tests {
             ),
             (
                 "old reader applies v3 inbox update",
-                serde_json::json!({"state":"Follower","last_applied":13,"pending_waits":1,"inbox_depth":1}),
+                serde_json::json!({"state":"Follower","last_applied":13,"last_log":14,"pending_waits":1,"inbox_depth":1}),
             ),
             (
                 "retained event projection",
@@ -11432,6 +11492,14 @@ mod tests {
             preparation_command_id: prepare_id,
             activation_command_id: activate_id,
         };
+        assert!(validate_format_rollout_observations(&report).is_ok());
+        let old_update = report
+            .observations
+            .iter_mut()
+            .find(|observation| observation.step == "old reader applies v3 inbox update")
+            .unwrap();
+        old_update.actual["pending_waits"] = serde_json::json!(0);
+        old_update.actual["inbox_depth"] = serde_json::json!(0);
         assert!(validate_format_rollout_observations(&report).is_ok());
         for (step, changed) in [
             ("committed writer activation", serde_json::json!(4)),
