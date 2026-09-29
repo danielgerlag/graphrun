@@ -3506,24 +3506,42 @@ mod tests {
         let view = engine.format_status().await.unwrap();
         assert_eq!(view["prepared"]["1"]["reader_floor"], 5);
         let activation_id = CommandId::from_bytes([43; 16]);
-        let activated = engine
-            .activate_writer_format(5, activation_id)
-            .await
-            .unwrap();
-        assert!(activated.applied);
-        assert_eq!(activated.active_writer, 5);
-        assert_eq!(
-            engine
+        if crate::format_upgrade::CURRENT_WRITER < 5 {
+            assert_eq!(
+                engine
+                    .activate_writer_format(5, activation_id)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::FailedPrecondition
+            );
+        } else {
+            let activated = engine
                 .activate_writer_format(5, activation_id)
                 .await
-                .unwrap(),
-            activated
-        );
-        assert_eq!(engine.format_status().await.unwrap()["writer_format"], 5);
+                .unwrap();
+            assert!(activated.applied);
+            assert_eq!(activated.active_writer, 5);
+            assert_eq!(
+                engine
+                    .activate_writer_format(5, activation_id)
+                    .await
+                    .unwrap(),
+                activated
+            );
+            assert_eq!(engine.format_status().await.unwrap()["writer_format"], 5);
+        }
         engine.shutdown().await.unwrap();
         let opened = Engine::local(dir.path()).await.unwrap();
         let status = opened.format_status().await.unwrap();
-        assert_eq!(status["writer_format"], 5);
+        assert_eq!(
+            status["writer_format"],
+            if crate::format_upgrade::CURRENT_WRITER < 5 {
+                4
+            } else {
+                5
+            }
+        );
         assert_eq!(status["prepared"]["1"]["reader_floor"], 5);
         opened.shutdown().await.unwrap();
     }

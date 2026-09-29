@@ -703,6 +703,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_voters_prepare_and_activate_through_signed_admin_rpc() {
+        if crate::format_upgrade::CURRENT_WRITER < 5 {
+            return;
+        }
         let (first, second, third, dirs, addrs, materials, ca) = three_voters(false).await;
         let until = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {

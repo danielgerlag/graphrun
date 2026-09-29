@@ -6024,23 +6024,33 @@ mod tests {
             NEXT_FORMAT
         );
         let restore = dir.path().join("restore");
-        crate::engine::Engine::restore(&backup, &restore, "format test").unwrap();
-        let restored_domain = crate::engine::Engine::read_backup(&backup).unwrap();
-        assert_eq!(restored_domain.format_policy.active_writer, NEXT_FORMAT);
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let restored = crate::engine::Engine::local(&restore).await.unwrap();
+        if crate::format_upgrade::CURRENT_WRITER < NEXT_FORMAT {
             assert_eq!(
-                restored.format_status().await.unwrap()["writer_format"],
-                NEXT_FORMAT
+                crate::engine::Engine::restore(&backup, &restore, "format test")
+                    .unwrap_err()
+                    .kind,
+                crate::error::ErrorKind::FailedPrecondition
             );
-            let receipt = restored
-                .prepare_writer_format(NEXT_FORMAT, crate::ids::CommandId::from_bytes([1; 16]))
-                .await
-                .unwrap();
-            assert!(receipt.applied);
-            assert_ne!(receipt.cluster_id, TEST_CLUSTER_ID);
-            restored.shutdown().await.unwrap();
-        });
+            assert!(!restore.exists());
+        } else {
+            crate::engine::Engine::restore(&backup, &restore, "format test").unwrap();
+            let restored_domain = crate::engine::Engine::read_backup(&backup).unwrap();
+            assert_eq!(restored_domain.format_policy.active_writer, NEXT_FORMAT);
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let restored = crate::engine::Engine::local(&restore).await.unwrap();
+                assert_eq!(
+                    restored.format_status().await.unwrap()["writer_format"],
+                    NEXT_FORMAT
+                );
+                let receipt = restored
+                    .prepare_writer_format(NEXT_FORMAT, crate::ids::CommandId::from_bytes([1; 16]))
+                    .await
+                    .unwrap();
+                assert!(receipt.applied);
+                assert_ne!(receipt.cluster_id, TEST_CLUSTER_ID);
+                restored.shutdown().await.unwrap();
+            });
+        }
         assert_eq!(
             load_domain_readonly(&path)
                 .unwrap()
@@ -6048,9 +6058,16 @@ mod tests {
                 .active_writer,
             NEXT_FORMAT
         );
-        let (handle, thread) = StorageHandle::open(&path).unwrap();
-        handle.shutdown();
-        thread.join().unwrap();
+        if crate::format_upgrade::CURRENT_WRITER < NEXT_FORMAT {
+            assert_eq!(
+                StorageHandle::open(&path).err().unwrap().kind,
+                crate::error::ErrorKind::FailedPrecondition
+            );
+        } else {
+            let (handle, thread) = StorageHandle::open(&path).unwrap();
+            handle.shutdown();
+            thread.join().unwrap();
+        }
     }
 
     #[test]
