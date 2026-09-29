@@ -203,6 +203,9 @@ cargo run --locked -p graphrun-e2e -- contract-format-proof \
 
 These commands do not produce a matrix report. `verify` must run all cases in
 the same fresh invocation; CI does not skip the snapshot-controller test.
+`diagnose-format-report --report <path>` rechecks a retained rollout's
+observations and files without rebuilding. It does not bind source or binary
+fingerprints and cannot certify a release.
 `CONTRACT-002` remains a failure until its current and old release binaries
 are built in the same run, their identities and build logs are validated,
 and the mixed-version reader-first rollout is observed through real members.

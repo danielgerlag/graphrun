@@ -120,6 +120,10 @@ enum Commands {
         #[arg(long)]
         artifacts: PathBuf,
     },
+    DiagnoseFormatReport {
+        #[arg(long)]
+        report: PathBuf,
+    },
     Verify {
         #[arg(long)]
         cli: PathBuf,
@@ -379,6 +383,7 @@ fn main() -> ExitCode {
         Commands::ContractFormatProof { cli, artifacts } => {
             focused_contract_format_proof(&cli, &artifacts)
         }
+        Commands::DiagnoseFormatReport { report } => diagnose_format_report(&report),
         Commands::Verify {
             cli,
             matrix,
@@ -634,6 +639,44 @@ fn focused_contract_format_proof(cli: &Path, artifacts: &Path) -> ExitCode {
         Err(err) => {
             eprintln!("CONTRACT-002 focused proof: {err}");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn diagnose_format_report(path: &Path) -> ExitCode {
+    let check = (|| -> Result<String, String> {
+        let saved = fs::canonicalize(path).map_err(|err| err.to_string())?;
+        let proof = saved.parent().ok_or("report has no proof directory")?;
+        let cwd = proof.parent().ok_or("report has no rollout directory")?;
+        let root = cwd.parent().ok_or("report has no fresh run directory")?;
+        let run_id = proof
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("report has no UTF-8 run ID")?;
+        let report: FormatRolloutReport =
+            serde_json::from_slice(&fs::read(&saved).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())?;
+        if report.run_id != run_id
+            || report.status != "PASS"
+            || report.error.is_some()
+            || !report.binary_integrity
+        {
+            return Err("saved rollout report has stale or failed identity".to_owned());
+        }
+        validate_format_rollout_observations(&report)?;
+        validate_format_rollout_files(&report, root, cwd)?;
+        Ok(report.run_id)
+    })();
+    match check {
+        Ok(run_id) => {
+            println!(
+                "diagnostic-only format report {run_id}: 19 steps and persisted files agree; not release certification"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("format report diagnostic failed: {err}");
+            ExitCode::from(1)
         }
     }
 }
@@ -1450,6 +1493,7 @@ fn validate_member_snapshot_location(
     root: &Path,
     cwd: &Path,
     member_id: u64,
+    publisher: u64,
     store: &Path,
     location: &Path,
 ) -> Result<(), String> {
@@ -1471,11 +1515,30 @@ fn validate_member_snapshot_location(
     match fs::symlink_metadata(&path) {
         Ok(_) if format_artifact(root, cwd, location)?.is_dir() => Ok(()),
         Ok(_) => Err("CONTRACT-002 snapshot path is not a directory".to_owned()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound && member_id != 2 => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && member_id != publisher => Ok(()),
         Err(err) => Err(format!(
             "CONTRACT-002 member {member_id} snapshot directory: {err}"
         )),
     }
+}
+
+fn snapshot_publisher(
+    registry: &serde_json::Value,
+    snapshot: &Path,
+    stores: &HashMap<u64, PathBuf>,
+) -> Result<u64, String> {
+    let member = registry["member"]
+        .as_u64()
+        .filter(|member| stores.contains_key(member))
+        .ok_or("CONTRACT-002 snapshot publisher is outside the committed roster")?;
+    let expected_dir = stores[&member]
+        .parent()
+        .ok_or("CONTRACT-002 publisher has no store directory")?
+        .join("snapshots");
+    if snapshot.parent() != Some(expected_dir.as_path()) {
+        return Err("CONTRACT-002 snapshot file is not owned by the publishing member".to_owned());
+    }
+    Ok(member)
 }
 
 fn validate_format_rollout_files(
@@ -1606,6 +1669,7 @@ fn validate_format_rollout_files(
         .find(|observation| observation.step == "v5 snapshot registry and readers")
         .ok_or("CONTRACT-002 lacks a v5 snapshot registry")?;
     let actual = &registry.actual;
+    let publisher = snapshot_publisher(actual, &snapshot_path, &stores)?;
     let registered_path = actual["snapshot_path"]
         .as_str()
         .ok_or("CONTRACT-002 registry has no snapshot path")?;
@@ -1664,7 +1728,14 @@ fn validate_format_rollout_files(
         {
             return Err(format!("CONTRACT-002 invalid {} process exit", exit.label));
         }
-        validate_member_snapshot_location(root, cwd, exit.member_id, &store, &exit.snapshot_dir)?;
+        validate_member_snapshot_location(
+            root,
+            cwd,
+            exit.member_id,
+            publisher,
+            &store,
+            &exit.snapshot_dir,
+        )?;
         let log = format_artifact(root, cwd, &exit.log)?;
         let text = fs::read_to_string(&log).map_err(|err| err.to_string())?;
         if exit.label == "rejected-restart"
@@ -11566,24 +11637,54 @@ mod tests {
         }
         let snapshot = |n: usize| cwd.join(format!("m{n}/snapshots"));
         assert!(
-            validate_member_snapshot_location(&root, &cwd, 1, &stores[0], &snapshot(1)).is_ok()
+            validate_member_snapshot_location(&root, &cwd, 1, 2, &stores[0], &snapshot(1)).is_ok()
         );
         assert!(
-            validate_member_snapshot_location(&root, &cwd, 3, &stores[2], &snapshot(3)).is_ok()
+            validate_member_snapshot_location(&root, &cwd, 3, 2, &stores[2], &snapshot(3)).is_ok()
         );
         assert!(
-            validate_member_snapshot_location(&root, &cwd, 2, &stores[1], &snapshot(2)).is_err()
+            validate_member_snapshot_location(&root, &cwd, 2, 2, &stores[1], &snapshot(2)).is_err()
         );
         fs::create_dir(snapshot(2)).unwrap();
         assert!(
-            validate_member_snapshot_location(&root, &cwd, 2, &stores[1], &snapshot(2)).is_ok()
+            validate_member_snapshot_location(&root, &cwd, 2, 2, &stores[1], &snapshot(2)).is_ok()
         );
         assert!(
-            validate_member_snapshot_location(&root, &cwd, 1, &stores[0], &snapshot(2)).is_err()
+            validate_member_snapshot_location(&root, &cwd, 3, 3, &stores[2], &snapshot(3)).is_err()
+        );
+        fs::create_dir(snapshot(3)).unwrap();
+        assert!(
+            validate_member_snapshot_location(&root, &cwd, 3, 3, &stores[2], &snapshot(3)).is_ok()
+        );
+        assert!(
+            validate_member_snapshot_location(&root, &cwd, 1, 3, &stores[0], &snapshot(2)).is_err()
         );
         fs::write(snapshot(1), b"not a directory").unwrap();
         assert!(
-            validate_member_snapshot_location(&root, &cwd, 1, &stores[0], &snapshot(1)).is_err()
+            validate_member_snapshot_location(&root, &cwd, 1, 3, &stores[0], &snapshot(1)).is_err()
+        );
+    }
+
+    #[test]
+    fn contract_two_rejects_snapshot_registry_for_another_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let stores: HashMap<u64, PathBuf> = (1..=3)
+            .map(|member| {
+                (
+                    member,
+                    dir.path().join(format!("m{member}")).join("member.redb"),
+                )
+            })
+            .collect();
+        let snapshot = dir.path().join("m2").join("snapshots").join("snap-14.snap");
+        assert_eq!(
+            snapshot_publisher(&serde_json::json!({"member":2}), &snapshot, &stores).unwrap(),
+            2
+        );
+        assert!(snapshot_publisher(&serde_json::json!({"member":3}), &snapshot, &stores).is_err());
+        assert!(snapshot_publisher(&serde_json::json!({"member":4}), &snapshot, &stores).is_err());
+        assert!(
+            snapshot_publisher(&serde_json::json!({"member":"2"}), &snapshot, &stores).is_err()
         );
     }
 
