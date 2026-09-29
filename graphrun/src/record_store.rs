@@ -881,7 +881,7 @@ pub(crate) fn encode_applied(
             let order = if let Some(old) = previous.get(&key) {
                 let old: VersionedRecord = serde_json::from_slice(old)
                     .map_err(|err| invalid(format!("corrupt {field} entry: {err}")))?;
-                if old.format != FORMAT {
+                if !supported_record(&old.format) {
                     return Err(invalid(format!("unsupported {field} entry")));
                 }
                 old.order
@@ -1303,6 +1303,32 @@ mod tests {
                 "{field} changed its retained identity"
             );
         }
+        let mut mixed = old.clone();
+        for field in ["inbox", "obligations"] {
+            let key = old
+                .keys()
+                .find(|key| key.contains(&format!("/run-{}/{}", retained.to_hex(), field)))
+                .unwrap();
+            mixed.insert(key.clone(), for_writer(&old[key], 5).unwrap());
+        }
+        let applied = encode_applied(
+            &state,
+            1,
+            3,
+            &BTreeSet::from([retained]),
+            &[],
+            None,
+            &BTreeSet::new(),
+            &mixed,
+            &BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        assert!(
+            applied
+                .keys()
+                .any(|key| key.contains(&format!("/run-{}/inbox/list/", retained.to_hex())))
+        );
     }
 
     #[test]

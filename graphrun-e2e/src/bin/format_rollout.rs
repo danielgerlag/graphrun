@@ -23,6 +23,8 @@ struct Args {
     writer_source: String,
     #[arg(long)]
     artifacts: PathBuf,
+    #[arg(long)]
+    run_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -66,6 +68,9 @@ struct Cluster {
     addrs: Vec<SocketAddr>,
     processes: Vec<Member>,
     observations: Vec<Observation>,
+    workflow_run_id: Option<String>,
+    preparation_command_id: Option<String>,
+    activation_command_id: Option<String>,
 }
 
 impl Cluster {
@@ -106,6 +111,9 @@ impl Cluster {
             addrs,
             processes: Vec::new(),
             observations: Vec::new(),
+            workflow_run_id: None,
+            preparation_command_id: None,
+            activation_command_id: None,
         })
     }
 
@@ -244,6 +252,21 @@ impl Cluster {
         self.cli(&args)
     }
 
+    fn remote_leader(&self, command: &[&str]) -> Result<Value, String> {
+        let mut failures = Vec::new();
+        for id in [2, 3] {
+            match self.remote(id, &["cluster", "format", "status"]) {
+                Ok(status) if status["quorum"] == true => match self.remote(id, command) {
+                    Ok(result) => return Ok(result),
+                    Err(err) => failures.push(format!("member {id}: {err}")),
+                },
+                Ok(status) => failures.push(format!("member {id} has no quorum: {status}")),
+                Err(err) => failures.push(format!("member {id}: {err}")),
+            }
+        }
+        Err(format!("no current writer leader: {}", failures.join("; ")))
+    }
+
     fn local(&self, id: usize, command: &[&str]) -> Result<Value, String> {
         let mut args = command
             .iter()
@@ -295,6 +318,7 @@ impl Cluster {
     }
 
     fn finish(&mut self) -> Vec<Value> {
+        let root = self.root.clone();
         self.processes
             .iter_mut()
             .map(|member| {
@@ -316,7 +340,9 @@ impl Cluster {
                     "pid":pid,
                     "terminated":terminated,
                     "status":status,
-                    "log":self.root.join(format!("member-{}-{}.log",member.id,member.label)).display().to_string()
+                    "log":root.join(format!("member-{}-{}.log",member.id,member.label)).display().to_string(),
+                    "store":root.join(format!("m{}",member.id)).join("member.redb").display().to_string(),
+                    "snapshot_dir":root.join(format!("m{}",member.id)).join("snapshots").display().to_string()
                 })
             })
             .collect()
@@ -348,8 +374,11 @@ fn sha(path: &Path) -> Result<String, String> {
 }
 
 fn evidence(role: &'static str, path: &Path, revision: String) -> Result<Binary, String> {
-    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("{role} needs a pinned 40-hex source revision"));
+    if !matches!(revision.len(), 40 | 64) || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(format!(
+            "{role} needs a pinned 40-hex source commit or 64-hex source digest"
+        ));
     }
     let path = fs::canonicalize(path).map_err(|err| err.to_string())?;
     let output = Command::new(&path)
@@ -411,6 +440,7 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
         .as_str()
         .ok_or("start returned no run ID")?
         .to_owned();
+    cluster.workflow_run_id = Some(run.clone());
     cluster.await_value(
         "pre-activation event wait",
         || cluster.local(1, &["inspect", "--run", &run]),
@@ -428,6 +458,7 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
     )?;
 
     let prepare_id = graphrun::ids::CommandId::generate().to_hex();
+    cluster.preparation_command_id = Some(prepare_id.clone());
     let prepared = cluster.remote(
         1,
         &[
@@ -520,6 +551,7 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
     )?;
 
     let activation_id = graphrun::ids::CommandId::generate().to_hex();
+    cluster.activation_command_id = Some(activation_id.clone());
     let activated = cluster.remote(
         leader,
         &[
@@ -558,21 +590,25 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
         true,
     )?;
     let output = cluster.root.join("approval.json");
-    let signal = cluster.remote(
-        leader,
-        &[
-            "signal",
-            "--run",
-            &run,
-            "--name",
-            "approval",
-            "--key",
-            "format-rollout",
-            "--event-id",
-            &graphrun::EventId::generate().to_hex(),
-            "--payload",
-            output.to_str().ok_or("payload path is not UTF-8")?,
-        ],
+    let signal_id = graphrun::EventId::generate().to_hex();
+    let signal = cluster.await_value(
+        "post-activation signal receipt",
+        || {
+            cluster.remote_leader(&[
+                "signal",
+                "--run",
+                &run,
+                "--name",
+                "approval",
+                "--key",
+                "format-rollout",
+                "--event-id",
+                &signal_id,
+                "--payload",
+                output.to_str().ok_or("payload path is not UTF-8")?,
+            ])
+        },
+        |value| value["status"] == "ok",
     )?;
     cluster.check(
         "new-format workflow progress",
@@ -580,9 +616,27 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
         signal,
         true,
     )?;
+    let leader_applied = cluster.remote_leader(&["cluster", "health"])?["last_applied"]
+        .as_u64()
+        .ok_or("new writer health omitted its applied index")?;
+    let bridge_after_signal = cluster.await_value(
+        "bridge signal application",
+        || cluster.local(1, &["cluster", "health"]),
+        |value| {
+            value["last_applied"]
+                .as_u64()
+                .is_some_and(|index| index >= leader_applied)
+        },
+    )?;
+    cluster.check(
+        "old reader applies v3 inbox update",
+        "old bridge reads new-format ordered inbox state while remaining a follower",
+        bridge_after_signal.clone(),
+        bridge_after_signal["state"] == "Follower",
+    )?;
     let result = cluster.await_value(
         "historical workflow completion",
-        || cluster.remote(leader, &["inspect", "--run", &run]),
+        || cluster.remote_leader(&["inspect", "--run", &run]),
         |value| value["status"] == "succeeded",
     )?;
     cluster.check(
@@ -591,7 +645,7 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
         result.clone(),
         result["output"]["approved"] == true,
     )?;
-    let history = cluster.remote(leader, &["history", "--run", &run])?;
+    let history = cluster.remote_leader(&["history", "--run", &run])?;
     cluster.check(
         "retained history page",
         "pre-activation and post-activation events retain their sequence range",
@@ -603,16 +657,13 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
     let through = history["retained_through"]
         .as_u64()
         .ok_or("history has no retained upper boundary")?;
-    let replay = cluster.remote(
-        leader,
-        &[
-            "replay",
-            "--run",
-            &run,
-            "--through-sequence",
-            &through.to_string(),
-        ],
-    )?;
+    let replay = cluster.remote_leader(&[
+        "replay",
+        "--run",
+        &run,
+        "--through-sequence",
+        &through.to_string(),
+    ])?;
     cluster.check(
         "versioned history reconstruction",
         "read-only event replay returns the same exact result as live inspection",
@@ -668,7 +719,18 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
 
 fn main() {
     let args = Args::parse();
-    let run_id = graphrun::ids::CommandId::generate().to_hex();
+    let run_id = args
+        .run_id
+        .unwrap_or_else(|| graphrun::ids::CommandId::generate().to_hex());
+    if run_id.is_empty()
+        || run_id.len() > 96
+        || !run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        eprintln!("run ID must be 1..=96 ASCII letters, digits, hyphens, or underscores");
+        std::process::exit(2);
+    }
     let root = args.artifacts.join(&run_id);
     let mut cluster = match Cluster::new(root.clone(), args.cli.clone()) {
         Ok(cluster) => cluster,
@@ -713,6 +775,11 @@ fn main() {
         "binaries":binaries.iter().map(|binary| binary.as_ref().ok()).collect::<Vec<_>>(),
         "observations":std::mem::take(&mut cluster.observations),
         "process_exits":exits,
+        "member_stores":(1..=3).map(|id| cluster.dir(id).join("member.redb").display().to_string()).collect::<Vec<_>>(),
+        "backup_manifest":cluster.root.join("bridge-backup").join("manifest.json").display().to_string(),
+        "workflow_run_id":cluster.workflow_run_id,
+        "preparation_command_id":cluster.preparation_command_id,
+        "activation_command_id":cluster.activation_command_id,
     });
     drop(cluster);
     if let Err(err) = fs::write(
