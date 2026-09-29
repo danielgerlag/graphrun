@@ -792,12 +792,25 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
     let backup = cluster.root.join("bridge-backup");
     graphrun::Engine::backup(cluster.dir(1), &backup).map_err(|err| err.to_string())?;
     let backed = graphrun::Engine::read_backup(&backup).map_err(|err| err.to_string())?;
+    let run_id = graphrun::RunId::from_hex(&run).map_err(|err| err.to_string())?;
+    let checkpoint = backed
+        .checkpoints
+        .get(&run_id)
+        .ok_or("terminal run has no retained checkpoint")?;
     cluster.check(
         "backup reader versions",
-        "backup preserves the v5 writer policy and old run history",
-        json!({"writer":backed.format_policy.active_writer,"history":backed.history.len()}),
+        "backup preserves the v5 writer policy, old run history and its v2 checkpoint",
+        json!({
+            "writer":backed.format_policy.active_writer,
+            "history":backed.history.len(),
+            "checkpoints":backed.checkpoints.len(),
+            "checkpoint_format":checkpoint.format,
+            "checkpoint_through":checkpoint.through_run_sequence
+        }),
         backed.format_policy.active_writer == 5
-            && backed.history.iter().any(|(id, _)| id.to_hex() == run),
+            && backed.history.contains_key(&run_id)
+            && checkpoint.format == graphrun::history::CHECKPOINT_FORMAT
+            && checkpoint.through_run_sequence == through,
     )?;
     cluster.spawn(bridge, 1, false, "rejected-restart")?;
     let restart = cluster.processes.last_mut().ok_or("restart PID missing")?;
