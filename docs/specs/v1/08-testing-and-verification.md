@@ -220,6 +220,11 @@ publication, history, signed-history, and worker SDK tests, plus its own gate
 tests, in that invocation. `GATE-001` rejects a failed integration suite even
 when no other matrix row names its failing test.
 
+`STORE-003` through `STORE-006` require the commit-cut, snapshot-generation,
+log-GC, and admission tests that match each matrix row. `STORE-006` also
+requires the 20,000-entry snapshot-controller test in the same unfiltered
+library run.
+
 Give each test case its own evidence file and aggregate afterward. Bind
 evidence to a fresh run ID and current source/binary fingerprints. Require
 successful test processes and executed named tests, not matching log text
