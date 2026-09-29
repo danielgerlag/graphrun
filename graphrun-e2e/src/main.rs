@@ -9647,8 +9647,7 @@ mod tests {
             .connect_timeout(Duration::from_millis(100))
             .connect()
             .await
-            .err()
-            .expect("port zero cannot accept connections");
+            .expect_err("port zero cannot accept connections");
         let mut tls_denied = tonic::Status::cancelled("operation was canceled");
         tls_denied.set_source(std::sync::Arc::new(transport));
         assert!(
