@@ -418,12 +418,11 @@ pub async fn membership_barrier(
 ) -> Result<FormatPolicy> {
     crate::write::linearizable_read(raft).await?;
     let metrics = raft.metrics().borrow().clone();
-    if metrics.last_applied.map_or(0, |id| id.index) < metrics.last_log_index.unwrap_or(0)
-        || storage.applied_membership().await? != *metrics.membership_config
-    {
+    let applied_roster = storage.applied_membership().await?;
+    if applied_roster != *metrics.membership_config {
         return Err(Error::new(
             ErrorKind::Unavailable,
-            "membership change waits for all pending entries and the applied roster",
+            "membership change waits for the applied roster",
         ));
     }
     let policy = storage.query_state().await.format_policy;
@@ -433,7 +432,14 @@ pub async fn membership_barrier(
             "committed writer policy differs from the local store manifest",
         ));
     }
-    ensure_writer(storage.required_writer_format().await?)?;
+    let required = storage.required_writer_format().await?;
+    if required > policy.active_writer {
+        return Err(Error::new(
+            ErrorKind::Unavailable,
+            "membership change waits for pending writer activation",
+        ));
+    }
+    ensure_writer(required)?;
     Ok(policy)
 }
 
