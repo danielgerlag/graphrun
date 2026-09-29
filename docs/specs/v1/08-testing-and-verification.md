@@ -204,6 +204,8 @@ the same fresh invocation; CI does not skip the snapshot-controller test.
 `CONTRACT-002` remains a failure until its current and old release binaries
 are built in the same run, their identities and build logs are validated,
 and the mixed-version reader-first rollout is observed through real members.
+CI retains Git history for the pinned old-reader source. The gate builds that
+binary from source rather than downloading a prebuilt executable.
 
 ## Evidence format
 
