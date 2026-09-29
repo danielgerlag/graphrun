@@ -114,6 +114,12 @@ enum Commands {
         #[arg(long)]
         artifacts: PathBuf,
     },
+    ContractFormatProof {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
     Verify {
         #[arg(long)]
         cli: PathBuf,
@@ -370,6 +376,9 @@ fn main() -> ExitCode {
         Commands::ContractArtifactProof { cli, artifacts } => {
             focused_contract_artifact_proof(&cli, &artifacts)
         }
+        Commands::ContractFormatProof { cli, artifacts } => {
+            focused_contract_format_proof(&cli, &artifacts)
+        }
         Commands::Verify {
             cli,
             matrix,
@@ -560,6 +569,70 @@ fn focused_contract_artifact_proof(cli: &Path, artifacts: &Path) -> ExitCode {
         }
         Err(err) => {
             eprintln!("CONTRACT-001 focused proof: {err}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn focused_contract_format_proof(cli: &Path, artifacts: &Path) -> ExitCode {
+    let result = (|| -> Result<CaseResult, String> {
+        fs::create_dir_all(artifacts).map_err(|err| err.to_string())?;
+        let run_dir = tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(artifacts)
+            .map_err(|err| err.to_string())?
+            .keep();
+        let row = parse_matrix(include_str!("../../docs/specs/v1/verification-matrix.tsv"))?
+            .into_iter()
+            .find(|row| row.id == "CONTRACT-002")
+            .ok_or("CONTRACT-002 missing from canonical matrix")?;
+        let mut context = RunContext::new(cli, &run_dir)?;
+        context.cli_version = binary_version(cli)?;
+        let mut case = enforce_case(
+            &row,
+            contract_format_rollout(cli, &run_dir, &row, &context),
+            &run_dir,
+        );
+        if case.status == "PASS" {
+            let driver = std::env::current_exe().map_err(|err| err.to_string())?;
+            if source_fingerprint(&run_dir)? != context.source_sha256
+                || hash_file(cli)? != context.cli_sha256
+                || hash_file(&driver)? != context.driver_sha256
+            {
+                case.status = "FAIL".to_owned();
+                case.actual = "source, CLI, or verifier changed during proof".to_owned();
+            }
+        }
+        let mut case = context.bind(case);
+        write_case(&run_dir, &case)?;
+        if case.status == "PASS"
+            && let Err(err) = validate_coverage(
+                std::slice::from_ref(&row),
+                std::slice::from_ref(&case),
+                &run_dir,
+                &context,
+            )
+        {
+            case.status = "FAIL".to_owned();
+            case.actual = format!("fresh proof coverage: {err}");
+            write_case(&run_dir, &case)?;
+        }
+        Ok(case)
+    })();
+    match result {
+        Ok(case) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&case).unwrap_or_default()
+            );
+            if case.status == "PASS" {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(err) => {
+            eprintln!("CONTRACT-002 focused proof: {err}");
             ExitCode::from(2)
         }
     }
@@ -1321,8 +1394,16 @@ fn validate_format_rollout_observations(report: &FormatRolloutReport) -> Result<
     {
         return Err("CONTRACT-002 lost an ordered pre/post-activation event".to_owned());
     }
+    let checkpoint = observed("backup reader versions");
+    if checkpoint["writer"] != 5
+        || checkpoint["history"] != 1
+        || checkpoint["checkpoints"] != 1
+        || checkpoint["checkpoint_format"] != "graphrun.run-checkpoint/v2"
+        || checkpoint["checkpoint_through"] != page["retained_through"]
+    {
+        return Err("CONTRACT-002 backup lost its retained v2 checkpoint".to_owned());
+    }
     for step in [
-        "backup reader versions",
         "member 1 retained format",
         "member 2 retained format",
         "member 3 retained format",
@@ -1390,6 +1471,14 @@ fn validate_format_rollout_files(
             .history_records
             .get(&run)
             .is_none_or(|entries| entries.len() < 15)
+        || backup.checkpoints.get(&run).is_none_or(|checkpoint| {
+            checkpoint.format != "graphrun.run-checkpoint/v2"
+                || checkpoint.through_run_sequence != 15
+                || !matches!(
+                    checkpoint.projection.runs.get(&run).map(|run| &run.status),
+                    Some(graphrun::domain::RunStatus::Succeeded { output }) if output == &expected_output
+                )
+        })
         || hash_file(&manifest)? != manifest_hash
     {
         return Err("CONTRACT-002 backup lost the pre-v5 run or changed during read".to_owned());
@@ -11256,7 +11345,7 @@ mod tests {
             ),
             (
                 "backup reader versions",
-                serde_json::json!({"writer":5,"history":1}),
+                serde_json::json!({"writer":5,"history":1,"checkpoints":1,"checkpoint_format":"graphrun.run-checkpoint/v2","checkpoint_through":15}),
             ),
             (
                 "v5 framed snapshot file",

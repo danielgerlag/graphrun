@@ -197,6 +197,8 @@ cargo run --locked -p graphrun-e2e -- smoke-forged-worker \
 	--cli target/release/graphrun --artifacts target/worker-smoke
 cargo run --locked -p graphrun-e2e -- smoke-application \
 	--cli target/release/graphrun --artifacts target/application-smoke
+cargo run --locked -p graphrun-e2e -- contract-format-proof \
+	--cli target/release/graphrun --artifacts /tmp/gr-format-proof
 ```
 
 These commands do not produce a matrix report. `verify` must run all cases in
