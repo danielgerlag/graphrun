@@ -25,6 +25,7 @@ pub mod flow;
 #[cfg(feature = "format-proof")]
 #[doc(hidden)]
 pub mod format_proof;
+pub mod format_upgrade;
 #[doc(hidden)]
 pub mod generated;
 pub mod handlers;

@@ -186,6 +186,10 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum ClusterCommands {
+    Format {
+        #[command(subcommand)]
+        command: FormatCommands,
+    },
     Health {
         #[command(flatten)]
         connect: ConnectArgs,
@@ -221,6 +225,30 @@ enum ClusterCommands {
     Remove {
         #[arg(long)]
         node_id: u64,
+        #[command(flatten)]
+        connect: ConnectArgs,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum FormatCommands {
+    Status {
+        #[command(flatten)]
+        connect: ConnectArgs,
+    },
+    Prepare {
+        #[arg(long)]
+        target: u16,
+        #[arg(long)]
+        command_id: Option<String>,
+        #[command(flatten)]
+        connect: ConnectArgs,
+    },
+    Activate {
+        #[arg(long)]
+        target: u16,
+        #[arg(long)]
+        command_id: Option<String>,
         #[command(flatten)]
         connect: ConnectArgs,
     },
@@ -700,6 +728,84 @@ async fn run() -> Result<(), String> {
                     .map_err(|err| err.to_string())?;
             }
             engine.shutdown().await.map_err(|err| err.to_string())?;
+            Ok(())
+        }
+        Commands::Cluster {
+            command: ClusterCommands::Format { command },
+        } => {
+            let preparing = matches!(&command, FormatCommands::Prepare { .. });
+            match command {
+                FormatCommands::Status { connect } => {
+                    let status = if let Some(mut client) = grpc_client(&connect).await? {
+                        client
+                            .format_status()
+                            .await
+                            .map_err(|err| err.to_string())?
+                    } else {
+                        let local_dir = require_local(connect.local_dir)?;
+                        dispatch(&local_dir, ControlRequest::FormatStatus, false).await?
+                    };
+                    println!("{status}");
+                }
+                FormatCommands::Prepare {
+                    target,
+                    command_id,
+                    connect,
+                }
+                | FormatCommands::Activate {
+                    target,
+                    command_id,
+                    connect,
+                } => {
+                    let id = CommandId::from_hex(
+                        &command_id.unwrap_or_else(|| CommandId::generate().to_hex()),
+                    )?;
+                    let receipt = if let Some(mut client) = grpc_client(&connect).await? {
+                        if preparing {
+                            serde_json::to_value(
+                                client
+                                    .prepare_writer_format(target, id)
+                                    .await
+                                    .map_err(|err| err.to_string())?,
+                            )
+                        } else {
+                            serde_json::to_value(
+                                client
+                                    .activate_writer_format(target, id)
+                                    .await
+                                    .map_err(|err| err.to_string())?,
+                            )
+                        }
+                        .map_err(|err| err.to_string())?
+                    } else {
+                        let local_dir = require_local(connect.local_dir)?;
+                        dispatch(
+                            &local_dir,
+                            if preparing {
+                                ControlRequest::PrepareWriterFormat {
+                                    command_id: id.to_hex(),
+                                    target,
+                                }
+                            } else {
+                                ControlRequest::ActivateWriterFormat {
+                                    command_id: id.to_hex(),
+                                    target,
+                                }
+                            },
+                            true,
+                        )
+                        .await?
+                    };
+                    println!("{receipt}");
+                    if receipt["applied"] != true {
+                        return Err(format!(
+                            "format command {} committed a rejection: {}",
+                            id.to_hex(),
+                            receipt["message"]
+                        ));
+                    }
+                }
+            }
             Ok(())
         }
         Commands::Cluster {

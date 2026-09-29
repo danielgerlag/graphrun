@@ -48,11 +48,14 @@ pub(crate) async fn write_raft_response(
             ),
         ));
     }
+    let active_writer = storage.writer_format().await?;
+    crate::format_upgrade::ensure_writer(active_writer)?;
     #[cfg(feature = "format-proof")]
-    crate::format_proof::ensure_local_writer(storage.proof_writer_format().await?)?;
+    crate::format_proof::ensure_local_writer(active_writer)?;
     storage.clock().authorize(storage, raft).await?;
     let encoded = serde_json::to_vec(&RaftRequest {
         command: command.clone(),
+        writer_format: active_writer,
         #[cfg(feature = "format-proof")]
         proof_writer_format: crate::format_proof::WRITER_CAPABILITY,
     })
@@ -78,6 +81,7 @@ pub(crate) async fn write_raft_response(
     let resp = raft
         .client_write(RaftRequest {
             command,
+            writer_format: active_writer,
             #[cfg(feature = "format-proof")]
             proof_writer_format: crate::format_proof::WRITER_CAPABILITY,
         })

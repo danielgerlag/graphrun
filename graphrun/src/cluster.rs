@@ -1,4 +1,7 @@
-use crate::generated::{Blob, ClockHealthRequest, ElectionRequest, raft_client::RaftClient};
+use crate::generated::{
+    Blob, CandidateReaderRequest, ClockHealthRequest, ElectionRequest, ReaderRequest,
+    raft_client::RaftClient,
+};
 #[cfg(test)]
 use crate::rpc::client_tls;
 use crate::storage::TypeConfig;
@@ -50,6 +53,97 @@ pub(crate) struct ElectionEvidence {
 }
 
 impl ClusterNetwork {
+    pub async fn candidate_readers(
+        &self,
+        target: u64,
+        endpoint: &str,
+        active_writer: u16,
+        cluster_id: &str,
+    ) -> io::Result<()> {
+        let configured = self.peers.lock().unwrap().get(&target).cloned();
+        let mut client = PeerClient {
+            target,
+            peer: configured,
+            expected_endpoint: endpoint.to_owned(),
+            local_id: self.local_id,
+            local_tls: self.local_tls.clone(),
+        }
+        .client()
+        .await?;
+        let mut request = tonic::Request::new(CandidateReaderRequest {
+            sender_id: self.local_id,
+            target: active_writer.into(),
+        });
+        crate::format_upgrade::attach_writer(&mut request);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.candidate_readers(request),
+        )
+        .await
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?
+        .into_inner();
+        if response.member_id != target
+            || response.cluster_id != cluster_id
+            || !response.pristine
+            || response.reader_capability < u32::from(active_writer)
+            || response.writer_capability < u32::from(active_writer)
+        {
+            return Err(io::Error::other(
+                "candidate reader or writer capability is incompatible with active policy",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn reader_request(
+        &self,
+        target: u64,
+        committed_endpoint: &str,
+        roster: Option<openraft::LogId<u64>>,
+        format: u16,
+        prepare: bool,
+    ) -> io::Result<crate::format_upgrade::ReaderProof> {
+        let configured = self.peers.lock().unwrap().get(&target).cloned();
+        let mut client = PeerClient {
+            target,
+            peer: configured,
+            expected_endpoint: committed_endpoint.to_owned(),
+            local_id: self.local_id,
+            local_tls: self.local_tls.clone(),
+        }
+        .client()
+        .await?;
+        let mut request = tonic::Request::new(ReaderRequest {
+            sender_id: self.local_id,
+            target: format.into(),
+            roster_log_id_json: serde_json::to_vec(&crate::format_upgrade::position(roster))
+                .map_err(io::Error::other)?,
+        });
+        crate::format_upgrade::attach_writer(&mut request);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if prepare {
+                client.prepare_readers(request).await
+            } else {
+                client.probe_readers(request).await
+            }
+        })
+        .await
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?
+        .into_inner();
+        let proof: crate::format_upgrade::ReaderProof =
+            serde_json::from_slice(&result.proof_json).map_err(io::Error::other)?;
+        if proof.member_id != target
+            || proof.roster_log_id != crate::format_upgrade::position(roster)
+        {
+            return Err(io::Error::other(
+                "signed reader preparation response differs from committed roster",
+            ));
+        }
+        Ok(proof)
+    }
+
     pub fn new(
         local_id: u64,
         local_tls: TlsMaterial,
@@ -163,10 +257,12 @@ impl ClusterNetwork {
             tokio::time::timeout(std::time::Duration::from_millis(500), async {
                 let mut client = peer.client().await?;
                 let before_wall = crate::time::wall_millis().map_err(io::Error::other)?;
+                let mut request = tonic::Request::new(ClockHealthRequest {
+                    sender_id: self.local_id,
+                });
+                crate::format_upgrade::attach_writer(&mut request);
                 let response = client
-                    .clock_health(ClockHealthRequest {
-                        sender_id: self.local_id,
-                    })
+                    .clock_health(request)
                     .await
                     .map_err(io::Error::other)?
                     .into_inner();
@@ -214,15 +310,14 @@ impl ClusterNetwork {
             local_tls: self.local_tls.clone(),
         };
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let request = tonic::Request::new(ElectionRequest {
+            let mut request = tonic::Request::new(ElectionRequest {
                 sender_id: self.local_id,
                 expected_term: evidence.expected_term,
                 membership_index: evidence.membership_index,
                 min_applied_index: evidence.min_applied_index,
                 min_last_log_index: evidence.min_last_log_index,
             });
-            #[cfg(feature = "format-proof")]
-            let mut request = request;
+            crate::format_upgrade::attach_writer(&mut request);
             #[cfg(feature = "format-proof")]
             request.metadata_mut().insert(
                 crate::format_proof::WRITER_HEADER,
@@ -381,9 +476,8 @@ impl PeerClient {
             json: serde_json::to_vec(&rpc).map_err(io::Error::other)?,
             sender_id: self.local_id,
         };
-        let request = tonic::Request::new(blob);
-        #[cfg(feature = "format-proof")]
-        let mut request = request;
+        let mut request = tonic::Request::new(blob);
+        crate::format_upgrade::attach_writer(&mut request);
         #[cfg(feature = "format-proof")]
         request.metadata_mut().insert(
             crate::format_proof::WRITER_HEADER,

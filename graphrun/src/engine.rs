@@ -155,6 +155,15 @@ pub struct LocalBuilder {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ControlRequest {
+    FormatStatus,
+    PrepareWriterFormat {
+        command_id: String,
+        target: u16,
+    },
+    ActivateWriterFormat {
+        command_id: String,
+        target: u16,
+    },
     #[cfg(feature = "format-proof")]
     ProofStatus {
         command_id: Option<String>,
@@ -271,6 +280,41 @@ pub struct ControlResponse {
 }
 
 impl Engine {
+    pub async fn format_status(&self) -> Result<serde_json::Value> {
+        crate::format_upgrade::status(&self.raft, &self.storage).await
+    }
+
+    pub async fn prepare_writer_format(
+        &self,
+        target: u16,
+        command_id: CommandId,
+    ) -> Result<crate::format_upgrade::FormatReceipt> {
+        crate::format_upgrade::prepare(
+            &self.raft,
+            &self.storage,
+            self.cluster_net.as_ref(),
+            &self.publication_auth,
+            command_id,
+            target,
+        )
+        .await
+    }
+
+    pub async fn activate_writer_format(
+        &self,
+        target: u16,
+        command_id: CommandId,
+    ) -> Result<crate::format_upgrade::FormatReceipt> {
+        crate::format_upgrade::activate(
+            &self.raft,
+            &self.storage,
+            &self.publication_auth,
+            command_id,
+            target,
+        )
+        .await
+    }
+
     /// Build a local engine. Register handlers with [`LocalBuilder::activity`]
     /// before [`LocalBuilder::open`]. Call [`LocalBuilder::fixtures`] to enable
     /// the sample catalog names (`counter.increment`, `inventory.reserve`, …).
@@ -1057,6 +1101,15 @@ impl Engine {
     }
 
     pub async fn add_learner(&self, id: u64, addr: SocketAddr) -> Result<()> {
+        let _guard = self.storage.format_admin_guard().await;
+        crate::format_upgrade::verify_candidate(
+            &self.raft,
+            &self.storage,
+            self.cluster_net.as_ref(),
+            id,
+            &addr.to_string(),
+        )
+        .await?;
         self.raft
             .add_learner(id, BasicNode::new(addr.to_string()), true)
             .await
@@ -1065,6 +1118,20 @@ impl Engine {
     }
 
     pub async fn add_voter(&self, id: u64) -> Result<()> {
+        let _guard = self.storage.format_admin_guard().await;
+        let policy = crate::format_upgrade::membership_barrier(&self.raft, &self.storage).await?;
+        if policy.active_writer == crate::format_upgrade::NEXT_FORMAT
+            && (policy.roster_log_id
+                != crate::format_upgrade::position(
+                    *self.storage.applied_membership().await?.log_id(),
+                )
+                || !policy.prepared.contains_key(&id))
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "learner has no committed reader preparation for the active writer",
+            ));
+        }
         self.raft
             .change_membership(
                 ChangeMembers::AddVoterIds(std::iter::once(id).collect()),
@@ -1076,6 +1143,8 @@ impl Engine {
     }
 
     pub async fn remove_voter(&self, id: u64) -> Result<()> {
+        let _guard = self.storage.format_admin_guard().await;
+        crate::format_upgrade::membership_barrier(&self.raft, &self.storage).await?;
         self.raft
             .change_membership(
                 ChangeMembers::RemoveVoters(std::iter::once(id).collect()),
@@ -1163,20 +1232,24 @@ impl Engine {
             .map_err(|err| Error::invalid(err.to_string()))?
             .len();
         drop(raw);
+        let mut record_formats = vec![
+            "graphrun.domain/v1".to_owned(),
+            crate::history::EVENT_FORMAT.to_owned(),
+            crate::history::CHECKPOINT_FORMAT.to_owned(),
+            crate::publication::RESULT_FORMAT.to_owned(),
+            crate::record_store::FORMAT.to_owned(),
+            crate::record_store::FRAGMENT_FORMAT.to_owned(),
+        ];
+        if state.format_policy.active_writer == crate::format_upgrade::NEXT_FORMAT {
+            record_formats.push(crate::record_store::NEXT_FORMAT.to_owned());
+        }
         let snapshot_manifest = SnapshotManifest {
             framing_version: 1,
             generation: 0,
             applied_json: b"null".to_vec(),
             membership_json: b"null".to_vec(),
             payload_bytes: body_len,
-            record_formats: vec![
-                "graphrun.domain/v1".to_owned(),
-                crate::history::EVENT_FORMAT.to_owned(),
-                crate::history::CHECKPOINT_FORMAT.to_owned(),
-                crate::publication::RESULT_FORMAT.to_owned(),
-                crate::record_store::FORMAT.to_owned(),
-                crate::record_store::FRAGMENT_FORMAT.to_owned(),
-            ],
+            record_formats,
             record_count: 1,
             artifact_origin_ids: state.artifact_origins.iter().cloned().collect(),
         };
@@ -1261,11 +1334,15 @@ impl Engine {
             crate::record_store::FORMAT,
             crate::record_store::FRAGMENT_FORMAT,
         ];
+        let has_next = framing
+            .record_formats
+            .iter()
+            .any(|format| format == crate::record_store::NEXT_FORMAT);
         if manifest.sha256 != hex::encode(digest)
             || framing.generation != 0
             || framing.applied_json != b"null"
             || framing.membership_json != b"null"
-            || framing.record_formats.len() != required.len()
+            || framing.record_formats.len() != required.len() + usize::from(has_next)
             || required
                 .iter()
                 .any(|format| !framing.record_formats.iter().any(|stored| stored == format))
@@ -1306,6 +1383,15 @@ impl Engine {
                 format!("retained backup artifact is unavailable: {err}"),
             )
         })?;
+        crate::format_upgrade::validate_persisted_state(&domain)?;
+        if (domain.format_policy.active_writer == crate::format_upgrade::NEXT_FORMAT) != has_next
+            || domain.format_policy.active_writer > crate::format_upgrade::CURRENT_READER
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "backup writer policy disagrees with retained record reader versions",
+            ));
+        }
         Ok(domain)
     }
 
@@ -1315,6 +1401,9 @@ impl Engine {
         }
         let dest = dest.as_ref();
         let mut domain = Self::read_backup(from)?;
+        crate::format_upgrade::ensure_writer(domain.format_policy.active_writer)?;
+        domain.format_policy.prepared.clear();
+        domain.format_policy.roster_log_id = None;
         if dest.exists()
             && std::fs::read_dir(dest)
                 .map_err(|err| Error::invalid(err.to_string()))?
@@ -1753,6 +1842,30 @@ async fn dispatch_control(
     auth: &crate::publication::AuthContext,
 ) -> ControlResponse {
     let result = match req {
+        ControlRequest::FormatStatus => crate::format_upgrade::status(raft, storage).await,
+        ControlRequest::PrepareWriterFormat { command_id, target } => {
+            match CommandId::from_hex(&command_id) {
+                Ok(id) => {
+                    crate::format_upgrade::prepare(raft, storage, cluster_net, auth, id, target)
+                        .await
+                        .and_then(|receipt| {
+                            serde_json::to_value(receipt)
+                                .map_err(|err| Error::invalid(err.to_string()))
+                        })
+                }
+                Err(err) => Err(Error::invalid(err)),
+            }
+        }
+        ControlRequest::ActivateWriterFormat { command_id, target } => {
+            match CommandId::from_hex(&command_id) {
+                Ok(id) => crate::format_upgrade::activate(raft, storage, auth, id, target)
+                    .await
+                    .and_then(|receipt| {
+                        serde_json::to_value(receipt).map_err(|err| Error::invalid(err.to_string()))
+                    }),
+                Err(err) => Err(Error::invalid(err)),
+            }
+        }
         ControlRequest::PublishCatalog {
             version,
             catalog,
@@ -1945,6 +2058,7 @@ async fn dispatch_control(
                     let result = if direct {
                         raft.client_write(crate::storage::RaftRequest {
                             command,
+                            writer_format: crate::format_upgrade::CURRENT_WRITER,
                             proof_writer_format: crate::format_proof::WRITER_CAPABILITY,
                         })
                         .await
@@ -1983,6 +2097,7 @@ async fn dispatch_control(
                                 time: now(),
                                 body: CommandBody::PruneHistory { limit: 1 },
                             },
+                            writer_format: crate::format_upgrade::CURRENT_WRITER,
                             proof_writer_format: 4,
                         })
                         .await
@@ -2270,6 +2385,7 @@ async fn dispatch_control(
             (None, _) => Err(Error::invalid("join requires a clustered member")),
             (_, Err(err)) => Err(Error::invalid(err.to_string())),
             (Some(net), Ok(parsed)) => {
+                let _guard = storage.format_admin_guard().await;
                 net.insert_peer(
                     node_id,
                     parsed,
@@ -2280,21 +2396,60 @@ async fn dispatch_control(
                         server_name,
                     },
                 );
-                raft.add_learner(node_id, BasicNode::new(parsed.to_string()), true)
-                    .await
-                    .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
-                    .map_err(|err| Error::invalid(err.to_string()))
+                match crate::format_upgrade::verify_candidate(
+                    raft,
+                    storage,
+                    Some(net),
+                    node_id,
+                    &parsed.to_string(),
+                )
+                .await
+                {
+                    Err(err) => Err(err),
+                    Ok(()) => raft
+                        .add_learner(node_id, BasicNode::new(parsed.to_string()), true)
+                        .await
+                        .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
+                        .map_err(|err| Error::invalid(err.to_string())),
+                }
             }
         },
-        ControlRequest::Promote { node_id } => raft
-            .change_membership(
-                ChangeMembers::AddVoterIds(std::iter::once(node_id).collect()),
-                true,
-            )
-            .await
-            .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
-            .map_err(|err| Error::invalid(err.to_string())),
+        ControlRequest::Promote { node_id } => {
+            let _guard = storage.format_admin_guard().await;
+            let policy = crate::format_upgrade::membership_barrier(raft, storage).await;
+            let roster = storage.applied_membership().await;
+            match (policy, roster) {
+                (Err(err), _) | (_, Err(err)) => Err(err),
+                (Ok(policy), Ok(roster))
+                    if policy.active_writer == crate::format_upgrade::NEXT_FORMAT
+                        && (policy.roster_log_id
+                            != crate::format_upgrade::position(*roster.log_id())
+                            || !policy.prepared.contains_key(&node_id)) =>
+                {
+                    Err(Error::new(
+                        ErrorKind::FailedPrecondition,
+                        "learner has no committed reader preparation for the active writer",
+                    ))
+                }
+                (Ok(_), Ok(_)) => raft
+                    .change_membership(
+                        ChangeMembers::AddVoterIds(std::iter::once(node_id).collect()),
+                        true,
+                    )
+                    .await
+                    .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
+                    .map_err(|err| Error::invalid(err.to_string())),
+            }
+        }
         ControlRequest::Remove { node_id } => {
+            let _guard = storage.format_admin_guard().await;
+            if let Err(err) = crate::format_upgrade::membership_barrier(raft, storage).await {
+                return ControlResponse {
+                    ok: false,
+                    error: Some(err.to_string()),
+                    body: serde_json::Value::Null,
+                };
+            }
             match raft
                 .change_membership(
                     ChangeMembers::RemoveVoters(std::iter::once(node_id).collect()),
@@ -3332,6 +3487,39 @@ mod tests {
 
         let engine = Engine::local(dir.path()).await.unwrap();
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_reader_preparation_is_committed_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let command = CommandId::from_bytes([42; 16]);
+        let initial = engine.format_status().await.unwrap();
+        assert_eq!(initial["writer_format"], 4);
+        let prepared = engine.prepare_writer_format(5, command).await.unwrap();
+        assert!(prepared.applied);
+        assert_eq!(prepared.active_writer, 4);
+        assert_eq!(
+            engine.prepare_writer_format(5, command).await.unwrap(),
+            prepared
+        );
+        let view = engine.format_status().await.unwrap();
+        assert_eq!(view["prepared"]["1"]["reader_floor"], 5);
+        assert_eq!(
+            engine
+                .activate_writer_format(5, CommandId::from_bytes([43; 16]))
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::FailedPrecondition
+        );
+        engine.shutdown().await.unwrap();
+        let opened = Engine::local(dir.path()).await.unwrap();
+        assert_eq!(
+            opened.format_status().await.unwrap()["prepared"]["1"]["reader_floor"],
+            5
+        );
+        opened.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

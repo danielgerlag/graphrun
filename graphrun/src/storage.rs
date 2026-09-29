@@ -51,6 +51,8 @@ openraft::declare_raft_types!(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RaftRequest {
     pub command: Command,
+    #[serde(default = "crate::format_upgrade::base_format")]
+    pub writer_format: u16,
     #[cfg(feature = "format-proof")]
     pub proof_writer_format: u16,
 }
@@ -64,6 +66,8 @@ pub struct RaftResponse {
     pub command_result: Option<crate::publication::CommandResult>,
     #[serde(default)]
     pub run_id: Option<crate::ids::RunId>,
+    #[serde(default)]
+    pub format_receipt: Option<crate::format_upgrade::FormatReceipt>,
 }
 
 const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
@@ -91,9 +95,52 @@ struct StoreManifest {
     event_format: String,
     checkpoint_format: String,
     result_format: String,
+    #[serde(default = "base_domain_formats")]
+    enabled_domain_formats: Vec<String>,
+    #[serde(default = "base_event_formats")]
+    enabled_event_formats: Vec<String>,
+    #[serde(default = "base_checkpoint_formats")]
+    enabled_checkpoint_formats: Vec<String>,
+    #[serde(default = "base_command_formats")]
+    enabled_command_formats: Vec<u16>,
+    #[serde(default = "base_record_formats")]
+    enabled_state_record_formats: Vec<String>,
+}
+
+fn base_command_formats() -> Vec<u16> {
+    vec![4]
+}
+
+fn base_record_formats() -> Vec<String> {
+    vec![record_store::FORMAT.to_owned()]
+}
+
+fn base_domain_formats() -> Vec<String> {
+    vec!["graphrun.domain/v1".to_owned()]
+}
+
+fn base_event_formats() -> Vec<String> {
+    vec![crate::history::EVENT_FORMAT.to_owned()]
+}
+
+fn base_checkpoint_formats() -> Vec<String> {
+    vec![crate::history::CHECKPOINT_FORMAT.to_owned()]
 }
 
 impl StoreManifest {
+    fn activate_writer(&mut self) -> Result<()> {
+        if self.reader_floor < crate::format_upgrade::NEXT_FORMAT {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "writer activation requires a durably installed reader",
+            ));
+        }
+        self.format = "graphrun.member-store/v5".to_owned();
+        self.writer_format = crate::format_upgrade::NEXT_FORMAT;
+        self.state_record_format = record_store::NEXT_FORMAT.to_owned();
+        self.validate()
+    }
+
     fn new() -> Self {
         Self {
             format: "graphrun.member-store/v4".to_owned(),
@@ -109,22 +156,49 @@ impl StoreManifest {
             event_format: crate::history::EVENT_FORMAT.to_owned(),
             checkpoint_format: crate::history::CHECKPOINT_FORMAT.to_owned(),
             result_format: crate::publication::RESULT_FORMAT.to_owned(),
+            enabled_domain_formats: base_domain_formats(),
+            enabled_event_formats: base_event_formats(),
+            enabled_checkpoint_formats: base_checkpoint_formats(),
+            enabled_command_formats: base_command_formats(),
+            enabled_state_record_formats: base_record_formats(),
         }
     }
 
     fn validate(&self) -> Result<()> {
-        if self.format != "graphrun.member-store/v4"
-            || self.reader_floor > 4
-            || (self.writer_format != 4
-                && !(cfg!(feature = "format-proof") && self.writer_format == 5))
+        if !matches!(
+            self.format.as_str(),
+            "graphrun.member-store/v4" | "graphrun.member-store/v5"
+        ) || !matches!(self.reader_floor, 4 | 5)
+            || !matches!(self.writer_format, 4 | 5)
             || self.active_generation == 0
             || self.domain_format != "graphrun.domain/v1"
-            || self.state_record_format != record_store::FORMAT
+            || (self.writer_format == 4 && self.state_record_format != record_store::FORMAT)
+            || (self.writer_format == 5 && self.state_record_format != record_store::NEXT_FORMAT)
+            || (self.writer_format == 5
+                && (self.format != "graphrun.member-store/v5" || self.reader_floor != 5))
             || self.fragment_format != record_store::FRAGMENT_FORMAT
             || self.artifact_ref_format != crate::history::ARTIFACT_FORMAT
             || self.event_format != crate::history::EVENT_FORMAT
             || self.checkpoint_format != crate::history::CHECKPOINT_FORMAT
             || self.result_format != crate::publication::RESULT_FORMAT
+            || self.enabled_domain_formats != base_domain_formats()
+            || self.enabled_event_formats != base_event_formats()
+            || self.enabled_checkpoint_formats != base_checkpoint_formats()
+            || self.enabled_command_formats
+                != if self.reader_floor == 5 {
+                    vec![4, 5]
+                } else {
+                    vec![4]
+                }
+            || self.enabled_state_record_formats
+                != if self.reader_floor == 5 {
+                    vec![
+                        record_store::FORMAT.to_owned(),
+                        record_store::NEXT_FORMAT.to_owned(),
+                    ]
+                } else {
+                    base_record_formats()
+                }
             || self.cluster_id.is_some() != self.member_id.is_some()
         {
             return Err(Error::new(
@@ -336,6 +410,13 @@ enum Req {
     QueryState(oneshot::Sender<State>),
     ScheduleView(oneshot::Sender<std::result::Result<ScheduleView, StoErr>>),
     QueryWatermark(oneshot::Sender<u64>),
+    WriterFormat(oneshot::Sender<std::result::Result<u16, StoErr>>),
+    PrepareFormatReaders(
+        u16,
+        Option<LogIdT>,
+        bool,
+        oneshot::Sender<std::result::Result<crate::format_upgrade::ReaderProof, StoErr>>,
+    ),
     #[cfg(feature = "format-proof")]
     ProofWriterFormat(oneshot::Sender<std::result::Result<u16, StoErr>>),
     BindIdentity(
@@ -361,9 +442,71 @@ pub struct StorageHandle {
     schedule_wakes: Arc<[AtomicU64; 5]>,
     snapshot_dir: Arc<PathBuf>,
     inbound_snapshot: Arc<Semaphore>,
+    format_admin: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl StorageHandle {
+    pub async fn format_admin_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.format_admin.clone().lock_owned().await
+    }
+    pub async fn writer_format(&self) -> Result<u16> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Req::WriterFormat(tx)).await.map_err(|_| {
+            Error::new(
+                crate::error::ErrorKind::Unavailable,
+                "storage owner stopped",
+            )
+        })?;
+        rx.await
+            .map_err(|_| {
+                Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "storage owner dropped writer policy",
+                )
+            })?
+            .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))
+    }
+    pub async fn prepare_format_readers(
+        &self,
+        target: u16,
+        roster: Option<LogIdT>,
+    ) -> Result<crate::format_upgrade::ReaderProof> {
+        self.request_format_readers(target, roster, true).await
+    }
+
+    pub async fn probe_format_readers(
+        &self,
+        target: u16,
+        roster: Option<LogIdT>,
+    ) -> Result<crate::format_upgrade::ReaderProof> {
+        self.request_format_readers(target, roster, false).await
+    }
+
+    async fn request_format_readers(
+        &self,
+        target: u16,
+        roster: Option<LogIdT>,
+        durable: bool,
+    ) -> Result<crate::format_upgrade::ReaderProof> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Req::PrepareFormatReaders(target, roster, durable, tx))
+            .await
+            .map_err(|_| {
+                Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "storage owner stopped",
+                )
+            })?;
+        rx.await
+            .map_err(|_| {
+                Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "storage owner dropped reader preparation",
+                )
+            })?
+            .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))
+    }
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, JoinHandle<()>)> {
         Self::open_inner(path, false, false)
     }
@@ -411,6 +554,7 @@ impl StorageHandle {
                 ));
             }
             let store_manifest = verified_store_manifest(&db)?;
+            crate::format_upgrade::ensure_writer(store_manifest.writer_format)?;
             #[cfg(feature = "format-proof")]
             crate::format_proof::ensure_local_writer(store_manifest.writer_format)?;
             let state =
@@ -421,6 +565,12 @@ impl StorageHandle {
                     )
                 })?;
             validate_history_store(&state)?;
+            if state.format_policy.active_writer != store_manifest.writer_format {
+                return Err(Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "committed writer policy disagrees with the local store manifest",
+                ));
+            }
             validate_cluster_binding(&state, &store_manifest, restoring)?;
             if let Some(registry) = optional_json::<_, SnapshotRegistry>(&db, "snapshot_registry")?
             {
@@ -523,6 +673,7 @@ impl StorageHandle {
                     schedule_wakes,
                     snapshot_dir,
                     inbound_snapshot: Arc::new(Semaphore::new(1)),
+                    format_admin: Arc::new(tokio::sync::Mutex::new(())),
                 },
                 handle,
             )),
@@ -567,6 +718,12 @@ impl StorageHandle {
             )
         })?;
         validate_history_store(&state)?;
+        if state.format_policy.active_writer != manifest.writer_format {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "committed writer policy disagrees with the local store manifest",
+            ));
+        }
         validate_cluster_binding(&state, &manifest, restoring)?;
         drop(candidate);
         drop(Database::open(path).map_err(|err| {
@@ -739,6 +896,7 @@ impl StorageHandle {
 
     pub async fn install_domain(&self, state: State) -> Result<()> {
         validate_history_store(&state)?;
+        crate::format_upgrade::validate_persisted_state(&state)?;
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Req::InstallDomain(Box::new(state), tx))
@@ -860,6 +1018,12 @@ pub fn load_domain_readonly(path: impl AsRef<Path>) -> Result<State> {
         )
     })?;
     validate_history_store(&state)?;
+    if state.format_policy.active_writer != store_manifest.writer_format {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "committed writer policy disagrees with the local store manifest",
+        ));
+    }
     validate_cluster_binding(&state, &store_manifest, false)?;
     if let Some(registry) = optional_json::<_, SnapshotRegistry>(&db, "snapshot_registry")? {
         if registry.generation != store_manifest.active_generation {
@@ -914,6 +1078,12 @@ pub fn compact_offline(path: impl AsRef<Path>) -> Result<CompactOutcome> {
     let state = load_app_generation(&db, manifest.active_generation)
         .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))?;
     validate_history_store(&state)?;
+    if state.format_policy.active_writer != manifest.writer_format {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "committed writer policy disagrees with the local store manifest",
+        ));
+    }
     validate_cluster_binding(&state, &manifest, false)?;
     let mut passes = 0;
     while passes < 16 {
@@ -1383,6 +1553,12 @@ fn storage_thread(
                 Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string())
             })?;
         validate_history_store(&domain)?;
+        if domain.format_policy.active_writer != manifest.writer_format {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "committed writer policy disagrees with the local store manifest",
+            ));
+        }
         validate_cluster_binding(&domain, &manifest, restoring)?;
         optional_json::<_, VoteT>(db.as_ref(), "vote")?;
         Ok((last_purged, last_applied, membership, domain))
@@ -1676,6 +1852,26 @@ fn storage_thread(
             Req::QueryWatermark(tx) => {
                 let _ = tx.send(domain.engine_time_watermark_ms);
             }
+            Req::WriterFormat(tx) => {
+                let _ = tx.send(
+                    verified_store_manifest(db.as_ref())
+                        .map(|manifest| manifest.writer_format)
+                        .map_err(|err| sto_err(ErrorVerb::Read, err)),
+                );
+            }
+            Req::PrepareFormatReaders(target, roster, durable, tx) => {
+                let result = prepare_format_readers(
+                    db.as_ref(),
+                    &snapshot_dir,
+                    &domain,
+                    &last_membership,
+                    last_applied,
+                    target,
+                    roster,
+                    durable,
+                );
+                let _ = tx.send(result);
+            }
             #[cfg(feature = "format-proof")]
             Req::ProofWriterFormat(tx) => {
                 let _ = tx.send(
@@ -1706,10 +1902,40 @@ fn storage_thread(
                 let res = validate_history_store(&next)
                     .map_err(|err| sto_err(ErrorVerb::Write, err))
                     .and_then(|()| {
-                        let generation = verified_store_manifest(db.as_ref())
-                            .map_err(|err| sto_err(ErrorVerb::Read, err))?
-                            .active_generation;
+                        crate::format_upgrade::validate_persisted_state(&next)
+                            .map_err(|err| sto_err(ErrorVerb::Write, err))
+                    })
+                    .and_then(|()| {
+                        let mut manifest = verified_store_manifest(db.as_ref())
+                            .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+                        if next.format_policy.active_writer < manifest.writer_format
+                            || next.format_policy.active_writer
+                                > crate::format_upgrade::CURRENT_WRITER
+                        {
+                            return Err(sto_err(
+                                ErrorVerb::Write,
+                                "domain installation cannot downgrade or exceed the binary writer",
+                            ));
+                        }
+                        if next.format_policy.active_writer == crate::format_upgrade::NEXT_FORMAT {
+                            manifest.reader_floor = crate::format_upgrade::NEXT_FORMAT;
+                            manifest.enabled_command_formats = vec![4, 5];
+                            manifest.enabled_state_record_formats = vec![
+                                record_store::FORMAT.to_owned(),
+                                record_store::NEXT_FORMAT.to_owned(),
+                            ];
+                            manifest
+                                .activate_writer()
+                                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+                        }
+                        let generation = manifest.active_generation;
                         let txn = begin_immediate(&db)?;
+                        let bytes = serde_json::to_vec(&manifest)
+                            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+                        txn.open_table(META)
+                            .map_err(|err| sto_err(ErrorVerb::Write, err))?
+                            .insert("store_manifest", bytes.as_slice())
+                            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
                         write_app_delta(
                             &txn,
                             &domain,
@@ -1926,6 +2152,83 @@ fn verified_store_manifest<D: ReadableDatabase>(db: &D) -> Result<StoreManifest>
     Ok(manifest)
 }
 
+fn prepare_format_readers(
+    db: &Database,
+    snapshot_dir: &Path,
+    state: &State,
+    roster: &MembershipT,
+    applied: Option<LogIdT>,
+    target: u16,
+    expected_roster: Option<LogIdT>,
+    durable: bool,
+) -> std::result::Result<crate::format_upgrade::ReaderProof, StoErr> {
+    if target != crate::format_upgrade::NEXT_FORMAT
+        || crate::format_upgrade::CURRENT_READER < target
+        || *roster.log_id() != expected_roster
+    {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "reader target or committed roster changed",
+        ));
+    }
+    let mut manifest = verified_store_manifest(db).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let member = manifest
+        .member_id
+        .ok_or_else(|| sto_err(ErrorVerb::Read, "member genesis is not bound"))?;
+    let cluster = manifest
+        .cluster_id
+        .clone()
+        .ok_or_else(|| sto_err(ErrorVerb::Read, "cluster genesis is not bound"))?;
+    if roster.membership().get_node(&member).is_none()
+        || state.current_cluster_id != cluster
+        || state.format_policy.active_writer != manifest.writer_format
+    {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "local state, writer policy, and committed roster disagree",
+        ));
+    }
+    let retained = load_app_generation(db, manifest.active_generation)?;
+    validate_history_store(&retained).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    if let Some(registry) = optional_json::<_, SnapshotRegistry>(db, "snapshot_registry")
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+    {
+        verify_registry(snapshot_dir, &registry)?;
+    }
+    if durable && manifest.reader_floor < target {
+        manifest.reader_floor = target;
+        manifest.enabled_command_formats = vec![4, 5];
+        manifest.enabled_state_record_formats = vec![
+            record_store::FORMAT.to_owned(),
+            record_store::NEXT_FORMAT.to_owned(),
+        ];
+        let txn = begin_immediate(db)?;
+        let bytes = serde_json::to_vec(&manifest).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        txn.open_table(META)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?
+            .insert("store_manifest", bytes.as_slice())
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        commit_immediate(txn)?;
+    }
+    Ok(crate::format_upgrade::ReaderProof {
+        format: crate::format_upgrade::PROOF_FORMAT.to_owned(),
+        cluster_id: cluster,
+        member_id: member,
+        roster_log_id: crate::format_upgrade::position(*roster.log_id()),
+        active_generation: manifest.active_generation,
+        applied_log_id: crate::format_upgrade::position(applied),
+        reader_floor: manifest.reader_floor,
+        command_readers: manifest.enabled_command_formats,
+        domain_readers: manifest.enabled_domain_formats,
+        graph_readers: vec![crate::ir::FORMAT_VERSION],
+        state_records: manifest.enabled_state_record_formats,
+        event_readers: manifest.enabled_event_formats,
+        checkpoint_readers: manifest.enabled_checkpoint_formats,
+        artifact_readers: vec![crate::history::ARTIFACT_FORMAT.to_owned()],
+        snapshot_readers: vec![1],
+    })
+}
+
 fn validate_cluster_binding(
     state: &State,
     manifest: &StoreManifest,
@@ -2059,7 +2362,11 @@ fn load_app_generation<D: ReadableDatabase>(
     }
     let logical =
         record_store::restore_records(rows).map_err(|err| sto_err(ErrorVerb::Read, err))?;
-    record_store::decode(logical, generation).map_err(|err| sto_err(ErrorVerb::Read, err))
+    let state =
+        record_store::decode(logical, generation).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    crate::format_upgrade::validate_persisted_state(&state)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    Ok(state)
 }
 
 fn retired_record_visibility(
@@ -2484,6 +2791,48 @@ fn write_publication_delta(
     write_record_delta(txn, &previous, &next)
 }
 
+fn write_format_delta(
+    txn: &redb::WriteTransaction,
+    domain: &State,
+    generation: u64,
+    revision: u64,
+    receipt: &crate::format_upgrade::FormatReceipt,
+) -> std::result::Result<(), StoErr> {
+    let key = format!("{}/{}", receipt.principal_id, receipt.command_id.to_hex());
+    let table = txn
+        .open_table(APP_ROWS)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let mut previous = BTreeMap::new();
+    let mut next = BTreeMap::new();
+    for (field, tag, id, value) in [
+        (
+            "format_policy",
+            "scalar",
+            "",
+            serde_json::to_value(&domain.format_policy)
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?,
+        ),
+        (
+            "format_receipts",
+            "map",
+            key.as_str(),
+            serde_json::to_value(receipt).map_err(|err| sto_err(ErrorVerb::Write, err))?,
+        ),
+    ] {
+        let (key, bytes) =
+            record_store::encode_value(generation, revision, None, field, tag, id, value)
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        if let Some(stored) = stored_app_record(&table, &key)? {
+            previous.insert(key.clone(), stored.value);
+        }
+        if field != "format_policy" || domain.format_policy != Default::default() {
+            next.insert(key, bytes);
+        }
+    }
+    drop(table);
+    write_record_delta(txn, &previous, &next)
+}
+
 #[derive(Default)]
 struct PruneSelection {
     command_ids: Vec<crate::ids::CommandId>,
@@ -2753,6 +3102,18 @@ fn write_record_delta(
     previous: &BTreeMap<String, Vec<u8>>,
     next: &BTreeMap<String, Vec<u8>>,
 ) -> std::result::Result<(), StoErr> {
+    let writer = {
+        let meta = txn
+            .open_table(META)
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        let bytes = meta
+            .get("store_manifest")
+            .map_err(|err| sto_err(ErrorVerb::Read, err))?
+            .ok_or_else(|| sto_err(ErrorVerb::Read, "store manifest missing during apply"))?;
+        let manifest: StoreManifest =
+            serde_json::from_slice(bytes.value()).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        manifest.writer_format
+    };
     let mut table = txn
         .open_table(APP_ROWS)
         .map_err(|err| sto_err(ErrorVerb::Write, err))?;
@@ -2800,7 +3161,9 @@ fn write_record_delta(
                 ));
             }
         }
-        let framed = record_store::frame_records(std::iter::once((key.to_owned(), value.to_vec())))
+        let value = record_store::for_writer(value, writer)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        let framed = record_store::frame_records(std::iter::once((key.to_owned(), value)))
             .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         for (physical_key, bytes) in framed {
             table
@@ -2817,6 +3180,7 @@ struct ImportStats {
     records: u64,
     largest_batch_bytes: usize,
     largest_batch_records: usize,
+    formats: std::collections::BTreeSet<String>,
 }
 
 fn clear_inactive_generation(
@@ -2996,6 +3360,13 @@ fn stage_record_file(
             )
         })?;
         let key = format!("{target_prefix}{suffix}");
+        if !key.contains("/fragment/") {
+            stats.formats.insert(
+                record_store::record_format(&value)
+                    .map_err(|err| sto_err(ErrorVerb::Read, err))?
+                    .to_owned(),
+            );
+        }
         let size = key.len() + value.len();
         if batch.len() == 4_096 || batch_bytes.saturating_add(size) > 4 * 1024 * 1024 {
             persist_import_batch(db, &batch)?;
@@ -3029,6 +3400,8 @@ fn stage_record_file(
         stats.largest_batch_records = stats.largest_batch_records.max(batch.len());
     }
     let state = load_app_generation(db, generation)?;
+    crate::format_upgrade::validate_persisted_state(&state)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
     validate_history_store(&state).map_err(|err| sto_err(ErrorVerb::Read, err))?;
     Ok((stats, state))
 }
@@ -3671,9 +4044,17 @@ fn verify_registry(
                     | crate::history::CHECKPOINT_FORMAT
                     | crate::publication::RESULT_FORMAT
                     | record_store::FORMAT
+                    | record_store::NEXT_FORMAT
                     | record_store::FRAGMENT_FORMAT
             )
         })
+        || manifest.record_formats.len() > 7
+        || manifest
+            .record_formats
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != manifest.record_formats.len()
         || hex::encode(digest) != registry.sha256
     {
         return Err(sto_err(
@@ -4171,6 +4552,10 @@ fn apply_one_entry(
     let mut publication = None;
     let mut prune = false;
     let mut prune_selection = None;
+    let mut format_applied = false;
+    let mut format_operation = false;
+    let active_manifest =
+        verified_store_manifest(db).map_err(|err| sto_err(ErrorVerb::Read, err))?;
     #[cfg(feature = "format-proof")]
     let mut proof_manifest =
         verified_store_manifest(db).map_err(|err| sto_err(ErrorVerb::Read, err))?;
@@ -4202,6 +4587,71 @@ fn apply_one_entry(
             }
         }
         if !proof_handled {
+            if req.writer_format < active_manifest.writer_format {
+                reply.error_kind = Some(crate::error::ErrorKind::FailedPrecondition);
+                reply.error = Some("old writer entry rejected at committed apply".to_owned());
+                format_operation = true;
+            } else if req.writer_format > active_manifest.writer_format {
+                if req.writer_format > crate::format_upgrade::CURRENT_READER {
+                    return Err(sto_err(
+                        ErrorVerb::Read,
+                        "committed entry needs an unavailable command-format reader",
+                    ));
+                }
+                reply.error_kind = Some(crate::error::ErrorKind::FailedPrecondition);
+                reply.error = Some("writer format is not activated".to_owned());
+                format_operation = true;
+            } else if !active_manifest
+                .enabled_command_formats
+                .contains(&req.writer_format)
+            {
+                return Err(sto_err(
+                    ErrorVerb::Read,
+                    "committed entry needs an unavailable command-format reader",
+                ));
+            }
+        }
+        if !proof_handled && !format_operation {
+            if matches!(
+                body,
+                domain::CommandBody::PrepareWriterFormat { .. }
+                    | domain::CommandBody::ActivateWriterFormat { .. }
+            ) {
+                format_operation = true;
+                let principal = match &req.command.body {
+                    domain::CommandBody::Authenticated { principal_id, .. } => {
+                        principal_id.as_str()
+                    }
+                    _ => "",
+                };
+                let receipt = crate::format_upgrade::apply(
+                    &mut domain.format_policy,
+                    &mut domain.format_receipts,
+                    &req.command,
+                    last_membership,
+                    *entry.get_log_id(),
+                    principal,
+                    &domain.current_cluster_id,
+                );
+                match receipt {
+                    Ok(receipt) => {
+                        format_applied = receipt.applied
+                            && domain.format_policy.active_writer
+                                == crate::format_upgrade::NEXT_FORMAT;
+                        if !receipt.applied {
+                            reply.error_kind = Some(crate::error::ErrorKind::FailedPrecondition);
+                            reply.error = Some(receipt.message.clone());
+                        }
+                        reply.format_receipt = Some(receipt);
+                    }
+                    Err(err) => {
+                        reply.error_kind = Some(err.kind);
+                        reply.error = Some(err.message);
+                    }
+                }
+            }
+        }
+        if !proof_handled && !format_operation {
             prune = matches!(body, domain::CommandBody::PruneHistory { .. });
             if let domain::CommandBody::PruneHistory { limit } = body
                 && !domain.commands.contains_key(&req.command.id)
@@ -4384,6 +4834,22 @@ fn apply_one_entry(
             meta.insert("membership", bytes.as_slice())
                 .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         }
+        if format_applied {
+            if active_manifest.reader_floor != crate::format_upgrade::NEXT_FORMAT {
+                return Err(sto_err(
+                    ErrorVerb::Write,
+                    "committed activation cannot apply without durable local reader preparation",
+                ));
+            }
+            let mut manifest = active_manifest.clone();
+            manifest
+                .activate_writer()
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            let bytes =
+                serde_json::to_vec(&manifest).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+            meta.insert("store_manifest", bytes.as_slice())
+                .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+        }
         #[cfg(feature = "format-proof")]
         if proof_activation {
             proof_manifest.writer_format = 5;
@@ -4414,6 +4880,9 @@ fn apply_one_entry(
         command_id,
         &sessions,
     )?;
+    if format_operation && let Some(receipt) = &reply.format_receipt {
+        write_format_delta(&txn, domain, generation, record_revision, receipt)?;
+    }
     if let Some((key, operation)) = publication {
         write_publication_delta(&txn, domain, key, operation, generation, record_revision)?;
     }
@@ -4534,6 +5003,7 @@ fn build_snapshot(
     let prefix = format!("{generation:016x}/");
     let mut record_count = 0u64;
     let mut payload_bytes = (RECORD_MAGIC.len() + 8) as u64;
+    let mut retained_formats = std::collections::BTreeSet::new();
     for record in app
         .range(prefix.as_str()..)
         .map_err(|err| sto_err(ErrorVerb::Read, err))?
@@ -4553,6 +5023,13 @@ fn build_snapshot(
                 "snapshot row exceeds frame bounds",
             ));
         }
+        if !key.value().contains("/fragment/") {
+            retained_formats.insert(
+                record_store::record_format(value.value())
+                    .map_err(|err| sto_err(ErrorVerb::Read, err))?
+                    .to_owned(),
+            );
+        }
         record_count = record_count
             .checked_add(1)
             .ok_or_else(|| sto_err(ErrorVerb::Read, "snapshot row count overflow"))?;
@@ -4563,20 +5040,24 @@ fn build_snapshot(
     if record_count == 0 {
         return Err(sto_err(ErrorVerb::Read, "active generation has no records"));
     }
+    let mut record_formats = vec![
+        "graphrun.domain/v1".to_owned(),
+        crate::history::EVENT_FORMAT.to_owned(),
+        crate::history::CHECKPOINT_FORMAT.to_owned(),
+        crate::publication::RESULT_FORMAT.to_owned(),
+        record_store::FORMAT.to_owned(),
+        record_store::FRAGMENT_FORMAT.to_owned(),
+    ];
+    if retained_formats.contains(record_store::NEXT_FORMAT) {
+        record_formats.push(record_store::NEXT_FORMAT.to_owned());
+    }
     let manifest = SnapshotManifest {
         framing_version: 1,
         generation,
         applied_json: applied,
         membership_json: membership,
         payload_bytes,
-        record_formats: vec![
-            "graphrun.domain/v1".to_owned(),
-            crate::history::EVENT_FORMAT.to_owned(),
-            crate::history::CHECKPOINT_FORMAT.to_owned(),
-            crate::publication::RESULT_FORMAT.to_owned(),
-            record_store::FORMAT.to_owned(),
-            record_store::FRAGMENT_FORMAT.to_owned(),
-        ],
+        record_formats,
         record_count,
         artifact_origin_ids: origins.into_iter().collect(),
     };
@@ -4762,6 +5243,30 @@ fn install_snapshot(
             between_batches()
         },
     )?;
+    if manifest
+        .record_formats
+        .iter()
+        .any(|format| format == record_store::NEXT_FORMAT)
+        != imported.formats.contains(record_store::NEXT_FORMAT)
+        || restored.format_policy.active_writer < store_manifest.writer_format
+        || restored.format_policy.active_writer > crate::format_upgrade::CURRENT_READER
+    {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "snapshot reader inventory or writer policy differs from retained records",
+        ));
+    }
+    if restored.format_policy.active_writer == crate::format_upgrade::NEXT_FORMAT {
+        store_manifest.reader_floor = crate::format_upgrade::NEXT_FORMAT;
+        store_manifest.enabled_command_formats = vec![4, 5];
+        store_manifest.enabled_state_record_formats = vec![
+            record_store::FORMAT.to_owned(),
+            record_store::NEXT_FORMAT.to_owned(),
+        ];
+        store_manifest
+            .activate_writer()
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    }
     if manifest.artifact_origin_ids
         != restored
             .artifact_origins
@@ -5177,6 +5682,185 @@ mod tests {
         state
     }
 
+    #[test]
+    fn reader_preparation_and_activation_share_committed_manifest_authority() {
+        use crate::format_upgrade::NEXT_FORMAT;
+        use crate::ids::CommandId;
+        use crate::time::EngineTime;
+        use openraft::CommittedLeaderId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("member.redb");
+        let db = Database::create(&path).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let mut domain = bound_fixture(&db);
+        let roster_id = LogId::new(CommittedLeaderId::new(1, 1), 0);
+        let mut roster = StoredMembership::new(
+            Some(roster_id),
+            Membership::new(
+                vec![std::collections::BTreeSet::from([1])],
+                BTreeMap::from([(1, BasicNode::new("127.0.0.1:9001"))]),
+            ),
+        );
+        let membership_bytes = serde_json::to_vec(&roster).unwrap();
+        let txn = begin_immediate(&db).unwrap();
+        txn.open_table(META)
+            .unwrap()
+            .insert("membership", membership_bytes.as_slice())
+            .unwrap();
+        commit_immediate(txn).unwrap();
+        let preview = prepare_format_readers(
+            &db,
+            dir.path(),
+            &domain,
+            &roster,
+            None,
+            NEXT_FORMAT,
+            Some(roster_id),
+            false,
+        )
+        .unwrap();
+        assert_eq!(preview.reader_floor, 4);
+        assert!(!preview.supports(NEXT_FORMAT));
+        let proof = prepare_format_readers(
+            &db,
+            dir.path(),
+            &domain,
+            &roster,
+            None,
+            NEXT_FORMAT,
+            Some(roster_id),
+            true,
+        )
+        .unwrap();
+        assert!(proof.supports(NEXT_FORMAT));
+        assert_eq!(verified_store_manifest(&db).unwrap().reader_floor, 5);
+        assert_eq!(verified_store_manifest(&db).unwrap().writer_format, 4);
+        let mut applied = None;
+        let mut revision = 0;
+        let command = |id, body| domain::Command {
+            id: CommandId::from_bytes([id; 16]),
+            time: EngineTime::from_millis(u64::from(id)),
+            body: domain::CommandBody::Authenticated {
+                principal_id: "local-owner".to_owned(),
+                body: Box::new(body),
+            },
+        };
+        let entries = [
+            command(
+                1,
+                domain::CommandBody::PrepareWriterFormat {
+                    proofs: vec![proof],
+                    roster_log_id: Some(roster_id.into()),
+                },
+            ),
+            command(
+                2,
+                domain::CommandBody::ActivateWriterFormat {
+                    roster_log_id: Some(roster_id.into()),
+                    target: NEXT_FORMAT,
+                },
+            ),
+        ];
+        for (index, command) in entries.into_iter().enumerate() {
+            let entry = Entry::<TypeConfig> {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), index as u64 + 1),
+                payload: EntryPayload::Normal(RaftRequest {
+                    command,
+                    writer_format: 4,
+                    #[cfg(feature = "format-proof")]
+                    proof_writer_format: 4,
+                }),
+            };
+            append_logs(&db, std::slice::from_ref(&entry)).unwrap();
+            let response = apply_one_entry(
+                &db,
+                &mut applied,
+                &mut roster,
+                &mut domain,
+                &mut revision,
+                1,
+                entry,
+            )
+            .unwrap();
+            assert!(response.format_receipt.unwrap().applied);
+        }
+        let manifest = verified_store_manifest(&db).unwrap();
+        assert_eq!(manifest.writer_format, NEXT_FORMAT);
+        assert_eq!(manifest.state_record_format, record_store::NEXT_FORMAT);
+        let restored = load_app_generation(&db, 1).unwrap();
+        assert_eq!(restored.format_policy.active_writer, NEXT_FORMAT);
+        assert_eq!(restored.format_receipts.len(), 2);
+        assert_eq!(
+            restored.format_policy.activation_log_id,
+            crate::format_upgrade::position(applied)
+        );
+        let snapshots = dir.path().join("snapshots");
+        let (_, registry) = build_snapshot(&db, &path, &snapshots, false).unwrap();
+        assert!(
+            verify_registry(&snapshots, &registry)
+                .unwrap()
+                .record_formats
+                .contains(&record_store::NEXT_FORMAT.to_owned())
+        );
+        let receiving = tempfile::tempdir().unwrap();
+        let receiving_db_path = receiving.path().join("member.redb");
+        let receiving_db = Database::create(&receiving_db_path).unwrap();
+        initialize_publication_store(&receiving_db).unwrap();
+        let mut receiving_domain = bound_fixture(&receiving_db);
+        let mut receiving_applied = None;
+        let mut receiving_membership = StoredMembership::new(None, Membership::new(vec![], None));
+        let mut receiving_snapshot = None;
+        let mut receiving_revision = 0;
+        install_snapshot(
+            &receiving_db,
+            &receiving_db_path,
+            &receiving.path().join("snapshots"),
+            &mut receiving_applied,
+            &mut receiving_membership,
+            &mut receiving_domain,
+            &mut receiving_snapshot,
+            &mut receiving_revision,
+            registry.meta.clone(),
+            snapshots.join(&registry.file_name),
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(receiving_applied, applied);
+        assert_eq!(receiving_membership, roster);
+        assert_eq!(receiving_domain.format_policy.active_writer, NEXT_FORMAT);
+        assert_eq!(
+            verified_store_manifest(&receiving_db)
+                .unwrap()
+                .writer_format,
+            NEXT_FORMAT
+        );
+        drop(receiving_db);
+        drop(db);
+        let backup = dir.path().join("backup");
+        crate::engine::Engine::backup(dir.path(), &backup).unwrap();
+        assert_eq!(
+            crate::engine::Engine::read_backup(&backup)
+                .unwrap()
+                .format_policy
+                .active_writer,
+            NEXT_FORMAT
+        );
+        let restore = dir.path().join("restore");
+        assert_eq!(
+            crate::engine::Engine::restore(&backup, &restore, "format test")
+                .unwrap_err()
+                .kind,
+            crate::error::ErrorKind::FailedPrecondition
+        );
+        assert!(!restore.exists());
+        assert_eq!(
+            StorageHandle::open(&path).err().unwrap().kind,
+            crate::error::ErrorKind::FailedPrecondition
+        );
+    }
+
     pub struct RedbStoreBuilder;
 
     impl StoreBuilder<TypeConfig, LogStore, StateMachineStore, tempfile::TempDir> for RedbStoreBuilder {
@@ -5387,6 +6071,7 @@ nodes:
             let entry = Entry::<TypeConfig> {
                 log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
                 payload: EntryPayload::Normal(RaftRequest {
+                    writer_format: 4,
                     command: crate::domain::Command {
                         id: crate::ids::CommandId::from_bytes([9; 16]),
                         time: crate::time::EngineTime::from_millis(1),
@@ -5501,6 +6186,7 @@ nodes:
             let entry = Entry::<TypeConfig> {
                 log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), 1),
                 payload: EntryPayload::Normal(RaftRequest {
+                    writer_format: 4,
                     command: Command {
                         id: CommandId::from_bytes([3; 16]),
                         time: EngineTime::from_millis(2 + 30 * 24 * 60 * 60 * 1_000),
@@ -6407,6 +7093,7 @@ nodes:
         let entry = |index, time_ms, body| Entry::<TypeConfig> {
             log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
             payload: EntryPayload::Normal(RaftRequest {
+                writer_format: 4,
                 command: Command {
                     id: CommandId::from_bytes([index as u8; 16]),
                     time: EngineTime::from_millis(time_ms),
@@ -6693,6 +7380,7 @@ nodes:
                 let entry = Entry::<TypeConfig> {
                     log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
                     payload: EntryPayload::Normal(RaftRequest {
+                        writer_format: 4,
                         command: Command {
                             id: CommandId::from_bytes([id; 16]),
                             time: EngineTime::from_millis(time),
@@ -6803,6 +7491,7 @@ nodes:
                 imported_applied.unwrap().index + 1,
             ),
             payload: EntryPayload::Normal(RaftRequest {
+                writer_format: 4,
                 command: Command {
                     id: CommandId::from_bytes([40; 16]),
                     time: EngineTime::from_millis(89 * DAY + 40),
@@ -6841,6 +7530,7 @@ nodes:
                 vec![Entry::<TypeConfig> {
                     log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
                     payload: EntryPayload::Normal(RaftRequest {
+                        writer_format: 4,
                         command: Command {
                             id: CommandId::from_bytes([id; 16]),
                             time: EngineTime::from_millis(time),
