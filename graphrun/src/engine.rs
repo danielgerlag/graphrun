@@ -4273,26 +4273,26 @@ nodes:
         let _guard = COMPENSATION_TEST.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::local(dir.path()).await.unwrap();
-        let mut fail_order = order();
-        if let Value::Object(fields) = &mut fail_order {
-            fields.insert("fail_after_payment".to_owned(), Value::Bool(true));
-        }
         let run = engine
             .start_yaml(
-                include_str!("../../docs/specs/v1/examples/saga.yaml"),
+                include_str!("../../docs/specs/v1/examples/saga-cancel.yaml"),
                 &catalog(),
-                fail_order,
+                order(),
             )
             .await
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let state = engine.inspect(run).await.unwrap();
-            if state
-                .obligations
-                .iter()
-                .any(|item| item.handler == "inventory.release")
+            if state.obligations.iter().any(|item| {
+                item.handler == "inventory.release"
+                    && matches!(item.status, crate::domain::ObligationStatus::Open)
+            }) && state
+                .waits
+                .values()
+                .any(|wait| wait.run == run && wait.pending && wait.signal == "continue")
             {
+                assert!(matches!(state.runs[&run].status, RunStatus::Active));
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -4300,14 +4300,7 @@ nodes:
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        if let Err(err) = engine.cancel(run, "stop").await {
-            let state = engine.inspect(run).await.unwrap();
-            let inactive = !matches!(state.runs.get(&run).unwrap().status, RunStatus::Active);
-            assert!(
-                inactive || err.to_string().contains("not active"),
-                "cancel failed: {err}"
-            );
-        }
+        engine.cancel(run, "stop").await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let state = engine.inspect(run).await.unwrap();
@@ -4320,6 +4313,19 @@ nodes:
                     matches!(item.status, crate::domain::ObligationStatus::Compensated)
                 });
             if failed && compensated {
+                assert!(matches!(
+                    &state.runs[&run].status,
+                    RunStatus::Failed { error } if error.code == "run.cancelled"
+                ));
+                assert_eq!(state.obligations.len(), 1);
+                assert_eq!(state.obligations[0].handler, "inventory.release");
+                assert!(state.waits.values().all(|wait| !wait.pending));
+                assert!(state.scopes.values().all(|scope| {
+                    scope.run != run || !matches!(scope.status, crate::domain::ScopeStatus::Open)
+                }));
+                assert!(!state.activations.values().any(
+                    |activation| activation.run == run && activation.node.as_str() == "charge"
+                ));
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -4327,7 +4333,20 @@ nodes:
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert!(
+            engine
+                .history(run)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, crate::domain::DomainEvent::WaitCancelled { .. }))
+        );
         engine.shutdown().await.unwrap();
+        let replayed = replay(dir.path()).unwrap();
+        assert!(replayed.waits.values().all(|wait| !wait.pending));
+        assert!(replayed.scopes.values().all(|scope| {
+            scope.run != run || !matches!(scope.status, crate::domain::ScopeStatus::Open)
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

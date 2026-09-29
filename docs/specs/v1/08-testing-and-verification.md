@@ -189,6 +189,8 @@ cargo run --locked -p graphrun-e2e -- smoke-reconciliation \
 	--cli target/release/graphrun --artifacts target/reconciliation-smoke
 cargo run --locked -p graphrun-e2e -- smoke-saga-settlement \
 	--cli target/release/graphrun --artifacts target/saga-smoke
+cargo run --locked -p graphrun-e2e -- smoke-cancellation \
+	--cli target/release/graphrun --artifacts /tmp/gr-saga-cancel
 cargo run --locked -p graphrun-e2e -- smoke-security \
 	--cli target/release/graphrun --artifacts target/security-smoke
 cargo run --locked -p graphrun-e2e -- smoke-forged-worker \
