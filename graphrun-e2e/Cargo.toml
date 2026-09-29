@@ -10,14 +10,27 @@ description = "Graphrun verification driver and fixture processes"
 name = "graphrun-e2e"
 path = "src/main.rs"
 
+[[bin]]
+name = "graphrun-format-proof"
+path = "src/bin/format_proof.rs"
+required-features = ["format-proof-new"]
+
+[[bin]]
+name = "graphrun-format-rollout"
+path = "src/bin/format_rollout.rs"
+
 [features]
 default = []
 fault-injection = ["graphrun/fault-injection"]
+format-proof = ["graphrun/format-proof"]
+format-proof-new = ["format-proof", "graphrun/format-proof-new"]
 
 [dependencies]
 clap.workspace = true
 graphrun = { workspace = true, features = ["fixture-worker"] }
 hex.workspace = true
+prost.workspace = true
+redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

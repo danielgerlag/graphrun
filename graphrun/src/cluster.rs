@@ -1,4 +1,7 @@
-use crate::generated::{Blob, ClockHealthRequest, ElectionRequest, raft_client::RaftClient};
+use crate::generated::{
+    Blob, CandidateReaderRequest, ClockHealthRequest, ElectionRequest, ReaderRequest,
+    raft_client::RaftClient,
+};
 #[cfg(test)]
 use crate::rpc::client_tls;
 use crate::storage::TypeConfig;
@@ -50,6 +53,97 @@ pub(crate) struct ElectionEvidence {
 }
 
 impl ClusterNetwork {
+    pub async fn candidate_readers(
+        &self,
+        target: u64,
+        endpoint: &str,
+        active_writer: u16,
+        cluster_id: &str,
+    ) -> io::Result<()> {
+        let configured = self.peers.lock().unwrap().get(&target).cloned();
+        let mut client = PeerClient {
+            target,
+            peer: configured,
+            expected_endpoint: endpoint.to_owned(),
+            local_id: self.local_id,
+            local_tls: self.local_tls.clone(),
+        }
+        .client()
+        .await?;
+        let mut request = tonic::Request::new(CandidateReaderRequest {
+            sender_id: self.local_id,
+            target: active_writer.into(),
+        });
+        crate::format_upgrade::attach_writer(&mut request);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.candidate_readers(request),
+        )
+        .await
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?
+        .into_inner();
+        if response.member_id != target
+            || response.cluster_id != cluster_id
+            || !response.pristine
+            || response.reader_capability < u32::from(active_writer)
+            || response.writer_capability < u32::from(active_writer)
+        {
+            return Err(io::Error::other(
+                "candidate reader or writer capability is incompatible with active policy",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn reader_request(
+        &self,
+        target: u64,
+        committed_endpoint: &str,
+        roster: Option<openraft::LogId<u64>>,
+        format: u16,
+        prepare: bool,
+    ) -> io::Result<crate::format_upgrade::ReaderProof> {
+        let configured = self.peers.lock().unwrap().get(&target).cloned();
+        let mut client = PeerClient {
+            target,
+            peer: configured,
+            expected_endpoint: committed_endpoint.to_owned(),
+            local_id: self.local_id,
+            local_tls: self.local_tls.clone(),
+        }
+        .client()
+        .await?;
+        let mut request = tonic::Request::new(ReaderRequest {
+            sender_id: self.local_id,
+            target: format.into(),
+            roster_log_id_json: serde_json::to_vec(&crate::format_upgrade::position(roster))
+                .map_err(io::Error::other)?,
+        });
+        crate::format_upgrade::attach_writer(&mut request);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if prepare {
+                client.prepare_readers(request).await
+            } else {
+                client.probe_readers(request).await
+            }
+        })
+        .await
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?
+        .into_inner();
+        let proof: crate::format_upgrade::ReaderProof =
+            serde_json::from_slice(&result.proof_json).map_err(io::Error::other)?;
+        if proof.member_id != target
+            || proof.roster_log_id != crate::format_upgrade::position(roster)
+        {
+            return Err(io::Error::other(
+                "signed reader preparation response differs from committed roster",
+            ));
+        }
+        Ok(proof)
+    }
+
     pub fn new(
         local_id: u64,
         local_tls: TlsMaterial,
@@ -78,6 +172,69 @@ impl ClusterNetwork {
             .map(|(addr, tls)| (*addr, tls.server_name.clone()))
     }
 
+    #[cfg(feature = "format-proof")]
+    pub async fn proof_probe(&self, target: u64, kind: &str, endpoint: &str) -> io::Result<String> {
+        let peer = PeerClient {
+            target,
+            peer: self.peers.lock().unwrap().get(&target).cloned(),
+            expected_endpoint: endpoint.to_owned(),
+            local_id: self.local_id,
+            local_tls: self.local_tls.clone(),
+        };
+        let vote = openraft::Vote::new_committed(1_000_000, self.local_id);
+        let json = match kind {
+            "vote" => serde_json::to_vec(&VoteRequest {
+                vote,
+                last_log_id: None,
+            }),
+            "append" => serde_json::to_vec(&AppendEntriesRequest::<TypeConfig> {
+                vote,
+                prev_log_id: None,
+                entries: Vec::new(),
+                leader_commit: None,
+            }),
+            _ => return Err(io::Error::other("unknown proof RPC kind")),
+        }
+        .map_err(io::Error::other)?;
+        let mut request = tonic::Request::new(Blob {
+            json,
+            sender_id: self.local_id,
+        });
+        request.metadata_mut().insert(
+            crate::format_proof::WRITER_HEADER,
+            crate::format_proof::WRITER_CAPABILITY
+                .to_string()
+                .parse()
+                .expect("proof writer version is ASCII"),
+        );
+        let mut client = peer.client().await?;
+        let result = match kind {
+            "vote" => client.vote(request).await,
+            "append" => client.append_entries(request).await,
+            _ => unreachable!("kind checked before encoding"),
+        };
+        match result {
+            Err(status)
+                if status.code() == tonic::Code::FailedPrecondition
+                    && status.message().contains("member writer capability") =>
+            {
+                Ok(format!(
+                    "code={:?} message={}",
+                    status.code(),
+                    status.message()
+                ))
+            }
+            Err(status) => Err(io::Error::other(format!(
+                "proof {kind} got no format rejection: code={:?} message={}",
+                status.code(),
+                status.message()
+            ))),
+            Ok(_) => Err(io::Error::other(format!(
+                "unsafe: old writer {kind} accepted after activation"
+            ))),
+        }
+    }
+
     pub async fn probe_clock(&self, target: u64, committed_endpoint: &str) -> io::Result<()> {
         let peer = self.peers.lock().unwrap().get(&target).cloned();
         let Some((addr, _)) = &peer else {
@@ -100,10 +257,12 @@ impl ClusterNetwork {
             tokio::time::timeout(std::time::Duration::from_millis(500), async {
                 let mut client = peer.client().await?;
                 let before_wall = crate::time::wall_millis().map_err(io::Error::other)?;
+                let mut request = tonic::Request::new(ClockHealthRequest {
+                    sender_id: self.local_id,
+                });
+                crate::format_upgrade::attach_writer(&mut request);
                 let response = client
-                    .clock_health(ClockHealthRequest {
-                        sender_id: self.local_id,
-                    })
+                    .clock_health(request)
                     .await
                     .map_err(io::Error::other)?
                     .into_inner();
@@ -151,15 +310,25 @@ impl ClusterNetwork {
             local_tls: self.local_tls.clone(),
         };
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut request = tonic::Request::new(ElectionRequest {
+                sender_id: self.local_id,
+                expected_term: evidence.expected_term,
+                membership_index: evidence.membership_index,
+                min_applied_index: evidence.min_applied_index,
+                min_last_log_index: evidence.min_last_log_index,
+            });
+            crate::format_upgrade::attach_writer(&mut request);
+            #[cfg(feature = "format-proof")]
+            request.metadata_mut().insert(
+                crate::format_proof::WRITER_HEADER,
+                crate::format_proof::WRITER_CAPABILITY
+                    .to_string()
+                    .parse()
+                    .expect("proof writer version is ASCII"),
+            );
             peer.client()
                 .await?
-                .request_election(ElectionRequest {
-                    sender_id: self.local_id,
-                    expected_term: evidence.expected_term,
-                    membership_index: evidence.membership_index,
-                    min_applied_index: evidence.min_applied_index,
-                    min_last_log_index: evidence.min_last_log_index,
-                })
+                .request_election(request)
                 .await
                 .map_err(io::Error::other)
         })
@@ -249,6 +418,10 @@ impl Service<Uri> for VerifiedMemberConnector {
 
 impl PeerClient {
     async fn client(&self) -> std::io::Result<RaftClient<Channel>> {
+        #[cfg(feature = "format-proof")]
+        if crate::format_proof::partitioned() {
+            return Err(io::Error::other("proof member network partition"));
+        }
         let Some((addr, tls)) = &self.peer else {
             return Err(io::Error::other(format!("unknown peer {}", self.target)));
         };
@@ -303,10 +476,20 @@ impl PeerClient {
             json: serde_json::to_vec(&rpc).map_err(io::Error::other)?,
             sender_id: self.local_id,
         };
+        let mut request = tonic::Request::new(blob);
+        crate::format_upgrade::attach_writer(&mut request);
+        #[cfg(feature = "format-proof")]
+        request.metadata_mut().insert(
+            crate::format_proof::WRITER_HEADER,
+            crate::format_proof::WRITER_CAPABILITY
+                .to_string()
+                .parse()
+                .expect("proof writer version is ASCII"),
+        );
         let resp = match kind {
-            "append" => client.append_entries(blob).await,
-            "vote" => client.vote(blob).await,
-            "snapshot" => client.install_snapshot(blob).await,
+            "append" => client.append_entries(request).await,
+            "vote" => client.vote(request).await,
+            "snapshot" => client.install_snapshot(request).await,
             _ => return Err(io::Error::other("unknown raft rpc")),
         }
         .map_err(|err| io::Error::other(err.to_string()))?;
@@ -515,6 +698,205 @@ mod tests {
                 panic!("no survivor became leader");
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_voters_prepare_and_activate_through_signed_admin_rpc() {
+        if crate::format_upgrade::CURRENT_WRITER < 5 {
+            return;
+        }
+        let (first, second, third, dirs, addrs, materials, ca) = three_voters(false).await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let applied = first.last_applied_index().await;
+            if applied > 0
+                && second.last_applied_index().await >= applied
+                && third.last_applied_index().await >= applied
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "roster did not catch up"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut admin = crate::GrpcClient::connect(&format!("https://{}", addrs[0]), &materials[0])
+            .await
+            .unwrap();
+        assert_eq!(admin.format_status().await.unwrap()["writer_format"], 4);
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(20),
+            admin.prepare_writer_format(5, crate::ids::CommandId::from_bytes([51; 16])),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(prepared.applied);
+        assert_eq!(
+            first.format_status().await.unwrap()["prepared"]
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
+        let activation_id = crate::ids::CommandId::from_bytes([52; 16]);
+        let activated = admin
+            .activate_writer_format(5, activation_id)
+            .await
+            .unwrap();
+        assert!(activated.applied);
+        assert_eq!(
+            admin
+                .activate_writer_format(5, activation_id)
+                .await
+                .unwrap(),
+            activated
+        );
+        assert_eq!(admin.format_status().await.unwrap()["writer_format"], 5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let applied = first.last_applied_index().await;
+            if second.last_applied_index().await >= applied
+                && third.last_applied_index().await >= applied
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "activation did not apply on all voters"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let learner_dir = tempfile::tempdir().unwrap();
+        let learner_addr = unused_addr();
+        let learner_tls = issue_node(&ca, 4).unwrap();
+        let peers = (1..=3)
+            .map(|id| {
+                (
+                    id,
+                    (
+                        addrs[(id - 1) as usize],
+                        materials[(id - 1) as usize].clone(),
+                    ),
+                )
+            })
+            .collect();
+        let learner = Engine::member(MemberConfig {
+            data_dir: learner_dir.path().to_path_buf(),
+            node_id: 4,
+            bind: learner_addr,
+            peers,
+            tls: learner_tls.clone(),
+            host_activities: false,
+            initialize: false,
+        })
+        .await
+        .unwrap();
+        for member in [&first, &second, &third] {
+            member.insert_peer(4, learner_addr, learner_tls.clone());
+        }
+        first.add_learner(4, learner_addr).await.unwrap();
+        let roster_applied = first.last_applied_index().await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if second.last_applied_index().await >= roster_applied
+                && third.last_applied_index().await >= roster_applied
+                && learner.last_applied_index().await >= roster_applied
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "learner roster did not apply to every member"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            first.add_voter(4).await.unwrap_err().kind,
+            crate::error::ErrorKind::FailedPrecondition
+        );
+        let refreshed = first
+            .prepare_writer_format(5, crate::ids::CommandId::from_bytes([53; 16]))
+            .await
+            .unwrap();
+        assert!(refreshed.applied);
+        assert_eq!(
+            first.format_status().await.unwrap()["prepared"]
+                .as_object()
+                .unwrap()
+                .len(),
+            4
+        );
+        first.add_voter(4).await.unwrap();
+        learner.shutdown().await.unwrap();
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
+        third.shutdown().await.unwrap();
+        for dir in &dirs {
+            let state =
+                crate::storage::load_domain_readonly(dir.path().join("member.redb")).unwrap();
+            assert_eq!(state.format_policy.active_writer, 5);
+            assert_eq!(
+                state.format_policy.activation_log_id,
+                Some(activated.applied_log_id)
+            );
+        }
+        assert_eq!(
+            crate::storage::load_domain_readonly(learner_dir.path().join("member.redb"))
+                .unwrap()
+                .format_policy
+                .active_writer,
+            5
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn activation_has_no_authority_without_voter_quorum() {
+        let (first, second, third, dirs, _addrs, _materials, _ca) = three_voters(false).await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let applied = first.last_applied_index().await;
+            if applied > 0
+                && second.last_applied_index().await >= applied
+                && third.last_applied_index().await >= applied
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "roster did not catch up"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            first
+                .prepare_writer_format(5, crate::ids::CommandId::from_bytes([61; 16]))
+                .await
+                .unwrap()
+                .applied
+        );
+        second.shutdown().await.unwrap();
+        third.shutdown().await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(6),
+            first.activate_writer_format(5, crate::ids::CommandId::from_bytes([62; 16])),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Err(_))),
+            "activation cannot claim success without a quorum"
+        );
+        first.shutdown().await.unwrap();
+        for dir in &dirs {
+            assert_eq!(
+                crate::storage::load_domain_readonly(dir.path().join("member.redb"))
+                    .unwrap()
+                    .format_policy
+                    .active_writer,
+                4
+            );
         }
     }
 
