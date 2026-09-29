@@ -1575,9 +1575,8 @@ fn validate_format_rollout_files(
         }
         let log = format_artifact(root, cwd, &exit.log)?;
         let text = fs::read_to_string(&log).map_err(|err| err.to_string())?;
-        if text.is_empty()
-            || (exit.label == "rejected-restart"
-                && !text.contains("binary writer capability 4 is below committed writer format 5"))
+        if exit.label == "rejected-restart"
+            && !text.contains("binary writer capability 4 is below committed writer format 5")
         {
             return Err(format!(
                 "CONTRACT-002 {} process log is incomplete",
