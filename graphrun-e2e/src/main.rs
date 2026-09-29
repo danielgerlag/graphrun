@@ -203,11 +203,14 @@ struct CaseResult {
 struct RelatedBinary {
     role: String,
     path: String,
+    built_path: String,
+    target_dir: String,
     version: String,
     source_revision: String,
     sha256_before: String,
     sha256_after: String,
     build_log: String,
+    build_log_sha256: String,
     run_id: String,
 }
 
@@ -862,6 +865,10 @@ fn validate_related_binaries(
     let cli = fs::canonicalize(&context.cli_path).map_err(|err| err.to_string())?;
     let old_path = fs::canonicalize(&old.path).map_err(|err| err.to_string())?;
     let current_path = fs::canonicalize(&current.path).map_err(|err| err.to_string())?;
+    let old_target = fs::canonicalize(&old.target_dir).map_err(|err| err.to_string())?;
+    let current_target = fs::canonicalize(&current.target_dir).map_err(|err| err.to_string())?;
+    let old_log = fs::canonicalize(&old.build_log).map_err(|err| err.to_string())?;
+    let current_log = fs::canonicalize(&current.build_log).map_err(|err| err.to_string())?;
     if !old_path.starts_with(&root)
         || current_path != cli
         || old_path == current_path
@@ -872,6 +879,17 @@ fn validate_related_binaries(
     {
         return Err(
             "CONTRACT-002 binaries must be separate, with the old binary built in this run"
+                .to_owned(),
+        );
+    }
+    if !old_target.starts_with(&root)
+        || !current_target.starts_with(&root)
+        || old_target.starts_with(&current_target)
+        || current_target.starts_with(&old_target)
+        || old_log == current_log
+    {
+        return Err(
+            "CONTRACT-002 requires distinct in-run Cargo target directories and build logs"
                 .to_owned(),
         );
     }
@@ -887,6 +905,8 @@ fn validate_related_binaries(
     }
     for binary in &result.related_binaries {
         let path = fs::canonicalize(&binary.path).map_err(|err| err.to_string())?;
+        let built_path = fs::canonicalize(&binary.built_path).map_err(|err| err.to_string())?;
+        let target_dir = fs::canonicalize(&binary.target_dir).map_err(|err| err.to_string())?;
         let build_log = fs::canonicalize(&binary.build_log).map_err(|err| err.to_string())?;
         let hash = hash_file(&path)?;
         let sha256 = |value: &str| {
@@ -904,11 +924,24 @@ fn validate_related_binaries(
             || !sha256(&binary.sha256_before)
             || binary.sha256_before != binary.sha256_after
             || hash != binary.sha256_after
+            || !built_path.starts_with(&target_dir)
+            || (binary.role == "old_reader" && built_path != path)
+            || hash_file(&built_path)? != hash
+            || !result
+                .artifacts
+                .iter()
+                .any(|artifact| fs::canonicalize(artifact).is_ok_and(|saved| saved == built_path))
+            || !sha256(&binary.build_log_sha256)
+            || hash_file(&build_log)? != binary.build_log_sha256
             || !build_log.starts_with(&root)
             || !result
                 .artifacts
                 .iter()
                 .any(|artifact| fs::canonicalize(artifact).is_ok_and(|saved| saved == build_log))
+            || !fs::read_to_string(&build_log)
+                .map_err(|err| err.to_string())?
+                .lines()
+                .any(|line| line.contains("Compiling graphrun v"))
             || binary.version.is_empty()
         {
             return Err(format!(
@@ -10214,8 +10247,17 @@ mod tests {
         let run_dir = parent.path().join("run-current");
         fs::create_dir(&run_dir).unwrap();
         let current_path = parent.path().join("release-cli");
-        let old_path = run_dir.join("old-reader");
-        for (path, version) in [(&current_path, "new-v2"), (&old_path, "old-v1")] {
+        let old_target = run_dir.join("old-target");
+        let current_target = run_dir.join("current-target");
+        let old_path = old_target.join("release").join("old-reader");
+        let current_built = current_target.join("release").join("release-cli");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(current_built.parent().unwrap()).unwrap();
+        for (path, version) in [
+            (&current_path, "new-v2"),
+            (&current_built, "new-v2"),
+            (&old_path, "old-v1"),
+        ] {
             fs::write(path, format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n")).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -10243,10 +10285,15 @@ mod tests {
         };
         let old_build = run_dir.join("old-build.log");
         let current_build = run_dir.join("current-build.log");
-        fs::write(&old_build, "built old reader from pinned commit").unwrap();
-        fs::write(&current_build, "built current CLI").unwrap();
+        fs::write(&old_build, "Compiling graphrun v0.1.4\nFinished release\n").unwrap();
+        fs::write(
+            &current_build,
+            "Compiling graphrun v0.1.4\nFinished release\n",
+        )
+        .unwrap();
         case.artifacts.extend([
             old_path.display().to_string(),
+            current_built.display().to_string(),
             old_build.display().to_string(),
             current_build.display().to_string(),
         ]);
@@ -10258,6 +10305,16 @@ mod tests {
         .map(|(role, path, version, source_revision)| RelatedBinary {
             role: role.to_owned(),
             path: path.display().to_string(),
+            built_path: if role == "old_reader" {
+                old_path.display().to_string()
+            } else {
+                current_built.display().to_string()
+            },
+            target_dir: if role == "old_reader" {
+                old_target.display().to_string()
+            } else {
+                current_target.display().to_string()
+            },
             version: version.to_owned(),
             source_revision,
             sha256_before: hash_file(path).unwrap(),
@@ -10266,6 +10323,11 @@ mod tests {
                 old_build.display().to_string()
             } else {
                 current_build.display().to_string()
+            },
+            build_log_sha256: if role == "old_reader" {
+                hash_file(&old_build).unwrap()
+            } else {
+                hash_file(&current_build).unwrap()
             },
             run_id: context.run_id.clone(),
         })
@@ -10293,6 +10355,28 @@ mod tests {
         let mut wrong_revision = case.clone();
         wrong_revision.related_binaries[0].source_revision = "z".repeat(40);
         assert!(check(&wrong_revision).unwrap_err().contains("stale"));
+        let mut shared_target = case.clone();
+        shared_target.related_binaries[1].target_dir = old_target.display().to_string();
+        assert!(
+            check(&shared_target)
+                .unwrap_err()
+                .contains("distinct in-run")
+        );
+        let mut forged_log = case.clone();
+        forged_log.related_binaries[0].build_log_sha256 = "f".repeat(64);
+        assert!(check(&forged_log).unwrap_err().contains("stale"));
+        fs::write(&current_built, "stale writer build").unwrap();
+        assert!(check(&case).unwrap_err().contains("stale"));
+        fs::write(&current_built, fs::read(&current_path).unwrap()).unwrap();
+        fs::write(&current_build, "Finished release\n").unwrap();
+        case.related_binaries[1].build_log_sha256 = hash_file(&current_build).unwrap();
+        assert!(check(&case).unwrap_err().contains("stale"));
+        fs::write(
+            &current_build,
+            "Compiling graphrun v0.1.4\nFinished release\n",
+        )
+        .unwrap();
+        case.related_binaries[1].build_log_sha256 = hash_file(&current_build).unwrap();
         fs::write(&old_path, "tampered after proof").unwrap();
         assert!(check(&case).unwrap_err().contains("stale"));
     }
