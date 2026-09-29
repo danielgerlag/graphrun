@@ -10273,6 +10273,84 @@ mod tests {
     }
 
     #[test]
+    fn storage_cases_require_each_named_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let suite = || TestSuite {
+            command: "cargo test -p graphrun --lib --locked".to_owned(),
+            log: dir.path().join("lib.log"),
+            passed: HashSet::new(),
+            success: true,
+            duration_ms: 1,
+        };
+        let mut evidence = Evidence {
+            lib: suite(),
+            api: suite(),
+            ui: suite(),
+            crash: suite(),
+            publication: suite(),
+            history: suite(),
+            signed: suite(),
+            worker: suite(),
+            driver: suite(),
+        };
+        for (id, names) in [
+            (
+                "STORE-003",
+                &[
+                    "storage::tests::apply_cut_does_not_mix_transactions",
+                    "storage::tests::event_index_and_applied_metadata_cuts_leave_the_old_generation",
+                    "storage::tests::retirement_cut_keeps_either_complete_old_or_new_applied_prefix",
+                ][..],
+            ),
+            (
+                "STORE-004",
+                &[
+                    "storage::tests::snapshot_install_cut_keeps_generation",
+                    "storage::tests::snapshot_import_batches_are_bounded_before_generation_activation",
+                    "storage::tests::corrupted_active_snapshot_rejects_reopen_without_fallback",
+                    "storage::tests::snapshot_cleanup_is_bounded_and_preserves_active_file",
+                ][..],
+            ),
+            (
+                "STORE-005",
+                &[
+                    "storage::tests::purge_does_not_drop_domain_history",
+                    "storage::tests::physical_log_gc_limits_each_transaction_to_4096_rows",
+                    "storage::tests::committed_history_cleanup_survives_restart_after_log_purge",
+                ][..],
+            ),
+            (
+                "STORE-006",
+                &[
+                    "storage::tests::unapplied_credits_bound_append_without_truncating_reads",
+                    "write::tests::unapplied_credits_reject_above_limit",
+                    "storage::tests::snapshot_admission_enforces_disk_reservation_policy",
+                    "storage::tests::snapshot_byte_progress_survives_reopen",
+                    "storage::tests::import_batch_services_queued_raft_log_write",
+                    "engine::tests::snapshot_controller_fires_at_20000_entries",
+                ][..],
+            ),
+        ] {
+            evidence.lib.passed = names.iter().map(|name| (*name).to_owned()).collect();
+            let case = row(id);
+            assert_eq!(
+                run_case(Path::new("unused"), dir.path(), &evidence, &case).status,
+                "PASS",
+                "{id} should accept every required executed proof"
+            );
+            for name in names {
+                evidence.lib.passed.remove(*name);
+                assert_eq!(
+                    run_case(Path::new("unused"), dir.path(), &evidence, &case).status,
+                    "FAIL",
+                    "{id} must not pass without {name}"
+                );
+                evidence.lib.passed.insert((*name).to_owned());
+            }
+        }
+    }
+
+    #[test]
     fn declared_business_retry_cannot_prove_a_lost_worker_result() {
         let mut history = serde_json::json!({
             "events": [
