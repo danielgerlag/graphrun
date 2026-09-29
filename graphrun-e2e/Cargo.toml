@@ -1,5 +1,6 @@
 [package]
 name = "graphrun-e2e"
+default-run = "graphrun-e2e"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
