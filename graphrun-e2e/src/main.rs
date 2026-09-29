@@ -1342,6 +1342,19 @@ fn validate_format_rollout_observations(report: &FormatRolloutReport) -> Result<
     Ok(())
 }
 
+fn framed_snapshot_digest(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let footer_start = bytes
+        .len()
+        .checked_sub(32)
+        .ok_or("CONTRACT-002 snapshot is shorter than its checksum footer")?;
+    let (body, footer) = bytes.split_at(footer_start);
+    if Sha256::digest(body).as_slice() != footer {
+        return Err("CONTRACT-002 snapshot checksum footer does not match its bytes".to_owned());
+    }
+    Ok(hex::encode(footer))
+}
+
 fn validate_format_rollout_files(
     report: &FormatRolloutReport,
     root: &Path,
@@ -1430,7 +1443,7 @@ fn validate_format_rollout_files(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or("CONTRACT-002 snapshot has no filename")?
-        || actual["registry"]["sha256"] != hash_file(&snapshot_path)?
+        || actual["registry"]["sha256"] != framed_snapshot_digest(&snapshot_path)?
         || ![
             "graphrun.state-record/v2",
             "graphrun.state-record/v3",
@@ -11061,6 +11074,24 @@ mod tests {
             .observations
             .retain(|observation| observation.step != "old reader applies v3 inbox update");
         assert!(validate_format_rollout_observations(&report).is_err());
+    }
+
+    #[test]
+    fn contract_two_snapshot_digest_uses_verified_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot");
+        let body = b"framed snapshot bytes";
+        let footer = Sha256::digest(body);
+        fs::write(&path, [body.as_slice(), footer.as_slice()].concat()).unwrap();
+        assert_eq!(framed_snapshot_digest(&path).unwrap(), hex::encode(footer));
+        fs::write(
+            &path,
+            [b"changed snapshot bytes", footer.as_slice()].concat(),
+        )
+        .unwrap();
+        assert!(framed_snapshot_digest(&path).is_err());
+        fs::write(&path, b"short").unwrap();
+        assert!(framed_snapshot_digest(&path).is_err());
     }
 
     #[test]
