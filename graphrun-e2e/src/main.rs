@@ -644,7 +644,7 @@ fn verify(cli: &Path, matrix: &Path, artifacts: &Path, strict: bool) -> ExitCode
                 "test evidence preflight",
                 "test suite evidence unavailable",
             ),
-            (None, Some(evidence)) => run_case(cli, &run_dir, evidence, row),
+            (None, Some(evidence)) => run_case(cli, &run_dir, evidence, row, &context),
         };
         let result = context.bind(enforce_case(row, result, &run_dir));
         if let Err(err) = write_case(&run_dir, &result) {
@@ -1958,7 +1958,13 @@ fn collect_evidence(run_dir: &Path) -> Result<Evidence, String> {
     })
 }
 
-fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) -> CaseResult {
+fn run_case(
+    cli: &Path,
+    artifacts: &Path,
+    evidence: &Evidence,
+    row: &MatrixRow,
+    context: &RunContext,
+) -> CaseResult {
     let started = Instant::now();
     let result = match row.id.as_str() {
         "DSL-001" => yaml_validate_all(cli, artifacts, row),
@@ -2648,11 +2654,7 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
                 ),
             ],
         ),
-        "CONTRACT-002" => fail(
-            row,
-            "contract acceptance",
-            "normative contract defined; runtime acceptance not implemented yet",
-        ),
+        "CONTRACT-002" => contract_format_rollout(cli, artifacts, row, context),
         _ => fail(row, "unimplemented", "no implementation evidence yet"),
     };
     CaseResult {
@@ -7377,6 +7379,273 @@ fn contract_artifact_proof(cli: &Path, artifacts: &Path, row: &MatrixRow) -> Cas
     case
 }
 
+fn build_format_release(
+    source: &Path,
+    target: &Path,
+    log: &Path,
+    args: &[&str],
+) -> Result<(), String> {
+    let output = Command::new("cargo")
+        .args(["build", "--release", "--locked", "--color", "never"])
+        .args(args)
+        .current_dir(source)
+        .env("CARGO_TARGET_DIR", target)
+        .output()
+        .map_err(|err| format!("cannot build {}: {err}", source.display()))?;
+    let mut saved = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .map_err(|err| format!("{}: {err}", log.display()))?;
+    saved
+        .write_all(&output.stdout)
+        .and_then(|()| saved.write_all(&output.stderr))
+        .map_err(|err| format!("{}: {err}", log.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "release build {:?} exited {}; see {}",
+            args,
+            output.status,
+            log.display()
+        ));
+    }
+    Ok(())
+}
+
+fn binary_version(path: &Path) -> Result<String, String> {
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .map_err(|err| format!("{} --version: {err}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} --version exited {}",
+            path.display(),
+            output.status
+        ));
+    }
+    let version = String::from_utf8(output.stdout).map_err(|err| err.to_string())?;
+    if version.trim().is_empty() {
+        return Err(format!("{} has no version identifier", path.display()));
+    }
+    Ok(version.trim().to_owned())
+}
+
+fn contract_format_rollout(
+    cli: &Path,
+    artifacts: &Path,
+    row: &MatrixRow,
+    context: &RunContext,
+) -> CaseResult {
+    let started = Instant::now();
+    let root = match fs::canonicalize(artifacts) {
+        Ok(root) => root,
+        Err(err) => return fail(row, "fresh rollout artifacts", err.to_string()),
+    };
+    let cwd = root.join("CONTRACT-002-rollout");
+    if let Err(err) = fs::create_dir(&cwd) {
+        return fail(
+            row,
+            "fresh rollout artifacts",
+            format!("{}: {err}", cwd.display()),
+        );
+    }
+    let attempt = (|| -> Result<CaseResult, String> {
+        let ancestry = Command::new("git")
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                CONTRACT_TWO_BRIDGE_SOURCE,
+                "HEAD",
+            ])
+            .output()
+            .map_err(|err| format!("cannot check pinned bridge ancestry: {err}"))?;
+        if !ancestry.status.success() {
+            return Err(format!(
+                "pinned bridge {} is not an ancestor of this source: {}",
+                CONTRACT_TWO_BRIDGE_SOURCE,
+                String::from_utf8_lossy(&ancestry.stderr)
+            ));
+        }
+        let archive = cwd.join("bridge-source.tar");
+        let output = Command::new("git")
+            .args(["archive", "--format=tar"])
+            .arg(format!("--output={}", archive.display()))
+            .arg(CONTRACT_TWO_BRIDGE_SOURCE)
+            .output()
+            .map_err(|err| format!("cannot archive pinned bridge source: {err}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "pinned bridge archive failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let archive_sha256 = hash_file(&archive)?;
+        let bridge_source = cwd.join("bridge-source");
+        fs::create_dir(&bridge_source).map_err(|err| err.to_string())?;
+        let extraction = Command::new("tar")
+            .arg("-xf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&bridge_source)
+            .output()
+            .map_err(|err| format!("cannot extract pinned bridge source: {err}"))?;
+        if !extraction.status.success() {
+            return Err(format!(
+                "pinned bridge source extraction failed: {}",
+                String::from_utf8_lossy(&extraction.stderr)
+            ));
+        }
+        let current_source = std::env::current_dir().map_err(|err| err.to_string())?;
+        let old_target = cwd.join("bridge-target");
+        let current_target = cwd.join("current-target");
+        let old_log = cwd.join("bridge-build.log");
+        let current_log = cwd.join("current-build.log");
+        build_format_release(
+            &bridge_source,
+            &old_target,
+            &old_log,
+            &["-p", "graphrun-e2e", "--bin", "graphrun-e2e"],
+        )?;
+        build_format_release(
+            &current_source,
+            &current_target,
+            &current_log,
+            &[
+                "-p",
+                "graphrun-e2e",
+                "--bin",
+                "graphrun-e2e",
+                "--bin",
+                "graphrun-format-rollout",
+            ],
+        )?;
+        build_format_release(
+            &current_source,
+            &current_target,
+            &current_log,
+            &["-p", "graphrun-cli", "--bin", "graphrun"],
+        )?;
+        let release = |target: &Path, bin: &str| {
+            target
+                .join("release")
+                .join(format!("{bin}{}", std::env::consts::EXE_SUFFIX))
+        };
+        let bridge = release(&old_target, "graphrun-e2e");
+        let writer = release(&current_target, "graphrun-e2e");
+        let built_cli = release(&current_target, "graphrun");
+        let driver = release(&current_target, "graphrun-format-rollout");
+        let old_hash = hash_file(&bridge)?;
+        let writer_hash = hash_file(&writer)?;
+        let current_hash = hash_file(&built_cli)?;
+        if old_hash == writer_hash || current_hash != context.cli_sha256 {
+            return Err(format!(
+                "distinct release builds do not match source: old={old_hash} writer={writer_hash} cli={current_hash} supplied={}",
+                context.cli_sha256
+            ));
+        }
+        let old_version = binary_version(&bridge)?;
+        let current_version = binary_version(&built_cli)?;
+        if current_version != context.cli_version {
+            return Err(format!(
+                "fresh release CLI version {current_version} differs from supplied {}",
+                context.cli_version
+            ));
+        }
+        let output = Command::new(&driver)
+            .args(["--bridge"])
+            .arg(&bridge)
+            .arg("--writer")
+            .arg(&writer)
+            .arg("--cli")
+            .arg(&built_cli)
+            .args(["--bridge-source", CONTRACT_TWO_BRIDGE_SOURCE])
+            .args(["--writer-source", &context.source_sha256])
+            .args(["--artifacts", ".", "--run-id", &context.run_id])
+            .current_dir(&cwd)
+            .output()
+            .map_err(|err| format!("cannot run mixed-binary proof: {err}"))?;
+        let proof_log = cwd.join("rollout.log");
+        fs::write(
+            &proof_log,
+            [output.stdout.as_slice(), output.stderr.as_slice()].concat(),
+        )
+        .map_err(|err| format!("{}: {err}", proof_log.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "mixed-binary rollout exited {}; see {}",
+                output.status,
+                proof_log.display()
+            ));
+        }
+        let report = cwd.join(&context.run_id).join("report.json");
+        let mut case = context.bind(finish(
+            row,
+            "PASS",
+            "git archive pinned bridge; separate locked release builds; real three-voter format rollout",
+            format!(
+                "bridge={CONTRACT_TWO_BRIDGE_SOURCE} archive_sha256={archive_sha256} old={old_hash} writer={writer_hash} cli={current_hash}; report={}",
+                report.display()
+            ),
+            vec![
+                cwd.clone(),
+                archive,
+                old_log.clone(),
+                current_log.clone(),
+                bridge.clone(),
+                writer,
+                built_cli.clone(),
+                driver,
+                proof_log,
+                report,
+            ],
+        ));
+        case.related_binaries = vec![
+            RelatedBinary {
+                role: "old_reader".to_owned(),
+                path: bridge.display().to_string(),
+                built_path: bridge.display().to_string(),
+                target_dir: old_target.display().to_string(),
+                version: old_version,
+                source_revision: CONTRACT_TWO_BRIDGE_SOURCE.to_owned(),
+                sha256_before: old_hash.clone(),
+                sha256_after: hash_file(&bridge)?,
+                build_log: old_log.display().to_string(),
+                build_log_sha256: hash_file(&old_log)?,
+                run_id: context.run_id.clone(),
+            },
+            RelatedBinary {
+                role: "current_release".to_owned(),
+                path: cli.display().to_string(),
+                built_path: built_cli.display().to_string(),
+                target_dir: current_target.display().to_string(),
+                version: current_version,
+                source_revision: context.source_sha256.clone(),
+                sha256_before: context.cli_sha256.clone(),
+                sha256_after: hash_file(cli)?,
+                build_log: current_log.display().to_string(),
+                build_log_sha256: hash_file(&current_log)?,
+                run_id: context.run_id.clone(),
+            },
+        ];
+        validate_related_binaries(&case, &root, context)?;
+        validate_format_rollout_report(&case, &root, context)?;
+        Ok(case)
+    })();
+    let mut case = match attempt {
+        Ok(case) => case,
+        Err(err) => finish(
+            row,
+            "FAIL",
+            "pinned source builds and fresh mixed-binary rollout",
+            err,
+            vec![cwd],
+        ),
+    };
+    case.duration_ms = started.elapsed().as_millis();
+    case
+}
+
 fn contract_worker_proof(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
     let started = Instant::now();
     let mut observations = Vec::new();
@@ -11146,6 +11415,7 @@ mod tests {
     #[test]
     fn storage_cases_require_each_named_proof() {
         let dir = tempfile::tempdir().unwrap();
+        let context = context(dir.path());
         let suite = || TestSuite {
             command: "cargo test -p graphrun --lib --locked".to_owned(),
             log: dir.path().join("lib.log"),
@@ -11205,14 +11475,14 @@ mod tests {
             evidence.lib.passed = names.iter().map(|name| (*name).to_owned()).collect();
             let case = row(id);
             assert_eq!(
-                run_case(Path::new("unused"), dir.path(), &evidence, &case).status,
+                run_case(Path::new("unused"), dir.path(), &evidence, &case, &context).status,
                 "PASS",
                 "{id} should accept every required executed proof"
             );
             for name in names {
                 evidence.lib.passed.remove(*name);
                 assert_eq!(
-                    run_case(Path::new("unused"), dir.path(), &evidence, &case).status,
+                    run_case(Path::new("unused"), dir.path(), &evidence, &case, &context).status,
                     "FAIL",
                     "{id} must not pass without {name}"
                 );
