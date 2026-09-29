@@ -1436,6 +1436,38 @@ fn framed_snapshot_digest(path: &Path) -> Result<String, String> {
     Ok(hex::encode(footer))
 }
 
+fn validate_member_snapshot_location(
+    root: &Path,
+    cwd: &Path,
+    member_id: u64,
+    store: &Path,
+    location: &Path,
+) -> Result<(), String> {
+    let path = if location.is_absolute() {
+        location.to_path_buf()
+    } else {
+        cwd.join(location)
+    };
+    let parent = fs::canonicalize(
+        path.parent()
+            .ok_or("CONTRACT-002 snapshot directory has no member")?,
+    )
+    .map_err(|err| err.to_string())?;
+    if parent != store.parent().ok_or("CONTRACT-002 store has no member")?
+        || path.file_name().is_none_or(|name| name != "snapshots")
+    {
+        return Err("CONTRACT-002 snapshot directory does not belong to its member".to_owned());
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(_) if format_artifact(root, cwd, location)?.is_dir() => Ok(()),
+        Ok(_) => Err("CONTRACT-002 snapshot path is not a directory".to_owned()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && member_id != 2 => Ok(()),
+        Err(err) => Err(format!(
+            "CONTRACT-002 member {member_id} snapshot directory: {err}"
+        )),
+    }
+}
+
 fn validate_format_rollout_files(
     report: &FormatRolloutReport,
     root: &Path,
@@ -1569,10 +1601,10 @@ fn validate_format_rollout_files(
                 exit.label == *label && exit.member_id == *id && exit.status == *status
             })
             || stores.get(&exit.member_id) != Some(&store)
-            || !format_artifact(root, cwd, &exit.snapshot_dir)?.is_dir()
         {
             return Err(format!("CONTRACT-002 invalid {} process exit", exit.label));
         }
+        validate_member_snapshot_location(root, cwd, exit.member_id, &store, &exit.snapshot_dir)?;
         let log = format_artifact(root, cwd, &exit.log)?;
         let text = fs::read_to_string(&log).map_err(|err| err.to_string())?;
         if exit.label == "rejected-restart"
@@ -11449,6 +11481,42 @@ mod tests {
         assert!(framed_snapshot_digest(&path).is_err());
         fs::write(&path, b"short").unwrap();
         assert!(framed_snapshot_digest(&path).is_err());
+    }
+
+    #[test]
+    fn contract_two_requires_only_the_publishing_members_snapshot_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let cwd = root.join("rollout");
+        let mut stores = Vec::new();
+        for n in 1..=3 {
+            let member = cwd.join(format!("m{n}"));
+            fs::create_dir_all(&member).unwrap();
+            let store = member.join("member.redb");
+            fs::write(&store, b"member").unwrap();
+            stores.push(store);
+        }
+        let snapshot = |n: usize| cwd.join(format!("m{n}/snapshots"));
+        assert!(
+            validate_member_snapshot_location(&root, &cwd, 1, &stores[0], &snapshot(1)).is_ok()
+        );
+        assert!(
+            validate_member_snapshot_location(&root, &cwd, 3, &stores[2], &snapshot(3)).is_ok()
+        );
+        assert!(
+            validate_member_snapshot_location(&root, &cwd, 2, &stores[1], &snapshot(2)).is_err()
+        );
+        fs::create_dir(snapshot(2)).unwrap();
+        assert!(
+            validate_member_snapshot_location(&root, &cwd, 2, &stores[1], &snapshot(2)).is_ok()
+        );
+        assert!(
+            validate_member_snapshot_location(&root, &cwd, 1, &stores[0], &snapshot(2)).is_err()
+        );
+        fs::write(snapshot(1), b"not a directory").unwrap();
+        assert!(
+            validate_member_snapshot_location(&root, &cwd, 1, &stores[0], &snapshot(1)).is_err()
+        );
     }
 
     #[test]
