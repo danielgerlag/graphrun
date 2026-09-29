@@ -2518,7 +2518,7 @@ async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, _notify:
             )))
         });
         loop {
-            if *changes.borrow() != view.revision {
+            if crate::storage::schedule_revision_changed(&mut changes, view.revision) {
                 break;
             }
             tokio::select! {
@@ -2673,7 +2673,7 @@ async fn worker_loop(
         };
         if !ready {
             loop {
-                if *changes.borrow() != view.revision {
+                if crate::storage::schedule_revision_changed(&mut changes, view.revision) {
                     break;
                 }
                 tokio::select! {

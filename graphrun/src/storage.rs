@@ -194,6 +194,10 @@ pub(crate) enum ScheduleWake {
     Worker,
 }
 
+pub(crate) fn schedule_revision_changed(changes: &mut watch::Receiver<u64>, revision: u64) -> bool {
+    *changes.borrow_and_update() != revision
+}
+
 type LogIdT = LogId<u64>;
 type VoteT = Vote<u64>;
 type EntryT = Entry<TypeConfig>;
@@ -5077,6 +5081,32 @@ mod tests {
     use redb::ReadableTableMetadata;
 
     const TEST_CLUSTER_ID: &str = "11111111111111111111111111111111";
+
+    #[tokio::test]
+    async fn observed_schedule_revision_does_not_wake_again_without_change() {
+        let (sender, mut changes) = watch::channel(0);
+        sender.send_replace(1);
+        assert!(!schedule_revision_changed(&mut changes, 1));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), changes.changed())
+                .await
+                .is_err(),
+            "an already observed schedule revision woke a reader and caused another discovery"
+        );
+        sender.send_replace(2);
+        assert!(schedule_revision_changed(&mut changes, 1));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), changes.changed())
+                .await
+                .is_err(),
+            "a mismatched revision caused a second wake after resynchronization"
+        );
+        sender.send_replace(3);
+        tokio::time::timeout(std::time::Duration::from_secs(1), changes.changed())
+            .await
+            .expect("a newly committed revision did not wake the reader")
+            .unwrap();
+    }
 
     fn bound_fixture(db: &Database) -> State {
         let mut state = State::default();
