@@ -206,6 +206,9 @@ are built in the same run, their identities and build logs are validated,
 and the mixed-version reader-first rollout is observed through real members.
 CI retains Git history for the pinned old-reader source. The gate builds that
 binary from source rather than downloading a prebuilt executable.
+The old and current source builds use separate fresh Cargo target directories.
+Each build log must show `graphrun` compiling, and the release binary hashes
+must differ. A shared build cache cannot prove a mixed-version rollout.
 
 ## Evidence format
 
