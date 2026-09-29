@@ -214,6 +214,61 @@ struct RelatedBinary {
     run_id: String,
 }
 
+#[derive(Deserialize)]
+struct FormatRolloutReport {
+    run_id: String,
+    status: String,
+    scope: String,
+    error: Option<String>,
+    duration_ms: u128,
+    binary_integrity: bool,
+    driver: FormatRolloutDriver,
+    binaries: Vec<FormatRolloutBinary>,
+    observations: Vec<FormatRolloutObservation>,
+    process_exits: Vec<FormatRolloutExit>,
+    member_stores: Vec<PathBuf>,
+    backup_manifest: PathBuf,
+    workflow_run_id: String,
+    preparation_command_id: String,
+    activation_command_id: String,
+}
+
+#[derive(Deserialize)]
+struct FormatRolloutBinary {
+    role: String,
+    source_revision: String,
+    version: String,
+    #[serde(flatten)]
+    executable: FormatRolloutDriver,
+}
+
+#[derive(Deserialize)]
+struct FormatRolloutDriver {
+    path: PathBuf,
+    sha256_before: String,
+    sha256_after: String,
+}
+
+#[derive(Deserialize)]
+struct FormatRolloutObservation {
+    step: String,
+    expected: String,
+    actual: serde_json::Value,
+    passed: bool,
+}
+
+#[derive(Deserialize)]
+struct FormatRolloutExit {
+    member_id: u64,
+    label: String,
+    pid: u32,
+    terminated: bool,
+    status: String,
+    log: PathBuf,
+    store: PathBuf,
+    snapshot_dir: PathBuf,
+}
+
 #[derive(Serialize, Deserialize)]
 struct SampleBinaryEvidence {
     bin: String,
@@ -968,6 +1023,445 @@ fn validate_related_binaries(
     Ok(())
 }
 
+fn format_artifact(root: &Path, cwd: &Path, path: &Path) -> Result<PathBuf, String> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let saved = fs::canonicalize(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+    if !saved.starts_with(root) {
+        return Err(format!(
+            "CONTRACT-002 artifact {} is outside this run",
+            path.display()
+        ));
+    }
+    Ok(saved)
+}
+
+fn validate_format_rollout_report(
+    result: &CaseResult,
+    run_dir: &Path,
+    context: &RunContext,
+) -> Result<(), String> {
+    let root = fs::canonicalize(run_dir).map_err(|err| err.to_string())?;
+    let cwd = run_dir.join("CONTRACT-002-rollout");
+    let report_path = Path::new(&context.run_id).join("report.json");
+    let saved = format_artifact(&root, &cwd, &report_path)?;
+    if !result
+        .artifacts
+        .iter()
+        .any(|artifact| fs::canonicalize(artifact).is_ok_and(|path| path == saved))
+    {
+        return Err("CONTRACT-002 lacks its fresh rollout report artifact".to_owned());
+    }
+    let report: FormatRolloutReport = serde_json::from_slice(
+        &fs::read(&saved).map_err(|err| format!("{}: {err}", saved.display()))?,
+    )
+    .map_err(|err| format!("CONTRACT-002 rollout report: {err}"))?;
+    if report.run_id != context.run_id
+        || report.status != "PASS"
+        || report.scope != "focused production mixed-binary smoke, not matrix CONTRACT-002"
+        || report.error.is_some()
+        || !report.binary_integrity
+        || report.duration_ms == 0
+    {
+        return Err("CONTRACT-002 rollout has stale, incomplete, or failed status".to_owned());
+    }
+    for id in [
+        &report.workflow_run_id,
+        &report.preparation_command_id,
+        &report.activation_command_id,
+    ] {
+        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!(
+                "CONTRACT-002 has invalid workflow or command identity {id}"
+            ));
+        }
+    }
+    if report.preparation_command_id == report.activation_command_id {
+        return Err("CONTRACT-002 prepare and activation reused a command ID".to_owned());
+    }
+    let old = &result.related_binaries[0];
+    let current = &result.related_binaries[1];
+    if old.role != "old_reader" || current.role != "current_release" {
+        return Err("CONTRACT-002 related binaries must be ordered old then current".to_owned());
+    }
+    let mut roles = HashSet::new();
+    let writer_fixture = Path::new(&current.target_dir)
+        .join("release")
+        .join(format!("graphrun-e2e{}", std::env::consts::EXE_SUFFIX));
+    let rollout_driver = Path::new(&current.target_dir).join("release").join(format!(
+        "graphrun-format-rollout{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    for binary in &report.binaries {
+        if !roles.insert(binary.role.as_str()) {
+            return Err(format!(
+                "CONTRACT-002 duplicate rollout binary {}",
+                binary.role
+            ));
+        }
+        let (expected_path, expected_source, expected_hash, expected_version) =
+            match binary.role.as_str() {
+                "old_reader" => (
+                    Path::new(&old.path),
+                    old.source_revision.as_str(),
+                    old.sha256_after.as_str(),
+                    old.version.as_str(),
+                ),
+                "current_release" => (
+                    writer_fixture.as_path(),
+                    context.source_sha256.as_str(),
+                    binary.executable.sha256_after.as_str(),
+                    binary.version.as_str(),
+                ),
+                "cli" => (
+                    Path::new(&current.built_path),
+                    context.source_sha256.as_str(),
+                    context.cli_sha256.as_str(),
+                    context.cli_version.as_str(),
+                ),
+                _ => {
+                    return Err(format!(
+                        "CONTRACT-002 unexpected rollout binary {}",
+                        binary.role
+                    ));
+                }
+            };
+        let path = format_artifact(&root, &cwd, &binary.executable.path)?;
+        if path != fs::canonicalize(expected_path).map_err(|err| err.to_string())?
+            || !result
+                .artifacts
+                .iter()
+                .any(|artifact| fs::canonicalize(artifact).is_ok_and(|saved| saved == path))
+            || binary.source_revision != expected_source
+            || binary.version != expected_version
+            || binary.executable.sha256_before != expected_hash
+            || binary.executable.sha256_after != expected_hash
+            || hash_file(&path)? != expected_hash
+            || (binary.role == "current_release" && expected_hash == old.sha256_after)
+        {
+            return Err(format!(
+                "CONTRACT-002 {} source or binary hash differs",
+                binary.role
+            ));
+        }
+    }
+    if roles != HashSet::from(["old_reader", "current_release", "cli"]) {
+        return Err("CONTRACT-002 requires bridge, writer fixture, and release CLI".to_owned());
+    }
+    let driver = format_artifact(&root, &cwd, &report.driver.path)?;
+    if driver != fs::canonicalize(rollout_driver).map_err(|err| err.to_string())?
+        || report.driver.sha256_before != report.driver.sha256_after
+        || hash_file(&driver)? != report.driver.sha256_after
+        || !result
+            .artifacts
+            .iter()
+            .any(|artifact| fs::canonicalize(artifact).is_ok_and(|saved| saved == driver))
+    {
+        return Err("CONTRACT-002 rollout driver binary changed during proof".to_owned());
+    }
+    validate_format_rollout_observations(&report)?;
+    validate_format_rollout_files(&report, &root, &cwd)?;
+    Ok(())
+}
+
+fn validate_format_rollout_observations(report: &FormatRolloutReport) -> Result<(), String> {
+    const STEPS: [&str; 19] = [
+        "retained pre-activation wait",
+        "reader-first preparation",
+        "complete roster",
+        "old writer cannot activate",
+        "mixed writer followers",
+        "committed writer activation",
+        "old reader applies new policy",
+        "new-format workflow progress",
+        "old reader applies v3 inbox update",
+        "retained event projection",
+        "retained history page",
+        "versioned history reconstruction",
+        "backup reader versions",
+        "v5 framed snapshot file",
+        "v5 snapshot registry and readers",
+        "old binary restart fenced",
+        "member 1 retained format",
+        "member 2 retained format",
+        "member 3 retained format",
+    ];
+    let mut values = HashMap::new();
+    for observation in &report.observations {
+        if !observation.passed
+            || observation.expected.is_empty()
+            || observation.actual.is_null()
+            || values
+                .insert(observation.step.as_str(), &observation.actual)
+                .is_some()
+        {
+            return Err(format!(
+                "CONTRACT-002 missing or repeated successful observation {}",
+                observation.step
+            ));
+        }
+    }
+    if values.len() != STEPS.len() || STEPS.iter().any(|step| !values.contains_key(step)) {
+        return Err("CONTRACT-002 lacks a required mixed-version rollout step".to_owned());
+    }
+    let observed = |step: &str| -> &serde_json::Value { values[step] };
+    let wait = observed("retained pre-activation wait");
+    let prepare = observed("reader-first preparation");
+    let roster = observed("complete roster");
+    let activation = observed("committed writer activation");
+    let before_index = prepare["applied_log_id"]["index"]
+        .as_u64()
+        .ok_or("CONTRACT-002 prepare has no committed log index")?;
+    let active_index = activation["applied_log_id"]["index"]
+        .as_u64()
+        .ok_or("CONTRACT-002 activation has no committed log index")?;
+    if wait["run"] != report.workflow_run_id
+        || wait["status"] != "started"
+        || prepare["applied"] != true
+        || prepare["active_writer"] != 4
+        || prepare["command_id"] != report.preparation_command_id
+        || before_index == 0
+        || roster["writer_format"] != 4
+        || roster["quorum"] != true
+        || !roster["activation_log_id"].is_null()
+        || roster["joint_voters"] != serde_json::json!([[1, 2, 3]])
+        || activation["applied"] != true
+        || activation["active_writer"] != 5
+        || activation["command_id"] != report.activation_command_id
+        || active_index <= before_index
+        || activation["cluster_id"] != prepare["cluster_id"]
+        || !observed("old writer cannot activate")["result"]["Err"]
+            .as_str()
+            .is_some_and(|error| error.contains("FailedPrecondition"))
+    {
+        return Err(
+            "CONTRACT-002 reader-first preparation or writer activation is invalid".to_owned(),
+        );
+    }
+    let prepared = roster["prepared"]
+        .as_object()
+        .ok_or("CONTRACT-002 has no committed three-member reader roster")?;
+    if prepared.len() != 3
+        || ["1", "2", "3"].iter().any(|id| {
+            let proof = &prepared[*id];
+            proof["reader_floor"].as_u64().is_none_or(|floor| floor < 5)
+                || proof["command_readers"] != serde_json::json!([4, 5])
+                || proof["state_records"]
+                    != serde_json::json!(["graphrun.state-record/v2", "graphrun.state-record/v3"])
+        })
+    {
+        return Err("CONTRACT-002 reader roster lacks a v4/v5 and v2/v3 proof".to_owned());
+    }
+    for (step, minimum_index) in [
+        ("mixed writer followers", before_index),
+        ("old reader applies new policy", active_index),
+        ("old reader applies v3 inbox update", active_index + 1),
+    ] {
+        let health = observed(step);
+        if health["state"] != "Follower"
+            || health["last_applied"]
+                .as_u64()
+                .is_none_or(|index| index < minimum_index)
+            || health["pending_waits"] != 1
+        {
+            return Err(format!(
+                "CONTRACT-002 old reader did not catch up at {step}"
+            ));
+        }
+    }
+    if observed("new-format workflow progress")["status"] != "ok"
+        || observed("old reader applies v3 inbox update")["inbox_depth"] != 1
+    {
+        return Err("CONTRACT-002 post-v5 signal did not reach the old inbox".to_owned());
+    }
+    let projection = observed("retained event projection");
+    let replay = observed("versioned history reconstruction");
+    if projection["run"] != report.workflow_run_id
+        || projection["status"] != "succeeded"
+        || projection["output"] != serde_json::json!({"approved": true})
+        || projection["open_scopes"] != 0
+        || projection["pending_waits"] != serde_json::json!([])
+        || !projection["error"].is_null()
+        || replay["run"] != projection["run"]
+        || replay["status"] != projection["status"]
+        || replay["output"] != projection["output"]
+        || replay["event_count"] != projection["event_count"]
+    {
+        return Err("CONTRACT-002 retained run and read-only replay disagree".to_owned());
+    }
+    let page = observed("retained history page");
+    let events = page["events"]
+        .as_array()
+        .ok_or("CONTRACT-002 has no retained history page")?;
+    if page["run"] != report.workflow_run_id
+        || page["unavailable"] != false
+        || page["retained_from"] != 1
+        || page["retained_through"] != events.len()
+        || events.len() < 15
+        || projection["event_count"] != events.len()
+        || events.iter().enumerate().any(|(n, event)| {
+            event["sequence"] != n + 1
+                || event["format"] != "graphrun.run-event/v1"
+                || event["run"] != report.workflow_run_id
+        })
+        || ![
+            "wait_opened",
+            "event_accepted",
+            "wait_satisfied",
+            "run_succeeded",
+        ]
+        .iter()
+        .all(|kind| events.iter().any(|event| event["event"]["kind"] == *kind))
+    {
+        return Err("CONTRACT-002 lost an ordered pre/post-activation event".to_owned());
+    }
+    for step in [
+        "backup reader versions",
+        "member 1 retained format",
+        "member 2 retained format",
+        "member 3 retained format",
+    ] {
+        if observed(step)["writer"] != 5 || observed(step)["history"] != 1 {
+            return Err(format!("CONTRACT-002 {step} lacks retained v5 history"));
+        }
+    }
+    let fenced = observed("old binary restart fenced");
+    if fenced["status"] != "exit status: 2"
+        || !fenced["log"].as_str().is_some_and(|log| {
+            log.contains("binary writer capability 4 is below committed writer format 5")
+        })
+    {
+        return Err("CONTRACT-002 old writer reopened a v5 store".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_format_rollout_files(
+    report: &FormatRolloutReport,
+    root: &Path,
+    cwd: &Path,
+) -> Result<(), String> {
+    let manifest = format_artifact(root, cwd, &report.backup_manifest)?;
+    let _: serde_json::Value = serde_json::from_slice(
+        &fs::read(&manifest).map_err(|err| format!("backup manifest: {err}"))?,
+    )
+    .map_err(|err| format!("CONTRACT-002 backup manifest: {err}"))?;
+    if report.member_stores.len() != 3 {
+        return Err("CONTRACT-002 requires three member stores".to_owned());
+    }
+    let mut stores = HashMap::new();
+    for (n, store) in report.member_stores.iter().enumerate() {
+        let path = format_artifact(root, cwd, store)?;
+        if !path.ends_with(Path::new(&format!("m{}", n + 1)).join("member.redb"))
+            || fs::metadata(&path).map_err(|err| err.to_string())?.len() == 0
+        {
+            return Err(format!(
+                "CONTRACT-002 member {} has no durable store",
+                n + 1
+            ));
+        }
+        stores.insert((n + 1) as u64, path);
+    }
+    let snapshot = report
+        .observations
+        .iter()
+        .find(|observation| observation.step == "v5 framed snapshot file")
+        .ok_or("CONTRACT-002 lacks a v5 snapshot observation")?;
+    let snapshot_path = snapshot.actual["file"]
+        .as_str()
+        .ok_or("CONTRACT-002 snapshot has no file path")?;
+    let snapshot_path = format_artifact(root, cwd, Path::new(snapshot_path))?;
+    let registry = report
+        .observations
+        .iter()
+        .find(|observation| observation.step == "v5 snapshot registry and readers")
+        .ok_or("CONTRACT-002 lacks a v5 snapshot registry")?;
+    let actual = &registry.actual;
+    let registered_path = actual["snapshot_path"]
+        .as_str()
+        .ok_or("CONTRACT-002 registry has no snapshot path")?;
+    if format_artifact(root, cwd, Path::new(registered_path))? != snapshot_path
+        || actual["store_format"] != "graphrun.member-store/v5"
+        || actual["writer_format"] != 5
+        || actual["framing_version"] != 1
+        || actual["record_count"]
+            .as_u64()
+            .is_none_or(|count| count < 90)
+        || actual["registry"]["meta"]["last_log_id"]["index"]
+            .as_u64()
+            .is_none_or(|index| index < 14)
+        || actual["registry"]["file_name"]
+            != snapshot_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or("CONTRACT-002 snapshot has no filename")?
+        || actual["registry"]["sha256"] != hash_file(&snapshot_path)?
+        || ![
+            "graphrun.state-record/v2",
+            "graphrun.state-record/v3",
+            "graphrun.run-event/v1",
+        ]
+        .iter()
+        .all(|format| {
+            actual["record_formats"]
+                .as_array()
+                .is_some_and(|formats| formats.iter().any(|entry| entry == format))
+        })
+    {
+        return Err("CONTRACT-002 snapshot file, registry, or reader versions disagree".to_owned());
+    }
+    let expected = [
+        ("writer", 2, "exit status: 0"),
+        ("writer", 3, "exit status: 0"),
+        ("bridge", 1, "exit status: 0"),
+        ("bridge-return", 1, "exit status: 0"),
+        ("rejected-restart", 1, "exit status: 2"),
+    ];
+    let mut pids = HashSet::new();
+    let mut exits = HashSet::new();
+    if report.process_exits.len() != expected.len() {
+        return Err("CONTRACT-002 has incomplete process exit evidence".to_owned());
+    }
+    for exit in &report.process_exits {
+        let store = format_artifact(root, cwd, &exit.store)?;
+        if exit.pid == 0
+            || !pids.insert(exit.pid)
+            || !exits.insert((exit.label.as_str(), exit.member_id))
+            || exit.terminated
+            || !expected.iter().any(|(label, id, status)| {
+                exit.label == *label && exit.member_id == *id && exit.status == *status
+            })
+            || stores.get(&exit.member_id) != Some(&store)
+            || !format_artifact(root, cwd, &exit.snapshot_dir)?.is_dir()
+        {
+            return Err(format!("CONTRACT-002 invalid {} process exit", exit.label));
+        }
+        let log = format_artifact(root, cwd, &exit.log)?;
+        let text = fs::read_to_string(&log).map_err(|err| err.to_string())?;
+        if text.is_empty()
+            || (exit.label == "rejected-restart"
+                && !text.contains("binary writer capability 4 is below committed writer format 5"))
+        {
+            return Err(format!(
+                "CONTRACT-002 {} process log is incomplete",
+                exit.label
+            ));
+        }
+    }
+    if exits
+        != expected
+            .iter()
+            .map(|(label, id, _)| (*label, *id))
+            .collect()
+    {
+        return Err("CONTRACT-002 lacks an expected member process exit".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_sample_binaries(
     result: &CaseResult,
     run_dir: &Path,
@@ -1071,6 +1565,7 @@ fn validate_coverage(
         if result.id == "CONTRACT-002" {
             if result.status == "PASS" {
                 validate_related_binaries(result, run_dir, context)?;
+                validate_format_rollout_report(result, run_dir, context)?;
             }
         } else if !result.related_binaries.is_empty() {
             return Err(format!(
@@ -10267,15 +10762,7 @@ mod tests {
         context.cli_sha256 = hash_file(&current_path).unwrap();
         context.source_sha256 = "c".repeat(64);
         let mut case = passing_case(&row, &run_dir, &context);
-        let check = |case: &CaseResult| {
-            write_case(&run_dir, case).unwrap();
-            validate_coverage(
-                std::slice::from_ref(&row),
-                std::slice::from_ref(case),
-                &run_dir,
-                &context,
-            )
-        };
+        let check = |case: &CaseResult| validate_related_binaries(case, &run_dir, &context);
         assert!(check(&case).unwrap_err().contains("requires both"));
         let current_revision = context.source_sha256.clone();
         let old_revision = if current_revision == "a".repeat(40) {
@@ -10379,6 +10866,173 @@ mod tests {
         case.related_binaries[1].build_log_sha256 = hash_file(&current_build).unwrap();
         fs::write(&old_path, "tampered after proof").unwrap();
         assert!(check(&case).unwrap_err().contains("stale"));
+    }
+
+    #[test]
+    fn contract_two_requires_causal_mixed_version_observations() {
+        let run = "a".repeat(32);
+        let prepare_id = "b".repeat(32);
+        let activate_id = "c".repeat(32);
+        let proof = serde_json::json!({
+            "reader_floor": 5,
+            "command_readers": [4, 5],
+            "state_records": ["graphrun.state-record/v2", "graphrun.state-record/v3"],
+        });
+        let events: Vec<_> = (1..=15)
+            .map(|sequence| {
+                let kind = match sequence {
+                    8 => "wait_opened",
+                    9 => "event_accepted",
+                    11 => "wait_satisfied",
+                    15 => "run_succeeded",
+                    _ => "run_admitted",
+                };
+                serde_json::json!({
+                    "sequence": sequence,
+                    "format": "graphrun.run-event/v1",
+                    "run": run,
+                    "event": {"kind": kind},
+                })
+            })
+            .collect();
+        let steps = [
+            (
+                "retained pre-activation wait",
+                serde_json::json!({"run":run,"status":"started"}),
+            ),
+            (
+                "reader-first preparation",
+                serde_json::json!({"applied":true,"active_writer":4,"command_id":prepare_id,"cluster_id":"cluster-1","applied_log_id":{"index":10}}),
+            ),
+            (
+                "complete roster",
+                serde_json::json!({"writer_format":4,"quorum":true,"activation_log_id":null,"joint_voters":[[1,2,3]],"prepared":{"1":proof,"2":proof,"3":proof}}),
+            ),
+            (
+                "old writer cannot activate",
+                serde_json::json!({"result":{"Err":"FailedPrecondition"}}),
+            ),
+            (
+                "mixed writer followers",
+                serde_json::json!({"state":"Follower","last_applied":10,"pending_waits":1}),
+            ),
+            (
+                "committed writer activation",
+                serde_json::json!({"applied":true,"active_writer":5,"command_id":activate_id,"cluster_id":"cluster-1","applied_log_id":{"index":12}}),
+            ),
+            (
+                "old reader applies new policy",
+                serde_json::json!({"state":"Follower","last_applied":12,"pending_waits":1}),
+            ),
+            (
+                "new-format workflow progress",
+                serde_json::json!({"status":"ok"}),
+            ),
+            (
+                "old reader applies v3 inbox update",
+                serde_json::json!({"state":"Follower","last_applied":13,"pending_waits":1,"inbox_depth":1}),
+            ),
+            (
+                "retained event projection",
+                serde_json::json!({"run":run,"status":"succeeded","output":{"approved":true},"event_count":15,"open_scopes":0,"pending_waits":[],"error":null}),
+            ),
+            (
+                "retained history page",
+                serde_json::json!({"run":run,"unavailable":false,"retained_from":1,"retained_through":15,"events":events}),
+            ),
+            (
+                "versioned history reconstruction",
+                serde_json::json!({"run":run,"status":"succeeded","output":{"approved":true},"event_count":15}),
+            ),
+            (
+                "backup reader versions",
+                serde_json::json!({"writer":5,"history":1}),
+            ),
+            (
+                "v5 framed snapshot file",
+                serde_json::json!({"file":"snap.snap"}),
+            ),
+            (
+                "v5 snapshot registry and readers",
+                serde_json::json!({"writer_format":5}),
+            ),
+            (
+                "old binary restart fenced",
+                serde_json::json!({"status":"exit status: 2","log":"binary writer capability 4 is below committed writer format 5"}),
+            ),
+            (
+                "member 1 retained format",
+                serde_json::json!({"writer":5,"history":1}),
+            ),
+            (
+                "member 2 retained format",
+                serde_json::json!({"writer":5,"history":1}),
+            ),
+            (
+                "member 3 retained format",
+                serde_json::json!({"writer":5,"history":1}),
+            ),
+        ];
+        let mut report = FormatRolloutReport {
+            run_id: "run-current".to_owned(),
+            status: "PASS".to_owned(),
+            scope: "focused production mixed-binary smoke, not matrix CONTRACT-002".to_owned(),
+            error: None,
+            duration_ms: 1,
+            binary_integrity: true,
+            driver: FormatRolloutDriver {
+                path: PathBuf::new(),
+                sha256_before: String::new(),
+                sha256_after: String::new(),
+            },
+            binaries: Vec::new(),
+            observations: steps
+                .into_iter()
+                .map(|(step, actual)| FormatRolloutObservation {
+                    step: step.to_owned(),
+                    expected: "required".to_owned(),
+                    actual,
+                    passed: true,
+                })
+                .collect(),
+            process_exits: Vec::new(),
+            member_stores: Vec::new(),
+            backup_manifest: PathBuf::new(),
+            workflow_run_id: run,
+            preparation_command_id: prepare_id,
+            activation_command_id: activate_id,
+        };
+        assert!(validate_format_rollout_observations(&report).is_ok());
+        for (step, changed) in [
+            ("committed writer activation", serde_json::json!(4)),
+            ("old reader applies v3 inbox update", serde_json::json!(12)),
+        ] {
+            let field = if step == "committed writer activation" {
+                "active_writer"
+            } else {
+                "last_applied"
+            };
+            let observation = report
+                .observations
+                .iter_mut()
+                .find(|observation| observation.step == step)
+                .unwrap();
+            let original = std::mem::replace(&mut observation.actual[field], changed);
+            assert!(
+                validate_format_rollout_observations(&report).is_err(),
+                "{step}"
+            );
+            report
+                .observations
+                .iter_mut()
+                .find(|observation| observation.step == step)
+                .unwrap()
+                .actual[field] = original;
+        }
+        report
+            .observations
+            .retain(|observation| observation.step != "old reader applies v3 inbox update");
+        assert!(validate_format_rollout_observations(&report).is_err());
     }
 
     #[test]
