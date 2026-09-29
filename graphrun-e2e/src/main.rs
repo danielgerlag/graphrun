@@ -1352,6 +1352,35 @@ fn validate_format_rollout_files(
         &fs::read(&manifest).map_err(|err| format!("backup manifest: {err}"))?,
     )
     .map_err(|err| format!("CONTRACT-002 backup manifest: {err}"))?;
+    let manifest_hash = hash_file(&manifest)?;
+    let backup = graphrun::Engine::read_backup(
+        manifest
+            .parent()
+            .ok_or("CONTRACT-002 backup manifest has no directory")?,
+    )
+    .map_err(|err| format!("CONTRACT-002 read-only backup validation: {err}"))?;
+    let run = graphrun::RunId::from_hex(&report.workflow_run_id)
+        .map_err(|err| format!("CONTRACT-002 invalid retained run: {err}"))?;
+    let expected_output = graphrun::Value::Object(
+        [("approved".to_owned(), graphrun::Value::Bool(true))]
+            .into_iter()
+            .collect(),
+    );
+    if !matches!(
+        backup.runs.get(&run).map(|run| &run.status),
+        Some(graphrun::domain::RunStatus::Succeeded { output }) if output == &expected_output
+    ) || backup
+        .history
+        .get(&run)
+        .is_none_or(|events| events.len() < 15)
+        || backup
+            .history_records
+            .get(&run)
+            .is_none_or(|entries| entries.len() < 15)
+        || hash_file(&manifest)? != manifest_hash
+    {
+        return Err("CONTRACT-002 backup lost the pre-v5 run or changed during read".to_owned());
+    }
     if report.member_stores.len() != 3 {
         return Err("CONTRACT-002 requires three member stores".to_owned());
     }
