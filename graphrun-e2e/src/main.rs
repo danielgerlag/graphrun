@@ -72,6 +72,12 @@ enum Commands {
         #[arg(long)]
         artifacts: PathBuf,
     },
+    SmokeForgedWorker {
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(long)]
+        artifacts: PathBuf,
+    },
     SmokePerformance {
         #[arg(long)]
         cli: PathBuf,
@@ -276,6 +282,9 @@ fn main() -> ExitCode {
         }
         Commands::SmokeSecurity { cli, artifacts } => {
             smoke_case(&cli, &artifacts, "SEC-001", contract_worker_proof)
+        }
+        Commands::SmokeForgedWorker { cli, artifacts } => {
+            smoke_case(&cli, &artifacts, "ACT-003", forged_worker_process)
         }
         Commands::SmokePerformance { cli, artifacts } => {
             smoke_case(&cli, &artifacts, "PERF-001", perf_command_compile)
@@ -1980,6 +1989,8 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
                     &evidence.driver,
                     &[
                         "tests::coverage_rejects_missing_duplicate_and_stale_cases",
+                        "tests::start_run_identity_ignores_command_id",
+                        "tests::wrong_ca_cancelled_requires_transport_denial",
                         "tests::local_start_requires_exact_output_and_valid_run_identity",
                         "tests::sample_binary_evidence_rejects_missing_stale_and_wrong_outputs",
                         "tests::test_evidence_requires_executed_pass_and_successful_exit",
@@ -4256,6 +4267,34 @@ fn contract_reject<T>(
     }
 }
 
+fn started_run(stdout: &str) -> Result<String, String> {
+    let body: serde_json::Value =
+        serde_json::from_str(stdout).map_err(|err| format!("start response is not JSON: {err}"))?;
+    if body["status"] != "started" {
+        return Err(format!("start did not return a started run: {body}"));
+    }
+    let run = body["run"]
+        .as_str()
+        .ok_or("start response has no run identity")?;
+    graphrun::RunId::from_hex(run)
+        .map_err(|err| format!("start returned invalid run identity: {err}"))?;
+    Ok(run.to_owned())
+}
+
+fn wrong_ca_transport_denied(status: &tonic::Status) -> bool {
+    use std::error::Error as _;
+
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::Unauthenticated
+    ) || status.code() == tonic::Code::Cancelled
+        && status
+            .source()
+            .is_some_and(|source| source.is::<tonic::transport::Error>())
+        || status.code() == tonic::Code::Unknown
+            && format!("{status:?}").contains("hyper::Error(Io")
+}
+
 fn contract_reject_ack(
     label: &str,
     response: Result<tonic::Response<graphrun::generated::Ack>, tonic::Status>,
@@ -4409,8 +4448,6 @@ async fn contract_worker_rpc_probes(
     provider_url: &str,
     observations: &mut Vec<String>,
 ) -> Result<String, String> {
-    use std::error::Error as _;
-
     use graphrun::generated::{ClaimRequest, RegisterRequest, ReportRequest};
     use graphrun::ids::{ActivityKey, CommandId, ExecutionRole, WorkerSessionId};
     use graphrun::tls::PeerRole;
@@ -4465,15 +4502,7 @@ async fn contract_worker_rpc_probes(
     match contract_worker_client(cluster, &alien).await {
         Err(err) => observations.push(format!("wrong CA TLS denied: {err}")),
         Ok(mut client) => match client.register(valid_registration.clone()).await {
-            Err(status)
-                if matches!(status.code(), Code::Unavailable | Code::Unauthenticated)
-                    || status.code() == Code::Cancelled
-                        && status
-                            .source()
-                            .is_some_and(|source| source.is::<tonic::transport::Error>())
-                    || status.code() == Code::Unknown
-                        && format!("{status:?}").contains("hyper::Error(Io") =>
-            {
+            Err(status) if wrong_ca_transport_denied(&status) => {
                 observations.push(format!("wrong CA request denied: {status}"));
             }
             other => {
@@ -4760,11 +4789,7 @@ async fn contract_worker_rpc_probes(
     match contract_worker_client(cluster, &alien).await {
         Err(err) => observations.push(format!("wrong CA cached report TLS denied: {err}")),
         Ok(mut client) => match client.report(report.clone()).await {
-            Err(status)
-                if matches!(status.code(), Code::Unavailable | Code::Unauthenticated)
-                    || status.code() == Code::Unknown
-                        && format!("{status:?}").contains("hyper::Error(Io") =>
-            {
+            Err(status) if wrong_ca_transport_denied(&status) => {
                 observations.push(format!("wrong CA cached report TLS denied: {status}"));
             }
             other => {
@@ -7866,11 +7891,10 @@ fn forged_worker_process(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
     if !ok {
         return fail(row, "start", format!("{stdout}\n{stderr}"));
     }
-    let run = stdout
-        .split('"')
-        .find(|part| part.len() == 32)
-        .unwrap_or("")
-        .to_owned();
+    let run = match started_run(&stdout) {
+        Ok(run) => run,
+        Err(err) => return fail(row, "start run identity", format!("{err}: {stdout}")),
+    };
     let tls_clone = tls.clone();
     let addr_clone = addr.clone();
     let forged = std::thread::spawn(move || {
@@ -9473,6 +9497,46 @@ fn fixture_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_run_identity_ignores_command_id() {
+        let command = "a".repeat(32);
+        let run = "b".repeat(32);
+        let output = serde_json::json!({
+            "command_id": command,
+            "run": run,
+            "status": "started",
+        });
+        assert_eq!(started_run(&output.to_string()).unwrap(), run);
+        assert!(started_run(r#"{"command_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#).is_err());
+        assert!(started_run(r#"{"run":"invalid","status":"started"}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn wrong_ca_cancelled_requires_transport_denial() {
+        use std::error::Error as _;
+
+        let transport = tonic::transport::Channel::from_static("http://127.0.0.1:0")
+            .connect_timeout(Duration::from_millis(100))
+            .connect()
+            .await
+            .err()
+            .expect("port zero cannot accept connections");
+        let mut tls_denied = tonic::Status::cancelled("operation was canceled");
+        tls_denied.set_source(std::sync::Arc::new(transport));
+        assert!(
+            tls_denied
+                .source()
+                .is_some_and(|source| source.is::<tonic::transport::Error>())
+        );
+        assert!(wrong_ca_transport_denied(&tls_denied));
+        assert!(!wrong_ca_transport_denied(&tonic::Status::cancelled(
+            "application-level cancellation"
+        )));
+        assert!(!wrong_ca_transport_denied(
+            &tonic::Status::permission_denied("wrong role, not a TLS transport failure")
+        ));
+    }
 
     #[test]
     fn contract_artifact_reference_is_independently_domain_separated_and_strict() {

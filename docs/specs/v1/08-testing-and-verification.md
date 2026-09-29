@@ -191,6 +191,8 @@ cargo run --locked -p graphrun-e2e -- smoke-saga-settlement \
 	--cli target/release/graphrun --artifacts target/saga-smoke
 cargo run --locked -p graphrun-e2e -- smoke-security \
 	--cli target/release/graphrun --artifacts target/security-smoke
+cargo run --locked -p graphrun-e2e -- smoke-forged-worker \
+	--cli target/release/graphrun --artifacts target/worker-smoke
 cargo run --locked -p graphrun-e2e -- smoke-application \
 	--cli target/release/graphrun --artifacts target/application-smoke
 ```
