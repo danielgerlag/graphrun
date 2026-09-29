@@ -1999,6 +1999,7 @@ fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) 
                     &[
                         "tests::coverage_rejects_missing_duplicate_and_stale_cases",
                         "tests::start_run_identity_ignores_command_id",
+                        "tests::forged_worker_completion_requires_exact_run_and_output",
                         "tests::wrong_ca_cancelled_requires_transport_denial",
                         "tests::local_start_requires_exact_output_and_valid_run_identity",
                         "tests::sample_binary_evidence_rejects_missing_stale_and_wrong_outputs",
@@ -4288,6 +4289,17 @@ fn started_run(stdout: &str) -> Result<String, String> {
     graphrun::RunId::from_hex(run)
         .map_err(|err| format!("start returned invalid run identity: {err}"))?;
     Ok(run.to_owned())
+}
+
+fn forged_worker_completed(body: &str, run: &str) -> bool {
+    let Ok(view) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    view["run"] == run
+        && view["status"] == "succeeded"
+        && view.get("error").is_some_and(serde_json::Value::is_null)
+        && view["output"]
+            == serde_json::json!({"amount": 1000, "order_id": "o1", "payment_id": "pay-1"})
 }
 
 fn wrong_ca_transport_denied(status: &tonic::Status) -> bool {
@@ -8123,7 +8135,7 @@ fn forged_worker_process(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseR
                 &tls.server_name,
             ],
         );
-        if ok && body.contains("succeeded") && body.contains("pay-1") {
+        if ok && forged_worker_completed(&body, &run) {
             return finish(
                 row,
                 "PASS",
@@ -9585,6 +9597,29 @@ mod tests {
         assert_eq!(started_run(&output.to_string()).unwrap(), run);
         assert!(started_run(r#"{"command_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#).is_err());
         assert!(started_run(r#"{"run":"invalid","status":"started"}"#).is_err());
+    }
+
+    #[test]
+    fn forged_worker_completion_requires_exact_run_and_output() {
+        let run = "a".repeat(32);
+        let view = serde_json::json!({
+            "run": run,
+            "status": "succeeded",
+            "error": null,
+            "output": {"amount": 1000, "order_id": "o1", "payment_id": "pay-1"}
+        });
+        assert!(forged_worker_completed(&view.to_string(), &run));
+        let mut wrong = view.clone();
+        wrong["run"] = serde_json::json!("b".repeat(32));
+        assert!(!forged_worker_completed(&wrong.to_string(), &run));
+        wrong = view.clone();
+        wrong["output"]["payment_id"] = serde_json::json!("forged");
+        wrong["error"] = serde_json::json!("pay-1");
+        assert!(!forged_worker_completed(&wrong.to_string(), &run));
+        wrong = view;
+        wrong["status"] = serde_json::json!("active");
+        wrong["error"] = serde_json::json!("previous attempt succeeded");
+        assert!(!forged_worker_completed(&wrong.to_string(), &run));
     }
 
     #[tokio::test]
