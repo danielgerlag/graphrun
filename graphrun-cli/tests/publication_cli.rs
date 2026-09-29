@@ -2,15 +2,14 @@ use std::process::Command;
 
 #[test]
 fn publish_and_start_report_real_failure_and_timeout_as_errors() {
-    let root = std::env::current_dir()
-        .unwrap()
-        .join("target")
-        .join(format!("cli-{}", graphrun::ids::CommandId::generate()));
-    let store = root.join("store");
-    std::fs::create_dir_all(&root).unwrap();
-    let fail = root.join("fail.yaml");
-    let wait = root.join("wait.yaml");
-    let input = root.join("input.json");
+    let root = tempfile::Builder::new()
+        .prefix("gr-cli-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let store = root.path().join("store");
+    let fail = root.path().join("fail.yaml");
+    let wait = root.path().join("wait.yaml");
+    let input = root.path().join("input.json");
     std::fs::write(&input, "null").unwrap();
     std::fs::write(
         &fail,
@@ -134,18 +133,16 @@ nodes:
     let timeout_json: serde_json::Value = serde_json::from_slice(&timeout.stderr).unwrap();
     assert_eq!(timeout_json["status"], "error");
     assert!(timeout.stdout.is_empty(), "timeout must not print success");
-    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_control_socket_does_not_report_failure_or_timeout_as_success() {
-    let root = std::env::current_dir()
-        .unwrap()
-        .join("target")
-        .join(format!("cli-live-{}", graphrun::ids::CommandId::generate()));
-    let store = root.join("store");
-    std::fs::create_dir_all(&root).unwrap();
-    let input = root.join("input.json");
+    let root = tempfile::Builder::new()
+        .prefix("gr-cli-live-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let store = root.path().join("store");
+    let input = root.path().join("input.json");
     std::fs::write(&input, "null").unwrap();
     let engine = graphrun::Engine::local(&store).await.unwrap();
     let catalog = graphrun::Catalog::from_json(include_bytes!(
@@ -250,5 +247,4 @@ nodes:
             .contains("timed out waiting")
     );
     engine.shutdown().await.unwrap();
-    std::fs::remove_dir_all(root).unwrap();
 }

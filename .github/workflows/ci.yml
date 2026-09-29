@@ -80,19 +80,19 @@ jobs:
         run: >
           cargo run --locked -p graphrun-e2e -- smoke-cluster
           --cli target/release/graphrun
-          --artifacts target/cluster-smoke
+          --artifacts /tmp/gr-smoke
       - name: e2e matrix
         run: >
           cargo run --locked -p graphrun-e2e -- verify
           --cli target/release/graphrun
           --matrix docs/specs/v1/verification-matrix.tsv
-          --artifacts target/e2e-artifacts
+          --artifacts /tmp/gr-e2e
       - name: upload e2e artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-artifacts-${{ matrix.os }}
           path: |
-            target/e2e-artifacts/
-            target/cluster-smoke/
+            /tmp/gr-e2e/
+            /tmp/gr-smoke/
           if-no-files-found: warn
