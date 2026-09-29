@@ -128,6 +128,28 @@ fn base_checkpoint_formats() -> Vec<String> {
 }
 
 impl StoreManifest {
+    fn install_reader(&mut self, target: u16) -> Result<()> {
+        if !matches!(
+            target,
+            crate::format_upgrade::BASE_FORMAT | crate::format_upgrade::NEXT_FORMAT
+        ) || target > crate::format_upgrade::CURRENT_READER
+        {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "requested reader format is not installed in this binary",
+            ));
+        }
+        if target == crate::format_upgrade::NEXT_FORMAT && self.reader_floor < target {
+            self.reader_floor = target;
+            self.enabled_command_formats = vec![4, 5];
+            self.enabled_state_record_formats = vec![
+                record_store::FORMAT.to_owned(),
+                record_store::NEXT_FORMAT.to_owned(),
+            ];
+        }
+        self.validate()
+    }
+
     fn activate_writer(&mut self) -> Result<()> {
         if self.reader_floor < crate::format_upgrade::NEXT_FORMAT {
             return Err(Error::new(
@@ -411,12 +433,14 @@ enum Req {
     ScheduleView(oneshot::Sender<std::result::Result<ScheduleView, StoErr>>),
     QueryWatermark(oneshot::Sender<u64>),
     WriterFormat(oneshot::Sender<std::result::Result<u16, StoErr>>),
+    RequiredWriterFormat(oneshot::Sender<std::result::Result<u16, StoErr>>),
     PrepareFormatReaders(
         u16,
         Option<LogIdT>,
         bool,
         oneshot::Sender<std::result::Result<crate::format_upgrade::ReaderProof, StoErr>>,
     ),
+    PrepareCandidateReaderFloor(u16, oneshot::Sender<std::result::Result<(), StoErr>>),
     #[cfg(feature = "format-proof")]
     ProofWriterFormat(oneshot::Sender<std::result::Result<u16, StoErr>>),
     BindIdentity(
@@ -446,6 +470,26 @@ pub struct StorageHandle {
 }
 
 impl StorageHandle {
+    pub async fn required_writer_format(&self) -> Result<u16> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Req::RequiredWriterFormat(tx))
+            .await
+            .map_err(|_| {
+                Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "storage owner stopped",
+                )
+            })?;
+        rx.await
+            .map_err(|_| {
+                Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "storage owner dropped pending activation",
+                )
+            })?
+            .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))
+    }
     pub async fn format_admin_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.format_admin.clone().lock_owned().await
     }
@@ -472,6 +516,27 @@ impl StorageHandle {
         roster: Option<LogIdT>,
     ) -> Result<crate::format_upgrade::ReaderProof> {
         self.request_format_readers(target, roster, true).await
+    }
+
+    pub async fn prepare_candidate_reader_floor(&self, target: u16) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Req::PrepareCandidateReaderFloor(target, tx))
+            .await
+            .map_err(|_| {
+                Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "storage owner stopped",
+                )
+            })?;
+        rx.await
+            .map_err(|_| {
+                Error::new(
+                    crate::error::ErrorKind::Unavailable,
+                    "storage owner dropped candidate preparation",
+                )
+            })?
+            .map_err(|err| Error::new(crate::error::ErrorKind::FailedPrecondition, err.to_string()))
     }
 
     pub async fn probe_format_readers(
@@ -1859,6 +1924,9 @@ fn storage_thread(
                         .map_err(|err| sto_err(ErrorVerb::Read, err)),
                 );
             }
+            Req::RequiredWriterFormat(tx) => {
+                let _ = tx.send(required_writer_format(db.as_ref()));
+            }
             Req::PrepareFormatReaders(target, roster, durable, tx) => {
                 let result = prepare_format_readers(
                     db.as_ref(),
@@ -1869,6 +1937,16 @@ fn storage_thread(
                     target,
                     roster,
                     durable,
+                );
+                let _ = tx.send(result);
+            }
+            Req::PrepareCandidateReaderFloor(target, tx) => {
+                let result = prepare_candidate_reader_floor(
+                    db.as_ref(),
+                    &domain,
+                    &last_membership,
+                    last_applied,
+                    target,
                 );
                 let _ = tx.send(result);
             }
@@ -2152,6 +2230,63 @@ fn verified_store_manifest<D: ReadableDatabase>(db: &D) -> Result<StoreManifest>
     Ok(manifest)
 }
 
+fn required_writer_format<D: ReadableDatabase>(db: &D) -> std::result::Result<u16, StoErr> {
+    let manifest = verified_store_manifest(db).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    if manifest.writer_format == crate::format_upgrade::NEXT_FORMAT {
+        return Ok(manifest.writer_format);
+    }
+    let visible: Option<LogIdT> =
+        required_json(db, "visible_log_end").map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let applied = optional_json::<_, Option<LogIdT>>(db, "last_applied")
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+        .flatten();
+    let Some(last) = visible else {
+        return Ok(manifest.writer_format);
+    };
+    let first = applied.map_or(0, |id| id.index.saturating_add(1));
+    if first > last.index {
+        return Ok(manifest.writer_format);
+    }
+    let txn = db
+        .begin_read()
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let logs = txn
+        .open_table(LOG)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    let mut expected = first;
+    for record in logs
+        .range(first..=last.index)
+        .map_err(|err| sto_err(ErrorVerb::Read, err))?
+    {
+        let (index, value) = record.map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        if index.value() != expected {
+            return Err(sto_err(ErrorVerb::Read, "pending log has a visible gap"));
+        }
+        expected = expected.saturating_add(1);
+        let entry: EntryT =
+            serde_json::from_slice(value.value()).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+        if let EntryPayload::Normal(request) = entry.payload {
+            let body = match request.command.body {
+                domain::CommandBody::Authenticated { body, .. } => *body,
+                body => body,
+            };
+            if matches!(
+                body,
+                domain::CommandBody::ActivateWriterFormat {
+                    target: crate::format_upgrade::NEXT_FORMAT,
+                    ..
+                }
+            ) {
+                return Ok(crate::format_upgrade::NEXT_FORMAT);
+            }
+        }
+    }
+    if expected <= last.index {
+        return Err(sto_err(ErrorVerb::Read, "pending log has a missing tail"));
+    }
+    Ok(manifest.writer_format)
+}
+
 fn prepare_format_readers(
     db: &Database,
     snapshot_dir: &Path,
@@ -2164,11 +2299,17 @@ fn prepare_format_readers(
 ) -> std::result::Result<crate::format_upgrade::ReaderProof, StoErr> {
     if target != crate::format_upgrade::NEXT_FORMAT
         || crate::format_upgrade::CURRENT_READER < target
-        || *roster.log_id() != expected_roster
     {
+        return Err(sto_err(ErrorVerb::Read, "reader target is unsupported"));
+    }
+    if *roster.log_id() != expected_roster {
         return Err(sto_err(
             ErrorVerb::Read,
-            "reader target or committed roster changed",
+            format!(
+                "reader committed roster changed: expected {:?}, applied {:?}",
+                expected_roster,
+                roster.log_id()
+            ),
         ));
     }
     let mut manifest = verified_store_manifest(db).map_err(|err| sto_err(ErrorVerb::Read, err))?;
@@ -2196,12 +2337,9 @@ fn prepare_format_readers(
         verify_registry(snapshot_dir, &registry)?;
     }
     if durable && manifest.reader_floor < target {
-        manifest.reader_floor = target;
-        manifest.enabled_command_formats = vec![4, 5];
-        manifest.enabled_state_record_formats = vec![
-            record_store::FORMAT.to_owned(),
-            record_store::NEXT_FORMAT.to_owned(),
-        ];
+        manifest
+            .install_reader(target)
+            .map_err(|err| sto_err(ErrorVerb::Write, err))?;
         let txn = begin_immediate(db)?;
         let bytes = serde_json::to_vec(&manifest).map_err(|err| sto_err(ErrorVerb::Write, err))?;
         txn.open_table(META)
@@ -2227,6 +2365,39 @@ fn prepare_format_readers(
         artifact_readers: vec![crate::history::ARTIFACT_FORMAT.to_owned()],
         snapshot_readers: vec![1],
     })
+}
+
+fn prepare_candidate_reader_floor(
+    db: &Database,
+    state: &State,
+    roster: &MembershipT,
+    applied: Option<LogIdT>,
+    target: u16,
+) -> std::result::Result<(), StoErr> {
+    let mut manifest = verified_store_manifest(db).map_err(|err| sto_err(ErrorVerb::Read, err))?;
+    if applied.is_some()
+        || roster.membership().nodes().next().is_some()
+        || !state.runs.is_empty()
+        || !state.history.is_empty()
+        || state.format_policy.active_writer != crate::format_upgrade::BASE_FORMAT
+        || manifest.cluster_id.as_deref() != Some(state.current_cluster_id.as_str())
+        || manifest.member_id.is_none()
+    {
+        return Err(sto_err(
+            ErrorVerb::Read,
+            "reader floor can be prepared before join only on a pristine bound member",
+        ));
+    }
+    manifest
+        .install_reader(target)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    let txn = begin_immediate(db)?;
+    let bytes = serde_json::to_vec(&manifest).map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    txn.open_table(META)
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?
+        .insert("store_manifest", bytes.as_slice())
+        .map_err(|err| sto_err(ErrorVerb::Write, err))?;
+    commit_immediate(txn)
 }
 
 fn validate_cluster_binding(
@@ -2798,7 +2969,12 @@ fn write_format_delta(
     revision: u64,
     receipt: &crate::format_upgrade::FormatReceipt,
 ) -> std::result::Result<(), StoErr> {
-    let key = format!("{}/{}", receipt.principal_id, receipt.command_id.to_hex());
+    let key = format!(
+        "{}/{}/{}",
+        receipt.cluster_id,
+        receipt.principal_id,
+        receipt.command_id.to_hex()
+    );
     let table = txn
         .open_table(APP_ROWS)
         .map_err(|err| sto_err(ErrorVerb::Read, err))?;
@@ -5848,17 +6024,78 @@ mod tests {
             NEXT_FORMAT
         );
         let restore = dir.path().join("restore");
+        crate::engine::Engine::restore(&backup, &restore, "format test").unwrap();
+        let restored_domain = crate::engine::Engine::read_backup(&backup).unwrap();
+        assert_eq!(restored_domain.format_policy.active_writer, NEXT_FORMAT);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let restored = crate::engine::Engine::local(&restore).await.unwrap();
+            assert_eq!(
+                restored.format_status().await.unwrap()["writer_format"],
+                NEXT_FORMAT
+            );
+            let receipt = restored
+                .prepare_writer_format(NEXT_FORMAT, crate::ids::CommandId::from_bytes([1; 16]))
+                .await
+                .unwrap();
+            assert!(receipt.applied);
+            assert_ne!(receipt.cluster_id, TEST_CLUSTER_ID);
+            restored.shutdown().await.unwrap();
+        });
         assert_eq!(
-            crate::engine::Engine::restore(&backup, &restore, "format test")
-                .unwrap_err()
-                .kind,
-            crate::error::ErrorKind::FailedPrecondition
+            load_domain_readonly(&path)
+                .unwrap()
+                .format_policy
+                .active_writer,
+            NEXT_FORMAT
         );
-        assert!(!restore.exists());
-        assert_eq!(
-            StorageHandle::open(&path).err().unwrap().kind,
-            crate::error::ErrorKind::FailedPrecondition
-        );
+        let (handle, thread) = StorageHandle::open(&path).unwrap();
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn pending_activation_fences_old_writer_before_apply_and_unfences_on_truncate() {
+        use crate::domain::{Command, CommandBody};
+        use crate::ids::CommandId;
+        use crate::time::EngineTime;
+        use openraft::CommittedLeaderId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("member.redb")).unwrap();
+        initialize_publication_store(&db).unwrap();
+        let leader = CommittedLeaderId::new(1, 1);
+        let genesis = Entry::<TypeConfig> {
+            log_id: LogId::new(leader, 0),
+            payload: EntryPayload::Blank,
+        };
+        let activation = Entry::<TypeConfig> {
+            log_id: LogId::new(leader, 1),
+            payload: EntryPayload::Normal(RaftRequest {
+                command: Command {
+                    id: CommandId::from_bytes([91; 16]),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Authenticated {
+                        principal_id: "local-owner".to_owned(),
+                        body: Box::new(CommandBody::ActivateWriterFormat {
+                            target: 5,
+                            roster_log_id: Some(crate::format_upgrade::Position {
+                                term: 1,
+                                leader_id: 1,
+                                index: 0,
+                            }),
+                        }),
+                    },
+                },
+                writer_format: 4,
+                #[cfg(feature = "format-proof")]
+                proof_writer_format: 4,
+            }),
+        };
+        append_logs(&db, &[genesis, activation]).unwrap();
+        assert_eq!(verified_store_manifest(&db).unwrap().writer_format, 4);
+        assert_eq!(required_writer_format(&db).unwrap(), 5);
+        truncate_logs(&db, 1).unwrap();
+        assert_eq!(required_writer_format(&db).unwrap(), 4);
     }
 
     pub struct RedbStoreBuilder;

@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const CURRENT_READER: u16 = 5;
-pub const CURRENT_WRITER: u16 = 4;
+pub const CURRENT_WRITER: u16 = 5;
 pub const BASE_FORMAT: u16 = 4;
 pub const NEXT_FORMAT: u16 = 5;
 pub const PEER_WRITER_HEADER: &str = "graphrun-writer-format";
@@ -16,6 +16,7 @@ pub const RECEIPT_FORMAT: &str = "graphrun.writer-format-receipt/v1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
     pub term: u64,
+    pub leader_id: u64,
     pub index: u64,
 }
 
@@ -23,6 +24,7 @@ impl From<LogId<u64>> for Position {
     fn from(log: LogId<u64>) -> Self {
         Self {
             term: log.leader_id.term,
+            leader_id: log.leader_id.node_id,
             index: log.index,
         }
     }
@@ -30,7 +32,10 @@ impl From<LogId<u64>> for Position {
 
 impl Position {
     pub fn raft_log_id(self) -> LogId<u64> {
-        LogId::new(CommittedLeaderId::new(self.term, 0), self.index)
+        LogId::new(
+            CommittedLeaderId::new(self.term, self.leader_id),
+            self.index,
+        )
     }
 }
 
@@ -73,18 +78,26 @@ pub async fn verify_peer_writer<T>(
         .writer_format()
         .await
         .map_err(|err| tonic::Status::unavailable(err.to_string()))?;
-    if active == BASE_FORMAT {
-        return Ok(());
-    }
-    let writer = request
-        .metadata()
-        .get(PEER_WRITER_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| tonic::Status::failed_precondition("member writer format is missing"))?;
-    if writer < active {
+    let writer = match request.metadata().get(PEER_WRITER_HEADER) {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|text| text.parse::<u16>().ok())
+            .filter(|writer| matches!(*writer, BASE_FORMAT | NEXT_FORMAT))
+            .ok_or_else(|| tonic::Status::failed_precondition("unknown member writer format"))?,
+        None => BASE_FORMAT,
+    };
+    let required = if writer >= NEXT_FORMAT {
+        active
+    } else {
+        storage
+            .required_writer_format()
+            .await
+            .map_err(|err| tonic::Status::unavailable(err.to_string()))?
+    };
+    if writer < required {
         return Err(tonic::Status::failed_precondition(format!(
-            "member writer capability {writer} is below committed format {active}"
+            "member writer capability {writer} is below required format {required}"
         )));
     }
     Ok(())
@@ -167,6 +180,7 @@ impl Default for FormatPolicy {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormatReceipt {
     pub format: String,
+    pub cluster_id: String,
     pub principal_id: String,
     pub command_id: crate::ids::CommandId,
     pub request_digest: String,
@@ -204,7 +218,7 @@ pub fn apply(
             "format change requires a verified admin principal",
         ));
     }
-    let key = format!("{principal}/{}", command.id.to_hex());
+    let key = format!("{cluster_id}/{principal}/{}", command.id.to_hex());
     let digest = match body {
         CommandBody::PrepareWriterFormat { .. } => {
             request_digest(&("prepare", target, requested_roster))?
@@ -267,6 +281,7 @@ pub fn apply(
     })();
     let receipt = FormatReceipt {
         format: RECEIPT_FORMAT.to_owned(),
+        cluster_id: cluster_id.to_owned(),
         principal_id: principal.to_owned(),
         command_id: command.id,
         request_digest: digest,
@@ -343,7 +358,14 @@ pub fn validate_persisted_state(state: &crate::domain::State) -> Result<()> {
         })
         || state.format_receipts.iter().any(|(key, receipt)| {
             receipt.format != RECEIPT_FORMAT
-                || *key != format!("{}/{}", receipt.principal_id, receipt.command_id.to_hex())
+                || *key
+                    != format!(
+                        "{}/{}/{}",
+                        receipt.cluster_id,
+                        receipt.principal_id,
+                        receipt.command_id.to_hex()
+                    )
+                || crate::ids::ClusterId::from_hex(&receipt.cluster_id).is_err()
                 || receipt.request_digest.len() != 64
                 || hex::decode(&receipt.request_digest).is_err()
         })
@@ -411,7 +433,7 @@ pub async fn membership_barrier(
             "committed writer policy differs from the local store manifest",
         ));
     }
-    ensure_writer(policy.active_writer)?;
+    ensure_writer(storage.required_writer_format().await?)?;
     Ok(policy)
 }
 

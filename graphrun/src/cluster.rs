@@ -702,6 +702,202 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn three_voters_prepare_and_activate_through_signed_admin_rpc() {
+        let (first, second, third, dirs, addrs, materials, ca) = three_voters(false).await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let applied = first.last_applied_index().await;
+            if applied > 0
+                && second.last_applied_index().await >= applied
+                && third.last_applied_index().await >= applied
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "roster did not catch up"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut admin = crate::GrpcClient::connect(&format!("https://{}", addrs[0]), &materials[0])
+            .await
+            .unwrap();
+        assert_eq!(admin.format_status().await.unwrap()["writer_format"], 4);
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(20),
+            admin.prepare_writer_format(5, crate::ids::CommandId::from_bytes([51; 16])),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(prepared.applied);
+        assert_eq!(
+            first.format_status().await.unwrap()["prepared"]
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
+        let activation_id = crate::ids::CommandId::from_bytes([52; 16]);
+        let activated = admin
+            .activate_writer_format(5, activation_id)
+            .await
+            .unwrap();
+        assert!(activated.applied);
+        assert_eq!(
+            admin
+                .activate_writer_format(5, activation_id)
+                .await
+                .unwrap(),
+            activated
+        );
+        assert_eq!(admin.format_status().await.unwrap()["writer_format"], 5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let applied = first.last_applied_index().await;
+            if second.last_applied_index().await >= applied
+                && third.last_applied_index().await >= applied
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "activation did not apply on all voters"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let learner_dir = tempfile::tempdir().unwrap();
+        let learner_addr = unused_addr();
+        let learner_tls = issue_node(&ca, 4).unwrap();
+        let peers = (1..=3)
+            .map(|id| {
+                (
+                    id,
+                    (
+                        addrs[(id - 1) as usize],
+                        materials[(id - 1) as usize].clone(),
+                    ),
+                )
+            })
+            .collect();
+        let learner = Engine::member(MemberConfig {
+            data_dir: learner_dir.path().to_path_buf(),
+            node_id: 4,
+            bind: learner_addr,
+            peers,
+            tls: learner_tls.clone(),
+            host_activities: false,
+            initialize: false,
+        })
+        .await
+        .unwrap();
+        for member in [&first, &second, &third] {
+            member.insert_peer(4, learner_addr, learner_tls.clone());
+        }
+        first.add_learner(4, learner_addr).await.unwrap();
+        let roster_applied = first.last_applied_index().await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if second.last_applied_index().await >= roster_applied
+                && third.last_applied_index().await >= roster_applied
+                && learner.last_applied_index().await >= roster_applied
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "learner roster did not apply to every member"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            first.add_voter(4).await.unwrap_err().kind,
+            crate::error::ErrorKind::FailedPrecondition
+        );
+        let refreshed = first
+            .prepare_writer_format(5, crate::ids::CommandId::from_bytes([53; 16]))
+            .await
+            .unwrap();
+        assert!(refreshed.applied);
+        assert_eq!(
+            first.format_status().await.unwrap()["prepared"]
+                .as_object()
+                .unwrap()
+                .len(),
+            4
+        );
+        first.add_voter(4).await.unwrap();
+        learner.shutdown().await.unwrap();
+        first.shutdown().await.unwrap();
+        second.shutdown().await.unwrap();
+        third.shutdown().await.unwrap();
+        for dir in &dirs {
+            let state =
+                crate::storage::load_domain_readonly(dir.path().join("member.redb")).unwrap();
+            assert_eq!(state.format_policy.active_writer, 5);
+            assert_eq!(
+                state.format_policy.activation_log_id,
+                Some(activated.applied_log_id)
+            );
+        }
+        assert_eq!(
+            crate::storage::load_domain_readonly(learner_dir.path().join("member.redb"))
+                .unwrap()
+                .format_policy
+                .active_writer,
+            5
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn activation_has_no_authority_without_voter_quorum() {
+        let (first, second, third, dirs, _addrs, _materials, _ca) = three_voters(false).await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let applied = first.last_applied_index().await;
+            if applied > 0
+                && second.last_applied_index().await >= applied
+                && third.last_applied_index().await >= applied
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "roster did not catch up"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            first
+                .prepare_writer_format(5, crate::ids::CommandId::from_bytes([61; 16]))
+                .await
+                .unwrap()
+                .applied
+        );
+        second.shutdown().await.unwrap();
+        third.shutdown().await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(6),
+            first.activate_writer_format(5, crate::ids::CommandId::from_bytes([62; 16])),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Err(_))),
+            "activation cannot claim success without a quorum"
+        );
+        first.shutdown().await.unwrap();
+        for dir in &dirs {
+            assert_eq!(
+                crate::storage::load_domain_readonly(dir.path().join("member.redb"))
+                    .unwrap()
+                    .format_policy
+                    .active_writer,
+                4
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn clock_fault_leaves_committed_state_and_a_healthy_voter_takes_over() {
         let (old, second, third, dirs, addrs, tls, _ca) = three_voters(false).await;
         let catalog = Catalog::from_json(include_bytes!(

@@ -15,6 +15,10 @@ name = "graphrun-format-proof"
 path = "src/bin/format_proof.rs"
 required-features = ["format-proof-new"]
 
+[[bin]]
+name = "graphrun-format-rollout"
+path = "src/bin/format_rollout.rs"
+
 [features]
 default = []
 fault-injection = ["graphrun/fault-injection"]

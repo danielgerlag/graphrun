@@ -50,6 +50,9 @@ pub(crate) async fn write_raft_response(
     }
     let active_writer = storage.writer_format().await?;
     crate::format_upgrade::ensure_writer(active_writer)?;
+    if crate::format_upgrade::CURRENT_WRITER < crate::format_upgrade::NEXT_FORMAT {
+        crate::format_upgrade::ensure_writer(storage.required_writer_format().await?)?;
+    }
     #[cfg(feature = "format-proof")]
     crate::format_proof::ensure_local_writer(active_writer)?;
     storage.clock().authorize(storage, raft).await?;

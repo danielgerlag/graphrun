@@ -388,6 +388,10 @@ impl RaftSvc for GraphServices {
                 "prospective member is not fresh or lacks installed writer and reader versions",
             ));
         }
+        self.storage
+            .prepare_candidate_reader_floor(target)
+            .await
+            .map_err(status_error)?;
         Ok(Response::new(CandidateReaderResponse {
             member_id: self.node_id,
             cluster_id: state.current_cluster_id,
