@@ -4,6 +4,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -45,6 +46,63 @@ struct Binary {
     sha256_after: String,
 }
 
+#[derive(Clone, PartialEq, prost::Message)]
+struct SnapshotMetadata {
+    #[prost(uint32, tag = "1")]
+    framing_version: u32,
+    #[prost(uint64, tag = "2")]
+    generation: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    applied_json: Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    membership_json: Vec<u8>,
+    #[prost(uint64, tag = "5")]
+    payload_bytes: u64,
+    #[prost(string, repeated, tag = "6")]
+    record_formats: Vec<String>,
+    #[prost(uint64, tag = "7")]
+    record_count: u64,
+}
+
+fn snapshot_metadata(file: &Path) -> Result<SnapshotMetadata, String> {
+    use prost::Message;
+    let mut file = fs::File::open(file).map_err(|err| err.to_string())?;
+    let mut magic = [0u8; 21];
+    file.read_exact(&mut magic).map_err(|err| err.to_string())?;
+    if &magic != b"graphrun.snapshot/v1\0" {
+        return Err("snapshot framing version is unsupported".to_owned());
+    }
+    let mut size = [0u8; 4];
+    file.read_exact(&mut size).map_err(|err| err.to_string())?;
+    let len = u32::from_le_bytes(size) as usize;
+    if len == 0 || len > 1024 * 1024 {
+        return Err("snapshot manifest frame is invalid".to_owned());
+    }
+    let mut bytes = vec![0; len];
+    file.read_exact(&mut bytes).map_err(|err| err.to_string())?;
+    SnapshotMetadata::decode(&*bytes).map_err(|err| err.to_string())
+}
+
+fn registry_for_store(store: &Path) -> Result<(Value, Value), String> {
+    use redb::{ReadableDatabase, TableDefinition};
+    const META: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("meta");
+    let db = redb::ReadOnlyDatabase::open(store).map_err(|err| err.to_string())?;
+    let read = db.begin_read().map_err(|err| err.to_string())?;
+    let meta = read.open_table(META).map_err(|err| err.to_string())?;
+    let registry = meta
+        .get("snapshot_registry")
+        .map_err(|err| err.to_string())?
+        .ok_or("active snapshot registry is missing")?;
+    let manifest = meta
+        .get("store_manifest")
+        .map_err(|err| err.to_string())?
+        .ok_or("store manifest is missing")?;
+    Ok((
+        serde_json::from_slice(registry.value()).map_err(|err| err.to_string())?,
+        serde_json::from_slice(manifest.value()).map_err(|err| err.to_string())?,
+    ))
+}
+
 struct Member {
     id: usize,
     label: String,
@@ -76,6 +134,7 @@ struct Cluster {
 impl Cluster {
     fn new(root: PathBuf, cli: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+        let root = fs::canonicalize(root).map_err(|err| err.to_string())?;
         let ca = generate_ca().map_err(|err| err.to_string())?;
         let ca_path = root.join("ca.pem");
         fs::write(&ca_path, ca.pem.as_bytes()).map_err(|err| err.to_string())?;
@@ -265,6 +324,17 @@ impl Cluster {
             }
         }
         Err(format!("no current writer leader: {}", failures.join("; ")))
+    }
+
+    fn new_writer_leader(&self) -> Result<usize, String> {
+        for id in [2, 3] {
+            if let Ok(status) = self.remote(id, &["cluster", "format", "status"])
+                && status["quorum"] == true
+            {
+                return Ok(id);
+            }
+        }
+        Err("new writers have no live quorum leader".to_owned())
     }
 
     fn local(&self, id: usize, command: &[&str]) -> Result<Value, String> {
@@ -616,9 +686,16 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
         signal,
         true,
     )?;
-    let leader_applied = cluster.remote_leader(&["cluster", "health"])?["last_applied"]
-        .as_u64()
-        .ok_or("new writer health omitted its applied index")?;
+    let mut leader_applied = 0;
+    for id in [2, 3] {
+        let applied = cluster.local(id, &["cluster", "health"])?["last_applied"]
+            .as_u64()
+            .ok_or_else(|| format!("writer {id} health omitted its applied index"))?;
+        leader_applied = leader_applied.max(applied);
+    }
+    if leader_applied <= activation_index {
+        return Err("signal receipt did not advance the new writer's applied log".to_owned());
+    }
     let bridge_after_signal = cluster.await_value(
         "bridge signal application",
         || cluster.local(1, &["cluster", "health"]),
@@ -670,6 +747,47 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
         replay.clone(),
         replay["status"] == result["status"] && replay["output"] == result["output"],
     )?;
+    let snapshot_leader = cluster.new_writer_leader()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+    let snapshot_result = runtime
+        .block_on(graphrun::connect_control(
+            cluster.dir(snapshot_leader).join("control.sock"),
+            graphrun::ControlRequest::Snapshot,
+        ))
+        .map_err(|err| err.to_string())?;
+    if !snapshot_result.ok {
+        return Err(format!(
+            "new writer snapshot request failed: {:?}",
+            snapshot_result.error
+        ));
+    }
+    let snapshot = cluster.await_value(
+        "framed v5 snapshot publication",
+        || {
+            let files = fs::read_dir(cluster.dir(snapshot_leader).join("snapshots"))
+                .map_err(|err| err.to_string())?;
+            for file in files {
+                let path = file.map_err(|err| err.to_string())?.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "snap")
+                {
+                    return Ok(json!({"file":path.display().to_string()}));
+                }
+            }
+            Err("snapshot file has not been published".to_owned())
+        },
+        |value| value["file"].as_str().is_some(),
+    )?;
+    cluster.check(
+        "v5 framed snapshot file",
+        "current writer publishes an on-disk Raft snapshot after retained history progresses",
+        snapshot,
+        true,
+    )?;
     cluster.stop(1)?;
     let backup = cluster.root.join("bridge-backup");
     graphrun::Engine::backup(cluster.dir(1), &backup).map_err(|err| err.to_string())?;
@@ -703,6 +821,41 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
     )?;
     cluster.stop(2)?;
     cluster.stop(3)?;
+    let (registry, store_manifest) =
+        registry_for_store(&cluster.dir(snapshot_leader).join("member.redb"))?;
+    let file_name = registry["file_name"]
+        .as_str()
+        .ok_or("active snapshot registry has no file")?;
+    let snapshot_path = cluster
+        .dir(snapshot_leader)
+        .join("snapshots")
+        .join(file_name);
+    let metadata = snapshot_metadata(&snapshot_path)?;
+    cluster.check(
+        "v5 snapshot registry and readers",
+        "authoritative snapshot generation names a verified file with both retained record readers",
+        json!({
+            "member":snapshot_leader,
+            "registry":registry,
+            "store_format":store_manifest["format"],
+            "writer_format":store_manifest["writer_format"],
+            "snapshot_path":snapshot_path.display().to_string(),
+            "framing_version":metadata.framing_version,
+            "record_formats":metadata.record_formats,
+            "record_count":metadata.record_count
+        }),
+        registry["generation"] == store_manifest["active_generation"]
+            && metadata.framing_version == 1
+            && metadata.record_count > 0
+            && metadata
+                .record_formats
+                .iter()
+                .any(|format| format == "graphrun.state-record/v2")
+            && metadata
+                .record_formats
+                .iter()
+                .any(|format| format == "graphrun.state-record/v3"),
+    )?;
     for id in [1, 2, 3] {
         let state = graphrun::storage::load_domain_readonly(cluster.dir(id).join("member.redb"))
             .map_err(|err| err.to_string())?;

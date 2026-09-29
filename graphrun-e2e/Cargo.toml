@@ -29,6 +29,8 @@ format-proof-new = ["format-proof", "graphrun/format-proof-new"]
 clap.workspace = true
 graphrun = { workspace = true, features = ["fixture-worker"] }
 hex.workspace = true
+prost.workspace = true
+redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

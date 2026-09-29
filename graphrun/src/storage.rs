@@ -5949,6 +5949,33 @@ mod tests {
                 }),
             };
             append_logs(&db, std::slice::from_ref(&entry)).unwrap();
+            if index == 1 {
+                inject_cut("after-domain-index");
+                assert!(
+                    apply_one_entry(
+                        &db,
+                        &mut applied,
+                        &mut roster,
+                        &mut domain,
+                        &mut revision,
+                        1,
+                        entry.clone(),
+                    )
+                    .is_err()
+                );
+                clear_cut();
+                assert_eq!(verified_store_manifest(&db).unwrap().writer_format, 4);
+                assert_eq!(
+                    load_app_generation(&db, 1)
+                        .unwrap()
+                        .format_policy
+                        .active_writer,
+                    4
+                );
+                assert_eq!(persisted_applied(&db).unwrap(), applied);
+                assert_eq!(required_writer_format(&db).unwrap(), NEXT_FORMAT);
+                domain = load_app_generation(&db, 1).unwrap();
+            }
             let response = apply_one_entry(
                 &db,
                 &mut applied,
@@ -6013,6 +6040,25 @@ mod tests {
             NEXT_FORMAT
         );
         drop(receiving_db);
+        let corrupted = Database::open(&receiving_db_path).unwrap();
+        let key = record_store::scalar_key(2, "format_policy");
+        let txn = begin_immediate(&corrupted).unwrap();
+        let mut records = txn.open_table(APP_ROWS).unwrap();
+        let bytes = records.get(key.as_str()).unwrap().unwrap().value().to_vec();
+        let mut record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        record["format"] = serde_json::Value::String("graphrun.state-record/v99".to_owned());
+        let bytes = serde_json::to_vec(&record).unwrap();
+        records.insert(key.as_str(), bytes.as_slice()).unwrap();
+        drop(records);
+        commit_immediate(txn).unwrap();
+        drop(corrupted);
+        assert_eq!(
+            StorageHandle::open(&receiving_db_path).err().unwrap().kind,
+            crate::error::ErrorKind::FailedPrecondition
+        );
+        let read = ReadOnlyDatabase::open(&receiving_db_path).unwrap();
+        assert_eq!(verified_store_manifest(&read).unwrap().active_generation, 2);
+        drop(read);
         drop(db);
         let backup = dir.path().join("backup");
         crate::engine::Engine::backup(dir.path(), &backup).unwrap();
