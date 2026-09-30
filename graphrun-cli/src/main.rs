@@ -1103,12 +1103,7 @@ async fn dispatch(
         }
         _ => {}
     }
-    if !start_if_needed
-        && matches!(
-            req,
-            ControlRequest::Inspect { .. } | ControlRequest::List | ControlRequest::Health
-        )
-    {
+    if !start_if_needed && matches!(req, ControlRequest::Inspect { .. } | ControlRequest::List) {
         let engine = Engine::local(local_dir)
             .await
             .map_err(|err| err.to_string())?;
@@ -1121,7 +1116,6 @@ async fn dispatch(
                     .map_err(|err| err.to_string())?
             }
             ControlRequest::List => engine.list().await.map_err(|err| err.to_string())?,
-            ControlRequest::Health => engine.health().await,
             _ => unreachable!(),
         };
         engine.shutdown().await.map_err(|err| err.to_string())?;
@@ -1322,6 +1316,10 @@ async fn dispatch(
             engine.shutdown().await.map_err(|err| err.to_string())?;
             Ok(serde_json::json!({"status":"ok"}))
         }
+        ControlRequest::Health => Err(
+            "cluster health requires a live control socket; start a local member or use --endpoint"
+                .to_owned(),
+        ),
         _ => Err("engine is not running; start a local member first".to_owned()),
     }
 }
