@@ -794,7 +794,6 @@ async fn remote_reconciler_records_all_three_outcomes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn worker_keeps_assignment_across_leader_change() {
     let ca = generate_ca().unwrap();
-    let addresses = [unused_addr(), unused_addr(), unused_addr()];
     let members_tls = [1, 2, 3].map(|id| {
         signed_for_host(
             &ca,
@@ -803,34 +802,72 @@ async fn worker_keeps_assignment_across_leader_change() {
             &format!("node-{id}.graphrun.local"),
         )
     });
-    let dirs = [
-        tempfile::tempdir().unwrap(),
-        tempfile::tempdir().unwrap(),
-        tempfile::tempdir().unwrap(),
-    ];
-    let open = |index: usize, initialize: bool| {
-        let peers = (0..3)
-            .filter(|other| *other != index)
-            .map(|other| {
-                (
-                    (other + 1) as u64,
-                    (addresses[other], members_tls[other].clone()),
-                )
-            })
-            .collect();
-        MemberConfig {
-            data_dir: dirs[index].path().to_path_buf(),
-            node_id: (index + 1) as u64,
-            bind: addresses[index],
-            peers,
-            tls: members_tls[index].clone(),
-            host_activities: false,
-            initialize,
-        }
+    let mut attempts = 0;
+    let (first, second, third, addresses, _dirs) = loop {
+        attempts += 1;
+        let addresses = [unused_addr(), unused_addr(), unused_addr()];
+        let dirs = [
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        ];
+        let open = |index: usize, initialize: bool| {
+            let peers = (0..3)
+                .filter(|other| *other != index)
+                .map(|other| {
+                    (
+                        (other + 1) as u64,
+                        (addresses[other], members_tls[other].clone()),
+                    )
+                })
+                .collect();
+            MemberConfig {
+                data_dir: dirs[index].path().to_path_buf(),
+                node_id: (index + 1) as u64,
+                bind: addresses[index],
+                peers,
+                tls: members_tls[index].clone(),
+                host_activities: false,
+                initialize,
+            }
+        };
+        let listener_unavailable = |error: &graphrun::Error| {
+            error.kind == graphrun::ErrorKind::FailedPrecondition
+                && error.message.starts_with("member listener ")
+        };
+        let second = match Engine::member(open(1, false)).await {
+            Ok(engine) => engine,
+            Err(error) if listener_unavailable(&error) && attempts < 5 => {
+                eprintln!("retrying worker fixture after {error}");
+                continue;
+            }
+            Err(error) => panic!("member 2 startup attempt {attempts}: {error}"),
+        };
+        let third = match Engine::member(open(2, false)).await {
+            Ok(engine) => engine,
+            Err(error) => {
+                second.shutdown().await.unwrap();
+                if listener_unavailable(&error) && attempts < 5 {
+                    eprintln!("retrying worker fixture after {error}");
+                    continue;
+                }
+                panic!("member 3 startup attempt {attempts}: {error}");
+            }
+        };
+        let first = match Engine::member(open(0, true)).await {
+            Ok(engine) => engine,
+            Err(error) => {
+                third.shutdown().await.unwrap();
+                second.shutdown().await.unwrap();
+                if listener_unavailable(&error) && attempts < 5 {
+                    eprintln!("retrying worker fixture after {error}");
+                    continue;
+                }
+                panic!("member 1 startup attempt {attempts}: {error}");
+            }
+        };
+        break (first, second, third, addresses, dirs);
     };
-    let second = Engine::member(open(1, false)).await.unwrap();
-    let third = Engine::member(open(2, false)).await.unwrap();
-    let first = Engine::member(open(0, true)).await.unwrap();
     let (provider_task, _provider_dir, url) = provider().await;
     let started = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
