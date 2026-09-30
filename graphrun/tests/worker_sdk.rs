@@ -871,8 +871,10 @@ async fn worker_keeps_assignment_across_leader_change() {
     let (provider_task, _provider_dir, url) = provider().await;
     let started = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
+    let lost_claim = Arc::new(AtomicBool::new(false));
     let handler_started = started.clone();
     let handler_release = release.clone();
+    let handler_lost_claim = lost_claim.clone();
     let worker = Worker::builder(
         format!("https://{}", addresses[0]),
         signed(&ca, "app-worker", &[PeerRole::Worker]),
@@ -887,10 +889,13 @@ async fn worker_keeps_assignment_across_leader_change() {
         while !handler_release.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(
-            ctx.can_start_effect(),
-            "worker must renew its claim with new leader"
-        );
+        if !ctx.can_start_effect() {
+            handler_lost_claim.store(true, Ordering::SeqCst);
+            return Err(ActivityError::new(
+                "worker.claim_lost",
+                "worker did not renew its claim with the new leader",
+            ));
+        }
         let response =
             provider::apply_effect(&url, &ctx.effect_key, "forward", &Value::Int(input + 1))
                 .map_err(|err| ActivityError::new("provider.unavailable", err.to_string()))?;
@@ -950,6 +955,10 @@ async fn worker_keeps_assignment_across_leader_change() {
     provider_task.abort();
     second.shutdown().await.unwrap();
     third.shutdown().await.unwrap();
+    assert!(
+        !lost_claim.load(Ordering::SeqCst),
+        "the original assignment lost its claim during leader change"
+    );
 }
 
 #[cfg(feature = "fault-injection")]

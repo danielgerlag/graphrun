@@ -1079,8 +1079,16 @@ impl Worker {
                 observed = fault_watch.next(), if !draining => {
                     let status = match observed {
                         Ok(true) => tonic::Status::unavailable("member clock faulted"),
-                        Err(status) => status,
                         Ok(false) => continue,
+                        Err(status) if uncertain_rpc(&status) => {
+                            self.rotate_observers(&status, &mut watcher, &mut fault_watch)?;
+                            ready_watch = None;
+                            generation = 0;
+                            cursor = 0;
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            continue;
+                        }
+                        Err(status) => return Err(rpc_error(status)),
                     };
                     for claim in active.values() {
                         claim.cancelled.send_replace(true);
