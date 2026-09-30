@@ -247,7 +247,34 @@ impl Cluster {
             label: label.to_owned(),
             child,
         });
-        Ok(())
+        self.wait_member_ready(id, label)
+    }
+
+    fn wait_member_ready(&mut self, id: usize, label: &str) -> Result<(), String> {
+        let socket = self.dir(id).join("control.sock");
+        let log_path = self.root.join(format!("member-{id}-{label}.log"));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let process = self.processes.last_mut().ok_or("member process missing")?;
+            if let Some(status) = process.child.try_wait().map_err(|err| err.to_string())? {
+                let log = fs::read_to_string(&log_path)
+                    .map_err(|err| format!("{}: {err}", log_path.display()))?;
+                return Err(format!(
+                    "member {id} {label} exited {status} before control socket was ready: {log}"
+                ));
+            }
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "member {id} {label} PID {} did not bind {}",
+                    process.child.id(),
+                    socket.display()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn stop(&mut self, id: usize) -> Result<(), String> {
@@ -338,6 +365,9 @@ impl Cluster {
     }
 
     fn local(&self, id: usize, command: &[&str]) -> Result<Value, String> {
+        if !self.dir(id).join("control.sock").exists() {
+            return Err(format!("member {id} control socket not ready"));
+        }
         let mut args = command
             .iter()
             .map(|item| (*item).to_owned())
@@ -897,6 +927,7 @@ fn main() {
         eprintln!("run ID must be 1..=96 ASCII letters, digits, hyphens, or underscores");
         std::process::exit(2);
     }
+
     let root = args.artifacts.join(&run_id);
     let mut cluster = match Cluster::new(root.clone(), args.cli.clone()) {
         Ok(cluster) => cluster,
@@ -959,5 +990,51 @@ fn main() {
     if !passed {
         eprintln!("{}", report["error"]);
         std::process::exit(1);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn local_health_does_not_invoke_cli_without_member_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let invoked = dir.path().join("cli-invoked");
+        let cli = dir.path().join("cli");
+        fs::write(
+            &cli,
+            format!(
+                "#!/bin/sh\nprintf called > '{}'\nprintf '{{\"status\":\"ok\"}}\\n'\n",
+                invoked.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+        let cluster = Cluster::new(dir.path().join("members"), cli).unwrap();
+        let error = cluster
+            .local(1, &["cluster", "health"])
+            .expect_err("unready member must not be probed through the CLI");
+        assert!(error.contains("control socket not ready"), "{error}");
+        assert!(!invoked.exists(), "unready member CLI was invoked");
+    }
+
+    #[test]
+    fn member_restart_reports_child_exit_before_probing_local_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing = dir.path().join("failing-member");
+        fs::write(
+            &failing,
+            b"#!/bin/sh\nprintf 'owner conflict' >&2\nexit 2\n",
+        )
+        .unwrap();
+        fs::set_permissions(&failing, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut cluster = Cluster::new(dir.path().join("members"), failing.clone()).unwrap();
+        let error = cluster
+            .spawn(&failing, 1, false, "bridge-return")
+            .unwrap_err();
+        assert!(error.contains("exit status: 2"), "{error}");
+        assert!(error.contains("owner conflict"), "{error}");
     }
 }

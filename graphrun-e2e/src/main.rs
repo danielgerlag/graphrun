@@ -1206,11 +1206,32 @@ fn validate_format_rollout_report(
     if old.role != "old_reader" || current.role != "current_release" {
         return Err("CONTRACT-002 related binaries must be ordered old then current".to_owned());
     }
+    let fixture_target =
+        fs::canonicalize(cwd.join("current-target")).map_err(|err| err.to_string())?;
+    let cli_target = fs::canonicalize(&current.target_dir).map_err(|err| err.to_string())?;
+    let bridge_target = fs::canonicalize(&old.target_dir).map_err(|err| err.to_string())?;
+    let fixture_log =
+        fs::canonicalize(cwd.join("current-build.log")).map_err(|err| err.to_string())?;
+    if !fixture_target.starts_with(&root)
+        || fixture_target.starts_with(&cli_target)
+        || cli_target.starts_with(&fixture_target)
+        || fixture_target.starts_with(&bridge_target)
+        || bridge_target.starts_with(&fixture_target)
+        || !result
+            .artifacts
+            .iter()
+            .any(|artifact| fs::canonicalize(artifact).is_ok_and(|path| path == fixture_log))
+        || !fs::read_to_string(&fixture_log)
+            .map_err(|err| err.to_string())?
+            .contains("Compiling graphrun v")
+    {
+        return Err("CONTRACT-002 fixture and CLI require separate fresh source builds".to_owned());
+    }
     let mut roles = HashSet::new();
-    let writer_fixture = Path::new(&current.target_dir)
+    let writer_fixture = fixture_target
         .join("release")
         .join(format!("graphrun-e2e{}", std::env::consts::EXE_SUFFIX));
-    let rollout_driver = Path::new(&current.target_dir).join("release").join(format!(
+    let rollout_driver = fixture_target.join("release").join(format!(
         "graphrun-format-rollout{}",
         std::env::consts::EXE_SUFFIX
     ));
@@ -7750,8 +7771,10 @@ fn contract_format_rollout(
         let current_source = std::env::current_dir().map_err(|err| err.to_string())?;
         let old_target = cwd.join("bridge-target");
         let current_target = cwd.join("current-target");
+        let cli_target = cwd.join("cli-target");
         let old_log = cwd.join("bridge-build.log");
         let current_log = cwd.join("current-build.log");
+        let cli_log = cwd.join("cli-build.log");
         build_format_release(
             &bridge_source,
             &old_target,
@@ -7773,8 +7796,8 @@ fn contract_format_rollout(
         )?;
         build_format_release(
             &current_source,
-            &current_target,
-            &current_log,
+            &cli_target,
+            &cli_log,
             &["-p", "graphrun-cli", "--bin", "graphrun"],
         )?;
         let release = |target: &Path, bin: &str| {
@@ -7784,7 +7807,7 @@ fn contract_format_rollout(
         };
         let bridge = release(&old_target, "graphrun-e2e");
         let writer = release(&current_target, "graphrun-e2e");
-        let built_cli = release(&current_target, "graphrun");
+        let built_cli = release(&cli_target, "graphrun");
         let driver = release(&current_target, "graphrun-format-rollout");
         let old_hash = hash_file(&bridge)?;
         let writer_hash = hash_file(&writer)?;
@@ -7843,6 +7866,7 @@ fn contract_format_rollout(
                 archive,
                 old_log.clone(),
                 current_log.clone(),
+                cli_log.clone(),
                 bridge.clone(),
                 writer,
                 built_cli.clone(),
@@ -7869,13 +7893,13 @@ fn contract_format_rollout(
                 role: "current_release".to_owned(),
                 path: cli.display().to_string(),
                 built_path: built_cli.display().to_string(),
-                target_dir: current_target.display().to_string(),
+                target_dir: cli_target.display().to_string(),
                 version: current_version,
                 source_revision: context.source_sha256.clone(),
                 sha256_before: context.cli_sha256.clone(),
                 sha256_after: hash_file(cli)?,
-                build_log: current_log.display().to_string(),
-                build_log_sha256: hash_file(&current_log)?,
+                build_log: cli_log.display().to_string(),
+                build_log_sha256: hash_file(&cli_log)?,
                 run_id: context.run_id.clone(),
             },
         ];
