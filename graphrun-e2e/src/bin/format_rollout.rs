@@ -109,6 +109,11 @@ struct Member {
     child: Child,
 }
 
+enum StartupExpectation {
+    Ready,
+    Rejected,
+}
+
 impl Drop for Member {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
@@ -190,6 +195,7 @@ impl Cluster {
         id: usize,
         initialize: bool,
         label: &str,
+        expectation: StartupExpectation,
     ) -> Result<(), String> {
         fs::create_dir_all(self.dir(id)).map_err(|err| err.to_string())?;
         if self.marker(id).exists() {
@@ -247,7 +253,10 @@ impl Cluster {
             label: label.to_owned(),
             child,
         });
-        self.wait_member_ready(id, label)
+        match expectation {
+            StartupExpectation::Ready => self.wait_member_ready(id, label),
+            StartupExpectation::Rejected => Ok(()),
+        }
     }
 
     fn wait_member_ready(&mut self, id: usize, label: &str) -> Result<(), String> {
@@ -503,9 +512,9 @@ fn evidence(role: &'static str, path: &Path, revision: String) -> Result<Binary,
 }
 
 fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String> {
-    cluster.spawn(writer, 2, false, "writer")?;
-    cluster.spawn(writer, 3, false, "writer")?;
-    cluster.spawn(bridge, 1, true, "bridge")?;
+    cluster.spawn(writer, 2, false, "writer", StartupExpectation::Ready)?;
+    cluster.spawn(writer, 3, false, "writer", StartupExpectation::Ready)?;
+    cluster.spawn(bridge, 1, true, "bridge", StartupExpectation::Ready)?;
     cluster.await_value(
         "bridge leadership",
         || cluster.remote(1, &["cluster", "format", "status"]),
@@ -629,7 +638,7 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
             let leader = value["member"].as_u64().ok_or("leader ID missing")? as usize;
             Ok((leader, value))
         })?;
-    cluster.spawn(bridge, 1, false, "bridge-return")?;
+    cluster.spawn(bridge, 1, false, "bridge-return", StartupExpectation::Ready)?;
     let before_activation = cluster.await_value(
         "bridge catch-up before activation",
         || cluster.local(1, &["cluster", "health"]),
@@ -842,7 +851,13 @@ fn run(cluster: &mut Cluster, bridge: &Path, writer: &Path) -> Result<(), String
             && checkpoint.format == graphrun::history::CHECKPOINT_FORMAT
             && checkpoint.through_run_sequence == through,
     )?;
-    cluster.spawn(bridge, 1, false, "rejected-restart")?;
+    cluster.spawn(
+        bridge,
+        1,
+        false,
+        "rejected-restart",
+        StartupExpectation::Rejected,
+    )?;
     let restart = cluster.processes.last_mut().ok_or("restart PID missing")?;
     let deadline = Instant::now() + Duration::from_secs(10);
     let exit = loop {
@@ -1032,9 +1047,46 @@ mod tests {
         fs::set_permissions(&failing, fs::Permissions::from_mode(0o700)).unwrap();
         let mut cluster = Cluster::new(dir.path().join("members"), failing.clone()).unwrap();
         let error = cluster
-            .spawn(&failing, 1, false, "bridge-return")
+            .spawn(
+                &failing,
+                1,
+                false,
+                "bridge-return",
+                StartupExpectation::Ready,
+            )
             .unwrap_err();
         assert!(error.contains("exit status: 2"), "{error}");
         assert!(error.contains("owner conflict"), "{error}");
+    }
+
+    #[test]
+    fn expected_old_binary_rejection_does_not_wait_for_a_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let rejected = dir.path().join("old-member");
+        fs::write(&rejected, b"#!/bin/sh\nexit 2\n").unwrap();
+        fs::set_permissions(&rejected, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut cluster = Cluster::new(dir.path().join("members"), rejected.clone()).unwrap();
+        cluster
+            .spawn(
+                &rejected,
+                1,
+                false,
+                "rejected-restart",
+                StartupExpectation::Rejected,
+            )
+            .unwrap();
+        let process = cluster.processes.last_mut().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = process.child.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(2));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "old binary did not reject startup"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
