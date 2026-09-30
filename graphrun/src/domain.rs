@@ -274,6 +274,16 @@ pub enum ScopeRole {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CommandBody {
+    PrepareWriterFormat {
+        proofs: Vec<crate::format_upgrade::ReaderProof>,
+        roster_log_id: Option<crate::format_upgrade::Position>,
+    },
+    ActivateWriterFormat {
+        roster_log_id: Option<crate::format_upgrade::Position>,
+        target: u16,
+    },
+    #[cfg(feature = "format-proof")]
+    ProofActivateWriter,
     /// Replicated provenance minted at a verified ingress, not decoded from a client request.
     Authenticated {
         principal_id: String,
@@ -677,6 +687,10 @@ pub struct InboxEntry {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
+    pub format_policy: crate::format_upgrade::FormatPolicy,
+    #[serde(default)]
+    pub format_receipts: BTreeMap<String, crate::format_upgrade::FormatReceipt>,
+    #[serde(default)]
     pub current_cluster_id: String,
     #[serde(default)]
     pub artifact_origins: std::collections::BTreeSet<String>,
@@ -761,6 +775,13 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
     }
     let mut ids = IdGen::new(command.id);
     match &command.body {
+        CommandBody::PrepareWriterFormat { .. } | CommandBody::ActivateWriterFormat { .. } => {
+            Err(Error::invalid("format policy requires ordered Raft apply"))
+        }
+        #[cfg(feature = "format-proof")]
+        CommandBody::ProofActivateWriter => Err(Error::invalid(
+            "proof activation requires the ordered Raft apply",
+        )),
         CommandBody::Authenticated { .. } => Err(Error::invalid(
             "authenticated cause requires replicated apply",
         )),

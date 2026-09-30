@@ -197,13 +197,24 @@ cargo run --locked -p graphrun-e2e -- smoke-forged-worker \
 	--cli target/release/graphrun --artifacts target/worker-smoke
 cargo run --locked -p graphrun-e2e -- smoke-application \
 	--cli target/release/graphrun --artifacts target/application-smoke
+cargo run --locked -p graphrun-e2e -- contract-format-proof \
+	--cli target/release/graphrun --artifacts /tmp/gr-format-proof
 ```
 
 These commands do not produce a matrix report. `verify` must run all cases in
 the same fresh invocation; CI does not skip the snapshot-controller test.
+`diagnose-format-report --report <path>` rechecks a retained rollout's
+observations and files without rebuilding. It does not bind source or binary
+fingerprints and cannot certify a release.
 `CONTRACT-002` remains a failure until its current and old release binaries
 are built in the same run, their identities and build logs are validated,
 and the mixed-version reader-first rollout is observed through real members.
+CI retains Git history for the pinned old-reader source. The gate builds that
+binary from source rather than downloading a prebuilt executable.
+The old reader, current fixture, and production CLI use three separate fresh
+Cargo target directories. Each build log must show `graphrun` compiling, and
+the old and current member binaries must have different hashes. The CLI build
+must not reuse the fixture worker's feature-enabled dependency cache.
 
 ## Evidence format
 
