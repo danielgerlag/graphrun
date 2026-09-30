@@ -167,6 +167,14 @@ missing case; it allows only measured `PERF-*` hardware blockers and reports
 `release_certified=false`. Strict release certification also exits nonzero on
 any blocked performance case or a substituted/incomplete matrix.
 
+This foundation PR checks 90 cases. Production writer activation and
+`CONTRACT-002` belong to the dependent PR. The report names `CONTRACT-002`
+under `deferred_release_contracts` and sets `release_scope_complete=false`
+and `release_certified=false`. `--release-certification` fails while that
+contract is deferred, even if both `PERF-*` cases pass on reference hardware.
+The dependent PR must restore `CONTRACT-002` to the mandatory matrix and
+prove it with independently built release binaries before v1 release signoff.
+
 Also run the workspace on the selected minimum toolchain. If the pinned dependencies cannot meet it, resolve and document the compatibility change instead of asserting untested support.
 
 The release build command must not enable test-only features through workspace feature unification. Assert that the resulting binary exposes no test fault controls.
@@ -201,9 +209,10 @@ cargo run --locked -p graphrun-e2e -- smoke-application \
 
 These commands do not produce a matrix report. `verify` must run all cases in
 the same fresh invocation; CI does not skip the snapshot-controller test.
-`CONTRACT-002` remains a failure until its current and old release binaries
-are built in the same run, their identities and build logs are validated,
-and the mixed-version reader-first rollout is observed through real members.
+The foundation matrix does not claim `CONTRACT-002` coverage. The dependent PR
+must build its current and old release binaries in the same run, validate
+their identities and build logs, and observe reader-first rollout through
+real members.
 
 ## Evidence format
 

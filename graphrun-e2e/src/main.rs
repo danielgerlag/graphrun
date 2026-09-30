@@ -634,7 +634,9 @@ fn verify(cli: &Path, matrix: &Path, artifacts: &Path, strict: bool) -> ExitCode
         }
     }
     let coverage = validate_coverage(&rows, &results, &run_dir, &context);
-    let (exit_code, release_certified) = verification_gate(&results, strict);
+    let release_scope_complete = rows.iter().any(|row| row.id == "CONTRACT-002");
+    let (exit_code, release_certified) =
+        verification_gate(&results, strict, release_scope_complete);
     let canonical_matrix = release_matrix_complete(&rows);
     let matrix_complete = canonical_matrix.is_ok();
     let failed = exit_code != ExitCode::SUCCESS
@@ -653,6 +655,8 @@ fn verify(cli: &Path, matrix: &Path, artifacts: &Path, strict: bool) -> ExitCode
         "matrix": matrix.display().to_string(),
         "release_matrix_complete": matrix_complete,
         "release_matrix_error": canonical_matrix.err(),
+        "release_scope_complete": release_scope_complete,
+        "deferred_release_contracts": if release_scope_complete { vec![] } else { vec!["CONTRACT-002"] },
         "strict_release_certification": strict,
         "release_certified": certified,
         "coverage_error": coverage.err(),
@@ -1059,20 +1063,25 @@ fn validate_coverage(
     Ok(())
 }
 
-fn verification_gate(results: &[CaseResult], strict: bool) -> (ExitCode, bool) {
-    let certified = results.iter().all(|result| result.status == "PASS");
-    let allowed = results.iter().all(|result| {
-        result.status == "PASS"
-            || (!strict
-                && result.status == "BLOCKED"
-                && result.id.starts_with("PERF-")
-                && result.performance.as_ref().is_some_and(|perf| {
-                    !perf.reference_hardware_available
-                        && !perf.hardware.is_empty()
-                        && !perf.measurements.is_empty()
-                        && !perf.reason.is_empty()
-                }))
-    });
+fn verification_gate(
+    results: &[CaseResult],
+    strict: bool,
+    release_scope_complete: bool,
+) -> (ExitCode, bool) {
+    let certified = release_scope_complete && results.iter().all(|result| result.status == "PASS");
+    let allowed = (!strict || release_scope_complete)
+        && results.iter().all(|result| {
+            result.status == "PASS"
+                || (!strict
+                    && result.status == "BLOCKED"
+                    && result.id.starts_with("PERF-")
+                    && result.performance.as_ref().is_some_and(|perf| {
+                        !perf.reference_hardware_available
+                            && !perf.hardware.is_empty()
+                            && !perf.measurements.is_empty()
+                            && !perf.reason.is_empty()
+                    }))
+        });
     (
         if allowed {
             ExitCode::SUCCESS
@@ -10219,7 +10228,13 @@ mod tests {
             fs::write(path, format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n")).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let row = row("CONTRACT-002");
+        let row = MatrixRow {
+            id: "CONTRACT-002".to_owned(),
+            requirement: "REQ-DURABILITY".to_owned(),
+            layer: "storage".to_owned(),
+            scenario: "Format compatibility and indexed history".to_owned(),
+            pass_criterion: "Reader-first activation fences old writers".to_owned(),
+        };
         let mut context = context(&run_dir);
         context.cli_path = current_path.clone();
         context.cli_sha256 = hash_file(&current_path).unwrap();
@@ -10501,12 +10516,12 @@ mod tests {
         assert!(release_matrix_complete(std::slice::from_ref(&functional)).is_err());
         let passing = passing_case(&functional, &run_dir, &context);
         assert_eq!(
-            verification_gate(std::slice::from_ref(&passing), false),
+            verification_gate(std::slice::from_ref(&passing), false, true),
             (ExitCode::SUCCESS, true)
         );
         let failure = context.bind(fail(&functional, "test", "missing"));
         assert_eq!(
-            verification_gate(&[passing.clone(), failure], false),
+            verification_gate(&[passing.clone(), failure], false, true),
             (ExitCode::from(1), false)
         );
         let blocked = context.bind(finish(
@@ -10517,7 +10532,7 @@ mod tests {
             vec![run_dir.clone()],
         ));
         assert_eq!(
-            verification_gate(&[blocked], false),
+            verification_gate(&[blocked], false, true),
             (ExitCode::from(1), false)
         );
         let perf = row("PERF-001");
@@ -10529,7 +10544,7 @@ mod tests {
             vec![run_dir.clone()],
         ));
         assert_eq!(
-            verification_gate(&[measured.clone()], false),
+            verification_gate(&[measured.clone()], false, true),
             (ExitCode::from(1), false)
         );
         measured.performance = Some(PerformanceEvidence {
@@ -10539,16 +10554,24 @@ mod tests {
             reason: "reference hardware unavailable".to_owned(),
         });
         assert_eq!(
-            verification_gate(&[passing.clone(), measured.clone()], false),
+            verification_gate(&[passing.clone(), measured.clone()], false, true),
             (ExitCode::SUCCESS, false)
         );
         assert_eq!(
-            verification_gate(&[passing, measured.clone()], true),
+            verification_gate(&[passing.clone(), measured.clone()], true, true),
+            (ExitCode::from(1), false)
+        );
+        assert_eq!(
+            verification_gate(std::slice::from_ref(&passing), false, false),
+            (ExitCode::SUCCESS, false)
+        );
+        assert_eq!(
+            verification_gate(&[passing], true, false),
             (ExitCode::from(1), false)
         );
         measured.performance.as_mut().unwrap().measurements.clear();
         assert_eq!(
-            verification_gate(&[measured], false),
+            verification_gate(&[measured], false, true),
             (ExitCode::from(1), false)
         );
     }
@@ -10565,7 +10588,7 @@ mod tests {
         assert!(!dir.path().join("PERF-001-rate/control.sock").exists());
         let result = fail(&row("PERF-001"), "1000 committed starts measurement", err);
         assert_eq!(
-            verification_gate(&[result], false),
+            verification_gate(&[result], false, true),
             (ExitCode::from(1), false)
         );
     }
@@ -10575,6 +10598,8 @@ mod tests {
         let canonical =
             parse_matrix(include_str!("../../docs/specs/v1/verification-matrix.tsv")).unwrap();
         assert!(release_matrix_complete(&canonical).is_ok());
+        assert_eq!(canonical.len(), 90);
+        assert!(!canonical.iter().any(|row| row.id == "CONTRACT-002"));
 
         let subset = vec![
             canonical
@@ -10724,6 +10749,11 @@ mod tests {
         let first: serde_json::Value =
             serde_json::from_slice(&fs::read(artifacts.join("report.json")).unwrap()).unwrap();
         assert_eq!(first["release_certified"], false);
+        assert_eq!(first["release_scope_complete"], false);
+        assert_eq!(
+            first["deferred_release_contracts"],
+            serde_json::json!(["CONTRACT-002"])
+        );
         assert!(
             first["results"]
                 .as_array()
