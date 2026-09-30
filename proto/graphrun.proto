@@ -12,32 +12,6 @@ service Raft {
   rpc InstallSnapshot(Blob) returns (Blob);
   rpc ClockHealth(ClockHealthRequest) returns (ClockHealthResponse);
   rpc RequestElection(ElectionRequest) returns (ElectionResponse);
-  rpc ProbeReaders(ReaderRequest) returns (ReaderResponse);
-  rpc PrepareReaders(ReaderRequest) returns (ReaderResponse);
-  rpc CandidateReaders(CandidateReaderRequest) returns (CandidateReaderResponse);
-}
-
-message CandidateReaderRequest {
-  uint64 sender_id = 1;
-  uint32 target = 2;
-}
-
-message CandidateReaderResponse {
-  uint64 member_id = 1;
-  string cluster_id = 2;
-  uint32 reader_capability = 3;
-  uint32 writer_capability = 4;
-  bool pristine = 5;
-}
-
-message ReaderRequest {
-  uint64 sender_id = 1;
-  uint32 target = 2;
-  bytes roster_log_id_json = 3;
-}
-
-message ReaderResponse {
-  bytes proof_json = 1;
 }
 
 message ClockHealthRequest {
@@ -103,21 +77,6 @@ message CommandResultResponse {
   bytes result_json = 1;
 }
 
-message FormatStatusRequest {}
-
-message FormatStatusResponse {
-  bytes status_json = 1;
-}
-
-message FormatChangeRequest {
-  string command_id = 1;
-  uint32 target = 2;
-}
-
-message FormatChangeResponse {
-  bytes receipt_json = 1;
-}
-
 message SignalRequest {
   string command_id = 1;
   string run_id = 2;
@@ -178,9 +137,6 @@ message ClockAcknowledgeRequest {
 }
 
 service Client {
-  rpc FormatStatus(FormatStatusRequest) returns (FormatStatusResponse);
-  rpc PrepareWriterFormat(FormatChangeRequest) returns (FormatChangeResponse);
-  rpc ActivateWriterFormat(FormatChangeRequest) returns (FormatChangeResponse);
   rpc PublishCatalog(PublishCatalogRequest) returns (CommandResultResponse);
   rpc PublishDefinition(PublishDefinitionRequest) returns (CommandResultResponse);
   rpc GetCommandResult(CommandResultRequest) returns (CommandResultResponse);

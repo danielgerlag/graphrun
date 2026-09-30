@@ -248,31 +248,3 @@ nodes:
     );
     engine.shutdown().await.unwrap();
 }
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cluster_health_does_not_open_a_store_without_a_live_member() {
-    let root = tempfile::Builder::new()
-        .prefix("gr-cli-health-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let store = root.path().join("store");
-    let engine = graphrun::Engine::local(&store).await.unwrap();
-    engine.shutdown().await.unwrap();
-    assert!(!store.join("control.sock").exists());
-
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_graphrun"))
-        .args(["cluster", "health", "--local-dir", store.to_str().unwrap()])
-        .output()
-        .await
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    let failure: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(failure["status"], "error");
-    assert!(
-        failure["message"]
-            .as_str()
-            .unwrap()
-            .contains("live control socket")
-    );
-}

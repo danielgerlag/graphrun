@@ -7,40 +7,6 @@ pub struct Blob {
     pub sender_id: u64,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct CandidateReaderRequest {
-    #[prost(uint64, tag = "1")]
-    pub sender_id: u64,
-    #[prost(uint32, tag = "2")]
-    pub target: u32,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct CandidateReaderResponse {
-    #[prost(uint64, tag = "1")]
-    pub member_id: u64,
-    #[prost(string, tag = "2")]
-    pub cluster_id: ::prost::alloc::string::String,
-    #[prost(uint32, tag = "3")]
-    pub reader_capability: u32,
-    #[prost(uint32, tag = "4")]
-    pub writer_capability: u32,
-    #[prost(bool, tag = "5")]
-    pub pristine: bool,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ReaderRequest {
-    #[prost(uint64, tag = "1")]
-    pub sender_id: u64,
-    #[prost(uint32, tag = "2")]
-    pub target: u32,
-    #[prost(bytes = "vec", tag = "3")]
-    pub roster_log_id_json: ::prost::alloc::vec::Vec<u8>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ReaderResponse {
-    #[prost(bytes = "vec", tag = "1")]
-    pub proof_json: ::prost::alloc::vec::Vec<u8>,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClockHealthRequest {
     #[prost(uint64, tag = "1")]
     pub sender_id: u64,
@@ -131,25 +97,6 @@ pub struct CommandResultRequest {
 pub struct CommandResultResponse {
     #[prost(bytes = "vec", tag = "1")]
     pub result_json: ::prost::alloc::vec::Vec<u8>,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct FormatStatusRequest {}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct FormatStatusResponse {
-    #[prost(bytes = "vec", tag = "1")]
-    pub status_json: ::prost::alloc::vec::Vec<u8>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct FormatChangeRequest {
-    #[prost(string, tag = "1")]
-    pub command_id: ::prost::alloc::string::String,
-    #[prost(uint32, tag = "2")]
-    pub target: u32,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct FormatChangeResponse {
-    #[prost(bytes = "vec", tag = "1")]
-    pub receipt_json: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SignalRequest {
@@ -646,72 +593,6 @@ pub mod raft_client {
                 .insert(GrpcMethod::new("graphrun.v1.Raft", "RequestElection"));
             self.inner.unary(req, path, codec).await
         }
-        pub async fn probe_readers(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ReaderRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReaderResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/graphrun.v1.Raft/ProbeReaders",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("graphrun.v1.Raft", "ProbeReaders"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn prepare_readers(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ReaderRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReaderResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/graphrun.v1.Raft/PrepareReaders",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("graphrun.v1.Raft", "PrepareReaders"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn candidate_readers(
-            &mut self,
-            request: impl tonic::IntoRequest<super::CandidateReaderRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::CandidateReaderResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/graphrun.v1.Raft/CandidateReaders",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("graphrun.v1.Raft", "CandidateReaders"));
-            self.inner.unary(req, path, codec).await
-        }
     }
 }
 /// Generated server implementations.
@@ -751,21 +632,6 @@ pub mod raft_server {
             request: tonic::Request<super::ElectionRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ElectionResponse>,
-            tonic::Status,
-        >;
-        async fn probe_readers(
-            &self,
-            request: tonic::Request<super::ReaderRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReaderResponse>, tonic::Status>;
-        async fn prepare_readers(
-            &self,
-            request: tonic::Request<super::ReaderRequest>,
-        ) -> std::result::Result<tonic::Response<super::ReaderResponse>, tonic::Status>;
-        async fn candidate_readers(
-            &self,
-            request: tonic::Request<super::CandidateReaderRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::CandidateReaderResponse>,
             tonic::Status,
         >;
     }
@@ -1060,137 +926,6 @@ pub mod raft_server {
                     };
                     Box::pin(fut)
                 }
-                "/graphrun.v1.Raft/ProbeReaders" => {
-                    #[allow(non_camel_case_types)]
-                    struct ProbeReadersSvc<T: Raft>(pub Arc<T>);
-                    impl<T: Raft> tonic::server::UnaryService<super::ReaderRequest>
-                    for ProbeReadersSvc<T> {
-                        type Response = super::ReaderResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ReaderRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Raft>::probe_readers(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ProbeReadersSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/graphrun.v1.Raft/PrepareReaders" => {
-                    #[allow(non_camel_case_types)]
-                    struct PrepareReadersSvc<T: Raft>(pub Arc<T>);
-                    impl<T: Raft> tonic::server::UnaryService<super::ReaderRequest>
-                    for PrepareReadersSvc<T> {
-                        type Response = super::ReaderResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ReaderRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Raft>::prepare_readers(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = PrepareReadersSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/graphrun.v1.Raft/CandidateReaders" => {
-                    #[allow(non_camel_case_types)]
-                    struct CandidateReadersSvc<T: Raft>(pub Arc<T>);
-                    impl<
-                        T: Raft,
-                    > tonic::server::UnaryService<super::CandidateReaderRequest>
-                    for CandidateReadersSvc<T> {
-                        type Response = super::CandidateReaderResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::CandidateReaderRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Raft>::candidate_readers(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = CandidateReadersSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
                 _ => {
                     Box::pin(async move {
                         let mut response = http::Response::new(
@@ -1321,78 +1056,6 @@ pub mod client_client {
         pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
-        }
-        pub async fn format_status(
-            &mut self,
-            request: impl tonic::IntoRequest<super::FormatStatusRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::FormatStatusResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/graphrun.v1.Client/FormatStatus",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("graphrun.v1.Client", "FormatStatus"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn prepare_writer_format(
-            &mut self,
-            request: impl tonic::IntoRequest<super::FormatChangeRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::FormatChangeResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/graphrun.v1.Client/PrepareWriterFormat",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("graphrun.v1.Client", "PrepareWriterFormat"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn activate_writer_format(
-            &mut self,
-            request: impl tonic::IntoRequest<super::FormatChangeRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::FormatChangeResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/graphrun.v1.Client/ActivateWriterFormat",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("graphrun.v1.Client", "ActivateWriterFormat"));
-            self.inner.unary(req, path, codec).await
         }
         pub async fn publish_catalog(
             &mut self,
@@ -1646,27 +1309,6 @@ pub mod client_server {
     /// Generated trait containing gRPC methods that should be implemented for use with ClientServer.
     #[async_trait]
     pub trait Client: std::marker::Send + std::marker::Sync + 'static {
-        async fn format_status(
-            &self,
-            request: tonic::Request<super::FormatStatusRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::FormatStatusResponse>,
-            tonic::Status,
-        >;
-        async fn prepare_writer_format(
-            &self,
-            request: tonic::Request<super::FormatChangeRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::FormatChangeResponse>,
-            tonic::Status,
-        >;
-        async fn activate_writer_format(
-            &self,
-            request: tonic::Request<super::FormatChangeRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::FormatChangeResponse>,
-            tonic::Status,
-        >;
         async fn publish_catalog(
             &self,
             request: tonic::Request<super::PublishCatalogRequest>,
@@ -1797,141 +1439,6 @@ pub mod client_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
-                "/graphrun.v1.Client/FormatStatus" => {
-                    #[allow(non_camel_case_types)]
-                    struct FormatStatusSvc<T: Client>(pub Arc<T>);
-                    impl<
-                        T: Client,
-                    > tonic::server::UnaryService<super::FormatStatusRequest>
-                    for FormatStatusSvc<T> {
-                        type Response = super::FormatStatusResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::FormatStatusRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Client>::format_status(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = FormatStatusSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/graphrun.v1.Client/PrepareWriterFormat" => {
-                    #[allow(non_camel_case_types)]
-                    struct PrepareWriterFormatSvc<T: Client>(pub Arc<T>);
-                    impl<
-                        T: Client,
-                    > tonic::server::UnaryService<super::FormatChangeRequest>
-                    for PrepareWriterFormatSvc<T> {
-                        type Response = super::FormatChangeResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::FormatChangeRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Client>::prepare_writer_format(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = PrepareWriterFormatSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/graphrun.v1.Client/ActivateWriterFormat" => {
-                    #[allow(non_camel_case_types)]
-                    struct ActivateWriterFormatSvc<T: Client>(pub Arc<T>);
-                    impl<
-                        T: Client,
-                    > tonic::server::UnaryService<super::FormatChangeRequest>
-                    for ActivateWriterFormatSvc<T> {
-                        type Response = super::FormatChangeResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::FormatChangeRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as Client>::activate_writer_format(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ActivateWriterFormatSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
                 "/graphrun.v1.Client/PublishCatalog" => {
                     #[allow(non_camel_case_types)]
                     struct PublishCatalogSvc<T: Client>(pub Arc<T>);

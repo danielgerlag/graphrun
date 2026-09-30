@@ -879,8 +879,6 @@ dependencies = [
  "clap",
  "graphrun",
  "hex",
- "prost",
- "redb",
  "serde",
  "serde_json",
  "sha2",

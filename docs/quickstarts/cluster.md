@@ -97,50 +97,6 @@ Acknowledgement never lowers the committed engine-time watermark. A cluster
 also needs fresh bounded clock-health samples from a voting quorum before
 scheduling work.
 
-## Activate a new writer format
-
-Roll out a reader-capable v4 writer to every data-bearing voter and learner
-before preparing format 5. Keep writing v4 during this step. A member without
-the new reader protocol blocks preparation; removing it requires a committed
-membership change, not editing its directory. A pre-v4 directory is not
-upgraded in place.
-
-On the leader, use an admin certificate or the owner-only local socket:
-
-```sh
-graphrun cluster format status --local-dir /path/to/leader
-graphrun cluster format prepare --target 5 \
-	--command-id <stable-command-id> --local-dir /path/to/leader
-```
-
-`prepare` checks the entire committed roster before changing any member.
-Each voter and learner verifies its retained records and snapshot, then
-persists its reader floor. The leader commits the complete reader proof set
-against that roster. If a member is down or the voter quorum is unavailable,
-retry the same command ID after recovery. A membership change requires a new
-preparation against the new roster.
-
-After replacing the leader with a writer-capable binary, activate format 5:
-
-```sh
-graphrun cluster format activate --target 5 \
-	--command-id <another-stable-command-id> --local-dir /path/to/leader
-```
-
-Activation and the member's writer manifest commit in one apply transaction.
-Format 5 commands and state records follow only after that transaction. An
-older running member may apply compatible committed entries as a follower,
-but cannot write or obtain votes from updated members. The old writer cannot
-reopen a directory whose writer format is 5. Once activated, upgrade forward;
-do not lower the manifest, restore an older snapshot, or reuse a cached
-receipt to bypass the active writer policy.
-
-A new learner joining an activated cluster must advertise format 5 readers
-and writer capability before membership changes. After it catches up, run
-`format prepare --target 5` again to bind its proof to the new roster before
-promoting it. Both `status` and format changes need a live leader and quorum;
-quorum loss does not make any member an independent local writer.
-
 # Check live mTLS processes
 
 Build the CLI and verification driver, then run a focused process smoke test

@@ -8,12 +8,10 @@ use crate::generated::client_server::{Client, ClientServer};
 use crate::generated::raft_server::{Raft as RaftSvc, RaftServer};
 use crate::generated::worker_server::{Worker as WorkerSvc, WorkerServer};
 use crate::generated::{
-    Ack, Blob, CancelRequest, CandidateReaderRequest, CandidateReaderResponse, ClaimRequest,
-    ClaimResponse, ClockAcknowledgeRequest, ClockHealthRequest, ClockHealthResponse,
-    CommandResultRequest, CommandResultResponse, ElectionRequest, ElectionResponse,
-    FormatChangeRequest, FormatChangeResponse, FormatStatusRequest, FormatStatusResponse,
-    HistoryRequest, HistoryResponse, InspectRequest, InspectResponse, ListRequest, ListResponse,
-    PublishCatalogRequest, PublishDefinitionRequest, ReaderRequest, ReaderResponse,
+    Ack, Blob, CancelRequest, ClaimRequest, ClaimResponse, ClockAcknowledgeRequest,
+    ClockHealthRequest, ClockHealthResponse, CommandResultRequest, CommandResultResponse,
+    ElectionRequest, ElectionResponse, HistoryRequest, HistoryResponse, InspectRequest,
+    InspectResponse, ListRequest, ListResponse, PublishCatalogRequest, PublishDefinitionRequest,
     ReconcileRequest, RegisterRequest, RegisterResponse, RenewRequest, RenewResponse,
     RenewSessionRequest, RenewSessionResponse, ReplayRequest, ReplayResponse, ReportRequest,
     SignalRequest, StartRequest, StartResponse, WatchMemberFaultRequest, WatchMemberFaultResponse,
@@ -164,10 +162,6 @@ impl GraphServices {
 
     async fn member_context<T>(&self, request: &Request<T>, sender_id: u64) -> Result<(), Status> {
         let peer = self.verified_peer(request)?;
-        #[cfg(feature = "format-proof")]
-        if crate::format_proof::partitioned() {
-            return Err(Status::unavailable("proof member network partition"));
-        }
         let member_id =
             crate::tls::PrincipalId::parse(sender_id.to_string()).map_err(status_error)?;
         peer.require_member_identity(&self.publication_cluster, &member_id)
@@ -189,7 +183,6 @@ impl GraphServices {
                 "member endpoint does not match roster",
             ));
         }
-        crate::format_upgrade::verify_peer_writer(&self.storage, request).await?;
         Ok(())
     }
 
@@ -360,102 +353,9 @@ fn worker_duplicate(
 
 #[tonic::async_trait]
 impl RaftSvc for GraphServices {
-    async fn candidate_readers(
-        &self,
-        request: Request<CandidateReaderRequest>,
-    ) -> Result<Response<CandidateReaderResponse>, Status> {
-        self.member_context(&request, request.get_ref().sender_id)
-            .await?;
-        let request = request.into_inner();
-        let target = u16::try_from(request.target)
-            .map_err(|_| Status::invalid_argument("format overflows u16"))?;
-        let state = self.storage.query_state().await;
-        let roster = self
-            .storage
-            .applied_membership()
-            .await
-            .map_err(status_error)?;
-        let pristine = self.storage.last_applied_index().await == 0
-            && roster.membership().nodes().next().is_none()
-            && state.runs.is_empty()
-            && state.history.is_empty()
-            && state.format_policy.active_writer == crate::format_upgrade::BASE_FORMAT;
-        if !pristine
-            || target > crate::format_upgrade::CURRENT_READER
-            || target > crate::format_upgrade::CURRENT_WRITER
-        {
-            return Err(Status::failed_precondition(
-                "prospective member is not fresh or lacks installed writer and reader versions",
-            ));
-        }
-        self.storage
-            .prepare_candidate_reader_floor(target)
-            .await
-            .map_err(status_error)?;
-        Ok(Response::new(CandidateReaderResponse {
-            member_id: self.node_id,
-            cluster_id: state.current_cluster_id,
-            reader_capability: crate::format_upgrade::CURRENT_READER.into(),
-            writer_capability: crate::format_upgrade::CURRENT_WRITER.into(),
-            pristine,
-        }))
-    }
-
-    async fn probe_readers(
-        &self,
-        request: Request<ReaderRequest>,
-    ) -> Result<Response<ReaderResponse>, Status> {
-        self.member_context(&request, request.get_ref().sender_id)
-            .await?;
-        let request = request.into_inner();
-        let roster: Option<crate::format_upgrade::Position> =
-            serde_json::from_slice(&request.roster_log_id_json)
-                .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let proof = self
-            .storage
-            .probe_format_readers(
-                u16::try_from(request.target)
-                    .map_err(|_| Status::invalid_argument("format overflows u16"))?,
-                roster.map(crate::format_upgrade::Position::raft_log_id),
-            )
-            .await
-            .map_err(status_error)?;
-        Ok(Response::new(ReaderResponse {
-            proof_json: serde_json::to_vec(&proof)
-                .map_err(|err| Status::internal(err.to_string()))?,
-        }))
-    }
-
-    async fn prepare_readers(
-        &self,
-        request: Request<ReaderRequest>,
-    ) -> Result<Response<ReaderResponse>, Status> {
-        self.member_context(&request, request.get_ref().sender_id)
-            .await?;
-        let request = request.into_inner();
-        let roster: Option<crate::format_upgrade::Position> =
-            serde_json::from_slice(&request.roster_log_id_json)
-                .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let proof = self
-            .storage
-            .prepare_format_readers(
-                u16::try_from(request.target)
-                    .map_err(|_| Status::invalid_argument("format overflows u16"))?,
-                roster.map(crate::format_upgrade::Position::raft_log_id),
-            )
-            .await
-            .map_err(status_error)?;
-        Ok(Response::new(ReaderResponse {
-            proof_json: serde_json::to_vec(&proof)
-                .map_err(|err| Status::internal(err.to_string()))?,
-        }))
-    }
-
     async fn append_entries(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
         self.member_context(&request, request.get_ref().sender_id)
             .await?;
-        #[cfg(feature = "format-proof")]
-        crate::format_proof::verify_member_writer(&self.storage, &request).await?;
         let slots = if request.get_ref().json.len() <= 4 * 1024 {
             self.control_decode_slots.clone()
         } else {
@@ -513,8 +413,6 @@ impl RaftSvc for GraphServices {
     async fn vote(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
         self.member_context(&request, request.get_ref().sender_id)
             .await?;
-        #[cfg(feature = "format-proof")]
-        crate::format_proof::verify_member_writer(&self.storage, &request).await?;
         let _decode = self
             .control_decode_slots
             .clone()
@@ -542,8 +440,6 @@ impl RaftSvc for GraphServices {
     async fn install_snapshot(&self, request: Request<Blob>) -> Result<Response<Blob>, Status> {
         self.member_context(&request, request.get_ref().sender_id)
             .await?;
-        #[cfg(feature = "format-proof")]
-        crate::format_proof::verify_member_writer(&self.storage, &request).await?;
         if request.get_ref().json.len() > 8 * 1024 * 1024 {
             return Err(Status::resource_exhausted(
                 "Raft snapshot chunk exceeds the 8 MiB envelope",
@@ -597,8 +493,6 @@ impl RaftSvc for GraphServices {
     ) -> Result<Response<ElectionResponse>, Status> {
         self.member_context(&request, request.get_ref().sender_id)
             .await?;
-        #[cfg(feature = "format-proof")]
-        crate::format_proof::verify_member_writer(&self.storage, &request).await?;
         let req = request.into_inner();
         self.validate_election_request(&req).await?;
         let proof = self
@@ -636,67 +530,6 @@ impl RaftSvc for GraphServices {
 
 #[tonic::async_trait]
 impl Client for GraphServices {
-    async fn format_status(
-        &self,
-        request: Request<FormatStatusRequest>,
-    ) -> Result<Response<FormatStatusResponse>, Status> {
-        self.authenticated_context(&request, crate::tls::PeerRole::Admin)?;
-        let status = crate::format_upgrade::status(&self.raft, &self.storage)
-            .await
-            .map_err(status_error)?;
-        Ok(Response::new(FormatStatusResponse {
-            status_json: serde_json::to_vec(&status)
-                .map_err(|err| Status::internal(err.to_string()))?,
-        }))
-    }
-
-    async fn prepare_writer_format(
-        &self,
-        request: Request<FormatChangeRequest>,
-    ) -> Result<Response<FormatChangeResponse>, Status> {
-        let auth = self.authenticated_context(&request, crate::tls::PeerRole::Admin)?;
-        self.require_leader()?;
-        let request = request.into_inner();
-        let receipt = crate::format_upgrade::prepare(
-            &self.raft,
-            &self.storage,
-            Some(&self.network),
-            &auth,
-            parse_publication_command_id(&request.command_id)?,
-            u16::try_from(request.target)
-                .map_err(|_| Status::invalid_argument("format overflows u16"))?,
-        )
-        .await
-        .map_err(status_error)?;
-        Ok(Response::new(FormatChangeResponse {
-            receipt_json: serde_json::to_vec(&receipt)
-                .map_err(|err| Status::internal(err.to_string()))?,
-        }))
-    }
-
-    async fn activate_writer_format(
-        &self,
-        request: Request<FormatChangeRequest>,
-    ) -> Result<Response<FormatChangeResponse>, Status> {
-        let auth = self.authenticated_context(&request, crate::tls::PeerRole::Admin)?;
-        self.require_leader()?;
-        let request = request.into_inner();
-        let receipt = crate::format_upgrade::activate(
-            &self.raft,
-            &self.storage,
-            &auth,
-            parse_publication_command_id(&request.command_id)?,
-            u16::try_from(request.target)
-                .map_err(|_| Status::invalid_argument("format overflows u16"))?,
-        )
-        .await
-        .map_err(status_error)?;
-        Ok(Response::new(FormatChangeResponse {
-            receipt_json: serde_json::to_vec(&receipt)
-                .map_err(|err| Status::internal(err.to_string()))?,
-        }))
-    }
-
     async fn publish_catalog(
         &self,
         request: Request<PublishCatalogRequest>,

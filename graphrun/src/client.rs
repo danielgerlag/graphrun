@@ -2,9 +2,9 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::generated::client_client::ClientClient;
 use crate::generated::{
-    CancelRequest, ClockAcknowledgeRequest, CommandResultRequest, FormatChangeRequest,
-    FormatStatusRequest, HistoryRequest, InspectRequest, ListRequest, PublishCatalogRequest,
-    PublishDefinitionRequest, ReplayRequest, SignalRequest, StartRequest,
+    CancelRequest, ClockAcknowledgeRequest, CommandResultRequest, HistoryRequest, InspectRequest,
+    ListRequest, PublishCatalogRequest, PublishDefinitionRequest, ReplayRequest, SignalRequest,
+    StartRequest,
 };
 use crate::ids::{CommandId, EventId, RunId};
 use crate::rpc::client_tls;
@@ -23,54 +23,6 @@ pub struct GrpcClient {
 }
 
 impl GrpcClient {
-    pub async fn format_status(&mut self) -> Result<serde_json::Value> {
-        let response = self
-            .read(|mut client| async move { client.format_status(FormatStatusRequest {}).await })
-            .await?
-            .into_inner();
-        serde_json::from_slice(&response.status_json).map_err(|err| Error::invalid(err.to_string()))
-    }
-
-    pub async fn prepare_writer_format(
-        &mut self,
-        target: u16,
-        command_id: CommandId,
-    ) -> Result<crate::format_upgrade::FormatReceipt> {
-        let request = FormatChangeRequest {
-            command_id: command_id.to_hex(),
-            target: target.into(),
-        };
-        let response = self
-            .retry(command_id, |mut client| {
-                let request = request.clone();
-                async move { client.prepare_writer_format(request).await }
-            })
-            .await?
-            .into_inner();
-        serde_json::from_slice(&response.receipt_json)
-            .map_err(|err| Error::invalid(err.to_string()))
-    }
-
-    pub async fn activate_writer_format(
-        &mut self,
-        target: u16,
-        command_id: CommandId,
-    ) -> Result<crate::format_upgrade::FormatReceipt> {
-        let request = FormatChangeRequest {
-            command_id: command_id.to_hex(),
-            target: target.into(),
-        };
-        let response = self
-            .retry(command_id, |mut client| {
-                let request = request.clone();
-                async move { client.activate_writer_format(request).await }
-            })
-            .await?
-            .into_inner();
-        serde_json::from_slice(&response.receipt_json)
-            .map_err(|err| Error::invalid(err.to_string()))
-    }
-
     pub async fn connect(endpoint: &str, tls: &TlsMaterial) -> Result<Self> {
         crate::tls::install_provider();
         let channel = Channel::from_shared(endpoint.to_owned())

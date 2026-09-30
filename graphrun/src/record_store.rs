@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const FORMAT: &str = "graphrun.state-record/v2";
-pub(crate) const NEXT_FORMAT: &str = "graphrun.state-record/v3";
 pub(crate) const FRAGMENT_FORMAT: &str = "graphrun.record-fragments/v1";
 const NESTED_FIELDS: &[&str] = &["published_definitions", "start_keys"];
 const HISTORY_FIELDS: &[&str] = &["history", "history_records"];
@@ -35,7 +34,6 @@ const RUN_ACTIVATION_FIELDS: &[&str] = &[
     "interventions",
 ];
 const OMITTED_EMPTY_MAP_FIELDS: &[&str] = &[
-    "format_receipts",
     "command_actors",
     "command_external_ids",
     "authenticated_request_digests",
@@ -62,45 +60,6 @@ struct FragmentHeader {
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::FailedPrecondition, message.into())
-}
-
-fn supported_record(format: &str) -> bool {
-    matches!(format, FORMAT | NEXT_FORMAT)
-}
-
-pub(crate) fn record_format(bytes: &[u8]) -> Result<&'static str> {
-    if let Ok(header) = serde_json::from_slice::<FragmentHeader>(bytes)
-        && header.format == FRAGMENT_FORMAT
-    {
-        return Ok(FRAGMENT_FORMAT);
-    }
-    let record: VersionedRecord = serde_json::from_slice(bytes)
-        .map_err(|err| invalid(format!("corrupt state record inventory: {err}")))?;
-    if record.revision == 0 {
-        return Err(invalid("state record inventory has zero revision"));
-    }
-    match record.format.as_str() {
-        FORMAT => Ok(FORMAT),
-        NEXT_FORMAT => Ok(NEXT_FORMAT),
-        _ => Err(invalid(
-            "snapshot contains an unsupported state record version",
-        )),
-    }
-}
-
-pub(crate) fn for_writer(bytes: &[u8], writer: u16) -> Result<Vec<u8>> {
-    let mut record: VersionedRecord = serde_json::from_slice(bytes)
-        .map_err(|err| invalid(format!("cannot write malformed state record: {err}")))?;
-    if !supported_record(&record.format) || record.revision == 0 {
-        return Err(invalid("cannot write unsupported state record"));
-    }
-    record.format = match writer {
-        4 => FORMAT,
-        5 => NEXT_FORMAT,
-        _ => return Err(invalid("unsupported writer format")),
-    }
-    .to_owned();
-    serde_json::to_vec(&record).map_err(|err| Error::invalid(err.to_string()))
 }
 
 pub(crate) fn run_record_fields() -> impl Iterator<Item = &'static str> {
@@ -257,7 +216,7 @@ pub(crate) fn is_retired_marker(key: &str, bytes: &[u8], generation: u64) -> Res
     let run = RunId::from_hex(&decode_key(pieces[4])?).map_err(invalid)?;
     let record: VersionedRecord = serde_json::from_slice(bytes)
         .map_err(|err| invalid(format!("corrupt retired run marker: {err}")))?;
-    if !supported_record(&record.format)
+    if record.format != FORMAT
         || record.revision == 0
         || record.order.is_some()
         || record.value != Value::Bool(true)
@@ -385,7 +344,7 @@ pub(crate) fn decode_scalar(field: &str, bytes: &[u8]) -> Result<Value> {
     }
     let record: VersionedRecord = serde_json::from_slice(bytes)
         .map_err(|err| invalid(format!("corrupt {field} scalar: {err}")))?;
-    if !supported_record(&record.format) || record.revision == 0 {
+    if record.format != FORMAT || record.revision == 0 {
         return Err(invalid(format!("unsupported {field} scalar version")));
     }
     Ok(record.value)
@@ -396,10 +355,7 @@ pub(crate) fn same_value(left: &[u8], right: &[u8]) -> Result<bool> {
         .map_err(|err| invalid(format!("stored state record is corrupt: {err}")))?;
     let right: VersionedRecord = serde_json::from_slice(right)
         .map_err(|err| invalid(format!("new state record is corrupt: {err}")))?;
-    if !supported_record(&left.format)
-        || !supported_record(&right.format)
-        || left.revision == 0
-        || right.revision == 0
+    if left.format != FORMAT || right.format != FORMAT || left.revision == 0 || right.revision == 0
     {
         return Err(invalid("unsupported state record version"));
     }
@@ -526,13 +482,7 @@ pub(crate) fn encode(
     };
     let mut rows = BTreeMap::new();
     for (field, value) in fields {
-        if field == "format_policy" && state.format_policy == Default::default() {
-            continue;
-        }
-        if field == "format_policy" {
-            let key = record_key(generation, None, &field, "scalar", "", None);
-            insert(&mut rows, key, value, revision)?;
-        } else if HISTORY_FIELDS.contains(&field.as_str()) {
+        if HISTORY_FIELDS.contains(&field.as_str()) {
             let Value::Object(runs) = value else {
                 return Err(invalid(format!("{field} must be indexed by run")));
             };
@@ -865,7 +815,7 @@ pub(crate) fn encode_applied(
             .ok_or_else(|| invalid(format!("{field} order counter is missing")))?;
         let counter: VersionedRecord = serde_json::from_slice(counter)
             .map_err(|err| invalid(format!("invalid {field} order counter: {err}")))?;
-        if !supported_record(&counter.format) || counter.order.is_some() {
+        if counter.format != FORMAT || counter.order.is_some() {
             return Err(invalid(format!("unsupported {field} order counter")));
         }
         let mut next_order = counter
@@ -881,7 +831,7 @@ pub(crate) fn encode_applied(
             let order = if let Some(old) = previous.get(&key) {
                 let old: VersionedRecord = serde_json::from_slice(old)
                     .map_err(|err| invalid(format!("corrupt {field} entry: {err}")))?;
-                if !supported_record(&old.format) {
+                if old.format != FORMAT {
                     return Err(invalid(format!("unsupported {field} entry")));
                 }
                 old.order
@@ -994,7 +944,7 @@ pub(crate) fn decode(
         }
         let value: VersionedRecord = serde_json::from_slice(&bytes)
             .map_err(|err| invalid(format!("corrupt state record: {err}")))?;
-        if !supported_record(&value.format) || value.revision == 0 {
+        if value.format != FORMAT || value.revision == 0 {
             return Err(invalid("unsupported state record format or revision"));
         }
         let field = pieces[2];
@@ -1122,16 +1072,9 @@ pub(crate) fn decode(
                 })
                 .count()
     {
-        let missing = expected.keys().find(|key| !seen_keys.contains(*key));
-        let unexpected = seen_keys.iter().find(|key| {
-            let pieces: Vec<_> = key.split('/').collect();
-            pieces[2] != "retired_runs"
-                && !hidden_retired_row(key, &retired, &summarized)
-                && !expected.contains_key(*key)
-        });
-        return Err(invalid(format!(
-            "state record owner or identity does not match its value: missing={missing:?}, unexpected={unexpected:?}"
-        )));
+        return Err(invalid(
+            "state record owner or identity does not match its value",
+        ));
     }
     Ok(state)
 }
@@ -1303,32 +1246,6 @@ mod tests {
                 "{field} changed its retained identity"
             );
         }
-        let mut mixed = old.clone();
-        for field in ["inbox", "obligations"] {
-            let key = old
-                .keys()
-                .find(|key| key.contains(&format!("/run-{}/{}", retained.to_hex(), field)))
-                .unwrap();
-            mixed.insert(key.clone(), for_writer(&old[key], 5).unwrap());
-        }
-        let applied = encode_applied(
-            &state,
-            1,
-            3,
-            &BTreeSet::from([retained]),
-            &[],
-            None,
-            &BTreeSet::new(),
-            &mixed,
-            &BTreeMap::new(),
-        )
-        .unwrap()
-        .0;
-        assert!(
-            applied
-                .keys()
-                .any(|key| key.contains(&format!("/run-{}/inbox/list/", retained.to_hex())))
-        );
     }
 
     #[test]
@@ -1396,23 +1313,6 @@ mod tests {
         assert_eq!(
             decode(rows, 1).unwrap_err().kind,
             ErrorKind::FailedPrecondition
-        );
-    }
-
-    #[test]
-    fn mixed_record_versions_round_trip_without_rewriting_old_rows() {
-        let state = State::default();
-        let mut rows = encode(&state, 1, 1).unwrap();
-        let key = rows.keys().next().unwrap().clone();
-        let old = rows[&key].clone();
-        let next = for_writer(&old, 5).unwrap();
-        assert_eq!(record_format(&old).unwrap(), FORMAT);
-        assert_eq!(record_format(&next).unwrap(), NEXT_FORMAT);
-        assert!(same_value(&old, &next).unwrap());
-        rows.insert(key, next);
-        assert_eq!(
-            serde_json::to_value(decode(rows, 1).unwrap()).unwrap(),
-            serde_json::to_value(state).unwrap()
         );
     }
 

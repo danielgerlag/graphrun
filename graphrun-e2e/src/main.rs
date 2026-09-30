@@ -114,16 +114,6 @@ enum Commands {
         #[arg(long)]
         artifacts: PathBuf,
     },
-    ContractFormatProof {
-        #[arg(long)]
-        cli: PathBuf,
-        #[arg(long)]
-        artifacts: PathBuf,
-    },
-    DiagnoseFormatReport {
-        #[arg(long)]
-        report: PathBuf,
-    },
     Verify {
         #[arg(long)]
         cli: PathBuf,
@@ -213,73 +203,13 @@ struct CaseResult {
 struct RelatedBinary {
     role: String,
     path: String,
-    built_path: String,
-    target_dir: String,
     version: String,
     source_revision: String,
     sha256_before: String,
     sha256_after: String,
     build_log: String,
-    build_log_sha256: String,
     run_id: String,
 }
-
-#[derive(Deserialize)]
-struct FormatRolloutReport {
-    run_id: String,
-    status: String,
-    scope: String,
-    error: Option<String>,
-    duration_ms: u128,
-    binary_integrity: bool,
-    driver: FormatRolloutDriver,
-    binaries: Vec<FormatRolloutBinary>,
-    observations: Vec<FormatRolloutObservation>,
-    process_exits: Vec<FormatRolloutExit>,
-    member_stores: Vec<PathBuf>,
-    backup_manifest: PathBuf,
-    workflow_run_id: String,
-    preparation_command_id: String,
-    activation_command_id: String,
-}
-
-#[derive(Deserialize)]
-struct FormatRolloutBinary {
-    role: String,
-    source_revision: String,
-    version: String,
-    #[serde(flatten)]
-    executable: FormatRolloutDriver,
-}
-
-#[derive(Deserialize)]
-struct FormatRolloutDriver {
-    path: PathBuf,
-    sha256_before: String,
-    sha256_after: String,
-}
-
-#[derive(Deserialize)]
-struct FormatRolloutObservation {
-    step: String,
-    expected: String,
-    actual: serde_json::Value,
-    passed: bool,
-}
-
-#[derive(Deserialize)]
-struct FormatRolloutExit {
-    member_id: u64,
-    label: String,
-    pid: u32,
-    terminated: bool,
-    status: String,
-    log: PathBuf,
-    store: PathBuf,
-    snapshot_dir: PathBuf,
-}
-
-const CONTRACT_TWO_BRIDGE_SOURCE: &str = "c5d7458442a13df8e8b1deac7ce6444b24261bc5";
 
 #[derive(Serialize, Deserialize)]
 struct SampleBinaryEvidence {
@@ -380,10 +310,6 @@ fn main() -> ExitCode {
         Commands::ContractArtifactProof { cli, artifacts } => {
             focused_contract_artifact_proof(&cli, &artifacts)
         }
-        Commands::ContractFormatProof { cli, artifacts } => {
-            focused_contract_format_proof(&cli, &artifacts)
-        }
-        Commands::DiagnoseFormatReport { report } => diagnose_format_report(&report),
         Commands::Verify {
             cli,
             matrix,
@@ -579,108 +505,6 @@ fn focused_contract_artifact_proof(cli: &Path, artifacts: &Path) -> ExitCode {
     }
 }
 
-fn focused_contract_format_proof(cli: &Path, artifacts: &Path) -> ExitCode {
-    let result = (|| -> Result<CaseResult, String> {
-        fs::create_dir_all(artifacts).map_err(|err| err.to_string())?;
-        let run_dir = tempfile::Builder::new()
-            .prefix("run-")
-            .tempdir_in(artifacts)
-            .map_err(|err| err.to_string())?
-            .keep();
-        let row = parse_matrix(include_str!("../../docs/specs/v1/verification-matrix.tsv"))?
-            .into_iter()
-            .find(|row| row.id == "CONTRACT-002")
-            .ok_or("CONTRACT-002 missing from canonical matrix")?;
-        let mut context = RunContext::new(cli, &run_dir)?;
-        context.cli_version = binary_version(cli)?;
-        let mut case = enforce_case(
-            &row,
-            contract_format_rollout(cli, &run_dir, &row, &context),
-            &run_dir,
-        );
-        if case.status == "PASS" {
-            let driver = std::env::current_exe().map_err(|err| err.to_string())?;
-            if source_fingerprint(&run_dir)? != context.source_sha256
-                || hash_file(cli)? != context.cli_sha256
-                || hash_file(&driver)? != context.driver_sha256
-            {
-                case.status = "FAIL".to_owned();
-                case.actual = "source, CLI, or verifier changed during proof".to_owned();
-            }
-        }
-        let mut case = context.bind(case);
-        write_case(&run_dir, &case)?;
-        if case.status == "PASS"
-            && let Err(err) = validate_coverage(
-                std::slice::from_ref(&row),
-                std::slice::from_ref(&case),
-                &run_dir,
-                &context,
-            )
-        {
-            case.status = "FAIL".to_owned();
-            case.actual = format!("fresh proof coverage: {err}");
-            write_case(&run_dir, &case)?;
-        }
-        Ok(case)
-    })();
-    match result {
-        Ok(case) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&case).unwrap_or_default()
-            );
-            if case.status == "PASS" {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
-        }
-        Err(err) => {
-            eprintln!("CONTRACT-002 focused proof: {err}");
-            ExitCode::from(2)
-        }
-    }
-}
-
-fn diagnose_format_report(path: &Path) -> ExitCode {
-    let check = (|| -> Result<String, String> {
-        let saved = fs::canonicalize(path).map_err(|err| err.to_string())?;
-        let proof = saved.parent().ok_or("report has no proof directory")?;
-        let cwd = proof.parent().ok_or("report has no rollout directory")?;
-        let root = cwd.parent().ok_or("report has no fresh run directory")?;
-        let run_id = proof
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("report has no UTF-8 run ID")?;
-        let report: FormatRolloutReport =
-            serde_json::from_slice(&fs::read(&saved).map_err(|err| err.to_string())?)
-                .map_err(|err| err.to_string())?;
-        if report.run_id != run_id
-            || report.status != "PASS"
-            || report.error.is_some()
-            || !report.binary_integrity
-        {
-            return Err("saved rollout report has stale or failed identity".to_owned());
-        }
-        validate_format_rollout_observations(&report)?;
-        validate_format_rollout_files(&report, root, cwd)?;
-        Ok(report.run_id)
-    })();
-    match check {
-        Ok(run_id) => {
-            println!(
-                "diagnostic-only format report {run_id}: 19 steps and persisted files agree; not release certification"
-            );
-            ExitCode::SUCCESS
-        }
-        Err(err) => {
-            eprintln!("format report diagnostic failed: {err}");
-            ExitCode::from(1)
-        }
-    }
-}
-
 fn verify(cli: &Path, matrix: &Path, artifacts: &Path, strict: bool) -> ExitCode {
     if ACTIVE_CHILDREN.load(Ordering::SeqCst) != 0 {
         eprintln!("cannot start verification with owned child processes still active");
@@ -760,7 +584,7 @@ fn verify(cli: &Path, matrix: &Path, artifacts: &Path, strict: bool) -> ExitCode
                 "test evidence preflight",
                 "test suite evidence unavailable",
             ),
-            (None, Some(evidence)) => run_case(cli, &run_dir, evidence, row, &context),
+            (None, Some(evidence)) => run_case(cli, &run_dir, evidence, row),
         };
         let result = context.bind(enforce_case(row, result, &run_dir));
         if let Err(err) = write_case(&run_dir, &result) {
@@ -1038,10 +862,6 @@ fn validate_related_binaries(
     let cli = fs::canonicalize(&context.cli_path).map_err(|err| err.to_string())?;
     let old_path = fs::canonicalize(&old.path).map_err(|err| err.to_string())?;
     let current_path = fs::canonicalize(&current.path).map_err(|err| err.to_string())?;
-    let old_target = fs::canonicalize(&old.target_dir).map_err(|err| err.to_string())?;
-    let current_target = fs::canonicalize(&current.target_dir).map_err(|err| err.to_string())?;
-    let old_log = fs::canonicalize(&old.build_log).map_err(|err| err.to_string())?;
-    let current_log = fs::canonicalize(&current.build_log).map_err(|err| err.to_string())?;
     if !old_path.starts_with(&root)
         || current_path != cli
         || old_path == current_path
@@ -1055,19 +875,7 @@ fn validate_related_binaries(
                 .to_owned(),
         );
     }
-    if !old_target.starts_with(&root)
-        || !current_target.starts_with(&root)
-        || old_target.starts_with(&current_target)
-        || current_target.starts_with(&old_target)
-        || old_log == current_log
-    {
-        return Err(
-            "CONTRACT-002 requires distinct in-run Cargo target directories and build logs"
-                .to_owned(),
-        );
-    }
-    if old.source_revision != CONTRACT_TWO_BRIDGE_SOURCE
-        || current.source_revision != context.source_sha256
+    if current.source_revision != context.source_sha256
         || old.source_revision == current.source_revision
         || current.sha256_before != context.cli_sha256
         || old.sha256_before == current.sha256_before
@@ -1079,8 +887,6 @@ fn validate_related_binaries(
     }
     for binary in &result.related_binaries {
         let path = fs::canonicalize(&binary.path).map_err(|err| err.to_string())?;
-        let built_path = fs::canonicalize(&binary.built_path).map_err(|err| err.to_string())?;
-        let target_dir = fs::canonicalize(&binary.target_dir).map_err(|err| err.to_string())?;
         let build_log = fs::canonicalize(&binary.build_log).map_err(|err| err.to_string())?;
         let hash = hash_file(&path)?;
         let sha256 = |value: &str| {
@@ -1098,24 +904,11 @@ fn validate_related_binaries(
             || !sha256(&binary.sha256_before)
             || binary.sha256_before != binary.sha256_after
             || hash != binary.sha256_after
-            || !built_path.starts_with(&target_dir)
-            || (binary.role == "old_reader" && built_path != path)
-            || hash_file(&built_path)? != hash
-            || !result
-                .artifacts
-                .iter()
-                .any(|artifact| fs::canonicalize(artifact).is_ok_and(|saved| saved == built_path))
-            || !sha256(&binary.build_log_sha256)
-            || hash_file(&build_log)? != binary.build_log_sha256
             || !build_log.starts_with(&root)
             || !result
                 .artifacts
                 .iter()
                 .any(|artifact| fs::canonicalize(artifact).is_ok_and(|saved| saved == build_log))
-            || !fs::read_to_string(&build_log)
-                .map_err(|err| err.to_string())?
-                .lines()
-                .any(|line| line.contains("Compiling graphrun v"))
             || binary.version.is_empty()
         {
             return Err(format!(
@@ -1138,643 +931,6 @@ fn validate_related_binaries(
                 binary.role
             ));
         }
-    }
-    Ok(())
-}
-
-fn format_artifact(root: &Path, cwd: &Path, path: &Path) -> Result<PathBuf, String> {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-    let saved = fs::canonicalize(&path).map_err(|err| format!("{}: {err}", path.display()))?;
-    if !saved.starts_with(root) {
-        return Err(format!(
-            "CONTRACT-002 artifact {} is outside this run",
-            path.display()
-        ));
-    }
-    Ok(saved)
-}
-
-fn validate_format_rollout_report(
-    result: &CaseResult,
-    run_dir: &Path,
-    context: &RunContext,
-) -> Result<(), String> {
-    let root = fs::canonicalize(run_dir).map_err(|err| err.to_string())?;
-    let cwd = run_dir.join("CONTRACT-002-rollout");
-    let report_path = Path::new(&context.run_id).join("report.json");
-    let saved = format_artifact(&root, &cwd, &report_path)?;
-    if !result
-        .artifacts
-        .iter()
-        .any(|artifact| fs::canonicalize(artifact).is_ok_and(|path| path == saved))
-    {
-        return Err("CONTRACT-002 lacks its fresh rollout report artifact".to_owned());
-    }
-    let report: FormatRolloutReport = serde_json::from_slice(
-        &fs::read(&saved).map_err(|err| format!("{}: {err}", saved.display()))?,
-    )
-    .map_err(|err| format!("CONTRACT-002 rollout report: {err}"))?;
-    if report.run_id != context.run_id
-        || report.status != "PASS"
-        || report.scope != "focused production mixed-binary smoke, not matrix CONTRACT-002"
-        || report.error.is_some()
-        || !report.binary_integrity
-        || report.duration_ms == 0
-    {
-        return Err("CONTRACT-002 rollout has stale, incomplete, or failed status".to_owned());
-    }
-    for id in [
-        &report.workflow_run_id,
-        &report.preparation_command_id,
-        &report.activation_command_id,
-    ] {
-        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(format!(
-                "CONTRACT-002 has invalid workflow or command identity {id}"
-            ));
-        }
-    }
-    if report.preparation_command_id == report.activation_command_id {
-        return Err("CONTRACT-002 prepare and activation reused a command ID".to_owned());
-    }
-    let old = &result.related_binaries[0];
-    let current = &result.related_binaries[1];
-    if old.role != "old_reader" || current.role != "current_release" {
-        return Err("CONTRACT-002 related binaries must be ordered old then current".to_owned());
-    }
-    let fixture_target =
-        fs::canonicalize(cwd.join("current-target")).map_err(|err| err.to_string())?;
-    let cli_target = fs::canonicalize(&current.target_dir).map_err(|err| err.to_string())?;
-    let bridge_target = fs::canonicalize(&old.target_dir).map_err(|err| err.to_string())?;
-    let fixture_log =
-        fs::canonicalize(cwd.join("current-build.log")).map_err(|err| err.to_string())?;
-    if !fixture_target.starts_with(&root)
-        || fixture_target.starts_with(&cli_target)
-        || cli_target.starts_with(&fixture_target)
-        || fixture_target.starts_with(&bridge_target)
-        || bridge_target.starts_with(&fixture_target)
-        || !result
-            .artifacts
-            .iter()
-            .any(|artifact| fs::canonicalize(artifact).is_ok_and(|path| path == fixture_log))
-        || !fs::read_to_string(&fixture_log)
-            .map_err(|err| err.to_string())?
-            .contains("Compiling graphrun v")
-    {
-        return Err("CONTRACT-002 fixture and CLI require separate fresh source builds".to_owned());
-    }
-    let mut roles = HashSet::new();
-    let writer_fixture = fixture_target
-        .join("release")
-        .join(format!("graphrun-e2e{}", std::env::consts::EXE_SUFFIX));
-    let rollout_driver = fixture_target.join("release").join(format!(
-        "graphrun-format-rollout{}",
-        std::env::consts::EXE_SUFFIX
-    ));
-    for binary in &report.binaries {
-        if !roles.insert(binary.role.as_str()) {
-            return Err(format!(
-                "CONTRACT-002 duplicate rollout binary {}",
-                binary.role
-            ));
-        }
-        let (expected_path, expected_source, expected_hash, expected_version) =
-            match binary.role.as_str() {
-                "old_reader" => (
-                    Path::new(&old.path),
-                    old.source_revision.as_str(),
-                    old.sha256_after.as_str(),
-                    old.version.as_str(),
-                ),
-                "current_release" => (
-                    writer_fixture.as_path(),
-                    context.source_sha256.as_str(),
-                    binary.executable.sha256_after.as_str(),
-                    binary.version.as_str(),
-                ),
-                "cli" => (
-                    Path::new(&current.built_path),
-                    context.source_sha256.as_str(),
-                    context.cli_sha256.as_str(),
-                    context.cli_version.as_str(),
-                ),
-                _ => {
-                    return Err(format!(
-                        "CONTRACT-002 unexpected rollout binary {}",
-                        binary.role
-                    ));
-                }
-            };
-        let path = format_artifact(&root, &cwd, &binary.executable.path)?;
-        if path != fs::canonicalize(expected_path).map_err(|err| err.to_string())?
-            || !result
-                .artifacts
-                .iter()
-                .any(|artifact| fs::canonicalize(artifact).is_ok_and(|saved| saved == path))
-            || binary.source_revision != expected_source
-            || binary.version != expected_version
-            || binary.executable.sha256_before != expected_hash
-            || binary.executable.sha256_after != expected_hash
-            || hash_file(&path)? != expected_hash
-            || (binary.role == "current_release" && expected_hash == old.sha256_after)
-        {
-            return Err(format!(
-                "CONTRACT-002 {} source or binary hash differs",
-                binary.role
-            ));
-        }
-    }
-    if roles != HashSet::from(["old_reader", "current_release", "cli"]) {
-        return Err("CONTRACT-002 requires bridge, writer fixture, and release CLI".to_owned());
-    }
-    let driver = format_artifact(&root, &cwd, &report.driver.path)?;
-    if driver != fs::canonicalize(rollout_driver).map_err(|err| err.to_string())?
-        || report.driver.sha256_before != report.driver.sha256_after
-        || hash_file(&driver)? != report.driver.sha256_after
-        || !result
-            .artifacts
-            .iter()
-            .any(|artifact| fs::canonicalize(artifact).is_ok_and(|saved| saved == driver))
-    {
-        return Err("CONTRACT-002 rollout driver binary changed during proof".to_owned());
-    }
-    validate_format_rollout_observations(&report)?;
-    validate_format_rollout_files(&report, &root, &cwd)?;
-    Ok(())
-}
-
-fn validate_format_rollout_observations(report: &FormatRolloutReport) -> Result<(), String> {
-    const STEPS: [&str; 19] = [
-        "retained pre-activation wait",
-        "reader-first preparation",
-        "complete roster",
-        "old writer cannot activate",
-        "mixed writer followers",
-        "committed writer activation",
-        "old reader applies new policy",
-        "new-format workflow progress",
-        "old reader applies v3 inbox update",
-        "retained event projection",
-        "retained history page",
-        "versioned history reconstruction",
-        "backup reader versions",
-        "v5 framed snapshot file",
-        "v5 snapshot registry and readers",
-        "old binary restart fenced",
-        "member 1 retained format",
-        "member 2 retained format",
-        "member 3 retained format",
-    ];
-    let mut values = HashMap::new();
-    for observation in &report.observations {
-        if !observation.passed
-            || observation.expected.is_empty()
-            || observation.actual.is_null()
-            || values
-                .insert(observation.step.as_str(), &observation.actual)
-                .is_some()
-        {
-            return Err(format!(
-                "CONTRACT-002 missing or repeated successful observation {}",
-                observation.step
-            ));
-        }
-    }
-    if values.len() != STEPS.len() || STEPS.iter().any(|step| !values.contains_key(step)) {
-        return Err("CONTRACT-002 lacks a required mixed-version rollout step".to_owned());
-    }
-    let observed = |step: &str| -> &serde_json::Value { values[step] };
-    let wait = observed("retained pre-activation wait");
-    let prepare = observed("reader-first preparation");
-    let roster = observed("complete roster");
-    let activation = observed("committed writer activation");
-    let before_index = prepare["applied_log_id"]["index"]
-        .as_u64()
-        .ok_or("CONTRACT-002 prepare has no committed log index")?;
-    let active_index = activation["applied_log_id"]["index"]
-        .as_u64()
-        .ok_or("CONTRACT-002 activation has no committed log index")?;
-    if wait["run"] != report.workflow_run_id
-        || wait["status"] != "started"
-        || prepare["applied"] != true
-        || prepare["active_writer"] != 4
-        || prepare["command_id"] != report.preparation_command_id
-        || before_index == 0
-        || roster["writer_format"] != 4
-        || roster["quorum"] != true
-        || !roster["activation_log_id"].is_null()
-        || roster["joint_voters"] != serde_json::json!([[1, 2, 3]])
-        || activation["applied"] != true
-        || activation["active_writer"] != 5
-        || activation["command_id"] != report.activation_command_id
-        || active_index <= before_index
-        || activation["cluster_id"] != prepare["cluster_id"]
-        || !observed("old writer cannot activate")["result"]["Err"]
-            .as_str()
-            .is_some_and(|error| error.contains("FailedPrecondition"))
-    {
-        return Err(
-            "CONTRACT-002 reader-first preparation or writer activation is invalid".to_owned(),
-        );
-    }
-    let prepared = roster["prepared"]
-        .as_object()
-        .ok_or("CONTRACT-002 has no committed three-member reader roster")?;
-    if prepared.len() != 3
-        || ["1", "2", "3"].iter().any(|id| {
-            let proof = &prepared[*id];
-            proof["reader_floor"].as_u64().is_none_or(|floor| floor < 5)
-                || proof["command_readers"] != serde_json::json!([4, 5])
-                || proof["state_records"]
-                    != serde_json::json!(["graphrun.state-record/v2", "graphrun.state-record/v3"])
-        })
-    {
-        return Err("CONTRACT-002 reader roster lacks a v4/v5 and v2/v3 proof".to_owned());
-    }
-    for (step, minimum_index, wait_still_pending) in [
-        ("mixed writer followers", before_index, true),
-        ("old reader applies new policy", active_index, true),
-        (
-            "old reader applies v3 inbox update",
-            active_index + 1,
-            false,
-        ),
-    ] {
-        let health = observed(step);
-        if health["state"] != "Follower"
-            || health["last_applied"]
-                .as_u64()
-                .is_none_or(|index| index < minimum_index)
-            || (wait_still_pending && health["pending_waits"] != 1)
-        {
-            return Err(format!(
-                "CONTRACT-002 old reader did not catch up at {step}"
-            ));
-        }
-    }
-    let old_update = observed("old reader applies v3 inbox update");
-    if observed("new-format workflow progress")["status"] != "ok"
-        || old_update["inbox_depth"].as_u64().is_none()
-        || old_update["pending_waits"].as_u64().is_none()
-        || old_update["last_log"]
-            .as_u64()
-            .zip(old_update["last_applied"].as_u64())
-            .is_none_or(|(end, applied)| end < applied)
-    {
-        return Err("CONTRACT-002 post-v5 signal did not reach the old inbox".to_owned());
-    }
-    let projection = observed("retained event projection");
-    let replay = observed("versioned history reconstruction");
-    if projection["run"] != report.workflow_run_id
-        || projection["status"] != "succeeded"
-        || projection["output"] != serde_json::json!({"approved": true})
-        || projection["open_scopes"] != 0
-        || projection["pending_waits"] != serde_json::json!([])
-        || !projection["error"].is_null()
-        || replay["run"] != projection["run"]
-        || replay["status"] != projection["status"]
-        || replay["output"] != projection["output"]
-        || replay["event_count"] != projection["event_count"]
-    {
-        return Err("CONTRACT-002 retained run and read-only replay disagree".to_owned());
-    }
-    let page = observed("retained history page");
-    let events = page["events"]
-        .as_array()
-        .ok_or("CONTRACT-002 has no retained history page")?;
-    if page["run"] != report.workflow_run_id
-        || page["unavailable"] != false
-        || page["retained_from"] != 1
-        || page["retained_through"] != events.len()
-        || events.len() < 15
-        || projection["event_count"] != events.len()
-        || events.iter().enumerate().any(|(n, event)| {
-            event["sequence"] != n + 1
-                || event["format"] != "graphrun.run-event/v1"
-                || event["run"] != report.workflow_run_id
-        })
-        || ![
-            "wait_opened",
-            "event_accepted",
-            "wait_satisfied",
-            "run_succeeded",
-        ]
-        .iter()
-        .all(|kind| events.iter().any(|event| event["event"]["kind"] == *kind))
-    {
-        return Err("CONTRACT-002 lost an ordered pre/post-activation event".to_owned());
-    }
-    let checkpoint = observed("backup reader versions");
-    if checkpoint["writer"] != 5
-        || checkpoint["history"] != 1
-        || checkpoint["checkpoints"] != 1
-        || checkpoint["checkpoint_format"] != "graphrun.run-checkpoint/v2"
-        || checkpoint["checkpoint_through"] != page["retained_through"]
-    {
-        return Err("CONTRACT-002 backup lost its retained v2 checkpoint".to_owned());
-    }
-    for step in [
-        "member 1 retained format",
-        "member 2 retained format",
-        "member 3 retained format",
-    ] {
-        if observed(step)["writer"] != 5 || observed(step)["history"] != 1 {
-            return Err(format!("CONTRACT-002 {step} lacks retained v5 history"));
-        }
-    }
-    let fenced = observed("old binary restart fenced");
-    if fenced["status"] != "exit status: 2"
-        || !fenced["log"].as_str().is_some_and(|log| {
-            log.contains("binary writer capability 4 is below committed writer format 5")
-        })
-    {
-        return Err("CONTRACT-002 old writer reopened a v5 store".to_owned());
-    }
-    Ok(())
-}
-
-fn framed_snapshot_digest(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    let footer_start = bytes
-        .len()
-        .checked_sub(32)
-        .ok_or("CONTRACT-002 snapshot is shorter than its checksum footer")?;
-    let (body, footer) = bytes.split_at(footer_start);
-    if Sha256::digest(body).as_slice() != footer {
-        return Err("CONTRACT-002 snapshot checksum footer does not match its bytes".to_owned());
-    }
-    Ok(hex::encode(footer))
-}
-
-fn validate_member_snapshot_location(
-    root: &Path,
-    cwd: &Path,
-    member_id: u64,
-    publisher: u64,
-    store: &Path,
-    location: &Path,
-) -> Result<(), String> {
-    let path = if location.is_absolute() {
-        location.to_path_buf()
-    } else {
-        cwd.join(location)
-    };
-    let parent = fs::canonicalize(
-        path.parent()
-            .ok_or("CONTRACT-002 snapshot directory has no member")?,
-    )
-    .map_err(|err| err.to_string())?;
-    if parent != store.parent().ok_or("CONTRACT-002 store has no member")?
-        || path.file_name().is_none_or(|name| name != "snapshots")
-    {
-        return Err("CONTRACT-002 snapshot directory does not belong to its member".to_owned());
-    }
-    match fs::symlink_metadata(&path) {
-        Ok(_) if format_artifact(root, cwd, location)?.is_dir() => Ok(()),
-        Ok(_) => Err("CONTRACT-002 snapshot path is not a directory".to_owned()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound && member_id != publisher => Ok(()),
-        Err(err) => Err(format!(
-            "CONTRACT-002 member {member_id} snapshot directory: {err}"
-        )),
-    }
-}
-
-fn snapshot_publisher(
-    registry: &serde_json::Value,
-    snapshot: &Path,
-    stores: &HashMap<u64, PathBuf>,
-) -> Result<u64, String> {
-    let member = registry["member"]
-        .as_u64()
-        .filter(|member| stores.contains_key(member))
-        .ok_or("CONTRACT-002 snapshot publisher is outside the committed roster")?;
-    let expected_dir = stores[&member]
-        .parent()
-        .ok_or("CONTRACT-002 publisher has no store directory")?
-        .join("snapshots");
-    if snapshot.parent() != Some(expected_dir.as_path()) {
-        return Err("CONTRACT-002 snapshot file is not owned by the publishing member".to_owned());
-    }
-    Ok(member)
-}
-
-fn validate_format_rollout_files(
-    report: &FormatRolloutReport,
-    root: &Path,
-    cwd: &Path,
-) -> Result<(), String> {
-    let manifest = format_artifact(root, cwd, &report.backup_manifest)?;
-    let _: serde_json::Value = serde_json::from_slice(
-        &fs::read(&manifest).map_err(|err| format!("backup manifest: {err}"))?,
-    )
-    .map_err(|err| format!("CONTRACT-002 backup manifest: {err}"))?;
-    let manifest_hash = hash_file(&manifest)?;
-    let backup = graphrun::Engine::read_backup(
-        manifest
-            .parent()
-            .ok_or("CONTRACT-002 backup manifest has no directory")?,
-    )
-    .map_err(|err| format!("CONTRACT-002 read-only backup validation: {err}"))?;
-    let run = graphrun::RunId::from_hex(&report.workflow_run_id)
-        .map_err(|err| format!("CONTRACT-002 invalid retained run: {err}"))?;
-    let expected_output = graphrun::Value::Object(
-        [("approved".to_owned(), graphrun::Value::Bool(true))]
-            .into_iter()
-            .collect(),
-    );
-    if !matches!(
-        backup.runs.get(&run).map(|run| &run.status),
-        Some(graphrun::domain::RunStatus::Succeeded { output }) if output == &expected_output
-    ) || backup
-        .history
-        .get(&run)
-        .is_none_or(|events| events.len() < 15)
-        || backup
-            .history_records
-            .get(&run)
-            .is_none_or(|entries| entries.len() < 15)
-        || backup.checkpoints.get(&run).is_none_or(|checkpoint| {
-            checkpoint.format != "graphrun.run-checkpoint/v2"
-                || checkpoint.through_run_sequence != 15
-                || !matches!(
-                    checkpoint.projection.runs.get(&run).map(|run| &run.status),
-                    Some(graphrun::domain::RunStatus::Succeeded { output }) if output == &expected_output
-                )
-        })
-        || hash_file(&manifest)? != manifest_hash
-    {
-        return Err("CONTRACT-002 backup lost the pre-v5 run or changed during read".to_owned());
-    }
-    if report.member_stores.len() != 3 {
-        return Err("CONTRACT-002 requires three member stores".to_owned());
-    }
-    let mut stores = HashMap::new();
-    for (n, store) in report.member_stores.iter().enumerate() {
-        let path = format_artifact(root, cwd, store)?;
-        if !path.ends_with(Path::new(&format!("m{}", n + 1)).join("member.redb"))
-            || fs::metadata(&path).map_err(|err| err.to_string())?.len() == 0
-        {
-            return Err(format!(
-                "CONTRACT-002 member {} has no durable store",
-                n + 1
-            ));
-        }
-        stores.insert((n + 1) as u64, path);
-    }
-    let page = report
-        .observations
-        .iter()
-        .find(|observation| observation.step == "retained history page")
-        .ok_or("CONTRACT-002 has no retained signal history")?;
-    let accepted = page.actual["events"]
-        .as_array()
-        .and_then(|events| {
-            events.iter().find(|entry| {
-                entry["event"]["kind"] == "event_accepted"
-                    && entry["event"]["signal"] == "approval"
-                    && entry["event"]["key"] == "format-rollout"
-                    && entry["event"]["payload"] == serde_json::json!({"approved": true})
-            })
-        })
-        .and_then(|entry| entry["event"]["event_id"].as_str())
-        .ok_or("CONTRACT-002 history has no exact post-v5 signal identity")?;
-    let event_id = graphrun::EventId::from_hex(accepted)
-        .map_err(|err| format!("CONTRACT-002 invalid accepted event ID: {err}"))?;
-    for (member_id, store) in &stores {
-        let state = graphrun::engine::replay(
-            store
-                .parent()
-                .ok_or("CONTRACT-002 member store has no directory")?,
-        )
-        .map_err(|err| format!("CONTRACT-002 member {member_id} read-only replay: {err}"))?;
-        if state.history.get(&run).is_none_or(|events| {
-            !events.iter().any(|event| {
-                matches!(
-                    event,
-                    graphrun::domain::DomainEvent::EventAccepted {
-                        run: owner,
-                        event_id: accepted_id,
-                        signal,
-                        key,
-                        payload,
-                        ..
-                    } if *owner == run
-                        && *accepted_id == event_id
-                        && signal == "approval"
-                        && key == "format-rollout"
-                        && payload == &expected_output
-                )
-            })
-        }) {
-            return Err(format!(
-                "CONTRACT-002 member {member_id} did not durably apply the exact v5 signal"
-            ));
-        }
-    }
-    let snapshot = report
-        .observations
-        .iter()
-        .find(|observation| observation.step == "v5 framed snapshot file")
-        .ok_or("CONTRACT-002 lacks a v5 snapshot observation")?;
-    let snapshot_path = snapshot.actual["file"]
-        .as_str()
-        .ok_or("CONTRACT-002 snapshot has no file path")?;
-    let snapshot_path = format_artifact(root, cwd, Path::new(snapshot_path))?;
-    let registry = report
-        .observations
-        .iter()
-        .find(|observation| observation.step == "v5 snapshot registry and readers")
-        .ok_or("CONTRACT-002 lacks a v5 snapshot registry")?;
-    let actual = &registry.actual;
-    let publisher = snapshot_publisher(actual, &snapshot_path, &stores)?;
-    let registered_path = actual["snapshot_path"]
-        .as_str()
-        .ok_or("CONTRACT-002 registry has no snapshot path")?;
-    if format_artifact(root, cwd, Path::new(registered_path))? != snapshot_path
-        || actual["store_format"] != "graphrun.member-store/v5"
-        || actual["writer_format"] != 5
-        || actual["framing_version"] != 1
-        || actual["record_count"]
-            .as_u64()
-            .is_none_or(|count| count < 90)
-        || actual["registry"]["meta"]["last_log_id"]["index"]
-            .as_u64()
-            .is_none_or(|index| index < 14)
-        || actual["registry"]["file_name"]
-            != snapshot_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or("CONTRACT-002 snapshot has no filename")?
-        || actual["registry"]["sha256"] != framed_snapshot_digest(&snapshot_path)?
-        || ![
-            "graphrun.state-record/v2",
-            "graphrun.state-record/v3",
-            "graphrun.run-event/v1",
-        ]
-        .iter()
-        .all(|format| {
-            actual["record_formats"]
-                .as_array()
-                .is_some_and(|formats| formats.iter().any(|entry| entry == format))
-        })
-    {
-        return Err("CONTRACT-002 snapshot file, registry, or reader versions disagree".to_owned());
-    }
-    let expected = [
-        ("writer", 2, "exit status: 0"),
-        ("writer", 3, "exit status: 0"),
-        ("bridge", 1, "exit status: 0"),
-        ("bridge-return", 1, "exit status: 0"),
-        ("rejected-restart", 1, "exit status: 2"),
-    ];
-    let mut pids = HashSet::new();
-    let mut exits = HashSet::new();
-    if report.process_exits.len() != expected.len() {
-        return Err("CONTRACT-002 has incomplete process exit evidence".to_owned());
-    }
-    for exit in &report.process_exits {
-        let store = format_artifact(root, cwd, &exit.store)?;
-        if exit.pid == 0
-            || !pids.insert(exit.pid)
-            || !exits.insert((exit.label.as_str(), exit.member_id))
-            || exit.terminated
-            || !expected.iter().any(|(label, id, status)| {
-                exit.label == *label && exit.member_id == *id && exit.status == *status
-            })
-            || stores.get(&exit.member_id) != Some(&store)
-        {
-            return Err(format!("CONTRACT-002 invalid {} process exit", exit.label));
-        }
-        validate_member_snapshot_location(
-            root,
-            cwd,
-            exit.member_id,
-            publisher,
-            &store,
-            &exit.snapshot_dir,
-        )?;
-        let log = format_artifact(root, cwd, &exit.log)?;
-        let text = fs::read_to_string(&log).map_err(|err| err.to_string())?;
-        if exit.label == "rejected-restart"
-            && !text.contains("binary writer capability 4 is below committed writer format 5")
-        {
-            return Err(format!(
-                "CONTRACT-002 {} process log is incomplete",
-                exit.label
-            ));
-        }
-    }
-    if exits
-        != expected
-            .iter()
-            .map(|(label, id, _)| (*label, *id))
-            .collect()
-    {
-        return Err("CONTRACT-002 lacks an expected member process exit".to_owned());
     }
     Ok(())
 }
@@ -1882,7 +1038,6 @@ fn validate_coverage(
         if result.id == "CONTRACT-002" {
             if result.status == "PASS" {
                 validate_related_binaries(result, run_dir, context)?;
-                validate_format_rollout_report(result, run_dir, context)?;
             }
         } else if !result.related_binaries.is_empty() {
             return Err(format!(
@@ -2230,13 +1385,7 @@ fn collect_evidence(run_dir: &Path) -> Result<Evidence, String> {
     })
 }
 
-fn run_case(
-    cli: &Path,
-    artifacts: &Path,
-    evidence: &Evidence,
-    row: &MatrixRow,
-    context: &RunContext,
-) -> CaseResult {
+fn run_case(cli: &Path, artifacts: &Path, evidence: &Evidence, row: &MatrixRow) -> CaseResult {
     let started = Instant::now();
     let result = match row.id.as_str() {
         "DSL-001" => yaml_validate_all(cli, artifacts, row),
@@ -2926,7 +2075,11 @@ fn run_case(
                 ),
             ],
         ),
-        "CONTRACT-002" => contract_format_rollout(cli, artifacts, row, context),
+        "CONTRACT-002" => fail(
+            row,
+            "contract acceptance",
+            "normative contract defined; runtime acceptance not implemented yet",
+        ),
         _ => fail(row, "unimplemented", "no implementation evidence yet"),
     };
     CaseResult {
@@ -7651,276 +6804,6 @@ fn contract_artifact_proof(cli: &Path, artifacts: &Path, row: &MatrixRow) -> Cas
     case
 }
 
-fn build_format_release(
-    source: &Path,
-    target: &Path,
-    log: &Path,
-    args: &[&str],
-) -> Result<(), String> {
-    let output = Command::new("cargo")
-        .args(["build", "--release", "--locked", "--color", "never"])
-        .args(args)
-        .current_dir(source)
-        .env("CARGO_TARGET_DIR", target)
-        .output()
-        .map_err(|err| format!("cannot build {}: {err}", source.display()))?;
-    let mut saved = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .map_err(|err| format!("{}: {err}", log.display()))?;
-    saved
-        .write_all(&output.stdout)
-        .and_then(|()| saved.write_all(&output.stderr))
-        .map_err(|err| format!("{}: {err}", log.display()))?;
-    if !output.status.success() {
-        return Err(format!(
-            "release build {:?} exited {}; see {}",
-            args,
-            output.status,
-            log.display()
-        ));
-    }
-    Ok(())
-}
-
-fn binary_version(path: &Path) -> Result<String, String> {
-    let output = Command::new(path)
-        .arg("--version")
-        .output()
-        .map_err(|err| format!("{} --version: {err}", path.display()))?;
-    if !output.status.success() {
-        return Err(format!(
-            "{} --version exited {}",
-            path.display(),
-            output.status
-        ));
-    }
-    let version = String::from_utf8(output.stdout).map_err(|err| err.to_string())?;
-    if version.trim().is_empty() {
-        return Err(format!("{} has no version identifier", path.display()));
-    }
-    Ok(version.trim().to_owned())
-}
-
-fn contract_format_rollout(
-    cli: &Path,
-    artifacts: &Path,
-    row: &MatrixRow,
-    context: &RunContext,
-) -> CaseResult {
-    let started = Instant::now();
-    let root = match fs::canonicalize(artifacts) {
-        Ok(root) => root,
-        Err(err) => return fail(row, "fresh rollout artifacts", err.to_string()),
-    };
-    let cwd = root.join("CONTRACT-002-rollout");
-    if let Err(err) = fs::create_dir(&cwd) {
-        return fail(
-            row,
-            "fresh rollout artifacts",
-            format!("{}: {err}", cwd.display()),
-        );
-    }
-    let attempt = (|| -> Result<CaseResult, String> {
-        let ancestry = Command::new("git")
-            .args([
-                "merge-base",
-                "--is-ancestor",
-                CONTRACT_TWO_BRIDGE_SOURCE,
-                "HEAD",
-            ])
-            .output()
-            .map_err(|err| format!("cannot check pinned bridge ancestry: {err}"))?;
-        if !ancestry.status.success() {
-            return Err(format!(
-                "pinned bridge {} is not an ancestor of this source: {}",
-                CONTRACT_TWO_BRIDGE_SOURCE,
-                String::from_utf8_lossy(&ancestry.stderr)
-            ));
-        }
-        let archive = cwd.join("bridge-source.tar");
-        let output = Command::new("git")
-            .args(["archive", "--format=tar"])
-            .arg(format!("--output={}", archive.display()))
-            .arg(CONTRACT_TWO_BRIDGE_SOURCE)
-            .output()
-            .map_err(|err| format!("cannot archive pinned bridge source: {err}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "pinned bridge archive failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        let archive_sha256 = hash_file(&archive)?;
-        let bridge_source = cwd.join("bridge-source");
-        fs::create_dir(&bridge_source).map_err(|err| err.to_string())?;
-        let extraction = Command::new("tar")
-            .arg("-xf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&bridge_source)
-            .output()
-            .map_err(|err| format!("cannot extract pinned bridge source: {err}"))?;
-        if !extraction.status.success() {
-            return Err(format!(
-                "pinned bridge source extraction failed: {}",
-                String::from_utf8_lossy(&extraction.stderr)
-            ));
-        }
-        let current_source = std::env::current_dir().map_err(|err| err.to_string())?;
-        let old_target = cwd.join("bridge-target");
-        let current_target = cwd.join("current-target");
-        let cli_target = cwd.join("cli-target");
-        let old_log = cwd.join("bridge-build.log");
-        let current_log = cwd.join("current-build.log");
-        let cli_log = cwd.join("cli-build.log");
-        build_format_release(
-            &bridge_source,
-            &old_target,
-            &old_log,
-            &["-p", "graphrun-e2e", "--bin", "graphrun-e2e"],
-        )?;
-        build_format_release(
-            &current_source,
-            &current_target,
-            &current_log,
-            &[
-                "-p",
-                "graphrun-e2e",
-                "--bin",
-                "graphrun-e2e",
-                "--bin",
-                "graphrun-format-rollout",
-            ],
-        )?;
-        build_format_release(
-            &current_source,
-            &cli_target,
-            &cli_log,
-            &["-p", "graphrun-cli", "--bin", "graphrun"],
-        )?;
-        let release = |target: &Path, bin: &str| {
-            target
-                .join("release")
-                .join(format!("{bin}{}", std::env::consts::EXE_SUFFIX))
-        };
-        let bridge = release(&old_target, "graphrun-e2e");
-        let writer = release(&current_target, "graphrun-e2e");
-        let built_cli = release(&cli_target, "graphrun");
-        let driver = release(&current_target, "graphrun-format-rollout");
-        let old_hash = hash_file(&bridge)?;
-        let writer_hash = hash_file(&writer)?;
-        let current_hash = hash_file(&built_cli)?;
-        if old_hash == writer_hash || current_hash != context.cli_sha256 {
-            return Err(format!(
-                "distinct release builds do not match source: old={old_hash} writer={writer_hash} cli={current_hash} supplied={}",
-                context.cli_sha256
-            ));
-        }
-        let old_version = binary_version(&bridge)?;
-        let current_version = binary_version(&built_cli)?;
-        if current_version != context.cli_version {
-            return Err(format!(
-                "fresh release CLI version {current_version} differs from supplied {}",
-                context.cli_version
-            ));
-        }
-        let output = Command::new(&driver)
-            .args(["--bridge"])
-            .arg(&bridge)
-            .arg("--writer")
-            .arg(&writer)
-            .arg("--cli")
-            .arg(&built_cli)
-            .args(["--bridge-source", CONTRACT_TWO_BRIDGE_SOURCE])
-            .args(["--writer-source", &context.source_sha256])
-            .args(["--artifacts", ".", "--run-id", &context.run_id])
-            .current_dir(&cwd)
-            .output()
-            .map_err(|err| format!("cannot run mixed-binary proof: {err}"))?;
-        let proof_log = cwd.join("rollout.log");
-        fs::write(
-            &proof_log,
-            [output.stdout.as_slice(), output.stderr.as_slice()].concat(),
-        )
-        .map_err(|err| format!("{}: {err}", proof_log.display()))?;
-        if !output.status.success() {
-            return Err(format!(
-                "mixed-binary rollout exited {}; see {}",
-                output.status,
-                proof_log.display()
-            ));
-        }
-        let report = cwd.join(&context.run_id).join("report.json");
-        let mut case = context.bind(finish(
-            row,
-            "PASS",
-            "git archive pinned bridge; separate locked release builds; real three-voter format rollout",
-            format!(
-                "bridge={CONTRACT_TWO_BRIDGE_SOURCE} archive_sha256={archive_sha256} old={old_hash} writer={writer_hash} cli={current_hash}; report={}",
-                report.display()
-            ),
-            vec![
-                cwd.clone(),
-                archive,
-                old_log.clone(),
-                current_log.clone(),
-                cli_log.clone(),
-                bridge.clone(),
-                writer,
-                built_cli.clone(),
-                driver,
-                proof_log,
-                report,
-            ],
-        ));
-        case.related_binaries = vec![
-            RelatedBinary {
-                role: "old_reader".to_owned(),
-                path: bridge.display().to_string(),
-                built_path: bridge.display().to_string(),
-                target_dir: old_target.display().to_string(),
-                version: old_version,
-                source_revision: CONTRACT_TWO_BRIDGE_SOURCE.to_owned(),
-                sha256_before: old_hash.clone(),
-                sha256_after: hash_file(&bridge)?,
-                build_log: old_log.display().to_string(),
-                build_log_sha256: hash_file(&old_log)?,
-                run_id: context.run_id.clone(),
-            },
-            RelatedBinary {
-                role: "current_release".to_owned(),
-                path: cli.display().to_string(),
-                built_path: built_cli.display().to_string(),
-                target_dir: cli_target.display().to_string(),
-                version: current_version,
-                source_revision: context.source_sha256.clone(),
-                sha256_before: context.cli_sha256.clone(),
-                sha256_after: hash_file(cli)?,
-                build_log: cli_log.display().to_string(),
-                build_log_sha256: hash_file(&cli_log)?,
-                run_id: context.run_id.clone(),
-            },
-        ];
-        validate_related_binaries(&case, &root, context)?;
-        validate_format_rollout_report(&case, &root, context)?;
-        Ok(case)
-    })();
-    let mut case = match attempt {
-        Ok(case) => case,
-        Err(err) => finish(
-            row,
-            "FAIL",
-            "pinned source builds and fresh mixed-binary rollout",
-            err,
-            vec![cwd],
-        ),
-    };
-    case.duration_ms = started.elapsed().as_millis();
-    case
-}
-
 fn contract_worker_proof(cli: &Path, artifacts: &Path, row: &MatrixRow) -> CaseResult {
     let started = Instant::now();
     let mut observations = Vec::new();
@@ -11331,17 +10214,8 @@ mod tests {
         let run_dir = parent.path().join("run-current");
         fs::create_dir(&run_dir).unwrap();
         let current_path = parent.path().join("release-cli");
-        let old_target = run_dir.join("old-target");
-        let current_target = run_dir.join("current-target");
-        let old_path = old_target.join("release").join("old-reader");
-        let current_built = current_target.join("release").join("release-cli");
-        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
-        fs::create_dir_all(current_built.parent().unwrap()).unwrap();
-        for (path, version) in [
-            (&current_path, "new-v2"),
-            (&current_built, "new-v2"),
-            (&old_path, "old-v1"),
-        ] {
+        let old_path = run_dir.join("old-reader");
+        for (path, version) in [(&current_path, "new-v2"), (&old_path, "old-v1")] {
             fs::write(path, format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n")).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -11351,21 +10225,28 @@ mod tests {
         context.cli_sha256 = hash_file(&current_path).unwrap();
         context.source_sha256 = "c".repeat(64);
         let mut case = passing_case(&row, &run_dir, &context);
-        let check = |case: &CaseResult| validate_related_binaries(case, &run_dir, &context);
+        let check = |case: &CaseResult| {
+            write_case(&run_dir, case).unwrap();
+            validate_coverage(
+                std::slice::from_ref(&row),
+                std::slice::from_ref(case),
+                &run_dir,
+                &context,
+            )
+        };
         assert!(check(&case).unwrap_err().contains("requires both"));
         let current_revision = context.source_sha256.clone();
-        let old_revision = CONTRACT_TWO_BRIDGE_SOURCE.to_owned();
+        let old_revision = if current_revision == "a".repeat(40) {
+            "b".repeat(40)
+        } else {
+            "a".repeat(40)
+        };
         let old_build = run_dir.join("old-build.log");
         let current_build = run_dir.join("current-build.log");
-        fs::write(&old_build, "Compiling graphrun v0.1.4\nFinished release\n").unwrap();
-        fs::write(
-            &current_build,
-            "Compiling graphrun v0.1.4\nFinished release\n",
-        )
-        .unwrap();
+        fs::write(&old_build, "built old reader from pinned commit").unwrap();
+        fs::write(&current_build, "built current CLI").unwrap();
         case.artifacts.extend([
             old_path.display().to_string(),
-            current_built.display().to_string(),
             old_build.display().to_string(),
             current_build.display().to_string(),
         ]);
@@ -11377,16 +10258,6 @@ mod tests {
         .map(|(role, path, version, source_revision)| RelatedBinary {
             role: role.to_owned(),
             path: path.display().to_string(),
-            built_path: if role == "old_reader" {
-                old_path.display().to_string()
-            } else {
-                current_built.display().to_string()
-            },
-            target_dir: if role == "old_reader" {
-                old_target.display().to_string()
-            } else {
-                current_target.display().to_string()
-            },
             version: version.to_owned(),
             source_revision,
             sha256_before: hash_file(path).unwrap(),
@@ -11395,11 +10266,6 @@ mod tests {
                 old_build.display().to_string()
             } else {
                 current_build.display().to_string()
-            },
-            build_log_sha256: if role == "old_reader" {
-                hash_file(&old_build).unwrap()
-            } else {
-                hash_file(&current_build).unwrap()
             },
             run_id: context.run_id.clone(),
         })
@@ -11425,291 +10291,10 @@ mod tests {
             .retain(|artifact| artifact != &old_build.display().to_string());
         assert!(check(&missing_build).unwrap_err().contains("stale"));
         let mut wrong_revision = case.clone();
-        wrong_revision.related_binaries[0].source_revision = "a".repeat(40);
-        assert!(check(&wrong_revision).unwrap_err().contains("not distinct"));
-        let mut shared_target = case.clone();
-        shared_target.related_binaries[1].target_dir = old_target.display().to_string();
-        assert!(
-            check(&shared_target)
-                .unwrap_err()
-                .contains("distinct in-run")
-        );
-        let mut forged_log = case.clone();
-        forged_log.related_binaries[0].build_log_sha256 = "f".repeat(64);
-        assert!(check(&forged_log).unwrap_err().contains("stale"));
-        fs::write(&current_built, "stale writer build").unwrap();
-        assert!(check(&case).unwrap_err().contains("stale"));
-        fs::write(&current_built, fs::read(&current_path).unwrap()).unwrap();
-        fs::write(&current_build, "Finished release\n").unwrap();
-        case.related_binaries[1].build_log_sha256 = hash_file(&current_build).unwrap();
-        assert!(check(&case).unwrap_err().contains("stale"));
-        fs::write(
-            &current_build,
-            "Compiling graphrun v0.1.4\nFinished release\n",
-        )
-        .unwrap();
-        case.related_binaries[1].build_log_sha256 = hash_file(&current_build).unwrap();
+        wrong_revision.related_binaries[0].source_revision = "z".repeat(40);
+        assert!(check(&wrong_revision).unwrap_err().contains("stale"));
         fs::write(&old_path, "tampered after proof").unwrap();
         assert!(check(&case).unwrap_err().contains("stale"));
-    }
-
-    #[test]
-    fn contract_two_requires_causal_mixed_version_observations() {
-        let run = "a".repeat(32);
-        let prepare_id = "b".repeat(32);
-        let activate_id = "c".repeat(32);
-        let proof = serde_json::json!({
-            "reader_floor": 5,
-            "command_readers": [4, 5],
-            "state_records": ["graphrun.state-record/v2", "graphrun.state-record/v3"],
-        });
-        let events: Vec<_> = (1..=15)
-            .map(|sequence| {
-                let kind = match sequence {
-                    8 => "wait_opened",
-                    9 => "event_accepted",
-                    11 => "wait_satisfied",
-                    15 => "run_succeeded",
-                    _ => "run_admitted",
-                };
-                serde_json::json!({
-                    "sequence": sequence,
-                    "format": "graphrun.run-event/v1",
-                    "run": run,
-                    "event": {"kind": kind},
-                })
-            })
-            .collect();
-        let steps = [
-            (
-                "retained pre-activation wait",
-                serde_json::json!({"run":run,"status":"started"}),
-            ),
-            (
-                "reader-first preparation",
-                serde_json::json!({"applied":true,"active_writer":4,"command_id":prepare_id,"cluster_id":"cluster-1","applied_log_id":{"index":10}}),
-            ),
-            (
-                "complete roster",
-                serde_json::json!({"writer_format":4,"quorum":true,"activation_log_id":null,"joint_voters":[[1,2,3]],"prepared":{"1":proof,"2":proof,"3":proof}}),
-            ),
-            (
-                "old writer cannot activate",
-                serde_json::json!({"result":{"Err":"FailedPrecondition"}}),
-            ),
-            (
-                "mixed writer followers",
-                serde_json::json!({"state":"Follower","last_applied":10,"pending_waits":1}),
-            ),
-            (
-                "committed writer activation",
-                serde_json::json!({"applied":true,"active_writer":5,"command_id":activate_id,"cluster_id":"cluster-1","applied_log_id":{"index":12}}),
-            ),
-            (
-                "old reader applies new policy",
-                serde_json::json!({"state":"Follower","last_applied":12,"pending_waits":1}),
-            ),
-            (
-                "new-format workflow progress",
-                serde_json::json!({"status":"ok"}),
-            ),
-            (
-                "old reader applies v3 inbox update",
-                serde_json::json!({"state":"Follower","last_applied":13,"last_log":14,"pending_waits":1,"inbox_depth":1}),
-            ),
-            (
-                "retained event projection",
-                serde_json::json!({"run":run,"status":"succeeded","output":{"approved":true},"event_count":15,"open_scopes":0,"pending_waits":[],"error":null}),
-            ),
-            (
-                "retained history page",
-                serde_json::json!({"run":run,"unavailable":false,"retained_from":1,"retained_through":15,"events":events}),
-            ),
-            (
-                "versioned history reconstruction",
-                serde_json::json!({"run":run,"status":"succeeded","output":{"approved":true},"event_count":15}),
-            ),
-            (
-                "backup reader versions",
-                serde_json::json!({"writer":5,"history":1,"checkpoints":1,"checkpoint_format":"graphrun.run-checkpoint/v2","checkpoint_through":15}),
-            ),
-            (
-                "v5 framed snapshot file",
-                serde_json::json!({"file":"snap.snap"}),
-            ),
-            (
-                "v5 snapshot registry and readers",
-                serde_json::json!({"writer_format":5}),
-            ),
-            (
-                "old binary restart fenced",
-                serde_json::json!({"status":"exit status: 2","log":"binary writer capability 4 is below committed writer format 5"}),
-            ),
-            (
-                "member 1 retained format",
-                serde_json::json!({"writer":5,"history":1}),
-            ),
-            (
-                "member 2 retained format",
-                serde_json::json!({"writer":5,"history":1}),
-            ),
-            (
-                "member 3 retained format",
-                serde_json::json!({"writer":5,"history":1}),
-            ),
-        ];
-        let mut report = FormatRolloutReport {
-            run_id: "run-current".to_owned(),
-            status: "PASS".to_owned(),
-            scope: "focused production mixed-binary smoke, not matrix CONTRACT-002".to_owned(),
-            error: None,
-            duration_ms: 1,
-            binary_integrity: true,
-            driver: FormatRolloutDriver {
-                path: PathBuf::new(),
-                sha256_before: String::new(),
-                sha256_after: String::new(),
-            },
-            binaries: Vec::new(),
-            observations: steps
-                .into_iter()
-                .map(|(step, actual)| FormatRolloutObservation {
-                    step: step.to_owned(),
-                    expected: "required".to_owned(),
-                    actual,
-                    passed: true,
-                })
-                .collect(),
-            process_exits: Vec::new(),
-            member_stores: Vec::new(),
-            backup_manifest: PathBuf::new(),
-            workflow_run_id: run,
-            preparation_command_id: prepare_id,
-            activation_command_id: activate_id,
-        };
-        assert!(validate_format_rollout_observations(&report).is_ok());
-        let old_update = report
-            .observations
-            .iter_mut()
-            .find(|observation| observation.step == "old reader applies v3 inbox update")
-            .unwrap();
-        old_update.actual["pending_waits"] = serde_json::json!(0);
-        old_update.actual["inbox_depth"] = serde_json::json!(0);
-        assert!(validate_format_rollout_observations(&report).is_ok());
-        for (step, changed) in [
-            ("committed writer activation", serde_json::json!(4)),
-            ("old reader applies v3 inbox update", serde_json::json!(12)),
-        ] {
-            let field = if step == "committed writer activation" {
-                "active_writer"
-            } else {
-                "last_applied"
-            };
-            let observation = report
-                .observations
-                .iter_mut()
-                .find(|observation| observation.step == step)
-                .unwrap();
-            let original = std::mem::replace(&mut observation.actual[field], changed);
-            assert!(
-                validate_format_rollout_observations(&report).is_err(),
-                "{step}"
-            );
-            report
-                .observations
-                .iter_mut()
-                .find(|observation| observation.step == step)
-                .unwrap()
-                .actual[field] = original;
-        }
-        report
-            .observations
-            .retain(|observation| observation.step != "old reader applies v3 inbox update");
-        assert!(validate_format_rollout_observations(&report).is_err());
-    }
-
-    #[test]
-    fn contract_two_snapshot_digest_uses_verified_footer() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("snapshot");
-        let body = b"framed snapshot bytes";
-        let footer = Sha256::digest(body);
-        fs::write(&path, [body.as_slice(), footer.as_slice()].concat()).unwrap();
-        assert_eq!(framed_snapshot_digest(&path).unwrap(), hex::encode(footer));
-        fs::write(
-            &path,
-            [b"changed snapshot bytes", footer.as_slice()].concat(),
-        )
-        .unwrap();
-        assert!(framed_snapshot_digest(&path).is_err());
-        fs::write(&path, b"short").unwrap();
-        assert!(framed_snapshot_digest(&path).is_err());
-    }
-
-    #[test]
-    fn contract_two_requires_only_the_publishing_members_snapshot_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(dir.path()).unwrap();
-        let cwd = root.join("rollout");
-        let mut stores = Vec::new();
-        for n in 1..=3 {
-            let member = cwd.join(format!("m{n}"));
-            fs::create_dir_all(&member).unwrap();
-            let store = member.join("member.redb");
-            fs::write(&store, b"member").unwrap();
-            stores.push(store);
-        }
-        let snapshot = |n: usize| cwd.join(format!("m{n}/snapshots"));
-        assert!(
-            validate_member_snapshot_location(&root, &cwd, 1, 2, &stores[0], &snapshot(1)).is_ok()
-        );
-        assert!(
-            validate_member_snapshot_location(&root, &cwd, 3, 2, &stores[2], &snapshot(3)).is_ok()
-        );
-        assert!(
-            validate_member_snapshot_location(&root, &cwd, 2, 2, &stores[1], &snapshot(2)).is_err()
-        );
-        fs::create_dir(snapshot(2)).unwrap();
-        assert!(
-            validate_member_snapshot_location(&root, &cwd, 2, 2, &stores[1], &snapshot(2)).is_ok()
-        );
-        assert!(
-            validate_member_snapshot_location(&root, &cwd, 3, 3, &stores[2], &snapshot(3)).is_err()
-        );
-        fs::create_dir(snapshot(3)).unwrap();
-        assert!(
-            validate_member_snapshot_location(&root, &cwd, 3, 3, &stores[2], &snapshot(3)).is_ok()
-        );
-        assert!(
-            validate_member_snapshot_location(&root, &cwd, 1, 3, &stores[0], &snapshot(2)).is_err()
-        );
-        fs::write(snapshot(1), b"not a directory").unwrap();
-        assert!(
-            validate_member_snapshot_location(&root, &cwd, 1, 3, &stores[0], &snapshot(1)).is_err()
-        );
-    }
-
-    #[test]
-    fn contract_two_rejects_snapshot_registry_for_another_member() {
-        let dir = tempfile::tempdir().unwrap();
-        let stores: HashMap<u64, PathBuf> = (1..=3)
-            .map(|member| {
-                (
-                    member,
-                    dir.path().join(format!("m{member}")).join("member.redb"),
-                )
-            })
-            .collect();
-        let snapshot = dir.path().join("m2").join("snapshots").join("snap-14.snap");
-        assert_eq!(
-            snapshot_publisher(&serde_json::json!({"member":2}), &snapshot, &stores).unwrap(),
-            2
-        );
-        assert!(snapshot_publisher(&serde_json::json!({"member":3}), &snapshot, &stores).is_err());
-        assert!(snapshot_publisher(&serde_json::json!({"member":4}), &snapshot, &stores).is_err());
-        assert!(
-            snapshot_publisher(&serde_json::json!({"member":"2"}), &snapshot, &stores).is_err()
-        );
     }
 
     #[test]
@@ -11764,7 +10349,6 @@ mod tests {
     #[test]
     fn storage_cases_require_each_named_proof() {
         let dir = tempfile::tempdir().unwrap();
-        let context = context(dir.path());
         let suite = || TestSuite {
             command: "cargo test -p graphrun --lib --locked".to_owned(),
             log: dir.path().join("lib.log"),
@@ -11824,14 +10408,14 @@ mod tests {
             evidence.lib.passed = names.iter().map(|name| (*name).to_owned()).collect();
             let case = row(id);
             assert_eq!(
-                run_case(Path::new("unused"), dir.path(), &evidence, &case, &context).status,
+                run_case(Path::new("unused"), dir.path(), &evidence, &case).status,
                 "PASS",
                 "{id} should accept every required executed proof"
             );
             for name in names {
                 evidence.lib.passed.remove(*name);
                 assert_eq!(
-                    run_case(Path::new("unused"), dir.path(), &evidence, &case, &context).status,
+                    run_case(Path::new("unused"), dir.path(), &evidence, &case).status,
                     "FAIL",
                     "{id} must not pass without {name}"
                 );
