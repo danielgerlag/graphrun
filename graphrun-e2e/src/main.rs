@@ -1250,6 +1250,7 @@ fn validate_format_rollout_report(
                 binary.role
             ));
         }
+        let built_cli_hash = hash_file(Path::new(&current.built_path))?;
         let (expected_path, expected_source, expected_hash, expected_version) =
             match binary.role.as_str() {
                 "old_reader" => (
@@ -1267,7 +1268,7 @@ fn validate_format_rollout_report(
                 "cli" => (
                     Path::new(&current.built_path),
                     context.source_sha256.as_str(),
-                    context.cli_sha256.as_str(),
+                    built_cli_hash.as_str(),
                     context.cli_version.as_str(),
                 ),
                 _ => {
