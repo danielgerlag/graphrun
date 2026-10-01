@@ -11444,7 +11444,7 @@ mod tests {
         let mut forged_log = case.clone();
         forged_log.related_binaries[0].build_log_sha256 = "f".repeat(64);
         assert!(check(&forged_log).unwrap_err().contains("stale"));
-        fs::write(&current_built, "stale writer build").unwrap();
+        fs::write(&current_built, fs::read(&old_path).unwrap()).unwrap();
         assert!(check(&case).unwrap_err().contains("stale"));
         fs::write(&current_built, fs::read(&current_path).unwrap()).unwrap();
         fs::write(&current_build, "Finished release\n").unwrap();
