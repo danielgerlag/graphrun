@@ -7,7 +7,10 @@ use crate::ir::{
     ChooseCase, Compensation, ConsumeFrom, DSL, Definition, Digest, FORMAT_VERSION, FailError,
     Node, ParallelBranch, Region as IrRegion, RegionPath, SignalDecl,
 };
-use crate::policy::{COMPENSATION_ATTEMPT_TIMEOUT, FORWARD_ATTEMPT_TIMEOUT, RetryPolicy};
+use crate::policy::{
+    COMPENSATION_ATTEMPT_TIMEOUT, FORWARD_ATTEMPT_TIMEOUT, MAX_ATTEMPT_TIMEOUT,
+    MIN_ATTEMPT_TIMEOUT, RetryPolicy,
+};
 use crate::schema::{DurablePayload, SchemaRef};
 use crate::time::duration_to_millis;
 use crate::value::Value;
@@ -45,6 +48,7 @@ struct ScopeId(u64);
 
 pub struct ActivityRef<I, O> {
     key: ActivityKey,
+    retryable_codes: Vec<String>,
     _i: PhantomData<fn() -> I>,
     _o: PhantomData<fn() -> O>,
 }
@@ -61,6 +65,7 @@ impl<I: DurablePayload, O: DurablePayload> ActivityRef<I, O> {
         }
         Ok(Self {
             key,
+            retryable_codes: contract.retryable_codes(),
             _i: PhantomData,
             _o: PhantomData,
         })
@@ -239,6 +244,71 @@ pub struct Branch<I, O> {
     pub input: Binding,
     pub body: Region<I, O>,
 }
+
+mod parallel_sealed {
+    pub trait Sealed {}
+}
+
+/// An ordered tuple of 1 to 16 [`Branch`] values. Its output is the tuple of
+/// branch outputs in the same order.
+///
+/// ```compile_fail
+/// use graphrun::builder::{Branch, NodeRef, RegionBuilder};
+/// fn wrong_output(mut builder: RegionBuilder<String>, branch: Branch<String, i64>) {
+///     let _: NodeRef<(String,)> = builder.parallel("p", (branch,)).unwrap();
+/// }
+/// ```
+pub trait ParallelBranches: parallel_sealed::Sealed {
+    type Output: DurablePayload;
+
+    #[doc(hidden)]
+    fn into_parts(self) -> (Vec<ParallelBranch>, BTreeMap<String, SignalDecl>);
+}
+
+macro_rules! impl_parallel_branches {
+    ($($input:ident $output:ident $branch:ident),+) => {
+        impl<$($input: DurablePayload, $output: DurablePayload),+> parallel_sealed::Sealed
+            for ($(Branch<$input, $output>,)+) {}
+
+        impl<$($input: DurablePayload, $output: DurablePayload),+> ParallelBranches
+            for ($(Branch<$input, $output>,)+)
+        {
+            type Output = ($($output,)+);
+
+            fn into_parts(self) -> (Vec<ParallelBranch>, BTreeMap<String, SignalDecl>) {
+                let ($($branch,)+) = self;
+                let mut branches = Vec::new();
+                let mut signals = BTreeMap::new();
+                $(
+                    branches.push(ParallelBranch {
+                        name: $branch.name,
+                        input: $branch.input,
+                        body: $branch.body.ir,
+                    });
+                    signals.extend($branch.body.signals);
+                )+
+                (branches, signals)
+            }
+        }
+    };
+}
+
+impl_parallel_branches!(I0 O0 b0);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3, I4 O4 b4);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3, I4 O4 b4, I5 O5 b5);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3, I4 O4 b4, I5 O5 b5, I6 O6 b6);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3, I4 O4 b4, I5 O5 b5, I6 O6 b6, I7 O7 b7);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3, I4 O4 b4, I5 O5 b5, I6 O6 b6, I7 O7 b7, I8 O8 b8);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3, I4 O4 b4, I5 O5 b5, I6 O6 b6, I7 O7 b7, I8 O8 b8, I9 O9 b9);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3, I4 O4 b4, I5 O5 b5, I6 O6 b6, I7 O7 b7, I8 O8 b8, I9 O9 b9, I10 O10 b10);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3, I4 O4 b4, I5 O5 b5, I6 O6 b6, I7 O7 b7, I8 O8 b8, I9 O9 b9, I10 O10 b10, I11 O11 b11);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3, I4 O4 b4, I5 O5 b5, I6 O6 b6, I7 O7 b7, I8 O8 b8, I9 O9 b9, I10 O10 b10, I11 O11 b11, I12 O12 b12);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3, I4 O4 b4, I5 O5 b5, I6 O6 b6, I7 O7 b7, I8 O8 b8, I9 O9 b9, I10 O10 b10, I11 O11 b11, I12 O12 b12, I13 O13 b13);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3, I4 O4 b4, I5 O5 b5, I6 O6 b6, I7 O7 b7, I8 O8 b8, I9 O9 b9, I10 O10 b10, I11 O11 b11, I12 O12 b12, I13 O13 b13, I14 O14 b14);
+impl_parallel_branches!(I0 O0 b0, I1 O1 b1, I2 O2 b2, I3 O3 b3, I4 O4 b4, I5 O5 b5, I6 O6 b6, I7 O7 b7, I8 O8 b8, I9 O9 b9, I10 O10 b10, I11 O11 b11, I12 O12 b12, I13 O13 b13, I14 O14 b14, I15 O15 b15);
 
 pub struct Case<I, O> {
     pub name: String,
@@ -496,6 +566,21 @@ impl<I: DurablePayload> RegionBuilder<I> {
         self.graph.attach_compensation(node, compensator)
     }
 
+    pub fn compensate_with_retry<O, U>(
+        &mut self,
+        node: &NodeRef<O>,
+        compensator: &ActivityRef<O, U>,
+        retry: RetryPolicy,
+        timeout: Duration,
+    ) -> Result<()>
+    where
+        O: DurablePayload,
+        U: DurablePayload,
+    {
+        self.graph
+            .attach_compensation_with_retry(node, compensator, retry, timeout)
+    }
+
     pub fn parallel2<A, B, IA, IB>(
         &mut self,
         key: &str,
@@ -508,7 +593,16 @@ impl<I: DurablePayload> RegionBuilder<I> {
         IA: DurablePayload,
         IB: DurablePayload,
     {
-        let node = self.graph.declare_parallel2(key, left, right)?;
+        self.parallel(key, (left, right))
+    }
+
+    /// Append a parallel node with 1 to 16 ordered, heterogeneous branches.
+    pub fn parallel<B: ParallelBranches>(
+        &mut self,
+        key: &str,
+        branches: B,
+    ) -> Result<NodeRef<B::Output>> {
+        let node = self.graph.declare_parallel(key, branches)?;
         self.link_tail(node.entry())?;
         self.graph.draft.tail = Some(node.key.clone());
         Ok(node)
@@ -1060,7 +1154,44 @@ impl<I: DurablePayload> RegionGraphBuilder<I> {
                 activity: compensator.key.clone(),
                 input: Binding::from_ref(crate::binding::Reference::ForwardOutput),
                 timeout_ms: Some(duration_to_millis(COMPENSATION_ATTEMPT_TIMEOUT)?),
-                retry: None,
+                retry: Some(RetryPolicy::compensation_default(
+                    compensator.retryable_codes.clone(),
+                )),
+            },
+        )
+    }
+
+    pub fn attach_compensation_with_retry<O, U>(
+        &mut self,
+        node: &NodeRef<O>,
+        compensator: &ActivityRef<O, U>,
+        retry: RetryPolicy,
+        timeout: Duration,
+    ) -> Result<()>
+    where
+        O: DurablePayload,
+        U: DurablePayload,
+    {
+        retry.validate()?;
+        if retry
+            .errors
+            .iter()
+            .any(|code| !compensator.retryable_codes.contains(code))
+        {
+            return Err(Error::invalid(
+                "compensation retry lists terminal or unknown code",
+            ));
+        }
+        if !(MIN_ATTEMPT_TIMEOUT..=MAX_ATTEMPT_TIMEOUT).contains(&timeout) {
+            return Err(Error::invalid("compensation timeout is out of range"));
+        }
+        self.set_compensation(
+            &node.key,
+            Compensation::Activity {
+                activity: compensator.key.clone(),
+                input: Binding::from_ref(crate::binding::Reference::ForwardOutput),
+                timeout_ms: Some(duration_to_millis(timeout)?),
+                retry: Some(retry),
             },
         )
     }
@@ -1091,27 +1222,34 @@ impl<I: DurablePayload> RegionGraphBuilder<I> {
         IA: DurablePayload,
         IB: DurablePayload,
     {
+        self.declare_parallel(key, (left, right))
+    }
+
+    /// Declare a parallel node; the tuple type witnesses the ordered output schema.
+    pub fn declare_parallel<B: ParallelBranches>(
+        &mut self,
+        key: &str,
+        branches: B,
+    ) -> Result<NodeRef<B::Output>> {
         let node_key = self.insert_key(key)?;
+        let (branches, signals) = branches.into_parts();
+        let mut names = BTreeSet::new();
+        for branch in &branches {
+            if !valid_ascii_name(&branch.name) || !names.insert(branch.name.clone()) {
+                return Err(Error::invalid(format!(
+                    "invalid or duplicate branch name {}",
+                    branch.name
+                )));
+            }
+        }
         self.draft.nodes.insert(
             node_key.as_str().to_owned(),
             Node::Parallel {
-                branches: vec![
-                    ParallelBranch {
-                        name: left.name,
-                        input: left.input,
-                        body: left.body.ir,
-                    },
-                    ParallelBranch {
-                        name: right.name,
-                        input: right.input,
-                        body: right.body.ir,
-                    },
-                ],
+                branches,
                 next: node_key.clone(),
             },
         );
-        self.draft.signals.extend(left.body.signals);
-        self.draft.signals.extend(right.body.signals);
+        self.draft.signals.extend(signals);
         Ok(NodeRef {
             key: node_key,
             scope: self.draft.scope,

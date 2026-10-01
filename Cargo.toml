@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["graphrun", "graphrun-cli", "graphrun-e2e", "samples"]
+members = ["graphrun", "graphrun-cli", "graphrun-e2e", "samples", "scripts/proto-codegen"]
 default-members = ["graphrun", "graphrun-cli", "graphrun-e2e", "samples"]
 
 [workspace.package]
@@ -18,8 +18,10 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.3"
 hex = "0.4"
+hyper-util = { version = "0.1", features = ["tokio"] }
 indexmap = { version = "2", features = ["serde"] }
 jsonschema = "=0.56.0"
+libc = "0.2"
 openraft = { version = "=0.9.25", default-features = false, features = ["serde", "storage-v2"] }
 proptest = "1"
 prost = "0.14"
@@ -37,9 +39,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tonic = { version = "=0.14.6", features = ["tls-ring"] }
 tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
 tracing = "0.1"
 trybuild = "1"
 yaml-rust2 = "=0.13.0"
+x509-parser = "=0.17.0"
 
 [profile.release]
 lto = false

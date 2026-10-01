@@ -60,7 +60,12 @@ impl Ledger {
         let path = path.as_ref().to_path_buf();
         let data = if path.exists() {
             let bytes = std::fs::read(&path).map_err(|err| Error::invalid(err.to_string()))?;
-            serde_json::from_slice(&bytes).unwrap_or_default()
+            serde_json::from_slice(&bytes).map_err(|err| {
+                Error::new(
+                    ErrorKind::FailedPrecondition,
+                    format!("provider ledger {} is corrupt: {err}", path.display()),
+                )
+            })?
         } else {
             LedgerFile::default()
         };
@@ -91,6 +96,7 @@ impl Ledger {
             if held {
                 if entry.logical == 0 {
                     entry.status = EffectStatus::Pending;
+                    entry.output = Some(output);
                 }
             } else if entry.logical == 0 {
                 entry.logical = 1;
@@ -160,6 +166,19 @@ impl Ledger {
 
     fn release(&mut self, key: &str) -> Result<EffectResponse> {
         self.data.holds.remove(key);
+        let hold_all = self.data.holds.contains("*");
+        for (effect_key, entry) in &mut self.data.entries {
+            if entry.status == EffectStatus::Pending
+                && !hold_all
+                && !self.data.holds.contains(effect_key)
+            {
+                if entry.output.is_none() {
+                    return Err(Error::invalid("pending provider effect lost its output"));
+                }
+                entry.logical = 1;
+                entry.status = EffectStatus::Applied;
+            }
+        }
         self.persist()?;
         Ok(self.probe(key))
     }
@@ -180,8 +199,8 @@ impl Ledger {
         Ok(self.probe(key))
     }
 
-    fn dump(&self) -> serde_json::Value {
-        serde_json::to_value(&self.data).unwrap_or(serde_json::Value::Null)
+    fn dump(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(&self.data).map_err(|err| Error::invalid(err.to_string()))
     }
 }
 
@@ -285,7 +304,7 @@ fn raw_exchange(
         return Err(Error::invalid("provider response missing body"));
     };
     if rest.trim().is_empty() {
-        return Ok(serde_json::json!({"status":"ok"}));
+        return Err(Error::invalid("provider response missing JSON"));
     }
     serde_json::from_str(rest.trim()).map_err(|err| Error::invalid(err.to_string()))
 }
@@ -380,7 +399,10 @@ async fn handle_http(ledger: &Arc<Mutex<Ledger>>, notify: &Notify, req: &str) ->
         return serde_json::json!({"status":"ok"});
     }
     if method == "GET" && path == "/v1/ledger" {
-        return ledger.lock().unwrap().dump();
+        return match ledger.lock().unwrap().dump() {
+            Ok(value) => value,
+            Err(err) => serde_json::json!({"error": err.to_string()}),
+        };
     }
     let key = json
         .get("key")
@@ -401,8 +423,18 @@ async fn handle_http(ledger: &Arc<Mutex<Ledger>>, notify: &Notify, req: &str) ->
                 .cloned()
                 .map(|value| serde_json::from_value(value).unwrap_or(Value::Null))
                 .unwrap_or(Value::Null);
-            let mut guard = ledger.lock().unwrap();
-            match guard.apply(key, &kind, output) {
+            let applied = ledger.lock().unwrap().apply(key, &kind, output);
+            match applied {
+                Ok(resp) if resp.status == EffectStatus::Pending => loop {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    let current = ledger.lock().unwrap().probe(key);
+                    if current.status != EffectStatus::Unknown {
+                        break serde_json::to_value(current).unwrap_or(serde_json::Value::Null);
+                    }
+                    notified.await;
+                },
                 Ok(resp) => serde_json::to_value(resp).unwrap_or(serde_json::Value::Null),
                 Err(err) => serde_json::json!({"error": err.to_string()}),
             }
@@ -442,6 +474,16 @@ async fn handle_http(ledger: &Arc<Mutex<Ledger>>, notify: &Notify, req: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_ledger_does_not_reopen_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        std::fs::write(&path, b"{invalid").unwrap();
+        let err = Ledger::open(path).err().expect("corrupt ledger must fail");
+        assert_eq!(err.kind, ErrorKind::FailedPrecondition);
+        assert!(err.message.contains("provider ledger"));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ledger_counts_physical_retries_once_logically() {
@@ -487,29 +529,63 @@ mod tests {
         assert_eq!(second.physical, 2);
         assert_eq!(second.output, Some(output));
         hold_effect(&url, "k2").unwrap();
-        let pending = apply_effect(&url, "k2", "forward", &Value::Null).unwrap();
-        assert_eq!(pending.status, EffectStatus::Pending);
+        let url_clone = url.clone();
+        let pending = tokio::task::spawn_blocking(move || {
+            apply_effect(&url_clone, "k2", "forward", &Value::Null)
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if dump_ledger(&url).unwrap()["entries"]["k2"]["status"] == "pending" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provider never held k2");
+        assert!(!pending.is_finished());
         assert_eq!(
             probe_effect(&url, "k2").unwrap().status,
             EffectStatus::Unknown
         );
         release_effect(&url, "k2").unwrap();
+        let settled = pending.await.unwrap().unwrap();
+        assert_eq!(settled.status, EffectStatus::Applied);
+        assert_eq!(settled.logical, 1);
+        assert_eq!(settled.physical, 1);
         let applied = apply_effect(&url, "k2", "forward", &Value::Bool(true)).unwrap();
         assert_eq!(applied.status, EffectStatus::Applied);
         assert_eq!(applied.logical, 1);
-        assert!(applied.physical >= 2);
+        assert_eq!(applied.physical, 2);
         set_effect(&url, "k3", EffectStatus::NotApplied).unwrap();
         assert_eq!(
             probe_effect(&url, "k3").unwrap().status,
             EffectStatus::NotApplied
         );
         hold_effect(&url, "*").unwrap();
-        let blocked = apply_effect(&url, "k4", "forward", &Value::Bool(true)).unwrap();
-        assert_eq!(blocked.status, EffectStatus::Pending);
-        assert_eq!(blocked.logical, 0);
+        let url_clone = url.clone();
+        let blocked = tokio::task::spawn_blocking(move || {
+            apply_effect(&url_clone, "k4", "forward", &Value::Bool(true))
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if dump_ledger(&url).unwrap()["entries"]["k4"]["status"] == "pending" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provider never held k4");
+        assert!(!blocked.is_finished());
         assert_eq!(
             probe_effect(&url, "k4").unwrap().status,
             EffectStatus::Unknown
         );
+        release_effect(&url, "*").unwrap();
+        let settled = blocked.await.unwrap().unwrap();
+        assert_eq!(settled.status, EffectStatus::Applied);
+        assert_eq!(settled.logical, 1);
+        assert_eq!(settled.physical, 1);
     }
 }

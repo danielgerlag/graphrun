@@ -1,6 +1,109 @@
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub fn wall_millis() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| {
+            Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "wall clock precedes Unix epoch",
+            )
+        })?
+        .as_millis()
+        .try_into()
+        .map_err(|_| {
+            Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "wall clock out of range",
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
+pub fn boot_millis() -> Result<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "boot clock returned an invalid timespec",
+        ));
+    }
+    Ok((ts.tv_sec as u64)
+        .saturating_mul(1_000)
+        .saturating_add(ts.tv_nsec as u64 / 1_000_000))
+}
+
+#[cfg(target_os = "macos")]
+pub fn boot_millis() -> Result<u64> {
+    unsafe extern "C" {
+        fn mach_continuous_time() -> u64;
+        fn mach_timebase_info(info: *mut libc::mach_timebase_info_data_t) -> libc::kern_return_t;
+    }
+    let mut info = libc::mach_timebase_info_data_t { numer: 0, denom: 0 };
+    if unsafe { mach_timebase_info(&mut info) } != 0 || info.denom == 0 {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "mach continuous time unavailable",
+        ));
+    }
+    ((u128::from(unsafe { mach_continuous_time() }) * u128::from(info.numer))
+        / u128::from(info.denom)
+        / 1_000_000)
+        .try_into()
+        .map_err(|_| {
+            Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "boot clock out of range",
+            )
+        })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn boot_millis() -> Result<u64> {
+    Err(Error::new(
+        crate::error::ErrorKind::FailedPrecondition,
+        "suspend-aware boot clock is required on Linux or macOS",
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClockDeltaFault {
+    BootReversed,
+    WatchdogGap(u64),
+    WallBootSkew(u128, u64),
+}
+
+pub(crate) fn clock_delta_fault(
+    previous_wall: u64,
+    previous_boot: u64,
+    wall: u64,
+    boot: u64,
+) -> Option<ClockDeltaFault> {
+    let Some(elapsed) = boot.checked_sub(previous_boot) else {
+        return Some(ClockDeltaFault::BootReversed);
+    };
+    if elapsed > 2_000 {
+        return Some(ClockDeltaFault::WatchdogGap(elapsed));
+    }
+    let difference =
+        (i128::from(wall) - i128::from(previous_wall) - i128::from(elapsed)).unsigned_abs();
+    if difference > u128::from(250 + elapsed / 1_000) {
+        return Some(ClockDeltaFault::WallBootSkew(difference, elapsed));
+    }
+    None
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EngineTime(u64);

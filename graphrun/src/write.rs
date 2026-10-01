@@ -1,23 +1,14 @@
 use crate::domain::{Command, ObligationStatus, State, run_events};
 use crate::error::{Error, ErrorKind, Result};
 use crate::ids::RunId;
-use crate::storage::{RaftRequest, TypeConfig};
+use crate::storage::StorageHandle;
+use crate::storage::{RaftRequest, RaftResponse, TypeConfig};
 use crate::time::EngineTime;
-use openraft::Raft;
-use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-static WALL_WATERMARK_MS: AtomicU64 = AtomicU64::new(0);
-
-thread_local! {
-    static LOCAL_CLOCK_WATERMARK: Cell<Option<u64>> = const { Cell::new(None) };
-}
+use openraft::{Raft, ServerState};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) fn now() -> EngineTime {
-    let ms = wall_ms();
-    WALL_WATERMARK_MS.fetch_max(ms, Ordering::SeqCst);
-    EngineTime::from_millis(ms)
+    EngineTime::from_millis(wall_ms())
 }
 
 fn wall_ms() -> u64 {
@@ -27,43 +18,86 @@ fn wall_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub(crate) fn clock_is_safe() -> bool {
-    let ms = wall_ms();
-    let watermark = LOCAL_CLOCK_WATERMARK
-        .with(Cell::get)
-        .unwrap_or_else(|| WALL_WATERMARK_MS.load(Ordering::SeqCst));
-    ms.saturating_add(2_000) >= watermark
-}
-
-#[cfg(test)]
-pub fn inject_clock_watermark(ms: u64) {
-    LOCAL_CLOCK_WATERMARK.with(|cell| cell.set(Some(ms)));
-}
-
-#[cfg(test)]
-pub fn clear_clock_watermark() {
-    LOCAL_CLOCK_WATERMARK.with(|cell| cell.set(None));
-}
-
-pub(crate) async fn write_raft(raft: &Raft<TypeConfig>, command: Command) -> Result<()> {
-    if !clock_is_safe() {
-        return Err(Error::new(ErrorKind::FailedPrecondition, "clock rollback"));
+pub(crate) async fn write_raft(
+    raft: &Raft<TypeConfig>,
+    storage: &StorageHandle,
+    command: Command,
+) -> Result<()> {
+    let resp = write_raft_response(raft, storage, command).await?;
+    if let Some(err) = resp.error {
+        return Err(Error::new(
+            resp.error_kind.unwrap_or(ErrorKind::InvalidArgument),
+            err,
+        ));
     }
+    Ok(())
+}
+
+pub(crate) async fn write_raft_response(
+    raft: &Raft<TypeConfig>,
+    storage: &StorageHandle,
+    command: Command,
+) -> Result<RaftResponse> {
     let metrics = raft.metrics().borrow().clone();
-    let last_log = metrics.last_log_index.unwrap_or(0);
-    let applied = metrics.last_applied.map(|id| id.index).unwrap_or(0);
-    let pending = last_log.saturating_sub(applied);
-    let encoded = serde_json::to_vec(&command)
-        .map(|bytes| bytes.len() as u64)
-        .unwrap_or(0);
-    admit_unapplied(pending, pending.saturating_add(1).saturating_mul(encoded))?;
+    if metrics.state != ServerState::Leader {
+        return Err(Error::new(
+            ErrorKind::Unavailable,
+            format!(
+                "not leader (leader={:?}); outcome unknown for command {}",
+                metrics.current_leader, command.id
+            ),
+        ));
+    }
+    storage.clock().authorize(storage, raft).await?;
+    let encoded = serde_json::to_vec(&RaftRequest {
+        command: command.clone(),
+    })
+    .map_err(|err| Error::invalid(format!("command encoding failed: {err}")))?;
+    if encoded.len() > crate::limits::PUBLIC_COMMAND_ENVELOPE {
+        return Err(Error::new(
+            ErrorKind::ResourceExhausted,
+            "public command exceeds the 1 MiB envelope",
+        ));
+    }
+    let (pending, pending_bytes) = storage.unapplied_usage().await?;
+    admit_unapplied(
+        u64::from(pending).saturating_add(1),
+        pending_bytes.saturating_add(encoded.len() as u64),
+    )?;
+    let identity = match &command.body {
+        crate::domain::CommandBody::Publication { key, .. } => format!(
+            "cluster={} principal={} command={}",
+            key.cluster_id, key.principal_id, key.command_id
+        ),
+        _ => format!("command={}", command.id),
+    };
     let resp = raft
         .client_write(RaftRequest { command })
         .await
-        .map_err(|err| Error::invalid(err.to_string()))?;
-    if let Some(err) = resp.data.error {
-        return Err(Error::invalid(err));
-    }
+        .map_err(|err| {
+            Error::new(
+                ErrorKind::Unavailable,
+                format!("unknown outcome ({identity}); retry or query the same command ID: {err}"),
+            )
+        })?;
+    Ok(resp.data)
+}
+
+pub(crate) async fn linearizable_read(raft: &Raft<TypeConfig>) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), raft.ensure_linearizable())
+        .await
+        .map_err(|_| {
+            Error::new(
+                ErrorKind::DeadlineExceeded,
+                "read barrier deadline exceeded",
+            )
+        })?
+        .map_err(|err| {
+            Error::new(
+                ErrorKind::Unavailable,
+                format!("leader/quorum unavailable: {err}"),
+            )
+        })?;
     Ok(())
 }
 
@@ -108,6 +142,7 @@ pub(crate) fn inspect_view(state: &State, run: RunId) -> serde_json::Value {
         "run": run.to_hex(),
         "definition": run_state.definition.id,
         "version": run_state.definition.version,
+        "published": run_state.published,
         "status": match &run_state.status {
             crate::domain::RunStatus::Active => "active",
             crate::domain::RunStatus::Succeeded { .. } => "succeeded",
@@ -225,12 +260,30 @@ pub(crate) fn health_view(
     last_log: Option<u64>,
     voters: Vec<u64>,
     state: &State,
+    clock_safe: bool,
+    clock_fault: Option<String>,
+    quorum_safe: bool,
+    scheduler: crate::storage::SchedulerStats,
 ) -> serde_json::Value {
     let applied = last_applied.unwrap_or(0);
     let log = last_log.unwrap_or(0);
     serde_json::json!({
-        "status": "ok",
-        "clock_safe": clock_is_safe(),
+        "status": if clock_safe && quorum_safe { "ok" } else { "unavailable" },
+        "clock_safe": clock_safe,
+        "clock_fault": clock_fault,
+        "quorum_safe": quorum_safe,
+        "ready_index_discovery_reads": scheduler.ready_index_discovery_reads,
+        "schedule_revision": scheduler.revision,
+        "scheduler_observed_revision": scheduler.scheduler_observed_revision,
+        "local_worker_observed_revision": scheduler.local_worker_observed_revision,
+        "scheduler_wake_causes": {
+            "applied": scheduler.applied_wakes,
+            "leadership": scheduler.leadership_wakes,
+            "deadline": scheduler.deadline_wakes,
+            "retention": scheduler.retention_wakes,
+            "worker": scheduler.worker_wakes,
+        },
+        "engine_time_watermark_ms": state.engine_time_watermark_ms,
         "state": raft_state,
         "last_applied": last_applied,
         "last_log": last_log,
@@ -239,6 +292,7 @@ pub(crate) fn health_view(
         "voters": voters,
         "active_runs": state.runs.values().filter(|run| matches!(run.status, crate::domain::RunStatus::Active)).count(),
         "ready_leaves": state.activations.values().filter(|act| act.status == crate::domain::ActivationStatus::Ready).count(),
+        "pending_waits": state.waits.values().filter(|wait| wait.pending).count(),
         "inbox_depth": state.inbox.iter().filter(|entry| !entry.consumed).count(),
         "open_scopes": state.scopes.values().filter(|scope| matches!(scope.status, crate::domain::ScopeStatus::Open)).count(),
         "recovery": state.recovery.as_ref().map(|hold| {
@@ -252,13 +306,13 @@ pub(crate) fn health_view(
 }
 
 pub(crate) fn admit_unapplied(unapplied_entries: u64, unapplied_bytes: u64) -> Result<()> {
-    if unapplied_entries >= crate::limits::UNAPPLIED_ENTRIES as u64 {
+    if unapplied_entries > crate::limits::UNAPPLIED_ENTRIES as u64 {
         return Err(Error::new(
             ErrorKind::ResourceExhausted,
             "unapplied entry credit exhausted",
         ));
     }
-    if unapplied_bytes >= crate::limits::UNAPPLIED_BYTES {
+    if unapplied_bytes > crate::limits::UNAPPLIED_BYTES {
         return Err(Error::new(
             ErrorKind::ResourceExhausted,
             "unapplied byte credit exhausted",
@@ -272,8 +326,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unapplied_credits_reject_at_limit() {
+    fn unapplied_credits_reject_above_limit() {
         assert!(admit_unapplied(0, 0).is_ok());
+        assert!(
+            admit_unapplied(
+                u64::from(crate::limits::UNAPPLIED_ENTRIES),
+                crate::limits::UNAPPLIED_BYTES,
+            )
+            .is_ok()
+        );
         assert!(
             admit_unapplied(
                 u64::from(crate::limits::UNAPPLIED_ENTRIES) - 1,
@@ -281,10 +342,11 @@ mod tests {
             )
             .is_ok()
         );
-        let entries = admit_unapplied(u64::from(crate::limits::UNAPPLIED_ENTRIES), 0).unwrap_err();
+        let entries =
+            admit_unapplied(u64::from(crate::limits::UNAPPLIED_ENTRIES) + 1, 0).unwrap_err();
         assert_eq!(entries.kind, ErrorKind::ResourceExhausted);
         assert!(entries.to_string().contains("unapplied entry credit"));
-        let bytes = admit_unapplied(0, crate::limits::UNAPPLIED_BYTES).unwrap_err();
+        let bytes = admit_unapplied(0, crate::limits::UNAPPLIED_BYTES + 1).unwrap_err();
         assert_eq!(bytes.kind, ErrorKind::ResourceExhausted);
         assert!(bytes.to_string().contains("unapplied byte credit"));
     }

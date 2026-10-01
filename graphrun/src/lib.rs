@@ -15,6 +15,7 @@ pub mod binding;
 pub mod builder;
 pub mod catalog;
 pub mod client;
+mod clock;
 pub mod cluster;
 pub mod compiler;
 pub mod domain;
@@ -24,19 +25,27 @@ pub mod flow;
 #[doc(hidden)]
 pub mod generated;
 pub mod handlers;
+pub mod history;
 pub mod ids;
 pub mod ir;
 pub mod limits;
 pub mod policy;
 pub mod provider;
+pub mod publication;
+mod record_store;
 #[doc(hidden)]
 pub mod rpc;
+mod schedule;
 pub mod schema;
+mod snapshot_framing;
+
 #[doc(hidden)]
 pub mod storage;
 pub mod time;
 pub mod tls;
 pub mod value;
+pub mod worker;
+pub mod worker_contract;
 #[doc(hidden)]
 pub mod write;
 pub mod yaml;
@@ -49,16 +58,19 @@ pub use catalog::Catalog;
 pub use client::GrpcClient;
 pub use cluster::MemberConfig;
 pub use compiler::compile_yaml;
-pub use domain::{State, reconstruct, run_events, run_output};
+pub use domain::{State, reconstruct_in, run_events, run_output};
 pub use engine::{
     ControlRequest, ControlResponse, Engine, LedgerEntry, LocalBuilder, connect_control,
     ledger_get, replay,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use flow::{region, workflow};
-pub use handlers::Handlers;
+pub use handlers::{Handlers, LocalHandlerContext};
+pub use history::{HistoryPage, RecordedEvent, reconstruct_at};
 pub use ids::{EventId, RunId};
 pub use ir::Definition;
 pub use schema::{DurablePayload, SchemaRef};
 pub use tls::{CertificateAuthority, TlsMaterial, generate_ca, issue_node};
 pub use value::Value;
+pub use worker::{ActivityError, HandlerContext, Observed, Worker, WorkerBuilder};
+pub use worker_contract::WorkerCapability;

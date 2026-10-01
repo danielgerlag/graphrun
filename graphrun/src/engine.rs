@@ -1,18 +1,25 @@
 use crate::catalog::{Catalog, ExecutionKind};
-use crate::cluster::{ClusterNetwork, MemberConfig};
+use crate::clock::ClockFaultState;
+use crate::cluster::{ClusterNetwork, ElectionEvidence, MemberConfig};
 use crate::compiler::compile_yaml;
-use crate::domain::{
-    Command, CommandBody, RunStatus, State, active_runs, reconstruct, run_events, run_output,
-};
+use crate::domain::{Command, CommandBody, RunStatus, State, run_output};
 use crate::error::{Error, ErrorKind, Result};
-use crate::handlers::Handlers;
+use crate::handlers::{Handlers, LocalHandlerContext};
 use crate::ids::{CommandId, EventId, RunId};
 use crate::ir::Definition;
 use crate::limits;
 use crate::rpc::serve_grpc;
-use crate::storage::{LocalNetwork, StorageHandle, TypeConfig, load_domain_readonly};
+use crate::snapshot_framing::{
+    RemoveOnDrop, SnapshotManifest, copy_payload, verify_snapshot, write_snapshot,
+};
+use crate::storage::{
+    LocalNetwork, ScheduleWake, StorageHandle, TypeConfig, load_domain_readonly,
+    validate_history_store,
+};
 use crate::value::Value;
-use crate::write::{health_view, inspect_view, now, write_raft};
+use crate::write::{
+    health_view, inspect_view, linearizable_read, now, write_raft, write_raft_response,
+};
 use openraft::{BasicNode, ChangeMembers, Config, Raft, ServerState, SnapshotPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -114,8 +121,29 @@ pub struct Engine {
     control: tokio::task::JoinHandle<()>,
     raft_server: Option<tokio::task::JoinHandle<()>>,
     snapshot_task: Option<tokio::task::JoinHandle<()>>,
+    clock_watchdog: tokio::task::JoinHandle<()>,
     cluster_net: Option<ClusterNetwork>,
     handlers: Handlers,
+    publication_auth: crate::publication::AuthContext,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LogicalBackupManifest {
+    format: String,
+    kind: String,
+    snapshot: String,
+    sha256: String,
+}
+
+fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// Build a local engine and register activity handlers before it opens.
@@ -127,6 +155,27 @@ pub struct LocalBuilder {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ControlRequest {
+    PublishCatalog {
+        version: u32,
+        catalog: Catalog,
+        command_id: String,
+    },
+    PublishDefinition {
+        yaml: String,
+        catalog_version: u32,
+        command_id: String,
+    },
+    StartPublished {
+        workflow: String,
+        version: Option<u32>,
+        start_key: String,
+        input: Value,
+        command_id: String,
+        wait_ms: Option<u64>,
+    },
+    CommandResult {
+        command_id: String,
+    },
     Start {
         yaml: String,
         catalog: Catalog,
@@ -150,10 +199,21 @@ pub enum ControlRequest {
     List,
     History {
         run: String,
+        #[serde(default)]
+        after_sequence: u64,
+        #[serde(default)]
+        page_size: u32,
+    },
+    Replay {
+        run: String,
+        through_sequence: u64,
     },
     Snapshot,
     Health,
     Acknowledge {
+        reason: String,
+    },
+    AcknowledgeClock {
         reason: String,
     },
     ResolveBlocked {
@@ -235,6 +295,18 @@ impl LocalBuilder {
         Ok(self)
     }
 
+    /// Register an async activity that can observe local clock-fault cancellation.
+    pub fn activity_with_context<I, O, F, Fut>(self, name: &str, handler: F) -> Result<Self>
+    where
+        I: crate::schema::DurablePayload,
+        O: crate::schema::DurablePayload,
+        F: Fn(I, LocalHandlerContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<O>> + Send + 'static,
+    {
+        self.handlers.activity_with_context(name, handler)?;
+        Ok(self)
+    }
+
     /// Register a blocking activity handler at version 1.
     pub fn blocking<I, O, F>(self, name: &str, handler: F) -> Result<Self>
     where
@@ -246,21 +318,60 @@ impl LocalBuilder {
         Ok(self)
     }
 
+    /// Register a blocking activity whose thread may observe cancellation.
+    pub fn blocking_with_context<I, O, F>(self, name: &str, handler: F) -> Result<Self>
+    where
+        I: crate::schema::DurablePayload,
+        O: crate::schema::DurablePayload,
+        F: Fn(I, LocalHandlerContext) -> Result<O> + Send + Sync + 'static,
+    {
+        self.handlers.blocking_with_context(name, handler)?;
+        Ok(self)
+    }
+
     pub async fn open(self) -> Result<Engine> {
         let data_dir = self.data_dir;
         let handlers = self.handlers;
         std::fs::create_dir_all(&data_dir).map_err(|err| Error::invalid(err.to_string()))?;
-        write_identity(&data_dir)?;
         let db_path = data_dir.join("member.redb");
-        let (storage, storage_thread) = StorageHandle::open(&db_path)?;
+        let existing_identity = read_identity(&data_dir, None)?;
         let restored_path = data_dir.join("restored-domain.json");
-        if restored_path.exists() {
+        let restored_domain = if restored_path.exists() {
+            if !existing_identity
+                .as_ref()
+                .is_some_and(|(_, restored)| *restored)
+            {
+                return Err(Error::new(
+                    ErrorKind::FailedPrecondition,
+                    "restored domain has no matching restored identity (directory left untouched)",
+                ));
+            }
             let bytes =
                 std::fs::read(&restored_path).map_err(|err| Error::invalid(err.to_string()))?;
-            let domain: State =
-                serde_json::from_slice(&bytes).map_err(|err| Error::invalid(err.to_string()))?;
+            let domain: State = serde_json::from_slice(&bytes)
+                .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+            Some(domain)
+        } else {
+            None
+        };
+        let (storage, storage_thread) = if restored_domain.is_some() {
+            StorageHandle::open_restored(&db_path)?
+        } else {
+            StorageHandle::open(&db_path)?
+        };
+        let publication_auth = match existing_identity {
+            Some((auth, _)) => auth,
+            None => write_identity(&data_dir, None)?,
+        };
+        let restoring = restored_domain.is_some();
+        if let Some(domain) = restored_domain {
             storage.install_domain(domain).await?;
-            let _ = std::fs::remove_file(&restored_path);
+        }
+        storage
+            .bind_identity(publication_auth.cluster_id().to_owned(), 1)
+            .await?;
+        if restoring {
+            std::fs::remove_file(&restored_path).map_err(|err| Error::invalid(err.to_string()))?;
         }
         let log_store = storage.log_store();
         let state_machine = storage.state_machine();
@@ -270,6 +381,7 @@ impl LocalBuilder {
             election_timeout_min: 1000,
             election_timeout_max: 2000,
             max_payload_entries: 4,
+            snapshot_max_chunk_size: 1024 * 1024,
             snapshot_policy: SnapshotPolicy::Never,
             max_in_snapshot_log_to_keep: 1024,
             ..Config::default()
@@ -280,6 +392,14 @@ impl LocalBuilder {
             Raft::<TypeConfig>::new(1, Arc::new(config), LocalNetwork, log_store, state_machine)
                 .await
                 .map_err(|err| Error::invalid(err.to_string()))?;
+        let persisted_fault = matches!(
+            *storage.clock().subscribe_fault().borrow(),
+            ClockFaultState::Latched { .. }
+        );
+        if persisted_fault {
+            raft.runtime_config().heartbeat(false);
+            raft.runtime_config().elect(false);
+        }
         let members = BTreeMap::from([(1, BasicNode::new(""))]);
         match raft.initialize(members).await {
             Ok(()) => {}
@@ -290,10 +410,12 @@ impl LocalBuilder {
                 }
             }
         }
-        raft.wait(Some(Duration::from_secs(5)))
-            .state(ServerState::Leader, "local member is leader")
-            .await
-            .map_err(|err| Error::invalid(err.to_string()))?;
+        if !persisted_fault {
+            raft.wait(Some(Duration::from_secs(5)))
+                .state(ServerState::Leader, "local member is leader")
+                .await
+                .map_err(|err| Error::invalid(err.to_string()))?;
+        }
         let notify = Arc::new(Notify::new());
         let scheduler = Some(tokio::spawn(scheduler_loop(
             raft.clone(),
@@ -305,21 +427,25 @@ impl LocalBuilder {
             storage.clone(),
             notify.clone(),
             handlers.clone(),
+            publication_auth.clone(),
         ));
         let sock = data_dir.join("control.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).map_err(|err| Error::invalid(err.to_string()))?;
+        restrict_control_socket(&sock)?;
         let control = tokio::spawn(control_loop(
             listener,
             raft.clone(),
             storage.clone(),
             notify.clone(),
             None,
+            publication_auth.clone(),
         ));
         let snapshot_task = Some(tokio::spawn(snapshot_controller(
             raft.clone(),
             storage.clone(),
         )));
+        let clock_watchdog = tokio::spawn(clock_watchdog_loop(raft.clone(), storage.clone(), None));
         Ok(Engine {
             raft,
             storage,
@@ -331,8 +457,10 @@ impl LocalBuilder {
             control,
             raft_server: None,
             snapshot_task,
+            clock_watchdog,
             cluster_net: None,
             handlers,
+            publication_auth,
         })
     }
 }
@@ -340,11 +468,40 @@ impl LocalBuilder {
 impl Engine {
     pub async fn member(config: MemberConfig) -> Result<Self> {
         crate::tls::install_provider();
+        let expected_cluster = crate::tls::cluster_id_from_ca(&config.tls.ca_pem)?;
+        crate::tls::verify_peer_identity(
+            &config.tls.ca_pem,
+            &expected_cluster,
+            &crate::tls::load_certs(&config.tls.cert_pem)?,
+        )?
+        .require_member_identity(
+            &expected_cluster,
+            &crate::tls::PrincipalId::parse(config.node_id.to_string())?,
+        )?;
+        crate::tls::server_config(&config.tls)?;
+        let listener = tokio::net::TcpListener::bind(config.bind)
+            .await
+            .map_err(|err| {
+                Error::new(
+                    ErrorKind::FailedPrecondition,
+                    format!("member listener {} unavailable: {err}", config.bind),
+                )
+            })?;
         let data_dir = config.data_dir.clone();
         std::fs::create_dir_all(&data_dir).map_err(|err| Error::invalid(err.to_string()))?;
-        write_identity(&data_dir)?;
+        use sha2::Digest;
+        let ca_digest = sha2::Sha256::digest(config.tls.ca_pem.as_bytes());
+        let cluster_id = hex::encode(&ca_digest[..16]);
         let db_path = data_dir.join("member.redb");
-        let (storage, storage_thread) = StorageHandle::open(&db_path)?;
+        let existing_identity = read_identity(&data_dir, Some(&cluster_id))?;
+        let (storage, storage_thread) = StorageHandle::open_member(&db_path)?;
+        let publication_auth = match existing_identity {
+            Some((auth, _)) => auth,
+            None => write_identity(&data_dir, Some(&cluster_id))?,
+        };
+        storage
+            .bind_identity(publication_auth.cluster_id().to_owned(), config.node_id)
+            .await?;
         let log_store = storage.log_store();
         let state_machine = storage.state_machine();
         let raft_config = Config {
@@ -353,13 +510,15 @@ impl Engine {
             election_timeout_min: 1000,
             election_timeout_max: 2000,
             max_payload_entries: 4,
+            snapshot_max_chunk_size: 1024 * 1024,
             snapshot_policy: SnapshotPolicy::Never,
             max_in_snapshot_log_to_keep: 1024,
             ..Config::default()
         }
         .validate()
         .map_err(|err| Error::invalid(err.to_string()))?;
-        let network = ClusterNetwork::new(config.peers.clone());
+        let network = ClusterNetwork::new(config.node_id, config.tls.clone(), config.peers.clone());
+        storage.clock().configure_network(network.clone());
         let raft = Raft::<TypeConfig>::new(
             config.node_id,
             Arc::new(raft_config),
@@ -369,6 +528,14 @@ impl Engine {
         )
         .await
         .map_err(|err| Error::invalid(err.to_string()))?;
+        let persisted_fault = matches!(
+            *storage.clock().subscribe_fault().borrow(),
+            ClockFaultState::Latched { .. }
+        );
+        if persisted_fault {
+            raft.runtime_config().heartbeat(false);
+            raft.runtime_config().elect(false);
+        }
         let notify = Arc::new(Notify::new());
         let scheduler = Some(tokio::spawn(scheduler_loop(
             raft.clone(),
@@ -377,12 +544,28 @@ impl Engine {
         )));
         let raft_server = {
             let raft = raft.clone();
-            let bind = config.bind;
             let tls = config.tls.clone();
             let storage = storage.clone();
             let notify = notify.clone();
+            let node_id = config.node_id;
+            let mut genesis_members = BTreeMap::from([(node_id, config.bind)]);
+            genesis_members.extend(config.peers.iter().map(|(id, (addr, _))| (*id, *addr)));
+            let network = network.clone();
             tokio::spawn(async move {
-                let _ = serve_grpc(bind, tls, raft, storage, notify).await;
+                if let Err(error) = serve_grpc(
+                    listener,
+                    tls,
+                    raft,
+                    storage,
+                    notify,
+                    node_id,
+                    genesis_members,
+                    network,
+                )
+                .await
+                {
+                    tracing::error!(%error, "member gRPC listener stopped");
+                }
             })
         };
         if config.initialize {
@@ -400,10 +583,12 @@ impl Engine {
                     }
                 }
             }
-            raft.wait(Some(Duration::from_secs(10)))
-                .state(ServerState::Leader, "member is leader")
-                .await
-                .map_err(|err| Error::invalid(err.to_string()))?;
+            if !persisted_fault {
+                raft.wait(Some(Duration::from_secs(10)))
+                    .state(ServerState::Leader, "member is leader")
+                    .await
+                    .map_err(|err| Error::invalid(err.to_string()))?;
+            }
         }
         let handlers = if config.host_activities {
             Handlers::fixtures()
@@ -416,6 +601,7 @@ impl Engine {
                 storage.clone(),
                 notify.clone(),
                 handlers.clone(),
+                publication_auth.clone(),
             )))
         } else {
             None
@@ -423,17 +609,24 @@ impl Engine {
         let sock = data_dir.join("control.sock");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).map_err(|err| Error::invalid(err.to_string()))?;
+        restrict_control_socket(&sock)?;
         let control = tokio::spawn(control_loop(
             listener,
             raft.clone(),
             storage.clone(),
             notify.clone(),
             Some(network.clone()),
+            publication_auth.clone(),
         ));
         let snapshot_task = Some(tokio::spawn(snapshot_controller(
             raft.clone(),
             storage.clone(),
         )));
+        let clock_watchdog = tokio::spawn(clock_watchdog_loop(
+            raft.clone(),
+            storage.clone(),
+            Some(network.clone()),
+        ));
         Ok(Self {
             raft,
             storage,
@@ -445,9 +638,164 @@ impl Engine {
             control,
             raft_server: Some(raft_server),
             snapshot_task,
+            clock_watchdog,
             cluster_net: Some(network),
             handlers,
+            publication_auth,
         })
+    }
+
+    /// Commit an immutable catalog of versioned activity and schema contracts.
+    pub async fn publish_catalog(
+        &self,
+        version: u32,
+        catalog: Catalog,
+    ) -> Result<crate::publication::CommandResult> {
+        self.publish_catalog_with_command(version, catalog, CommandId::generate())
+            .await
+    }
+
+    pub async fn publish_catalog_with_command(
+        &self,
+        version: u32,
+        catalog: Catalog,
+        command_id: CommandId,
+    ) -> Result<crate::publication::CommandResult> {
+        self.publish_with_command(
+            command_id,
+            crate::publication::PublicationOperation::Catalog { version, catalog },
+        )
+        .await
+    }
+
+    /// Publish a compiled definition against an already published catalog.
+    pub async fn publish_definition(
+        &self,
+        definition: Definition,
+        catalog_version: u32,
+    ) -> Result<crate::publication::CommandResult> {
+        self.publish_definition_with_command(definition, catalog_version, CommandId::generate())
+            .await
+    }
+
+    pub async fn publish_definition_with_command(
+        &self,
+        definition: Definition,
+        catalog_version: u32,
+        command_id: CommandId,
+    ) -> Result<crate::publication::CommandResult> {
+        self.publish_with_command(
+            command_id,
+            crate::publication::PublicationOperation::Definition {
+                definition: Box::new(definition),
+                catalog_version,
+            },
+        )
+        .await
+    }
+
+    pub async fn publish_definition_yaml(
+        &self,
+        yaml: &str,
+        catalog_version: u32,
+    ) -> Result<crate::publication::CommandResult> {
+        self.publish_definition_yaml_with_command(yaml, catalog_version, CommandId::generate())
+            .await
+    }
+
+    pub async fn publish_definition_yaml_with_command(
+        &self,
+        yaml: &str,
+        catalog_version: u32,
+        command_id: CommandId,
+    ) -> Result<crate::publication::CommandResult> {
+        let state = self.storage.query_state().await;
+        let catalog = state
+            .published_catalogs
+            .get(&catalog_version)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "published catalog not found"))?;
+        catalog.verify()?;
+        self.publish_definition_with_command(
+            compile_yaml(yaml, &catalog.catalog)?,
+            catalog_version,
+            command_id,
+        )
+        .await
+    }
+
+    pub async fn start_published(
+        &self,
+        workflow: &str,
+        version: Option<u32>,
+        start_key: &str,
+        input: Value,
+    ) -> Result<RunId> {
+        self.start_published_with_command(
+            workflow,
+            version,
+            start_key,
+            input,
+            CommandId::generate(),
+        )
+        .await
+    }
+
+    /// Reuse `command_id` for all retries, including across leader changes.
+    pub async fn start_published_with_command(
+        &self,
+        workflow: &str,
+        version: Option<u32>,
+        start_key: &str,
+        input: Value,
+        command_id: CommandId,
+    ) -> Result<RunId> {
+        let receipt = self
+            .publish_with_command(
+                command_id,
+                crate::publication::PublicationOperation::Start {
+                    workflow: workflow.to_owned(),
+                    version,
+                    start_key: start_key.to_owned(),
+                    input,
+                },
+            )
+            .await?;
+        let run = receipt.applied_run()?;
+        wake(&self.notify);
+        Ok(run)
+    }
+
+    pub async fn command_result(
+        &self,
+        command_id: CommandId,
+    ) -> Result<crate::publication::CommandResult> {
+        linearizable_read(&self.raft).await?;
+        self.storage
+            .query_state()
+            .await
+            .command_results
+            .get(&self.publication_auth.key(command_id).storage_key())
+            .cloned()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "command result not found"))
+            .and_then(|receipt| {
+                receipt.ensure_format()?;
+                Ok(receipt)
+            })
+    }
+
+    async fn publish_with_command(
+        &self,
+        command_id: CommandId,
+        operation: crate::publication::PublicationOperation,
+    ) -> Result<crate::publication::CommandResult> {
+        publication_via_raft(
+            &self.raft,
+            &self.storage,
+            &self.publication_auth,
+            command_id,
+            operation,
+        )
+        .await
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -533,31 +881,56 @@ impl Engine {
     }
 
     pub async fn inspect(&self, run: RunId) -> Result<State> {
+        linearizable_read(&self.raft).await?;
         let state = self.storage.query_state().await;
-        if !state.runs.contains_key(&run) {
-            return Err(Error::new(ErrorKind::NotFound, "unknown run"));
+        let run_state = state
+            .runs
+            .get(&run)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "unknown run"))?;
+        if let Some(pinned) = &run_state.published {
+            pinned.verify(&run_state.definition, &run_state.catalog)?;
         }
         Ok(state)
     }
 
     pub async fn inspect_json(&self, run: RunId) -> Result<serde_json::Value> {
-        let state = self.inspect(run).await?;
+        let state = self.storage.query_state().await;
+        if let Some(summary) = state.terminal_summaries.get(&run) {
+            return Ok(crate::history::summary_view(summary));
+        }
+        let run_state = state
+            .runs
+            .get(&run)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "unknown run"))?;
+        if let Some(pinned) = &run_state.published {
+            pinned.verify(&run_state.definition, &run_state.catalog)?;
+        }
         Ok(inspect_view(&state, run))
     }
 
     pub async fn health(&self) -> serde_json::Value {
         let metrics = self.raft.metrics().borrow().clone();
         let state = self.storage.query_state().await;
+        let clock_safe = self.storage.clock().sample(&self.storage).await.is_ok();
+        let quorum_safe =
+            tokio::time::timeout(Duration::from_secs(2), self.raft.ensure_linearizable())
+                .await
+                .is_ok_and(|result| result.is_ok());
         health_view(
             format!("{:?}", metrics.state),
             metrics.last_applied.map(|id| id.index),
             metrics.last_log_index,
             metrics.membership_config.voter_ids().collect(),
             &state,
+            clock_safe,
+            self.storage.clock().fault_reason().await,
+            quorum_safe,
+            self.storage.scheduler_stats(),
         )
     }
 
-    pub async fn list(&self) -> serde_json::Value {
+    pub async fn list(&self) -> Result<serde_json::Value> {
+        linearizable_read(&self.raft).await?;
         let state = self.storage.query_state().await;
         let runs: Vec<_> = state
             .runs
@@ -574,101 +947,72 @@ impl Engine {
                 })
             })
             .collect();
-        serde_json::json!({ "runs": runs })
+        let mut runs = runs;
+        runs.extend(
+            state
+                .terminal_summaries
+                .values()
+                .map(crate::history::summary_view),
+        );
+        Ok(serde_json::json!({ "runs": runs }))
     }
 
     pub async fn history(&self, run: RunId) -> Result<Vec<crate::domain::DomainEvent>> {
-        let state = self.inspect(run).await?;
-        Ok(crate::domain::history_or_unavailable(&state, run, now())?.to_vec())
+        let state = history_state(&self.raft, &self.storage).await?;
+        let mut after = 0;
+        let mut events = Vec::new();
+        loop {
+            let page =
+                crate::history::page(&state, run, after, crate::history::MAX_PAGE_LIMIT, now())?;
+            if page.unavailable {
+                return Err(Error::new(
+                    ErrorKind::Unavailable,
+                    "history range is unavailable",
+                ));
+            }
+            events.extend(page.events.into_iter().map(|entry| entry.event));
+            match page.next_cursor {
+                Some(cursor) => after = cursor,
+                None => return Ok(events),
+            }
+        }
     }
 
+    pub async fn history_page(
+        &self,
+        run: RunId,
+        after: u64,
+        limit: u32,
+    ) -> Result<crate::history::HistoryPage> {
+        crate::history::page(
+            &history_state(&self.raft, &self.storage).await?,
+            run,
+            after,
+            limit,
+            now(),
+        )
+    }
+
+    pub async fn reconstruct_at(&self, run: RunId, through: u64) -> Result<State> {
+        crate::history::reconstruct_at(
+            &history_state(&self.raft, &self.storage).await?,
+            run,
+            through,
+            now(),
+        )
+    }
+
+    #[cfg(test)]
     pub async fn run_worker(endpoint: String, tls: crate::tls::TlsMaterial) -> Result<()> {
-        crate::tls::install_provider();
-        let session = crate::ids::WorkerSessionId::generate();
-        let channel = tonic::transport::Channel::from_shared(endpoint)
-            .map_err(|err| Error::invalid(err.to_string()))?
-            .tls_config(crate::rpc::client_tls(&tls)?)
-            .map_err(|err| Error::invalid(err.to_string()))?
-            .connect()
+        let catalog = Catalog::from_json(include_bytes!(
+            "../../docs/specs/v1/examples/activity-catalog.json"
+        ))?;
+        crate::worker::Worker::builder(endpoint, tls, catalog)
+            .fixture_handlers()
+            .open()
+            .await?
+            .run()
             .await
-            .map_err(|err| Error::invalid(err.to_string()))?;
-        let mut client = crate::generated::worker_client::WorkerClient::new(channel);
-        let reg = client
-            .register(crate::generated::RegisterRequest {
-                session_id: session.to_hex(),
-                activities: vec!["*".to_owned()],
-                capacity: crate::limits::CLAIM_BATCH,
-            })
-            .await
-            .map_err(|err| Error::invalid(err.to_string()))?;
-        if !reg.into_inner().error.is_empty() {
-            return Err(Error::invalid("worker register failed"));
-        }
-        loop {
-            let claimed = client
-                .claim(crate::generated::ClaimRequest {
-                    command_id: CommandId::generate().to_hex(),
-                    session_id: session.to_hex(),
-                    capacity: crate::limits::CLAIM_BATCH,
-                })
-                .await
-                .map_err(|err| Error::invalid(err.to_string()))?
-                .into_inner();
-            if !claimed.error.is_empty() || claimed.assignments.is_empty() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            for assignment in claimed.assignments {
-                let input: Value =
-                    serde_json::from_slice(&assignment.input_json).unwrap_or(Value::Null);
-                if assignment.role.contains("reconcil") {
-                    let outcome = builtin_reconcile(
-                        &assignment.activity_name,
-                        &input,
-                        Some(assignment.effect_key.as_str()),
-                    );
-                    let tag = match outcome.0 {
-                        crate::domain::ReconcileOutcome::Applied => "applied",
-                        crate::domain::ReconcileOutcome::NotApplied => "not_applied",
-                        crate::domain::ReconcileOutcome::Unknown => "unknown",
-                    };
-                    let _ = client
-                        .reconcile(crate::generated::ReconcileRequest {
-                            command_id: CommandId::generate().to_hex(),
-                            session_id: session.to_hex(),
-                            run_id: assignment.run_id,
-                            activation_id: assignment.activation_id,
-                            outcome: tag.to_owned(),
-                            output_json: outcome
-                                .1
-                                .map(|value| serde_json::to_vec(&value).unwrap_or_default())
-                                .unwrap_or_default(),
-                            generation: assignment.generation,
-                            revision: assignment.revision,
-                        })
-                        .await;
-                    continue;
-                }
-                let Ok(output) = dispatch_handler(
-                    &assignment.activity_name,
-                    &input,
-                    Some(&assignment.effect_key),
-                ) else {
-                    continue;
-                };
-                let _ = client
-                    .report(crate::generated::ReportRequest {
-                        command_id: CommandId::generate().to_hex(),
-                        session_id: session.to_hex(),
-                        run_id: assignment.run_id,
-                        activation_id: assignment.activation_id,
-                        generation: assignment.generation,
-                        revision: assignment.revision,
-                        output_json: serde_json::to_vec(&output).unwrap_or_default(),
-                    })
-                    .await;
-            }
-        }
     }
 
     pub fn is_leader(&self) -> bool {
@@ -713,6 +1057,13 @@ impl Engine {
         self.raft
             .change_membership(
                 ChangeMembers::RemoveVoters(std::iter::once(id).collect()),
+                false,
+            )
+            .await
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        self.raft
+            .change_membership(
+                ChangeMembers::RemoveNodes(std::iter::once(id).collect()),
                 false,
             )
             .await
@@ -767,36 +1118,192 @@ impl Engine {
         Ok(())
     }
 
+    pub async fn acknowledge_clock(&self, reason: &str) -> Result<()> {
+        self.storage
+            .clock()
+            .acknowledge(&self.storage, reason)
+            .await
+    }
+
     pub fn backup(data_dir: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<()> {
+        let state = load_domain_readonly(data_dir.as_ref().join("member.redb"))?;
         let out = out.as_ref();
         std::fs::create_dir_all(out).map_err(|err| Error::invalid(err.to_string()))?;
-        let state = load_domain_readonly(data_dir.as_ref().join("member.redb"))?;
-        let body =
-            serde_json::to_vec_pretty(&state).map_err(|err| Error::invalid(err.to_string()))?;
-        std::fs::write(out.join("domain.json"), body)
+        let id = CommandId::generate().to_hex();
+        let raw_path = out.join(format!("domain-{id}.json.tmp"));
+        let mut raw = private_file(&raw_path).map_err(|err| Error::invalid(err.to_string()))?;
+        let _raw_cleanup = RemoveOnDrop(raw_path.clone());
+        serde_json::to_writer(&mut raw, &state).map_err(|err| Error::invalid(err.to_string()))?;
+        raw.sync_all()
             .map_err(|err| Error::invalid(err.to_string()))?;
-        let manifest = serde_json::json!({
-            "format": "graphrun.backup/v1",
-            "kind": "logical-domain",
-        });
-        std::fs::write(
-            out.join("manifest.json"),
-            serde_json::to_vec_pretty(&manifest).unwrap(),
+        let body_len = raw
+            .metadata()
+            .map_err(|err| Error::invalid(err.to_string()))?
+            .len();
+        drop(raw);
+        let snapshot_manifest = SnapshotManifest {
+            framing_version: 1,
+            generation: 0,
+            applied_json: b"null".to_vec(),
+            membership_json: b"null".to_vec(),
+            payload_bytes: body_len,
+            record_formats: vec![
+                "graphrun.domain/v1".to_owned(),
+                crate::history::EVENT_FORMAT.to_owned(),
+                crate::history::CHECKPOINT_FORMAT.to_owned(),
+                crate::publication::RESULT_FORMAT.to_owned(),
+                crate::record_store::FORMAT.to_owned(),
+                crate::record_store::FRAGMENT_FORMAT.to_owned(),
+            ],
+            record_count: 1,
+            artifact_origin_ids: state.artifact_origins.iter().cloned().collect(),
+        };
+        let stage_path = out.join(format!("application-{id}.snap.tmp"));
+        let digest = write_snapshot(
+            &mut std::fs::File::open(&raw_path).map_err(|err| Error::invalid(err.to_string()))?,
+            &stage_path,
+            &snapshot_manifest,
         )
         .map_err(|err| Error::invalid(err.to_string()))?;
+        let _stage_cleanup = RemoveOnDrop(stage_path.clone());
+        let snapshot_name = format!("application-{}.snap", hex::encode(digest));
+        let snapshot_path = out.join(&snapshot_name);
+        if snapshot_path.exists() {
+            let (_, previous) =
+                verify_snapshot(&snapshot_path).map_err(|err| Error::invalid(err.to_string()))?;
+            if previous != digest {
+                return Err(Error::new(
+                    ErrorKind::AlreadyExists,
+                    "backup artifact identity collides with different bytes",
+                ));
+            }
+        } else {
+            std::fs::rename(&stage_path, &snapshot_path)
+                .map_err(|err| Error::invalid(err.to_string()))?;
+        }
+        std::fs::File::open(out)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        let manifest = LogicalBackupManifest {
+            format: "graphrun.backup/v3".to_owned(),
+            kind: "logical-application".to_owned(),
+            snapshot: snapshot_name,
+            sha256: hex::encode(digest),
+        };
+        let manifest_stage = out.join(format!("manifest-{id}.json.tmp"));
+        let mut file =
+            private_file(&manifest_stage).map_err(|err| Error::invalid(err.to_string()))?;
+        let _manifest_cleanup = RemoveOnDrop(manifest_stage.clone());
+        serde_json::to_writer_pretty(&mut file, &manifest)
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        file.sync_all()
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        std::fs::rename(&manifest_stage, out.join("manifest.json"))
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        std::fs::File::open(out)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|err| Error::invalid(err.to_string()))?;
         Ok(())
+    }
+
+    /// Verify a logical backup without opening an engine or dispatching handlers.
+    pub fn read_backup(from: impl AsRef<Path>) -> Result<State> {
+        let from = from.as_ref();
+        let manifest: LogicalBackupManifest = serde_json::from_slice(
+            &std::fs::read(from.join("manifest.json"))
+                .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?,
+        )
+        .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        if manifest.format != "graphrun.backup/v3"
+            || manifest.kind != "logical-application"
+            || !manifest.snapshot.starts_with("application-")
+            || !manifest.snapshot.ends_with(".snap")
+            || Path::new(&manifest.snapshot).components().count() != 1
+            || manifest.snapshot.contains('/')
+            || manifest.snapshot.contains('\\')
+            || manifest.snapshot.contains(':')
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "unsupported backup manifest; source left untouched",
+            ));
+        }
+        let snapshot = from.join(&manifest.snapshot);
+        let (framing, digest) = verify_snapshot(&snapshot)
+            .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        let required = [
+            "graphrun.domain/v1",
+            crate::history::EVENT_FORMAT,
+            crate::history::CHECKPOINT_FORMAT,
+            crate::publication::RESULT_FORMAT,
+            crate::record_store::FORMAT,
+            crate::record_store::FRAGMENT_FORMAT,
+        ];
+        if manifest.sha256 != hex::encode(digest)
+            || framing.generation != 0
+            || framing.applied_json != b"null"
+            || framing.membership_json != b"null"
+            || framing.record_formats.len() != required.len()
+            || required
+                .iter()
+                .any(|format| !framing.record_formats.iter().any(|stored| stored == format))
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "backup digest, authority, or retained reader versions are unavailable",
+            ));
+        }
+        let raw_path = std::env::temp_dir().join(format!(
+            "graphrun-restore-{}.json.tmp",
+            CommandId::generate().to_hex()
+        ));
+        let mut raw = private_file(&raw_path).map_err(|err| Error::invalid(err.to_string()))?;
+        let _raw_cleanup = RemoveOnDrop(raw_path.clone());
+        copy_payload(&snapshot, &mut raw)
+            .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        raw.sync_all()
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        drop(raw);
+        let domain: State = serde_json::from_reader(
+            std::fs::File::open(&raw_path).map_err(|err| Error::invalid(err.to_string()))?,
+        )
+        .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        if framing.artifact_origin_ids
+            != domain.artifact_origins.iter().cloned().collect::<Vec<_>>()
+            || crate::ids::ClusterId::from_hex(&domain.current_cluster_id).is_err()
+            || !domain.artifact_origins.contains(&domain.current_cluster_id)
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "backup artifact origins differ from retained records",
+            ));
+        }
+        validate_history_store(&domain).map_err(|err| {
+            Error::new(
+                ErrorKind::FailedPrecondition,
+                format!("retained backup artifact is unavailable: {err}"),
+            )
+        })?;
+        Ok(domain)
     }
 
     pub fn restore(from: impl AsRef<Path>, dest: impl AsRef<Path>, reason: &str) -> Result<()> {
         if reason.is_empty() {
             return Err(Error::invalid("restore requires a reason"));
         }
-        let from = from.as_ref();
         let dest = dest.as_ref();
-        let bytes = std::fs::read(from.join("domain.json"))
-            .map_err(|err| Error::invalid(err.to_string()))?;
-        let mut domain: State =
-            serde_json::from_slice(&bytes).map_err(|err| Error::invalid(err.to_string()))?;
+        let mut domain = Self::read_backup(from)?;
+        if dest.exists()
+            && std::fs::read_dir(dest)
+                .map_err(|err| Error::invalid(err.to_string()))?
+                .next()
+                .is_some()
+        {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "restore destination is not empty; directory left untouched",
+            ));
+        }
         domain.recovery = Some(crate::domain::RecoveryHold {
             reason: reason.to_owned(),
             authorized: false,
@@ -818,18 +1325,27 @@ impl Engine {
             "mode": "local",
             "node_id": 1u64,
             "cluster_name": cluster,
+            "format": "graphrun.local-identity/v1",
+            "cluster_id": crate::ids::ClusterId::generate().to_hex(),
             "restored": true,
         });
-        std::fs::write(
-            dest.join("identity.json"),
-            serde_json::to_vec_pretty(&identity).unwrap(),
-        )
-        .map_err(|err| Error::invalid(err.to_string()))?;
-        std::fs::write(
-            dest.join("restored-domain.json"),
-            serde_json::to_vec(&domain).unwrap(),
-        )
-        .map_err(|err| Error::invalid(err.to_string()))?;
+        let mut identity_file = private_file(&dest.join("identity.json"))
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        serde_json::to_writer_pretty(&mut identity_file, &identity)
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        identity_file
+            .sync_all()
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        let mut domain_file = private_file(&dest.join("restored-domain.json"))
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        serde_json::to_writer(&mut domain_file, &domain)
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        domain_file
+            .sync_all()
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        std::fs::File::open(dest)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|err| Error::invalid(err.to_string()))?;
         Ok(())
     }
 
@@ -845,6 +1361,16 @@ impl Engine {
         self.storage.last_applied_index().await
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_clock_watermark(&self, watermark: u64) {
+        self.storage.clock().inject_watermark(watermark);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_clock_watermark(&self) {
+        self.storage.clock().clear_injected_watermark();
+    }
+
     pub fn raft_applied_index(&self) -> u64 {
         self.raft
             .metrics()
@@ -852,6 +1378,36 @@ impl Engine {
             .last_applied
             .map(|id| id.index)
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raft_epoch(&self) -> (u64, u64) {
+        let metrics = self.raft.metrics().borrow().clone();
+        (
+            metrics.current_term,
+            metrics
+                .membership_config
+                .log_id()
+                .map(|id| id.index)
+                .unwrap_or(0),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn membership_applied(&self) -> bool {
+        self.storage
+            .applied_membership()
+            .await
+            .is_ok_and(|membership| membership == *self.raft.metrics().borrow().membership_config)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn has_fresh_clock_quorum(&self) -> bool {
+        self.storage
+            .clock()
+            .fresh_voter_quorum(&self.storage, &self.raft)
+            .await
+            .is_ok()
     }
 
     /// Block until `run` succeeds or fails, or `timeout` elapses.
@@ -863,10 +1419,12 @@ impl Engine {
         loop {
             let state = self.storage.query_state().await;
             if let Some(output) = run_output(&state, run) {
+                linearizable_read(&self.raft).await?;
                 return Ok(output);
             }
             if let Some(run_state) = state.runs.get(&run) {
                 if let RunStatus::Failed { error } = &run_state.status {
+                    linearizable_read(&self.raft).await?;
                     return Err(Error::invalid(format!(
                         "run failed: {} {}",
                         error.code, error.message
@@ -914,6 +1472,7 @@ impl Engine {
         if let Some(task) = &self.snapshot_task {
             task.abort();
         }
+        self.clock_watchdog.abort();
         let _ = self.raft.shutdown().await;
         self.storage.shutdown();
         if let Some(thread) = self.storage_thread.lock().unwrap().take() {
@@ -924,7 +1483,12 @@ impl Engine {
     }
 
     async fn write(&self, command: Command) -> Result<()> {
-        write_raft(&self.raft, command).await
+        let command = if matches!(command.body, CommandBody::Progress { .. }) {
+            command
+        } else {
+            command.authenticated_context(&self.publication_auth)
+        };
+        write_raft(&self.raft, &self.storage, command).await
     }
 }
 
@@ -936,6 +1500,7 @@ impl Drop for Engine {
         if let Some(scheduler) = &self.scheduler {
             scheduler.abort();
         }
+        self.clock_watchdog.abort();
         self.control.abort();
         if let Some(server) = &self.raft_server {
             server.abort();
@@ -954,18 +1519,28 @@ impl Drop for Engine {
 pub fn replay(data_dir: impl AsRef<Path>) -> Result<State> {
     let db_path = data_dir.as_ref().join("member.redb");
     let state = load_domain_readonly(&db_path)?;
+    for run in state.runs.keys() {
+        if !state.history.contains_key(run) {
+            return Err(Error::new(
+                ErrorKind::Unavailable,
+                format!("missing retained history for run {}", run.to_hex()),
+            ));
+        }
+    }
     for (run, events) in &state.history {
         let Some(run_state) = state.runs.get(run) else {
-            continue;
+            return Err(Error::new(
+                ErrorKind::Unavailable,
+                format!("history has no retained run {}", run.to_hex()),
+            ));
         };
-        let rebuilt = reconstruct(
-            run_state.definition.clone(),
-            run_state.catalog.clone(),
-            events,
-        )?;
+        if let Some(pinned) = &run_state.published {
+            pinned.verify(&run_state.definition, &run_state.catalog)?;
+        }
+        let rebuilt = crate::history::reconstruct_at(&state, *run, events.len() as u64, now())?;
         let live = run_output(&state, *run);
         let replayed = run_output(&rebuilt, *run);
-        if live != replayed {
+        if live != replayed || run_state.status != rebuilt.runs[run].status {
             return Err(Error::invalid(format!(
                 "replay mismatch for run {}",
                 run.to_hex()
@@ -973,6 +1548,13 @@ pub fn replay(data_dir: impl AsRef<Path>) -> Result<State> {
         }
     }
     Ok(state)
+}
+
+async fn history_state(raft: &Raft<TypeConfig>, storage: &StorageHandle) -> Result<State> {
+    raft.ensure_linearizable()
+        .await
+        .map_err(|err| Error::new(ErrorKind::Unavailable, err.to_string()))?;
+    Ok(storage.query_state().await)
 }
 
 pub async fn connect_control(
@@ -997,17 +1579,75 @@ pub async fn connect_control(
     serde_json::from_str(&response).map_err(|err| Error::invalid(err.to_string()))
 }
 
-fn write_identity(dir: &Path) -> Result<()> {
+fn read_identity(
+    dir: &Path,
+    expected_cluster: Option<&str>,
+) -> Result<Option<(crate::publication::AuthContext, bool)>> {
     let path = dir.join("identity.json");
     if path.exists() {
-        return Ok(());
+        let bytes = std::fs::read(&path).map_err(|err| Error::invalid(err.to_string()))?;
+        let identity: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err.to_string()))?;
+        if identity["format"] != "graphrun.local-identity/v1" {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "incompatible pre-publication identity (directory left untouched)",
+            ));
+        }
+        let cluster = identity["cluster_id"]
+            .as_str()
+            .ok_or_else(|| Error::new(ErrorKind::FailedPrecondition, "missing cluster identity"))?;
+        crate::ids::ClusterId::from_hex(cluster)
+            .map_err(|err| Error::new(ErrorKind::FailedPrecondition, err))?;
+        if expected_cluster.is_some_and(|expected| expected != cluster) {
+            return Err(Error::new(
+                ErrorKind::FailedPrecondition,
+                "cluster identity does not match configured CA",
+            ));
+        }
+        return Ok(Some((
+            crate::publication::AuthContext::local_owner(cluster.to_owned()),
+            identity["restored"] == true,
+        )));
     }
+    if dir.join("member.redb").exists() || dir.join("restored-domain.json").exists() {
+        return Err(Error::new(
+            ErrorKind::FailedPrecondition,
+            "member store or restored domain has no compatible identity (directory left untouched)",
+        ));
+    }
+    Ok(None)
+}
+
+fn write_identity(
+    dir: &Path,
+    expected_cluster: Option<&str>,
+) -> Result<crate::publication::AuthContext> {
+    let path = dir.join("identity.json");
+    let cluster_id = expected_cluster
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::ids::ClusterId::generate().to_hex());
     let body = serde_json::json!({
+        "format": "graphrun.local-identity/v1",
+        "cluster_id": cluster_id,
         "mode": "local",
         "node_id": 1u64,
         "cluster_name": "graphrun-local",
     });
-    std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap())
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|err| Error::invalid(err.to_string()))?;
+    file.write_all(&serde_json::to_vec_pretty(&body).unwrap())
+        .map_err(|err| Error::invalid(err.to_string()))?;
+    Ok(crate::publication::AuthContext::local_owner(cluster_id))
+}
+
+fn restrict_control_socket(sock: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))
         .map_err(|err| Error::invalid(err.to_string()))
 }
 
@@ -1017,6 +1657,7 @@ async fn control_loop(
     storage: StorageHandle,
     notify: Arc<Notify>,
     cluster_net: Option<ClusterNetwork>,
+    auth: crate::publication::AuthContext,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -1026,8 +1667,9 @@ async fn control_loop(
         let storage = storage.clone();
         let notify = notify.clone();
         let cluster_net = cluster_net.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
-            let _ = handle_control(stream, raft, storage, notify, cluster_net).await;
+            let _ = handle_control(stream, raft, storage, notify, cluster_net, auth).await;
         });
     }
 }
@@ -1038,7 +1680,29 @@ async fn handle_control(
     storage: StorageHandle,
     notify: Arc<Notify>,
     cluster_net: Option<ClusterNetwork>,
+    auth: crate::publication::AuthContext,
 ) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(
+        stream
+            .local_addr()
+            .map_err(|err| Error::invalid(err.to_string()))?
+            .as_pathname()
+            .ok_or_else(|| Error::invalid("control socket has no pathname"))?,
+    )
+    .map_err(|err| Error::invalid(err.to_string()))?
+    .uid();
+    if stream
+        .peer_cred()
+        .map_err(|err| Error::invalid(err.to_string()))?
+        .uid()
+        != owner
+    {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "control socket owner only",
+        ));
+    }
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader
@@ -1047,7 +1711,7 @@ async fn handle_control(
         .map_err(|err| Error::invalid(err.to_string()))?;
     let req: ControlRequest =
         serde_json::from_str(&line).map_err(|err| Error::invalid(err.to_string()))?;
-    let resp = dispatch_control(req, &raft, &storage, &notify, cluster_net.as_ref()).await;
+    let resp = dispatch_control(req, &raft, &storage, &notify, cluster_net.as_ref(), &auth).await;
     let mut out = serde_json::to_string(&resp).unwrap();
     out.push('\n');
     let mut stream = reader.into_inner();
@@ -1064,20 +1728,136 @@ async fn dispatch_control(
     storage: &StorageHandle,
     notify: &Notify,
     cluster_net: Option<&ClusterNetwork>,
+    auth: &crate::publication::AuthContext,
 ) -> ControlResponse {
     let result = match req {
+        ControlRequest::PublishCatalog {
+            version,
+            catalog,
+            command_id,
+        } => match CommandId::from_hex(&command_id) {
+            Ok(id) => publication_via_raft(
+                raft,
+                storage,
+                auth,
+                id,
+                crate::publication::PublicationOperation::Catalog { version, catalog },
+            )
+            .await
+            .and_then(|receipt| {
+                serde_json::to_value(receipt).map_err(|err| Error::invalid(err.to_string()))
+            }),
+            Err(err) => Err(Error::invalid(err)),
+        },
+        ControlRequest::PublishDefinition {
+            yaml,
+            catalog_version,
+            command_id,
+        } => match CommandId::from_hex(&command_id) {
+            Ok(id) => {
+                let state = storage.query_state().await;
+                let definition = state
+                    .published_catalogs
+                    .get(&catalog_version)
+                    .ok_or_else(|| Error::new(ErrorKind::NotFound, "published catalog not found"))
+                    .and_then(|published| {
+                        published.verify()?;
+                        compile_yaml(&yaml, &published.catalog)
+                    });
+                match definition {
+                    Ok(definition) => publication_via_raft(
+                        raft,
+                        storage,
+                        auth,
+                        id,
+                        crate::publication::PublicationOperation::Definition {
+                            definition: Box::new(definition),
+                            catalog_version,
+                        },
+                    )
+                    .await
+                    .and_then(|receipt| {
+                        serde_json::to_value(receipt).map_err(|err| Error::invalid(err.to_string()))
+                    }),
+                    Err(err) => Err(err),
+                }
+            }
+            Err(err) => Err(Error::invalid(err)),
+        },
+        ControlRequest::StartPublished {
+            workflow,
+            version,
+            start_key,
+            input,
+            command_id,
+            wait_ms,
+        } => match CommandId::from_hex(&command_id) {
+            Ok(id) => match publication_via_raft(
+                raft,
+                storage,
+                auth,
+                id,
+                crate::publication::PublicationOperation::Start {
+                    workflow,
+                    version,
+                    start_key,
+                    input,
+                },
+            )
+            .await
+            .and_then(|receipt| receipt.applied_run())
+            {
+                Ok(run) => {
+                    wake(notify);
+                    if let Some(ms) = wait_ms {
+                        wait_via_raft(raft, storage, notify, run, Duration::from_millis(ms)).await
+                                .map(|output| serde_json::json!({"run":run.to_hex(),"status":"succeeded","output":output}))
+                    } else {
+                        Ok(serde_json::json!({"run":run.to_hex(),"status":"started"}))
+                    }
+                }
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(Error::invalid(err)),
+        },
+        ControlRequest::CommandResult { command_id } => match CommandId::from_hex(&command_id) {
+            Ok(id) => match linearizable_read(raft).await {
+                Ok(_) => storage
+                    .query_state()
+                    .await
+                    .command_results
+                    .get(&auth.key(id).storage_key())
+                    .ok_or_else(|| Error::new(ErrorKind::NotFound, "command result not found"))
+                    .and_then(|receipt| {
+                        receipt.ensure_format()?;
+                        serde_json::to_value(receipt).map_err(|err| Error::invalid(err.to_string()))
+                    }),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(Error::invalid(err)),
+        },
         ControlRequest::Health => {
             let metrics = raft.metrics().borrow().clone();
             let state = storage.query_state().await;
+            let clock_safe = storage.clock().sample(storage).await.is_ok();
+            let quorum_safe =
+                tokio::time::timeout(Duration::from_secs(2), raft.ensure_linearizable())
+                    .await
+                    .is_ok_and(|result| result.is_ok());
             Ok(health_view(
                 format!("{:?}", metrics.state),
                 metrics.last_applied.map(|id| id.index),
                 metrics.last_log_index,
                 metrics.membership_config.voter_ids().collect(),
                 &state,
+                clock_safe,
+                storage.clock().fault_reason().await,
+                quorum_safe,
+                storage.scheduler_stats(),
             ))
         }
         ControlRequest::List => {
+            let checked = linearizable_read(raft).await;
             let state = storage.query_state().await;
             let runs: Vec<_> = state
                 .runs
@@ -1094,14 +1874,14 @@ async fn dispatch_control(
                     })
                 })
                 .collect();
-            Ok(serde_json::json!({"runs": runs}))
+            checked.map(|_| serde_json::json!({"runs": runs}))
         }
         ControlRequest::Start {
             yaml,
             catalog,
             input,
             wait_ms,
-        } => match start_via_raft(raft, notify, &yaml, catalog, input).await {
+        } => match start_via_raft(raft, storage, notify, &yaml, catalog, input, auth).await {
             Ok(run) => {
                 if let Some(ms) = wait_ms {
                     match wait_via_raft(raft, storage, notify, run, Duration::from_millis(ms)).await
@@ -1111,11 +1891,7 @@ async fn dispatch_control(
                             "status": "succeeded",
                             "output": output,
                         })),
-                        Err(err) => Ok(serde_json::json!({
-                            "run": run.to_hex(),
-                            "status": "pending",
-                            "error": err.to_string(),
-                        })),
+                        Err(err) => Err(err),
                     }
                 } else {
                     Ok(serde_json::json!({"run": run.to_hex(), "status": "started"}))
@@ -1134,6 +1910,7 @@ async fn dispatch_control(
             match parsed {
                 Ok((run, event_id)) => write_raft(
                     raft,
+                    storage,
                     Command {
                         id: CommandId::generate(),
                         time: now(),
@@ -1144,7 +1921,8 @@ async fn dispatch_control(
                             key,
                             payload,
                         },
-                    },
+                    }
+                    .authenticated_context(auth),
                 )
                 .await
                 .map(|_| {
@@ -1157,11 +1935,13 @@ async fn dispatch_control(
         ControlRequest::Cancel { run, reason } => match RunId::from_hex(&run) {
             Ok(run) => write_raft(
                 raft,
+                storage,
                 Command {
                     id: CommandId::generate(),
                     time: now(),
                     body: CommandBody::Cancel { run, reason },
-                },
+                }
+                .authenticated_context(auth),
             )
             .await
             .map(|_| {
@@ -1171,24 +1951,52 @@ async fn dispatch_control(
             Err(err) => Err(Error::invalid(err)),
         },
         ControlRequest::Inspect { run } => match RunId::from_hex(&run) {
-            Ok(run) => {
-                let state = storage.query_state().await;
-                if state.runs.contains_key(&run) {
-                    Ok(inspect_view(&state, run))
-                } else {
-                    Err(Error::new(ErrorKind::NotFound, "unknown run"))
+            Ok(run) => match linearizable_read(raft).await {
+                Ok(()) => {
+                    let state = storage.query_state().await;
+                    if let Some(summary) = state.terminal_summaries.get(&run) {
+                        Ok(crate::history::summary_view(summary))
+                    } else {
+                        state
+                            .runs
+                            .get(&run)
+                            .ok_or_else(|| Error::new(ErrorKind::NotFound, "unknown run"))
+                            .and_then(|run_state| {
+                                if let Some(pinned) = &run_state.published {
+                                    pinned.verify(&run_state.definition, &run_state.catalog)?;
+                                }
+                                Ok(inspect_view(&state, run))
+                            })
+                    }
                 }
-            }
+                Err(err) => Err(err),
+            },
             Err(err) => Err(Error::invalid(err)),
         },
-        ControlRequest::History { run } => match RunId::from_hex(&run) {
-            Ok(run) => {
-                let state = storage.query_state().await;
-                match serde_json::to_value(run_events(&state, run)) {
-                    Ok(body) => Ok(body),
-                    Err(err) => Err(Error::invalid(err.to_string())),
-                }
-            }
+        ControlRequest::History {
+            run,
+            after_sequence,
+            page_size,
+        } => match RunId::from_hex(&run) {
+            Ok(run) => match history_state(raft, storage).await {
+                Ok(state) => crate::history::page(&state, run, after_sequence, page_size, now())
+                    .and_then(|page| {
+                        serde_json::to_value(page).map_err(|err| Error::invalid(err.to_string()))
+                    }),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(Error::invalid(err)),
+        },
+        ControlRequest::Replay {
+            run,
+            through_sequence,
+        } => match RunId::from_hex(&run) {
+            Ok(run) => history_state(raft, storage)
+                .await
+                .and_then(|state| {
+                    crate::history::reconstruct_at(&state, run, through_sequence, now())
+                })
+                .map(|projection| inspect_view(&projection, run)),
             Err(err) => Err(Error::invalid(err)),
         },
         ControlRequest::Snapshot => raft
@@ -1199,17 +2007,24 @@ async fn dispatch_control(
             .map_err(|err| Error::invalid(err.to_string())),
         ControlRequest::Acknowledge { reason } => write_raft(
             raft,
+            storage,
             Command {
                 id: CommandId::generate(),
                 time: now(),
                 body: CommandBody::AcknowledgeRecovery { reason },
-            },
+            }
+            .authenticated_context(auth),
         )
         .await
         .map(|_| {
             wake(notify);
             serde_json::json!({"status":"ok"})
         }),
+        ControlRequest::AcknowledgeClock { reason } => storage
+            .clock()
+            .acknowledge(storage, &reason)
+            .await
+            .map(|_| serde_json::json!({"status":"ok"})),
         ControlRequest::ResolveBlocked {
             run,
             forward,
@@ -1220,6 +2035,7 @@ async fn dispatch_control(
         ) {
             (Ok(run), Ok(forward)) => write_raft(
                 raft,
+                storage,
                 Command {
                     id: CommandId::generate(),
                     time: now(),
@@ -1228,7 +2044,8 @@ async fn dispatch_control(
                         forward,
                         input,
                     },
-                },
+                }
+                .authenticated_context(auth),
             )
             .await
             .map(|_| {
@@ -1240,11 +2057,13 @@ async fn dispatch_control(
         ControlRequest::Abandon { run, reason } => match RunId::from_hex(&run) {
             Ok(run) => write_raft(
                 raft,
+                storage,
                 Command {
                     id: CommandId::generate(),
                     time: now(),
                     body: CommandBody::AbandonCompensation { run, reason },
-                },
+                }
+                .authenticated_context(auth),
             )
             .await
             .map(|_| {
@@ -1288,14 +2107,25 @@ async fn dispatch_control(
             .await
             .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
             .map_err(|err| Error::invalid(err.to_string())),
-        ControlRequest::Remove { node_id } => raft
-            .change_membership(
-                ChangeMembers::RemoveVoters(std::iter::once(node_id).collect()),
-                false,
-            )
-            .await
-            .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
-            .map_err(|err| Error::invalid(err.to_string())),
+        ControlRequest::Remove { node_id } => {
+            match raft
+                .change_membership(
+                    ChangeMembers::RemoveVoters(std::iter::once(node_id).collect()),
+                    false,
+                )
+                .await
+            {
+                Ok(_) => raft
+                    .change_membership(
+                        ChangeMembers::RemoveNodes(std::iter::once(node_id).collect()),
+                        false,
+                    )
+                    .await
+                    .map(|_| serde_json::json!({"status":"ok","node_id": node_id}))
+                    .map_err(|err| Error::invalid(err.to_string())),
+                Err(err) => Err(Error::invalid(err.to_string())),
+            }
+        }
     };
     match result {
         Ok(body) => ControlResponse {
@@ -1319,15 +2149,18 @@ fn parse_run_event(run: &str, event_id: &str) -> Result<(RunId, EventId)> {
 
 async fn start_via_raft(
     raft: &Raft<TypeConfig>,
+    storage: &StorageHandle,
     notify: &Notify,
     yaml: &str,
     catalog: Catalog,
     input: Value,
+    auth: &crate::publication::AuthContext,
 ) -> Result<RunId> {
     let definition = compile_yaml(yaml, &catalog)?;
     let run = RunId::generate();
     write_raft(
         raft,
+        storage,
         Command {
             id: CommandId::generate(),
             time: now(),
@@ -1337,28 +2170,51 @@ async fn start_via_raft(
                 input,
                 catalog: Box::new(catalog),
             },
-        },
+        }
+        .authenticated_context(auth),
     )
     .await?;
     wake(notify);
     Ok(run)
 }
 
+async fn publication_via_raft(
+    raft: &Raft<TypeConfig>,
+    storage: &StorageHandle,
+    auth: &crate::publication::AuthContext,
+    command_id: CommandId,
+    operation: crate::publication::PublicationOperation,
+) -> Result<crate::publication::CommandResult> {
+    let command = crate::publication::command(auth, command_id, now(), operation)?;
+    let reply = write_raft_response(raft, storage, command).await?;
+    let receipt = reply.command_result.ok_or_else(|| {
+        Error::new(
+            ErrorKind::Unavailable,
+            format!("unknown outcome for command {command_id}; query or retry the same ID"),
+        )
+    })?;
+    receipt.ensure_applied()?;
+    Ok(receipt)
+}
+
 async fn wait_via_raft(
     raft: &Raft<TypeConfig>,
     storage: &StorageHandle,
-    notify: &Notify,
+    _notify: &Notify,
     run: RunId,
     timeout: Duration,
 ) -> Result<Value> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut changes = storage.subscribe_schedule();
     loop {
         let state = storage.query_state().await;
         if let Some(output) = run_output(&state, run) {
+            linearizable_read(raft).await?;
             return Ok(output);
         }
         if let Some(run_state) = state.runs.get(&run) {
             if let RunStatus::Failed { error } = &run_state.status {
+                linearizable_read(raft).await?;
                 return Err(Error::invalid(format!(
                     "run failed: {} {}",
                     error.code, error.message
@@ -1371,66 +2227,365 @@ async fn wait_via_raft(
                 "timed out waiting for run",
             ));
         }
-        let _ = write_raft(
-            raft,
-            Command {
-                id: CommandId::generate(),
-                time: now(),
-                body: CommandBody::Progress { run },
-            },
-        )
-        .await;
-        wake(notify);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-pub const SNAPSHOT_ENTRY_THRESHOLD: u64 = 20_000;
-pub const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30 * 60);
-
-pub fn should_snapshot(applied: u64, last_snapshot: u64, since_snapshot: Duration) -> bool {
-    applied.saturating_sub(last_snapshot) >= SNAPSHOT_ENTRY_THRESHOLD
-        || (since_snapshot >= SNAPSHOT_INTERVAL && applied > last_snapshot)
-}
-
-async fn snapshot_controller(raft: Raft<TypeConfig>, _storage: StorageHandle) {
-    let mut last_snapshot = 0u64;
-    let mut since_snapshot = tokio::time::Instant::now();
-    loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let applied = raft
-            .metrics()
-            .borrow()
-            .last_applied
-            .map(|id| id.index)
-            .unwrap_or(0);
-        if should_snapshot(applied, last_snapshot, since_snapshot.elapsed()) {
-            if raft.trigger().snapshot().await.is_ok() {
-                last_snapshot = applied;
-                since_snapshot = tokio::time::Instant::now();
+        tokio::select! {
+            result = changes.changed() => result.map_err(|_| {
+                Error::new(ErrorKind::Unavailable, "storage schedule notifications stopped")
+            })?,
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(Error::new(ErrorKind::DeadlineExceeded, "timed out waiting for run"));
             }
         }
     }
 }
 
-async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, notify: Arc<Notify>) {
+pub const SNAPSHOT_ENTRY_THRESHOLD: u64 = 20_000;
+pub const SNAPSHOT_BYTE_THRESHOLD: u64 = 512 * 1024 * 1024;
+pub const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+pub fn should_snapshot(
+    applied: u64,
+    last_snapshot: u64,
+    applied_bytes_since_snapshot: u64,
+    since_snapshot: Duration,
+) -> bool {
+    applied.saturating_sub(last_snapshot) >= SNAPSHOT_ENTRY_THRESHOLD
+        || applied_bytes_since_snapshot >= SNAPSHOT_BYTE_THRESHOLD
+        || (since_snapshot >= SNAPSHOT_INTERVAL && applied > last_snapshot)
+}
+
+async fn snapshot_controller(raft: Raft<TypeConfig>, storage: StorageHandle) {
     loop {
-        tokio::select! {
-            _ = notify.notified() => {}
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let progress = match storage.snapshot_progress().await {
+            Ok(progress) => progress,
+            Err(error) => {
+                tracing::error!(%error, "snapshot controller cannot read durable progress");
+                return;
+            }
+        };
+        let metrics = raft.metrics().borrow().clone();
+        if metrics.state != ServerState::Leader {
+            continue;
         }
-        let state = storage.query_state().await;
-        for run in active_runs(&state) {
-            let _ = write_raft(
+        let applied = metrics.last_applied.map_or(0, |id| id.index);
+        let now_ms = match crate::time::wall_millis() {
+            Ok(now_ms) => now_ms,
+            Err(error) => {
+                tracing::error!(%error, "snapshot controller wall clock unavailable");
+                return;
+            }
+        };
+        let since = Duration::from_millis(now_ms.saturating_sub(progress.last_snapshot_ms));
+        if should_snapshot(
+            applied,
+            progress.last_snapshot_applied,
+            progress
+                .applied_bytes
+                .saturating_sub(progress.last_snapshot_bytes),
+            since,
+        ) && let Err(error) = raft.trigger().snapshot().await
+        {
+            tracing::warn!(%error, "snapshot threshold reached but build failed");
+        }
+    }
+}
+
+async fn clock_watchdog_loop(
+    raft: Raft<TypeConfig>,
+    storage: StorageHandle,
+    network: Option<ClusterNetwork>,
+) {
+    let mut fault = storage.clock().subscribe_fault();
+    let mut latched = false;
+    let mut transfers = tokio::task::JoinSet::new();
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let current = matches!(&*fault.borrow(), ClockFaultState::Latched { .. });
+        if current != latched {
+            latched = current;
+            raft.runtime_config().heartbeat(!latched);
+            raft.runtime_config().elect(!latched);
+            if latched {
+                if let Some(network) = network.clone() {
+                    transfers.spawn(transfer_faulted_leader(
+                        raft.clone(),
+                        storage.clone(),
+                        network,
+                    ));
+                }
+            } else {
+                transfers.abort_all();
+            }
+        }
+        tokio::select! {
+            _ = transfers.join_next(), if !transfers.is_empty() => {}
+            _ = ticker.tick() => {
+                if let Err(error) = storage.clock().sample(&storage).await {
+                    if !matches!(&*fault.borrow(), ClockFaultState::Latched { .. }) {
+                        tracing::error!(%error, "clock sampling failed without a latched fault");
+                    }
+                }
+            }
+            changed = fault.changed() => {
+                if changed.is_err() {
+                    tracing::error!("clock fault watch closed");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn transfer_faulted_leader(
+    raft: Raft<TypeConfig>,
+    storage: StorageHandle,
+    network: ClusterNetwork,
+) {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut previous_requested: Option<u64> = None;
+    loop {
+        if !matches!(
+            &*storage.clock().subscribe_fault().borrow(),
+            ClockFaultState::Latched { .. }
+        ) {
+            return;
+        }
+        let metrics = raft.metrics().borrow().clone();
+        if metrics.state != ServerState::Leader {
+            if let Some(leader) = metrics
+                .current_leader
+                .filter(|leader| *leader != network.local_id())
+            {
+                tracing::info!(leader, "Raft observed a new leader after local clock fault");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        } else {
+            let roster = storage.applied_membership().await;
+            match roster {
+                Ok(roster) if roster == *metrics.membership_config => {
+                    let last_log = metrics.last_log_index.unwrap_or(0);
+                    let candidates: Vec<_> =
+                        metrics
+                            .replication
+                            .as_ref()
+                            .map_or_else(Vec::new, |replication| {
+                                roster
+                                    .voter_ids()
+                                    .filter(|id| *id != network.local_id())
+                                    .filter_map(|id| {
+                                        let matched = replication.get(&id).copied().flatten()?;
+                                        let endpoint = &roster.membership().get_node(&id)?.addr;
+                                        (matched.index >= last_log).then(|| (id, endpoint.clone()))
+                                    })
+                                    .collect()
+                            });
+                    if candidates.is_empty() {
+                        tracing::warn!(
+                            "no committed voter has a leader-matched log for clock fault transfer"
+                        );
+                    } else {
+                        let evidence = ElectionEvidence {
+                            expected_term: metrics.current_term,
+                            membership_index: roster.log_id().map(|id| id.index).unwrap_or(0),
+                            min_applied_index: metrics.last_applied.map(|id| id.index).unwrap_or(0),
+                            min_last_log_index: last_log,
+                        };
+                        let start = previous_requested
+                            .and_then(|id| {
+                                candidates
+                                    .iter()
+                                    .position(|(candidate, _)| *candidate == id)
+                            })
+                            .map(|index| (index + 1) % candidates.len())
+                            .unwrap_or(0);
+                        for offset in 0..candidates.len() {
+                            if raft.metrics().borrow().state != ServerState::Leader {
+                                break;
+                            }
+                            let (target, endpoint) =
+                                &candidates[(start + offset) % candidates.len()];
+                            match network.request_election(*target, endpoint, evidence).await {
+                                Ok(()) => {
+                                    previous_requested = Some(*target);
+                                    tracing::info!(
+                                        target,
+                                        term = evidence.expected_term,
+                                        "healthy voter accepted election request; leadership not yet observed"
+                                    );
+                                    break;
+                                }
+                                Err(error) => tracing::warn!(
+                                    target,
+                                    %error,
+                                    "candidate rejected clock fault election request"
+                                ),
+                            }
+                        }
+                    }
+                }
+                Ok(_) => tracing::warn!("clock fault transfer postponed for changing membership"),
+                Err(error) => tracing::warn!(%error, "committed voter roster unavailable"),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+async fn scheduler_loop(raft: Raft<TypeConfig>, storage: StorageHandle, _notify: Arc<Notify>) {
+    let mut changes = storage.subscribe_schedule();
+    let mut metrics = raft.metrics();
+    let mut leader_term = None;
+    loop {
+        let observed = metrics.borrow().clone();
+        if observed.state != ServerState::Leader {
+            leader_term = None;
+            if metrics.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        if leader_term != Some(observed.current_term) {
+            storage.record_schedule_wake(ScheduleWake::Leadership);
+            leader_term = Some(observed.current_term);
+        }
+        let view = match storage.schedule_view().await {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::error!(%error, "scheduler index unavailable");
+                return;
+            }
+        };
+        storage.observe_scheduler(view.revision);
+        let now_ms = match crate::time::wall_millis() {
+            Ok(now_ms) => now_ms,
+            Err(error) => {
+                tracing::error!(%error, "scheduler wall clock unavailable");
+                return;
+            }
+        };
+        let mut next_due = view.retention_ms;
+        if view.retention_ms.is_some_and(|at| at <= now_ms) {
+            storage.record_schedule_wake(ScheduleWake::Retention);
+            if let Err(error) = write_raft(
                 &raft,
+                &storage,
                 Command {
                     id: CommandId::generate(),
                     time: now(),
-                    body: CommandBody::Progress { run },
+                    body: CommandBody::PruneHistory { limit: 512 },
                 },
             )
-            .await;
+            .await
+            {
+                tracing::warn!(%error, "retention proposal deferred");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            continue;
         }
+        let mut progressed = false;
+        for (run, row) in &view.runs {
+            if row.progress || row.deadline_ms.is_some_and(|at| at <= now_ms) {
+                if let Err(error) = write_raft(
+                    &raft,
+                    &storage,
+                    Command {
+                        id: CommandId::generate(),
+                        time: now(),
+                        body: CommandBody::Progress { run: *run },
+                    },
+                )
+                .await
+                {
+                    tracing::warn!(%run, %error, "run progression deferred");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                progressed = true;
+                break;
+            }
+            if let Some(at) = row.deadline_ms {
+                next_due = Some(next_due.map_or(at, |previous| previous.min(at)));
+            }
+        }
+        if progressed {
+            continue;
+        }
+        let mut deadline = next_due.map(|at| {
+            Box::pin(tokio::time::sleep(Duration::from_millis(
+                at.saturating_sub(now_ms),
+            )))
+        });
+        loop {
+            if crate::storage::schedule_revision_changed(&mut changes, view.revision) {
+                break;
+            }
+            tokio::select! {
+                change = changes.changed() => {
+                    if change.is_err() {
+                        return;
+                    }
+                    storage.record_schedule_wake(ScheduleWake::Applied);
+                    break;
+                }
+                change = metrics.changed() => {
+                    if change.is_err() {
+                        return;
+                    }
+                    let latest = metrics.borrow();
+                    if latest.state != ServerState::Leader
+                        || latest.current_term != observed.current_term
+                    {
+                        storage.record_schedule_wake(ScheduleWake::Leadership);
+                        break;
+                    }
+                }
+                _ = async {
+                    if let Some(timer) = deadline.as_mut() {
+                        timer.as_mut().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    storage.record_schedule_wake(ScheduleWake::Deadline);
+                    break;
+                },
+            }
+        }
+    }
+}
+
+async fn check_dispatch(
+    raft: &Raft<TypeConfig>,
+    storage: &StorageHandle,
+    session_expiry_ms: u64,
+    lease_expiry_ms: u64,
+    attempt_deadline_ms: u64,
+) -> Result<()> {
+    linearizable_read(raft).await?;
+    storage.clock().authorize(storage, raft).await?;
+    let wall = crate::time::wall_millis()?;
+    if wall >= attempt_deadline_ms
+        || wall.saturating_add(5_000) >= session_expiry_ms
+        || wall.saturating_add(5_000) >= lease_expiry_ms
+    {
+        return Err(Error::new(
+            ErrorKind::FailedPrecondition,
+            "assignment is at or beyond its execution or lease stop margin",
+        ));
+    }
+    Ok(())
+}
+
+async fn await_local_handler<T>(
+    context: &LocalHandlerContext,
+    operation: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = context.cancelled() => None,
+        outcome = operation => Some(outcome),
     }
 }
 
@@ -1439,11 +2594,17 @@ async fn worker_loop(
     storage: StorageHandle,
     notify: Arc<Notify>,
     handlers: Handlers,
+    auth: crate::publication::AuthContext,
 ) {
     let session = crate::ids::WorkerSessionId::generate();
     let blocking_slots = Arc::new(Semaphore::new(limits::BLOCKING_POOL_DEFAULT as usize));
+    let mut changes = storage.subscribe_schedule();
+    let mut leadership = raft.metrics();
+    let mut renewal = tokio::time::interval(Duration::from_secs(5));
+    renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let _ = write_raft(
         &raft,
+        &storage,
         Command {
             id: CommandId::generate(),
             time: now(),
@@ -1452,13 +2613,121 @@ async fn worker_loop(
                 activities: vec!["*".to_owned()],
                 capacity: crate::limits::CLAIM_BATCH,
             },
-        },
+        }
+        .authenticated_context(&auth),
     )
     .await;
     loop {
-        tokio::select! {
-            _ = notify.notified() => {}
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        let observed = leadership.borrow().clone();
+        if observed.state != ServerState::Leader {
+            if leadership.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let view = match storage.schedule_view().await {
+            Ok(view) => view,
+            Err(error) => {
+                tracing::error!(%error, "local worker schedule index unavailable");
+                return;
+            }
+        };
+        storage.observe_local_worker(view.revision);
+        let ready = if view.runs.iter().any(|(_, row)| row.ready) {
+            let state = storage.query_state().await;
+            if state
+                .sessions
+                .get(&session)
+                .is_none_or(|worker| now().as_millis() >= worker.expires_ms)
+            {
+                if let Err(error) = write_raft(
+                    &raft,
+                    &storage,
+                    Command {
+                        id: CommandId::generate(),
+                        time: now(),
+                        body: CommandBody::RegisterSession {
+                            session,
+                            activities: vec!["*".to_owned()],
+                            capacity: crate::limits::CLAIM_BATCH,
+                        },
+                    },
+                )
+                .await
+                {
+                    tracing::warn!(%error, "local worker registration deferred");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                continue;
+            } else {
+                match crate::domain::worker_has_ready(&state, session, now()) {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        tracing::error!(%error, "local worker readiness failed");
+                        return;
+                    }
+                }
+            }
+        } else {
+            false
+        };
+        if !ready {
+            loop {
+                if crate::storage::schedule_revision_changed(&mut changes, view.revision) {
+                    break;
+                }
+                tokio::select! {
+                    changed = changes.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        storage.record_schedule_wake(ScheduleWake::Worker);
+                        break;
+                    }
+                    changed = leadership.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        let latest = leadership.borrow();
+                        if latest.state != ServerState::Leader
+                            || latest.current_term != observed.current_term
+                        {
+                            storage.record_schedule_wake(ScheduleWake::Leadership);
+                            break;
+                        }
+                    }
+                    _ = renewal.tick() => {
+                        if let Err(error) = write_raft(
+                            &raft,
+                            &storage,
+                            Command {
+                                id: CommandId::generate(),
+                                time: now(),
+                                body: CommandBody::RenewLocalSession { session },
+                            },
+                        ).await {
+                            tracing::warn!(%error, "local worker renewal failed");
+                            match write_raft(
+                                &raft,
+                                &storage,
+                                Command {
+                                    id: CommandId::generate(),
+                                    time: now(),
+                                    body: CommandBody::RegisterSession {
+                                        session,
+                                        activities: vec!["*".to_owned()],
+                                        capacity: crate::limits::CLAIM_BATCH,
+                                    },
+                                },
+                            ).await {
+                                Ok(()) => break,
+                                Err(error) => tracing::warn!(%error, "local worker re-registration failed"),
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
         }
         let claim = Command {
             id: CommandId::generate(),
@@ -1467,10 +2736,22 @@ async fn worker_loop(
                 session,
                 capacity: crate::limits::CLAIM_BATCH,
             },
+        }
+        .authenticated_context(&auth);
+        let receipt_id = match crate::domain::authenticated_command_id(
+            &auth.key(claim.id).principal_id,
+            claim.id,
+        ) {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::error!(%err, "local worker has an invalid command identity");
+                continue;
+            }
         };
-        if write_raft(&raft, claim.clone()).await.is_err() {
+        if write_raft(&raft, &storage, claim.clone()).await.is_err() {
             let _ = write_raft(
                 &raft,
+                &storage,
                 Command {
                     id: CommandId::generate(),
                     time: now(),
@@ -1479,15 +2760,37 @@ async fn worker_loop(
                         activities: vec!["*".to_owned()],
                         capacity: crate::limits::CLAIM_BATCH,
                     },
-                },
+                }
+                .authenticated_context(&auth),
             )
             .await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         }
         let mut did_work = false;
         let state = storage.query_state().await;
-        let events = state.commands.get(&claim.id).cloned().unwrap_or_default();
-        for assignment in crate::domain::assignments_from(&state, &events) {
+        let events = state.commands.get(&receipt_id).cloned().unwrap_or_default();
+        let Ok(assignments) = crate::domain::assignments_from(&state, &events) else {
+            tracing::error!("committed local claim has an unavailable assignment");
+            continue;
+        };
+        for assignment in assignments {
+            let Some(session) = state.sessions.get(&assignment.session) else {
+                tracing::error!(session = %assignment.session, "committed assignment has no worker session");
+                break;
+            };
+            if let Err(error) = check_dispatch(
+                &raft,
+                &storage,
+                session.expires_ms,
+                assignment.lease_expiry_ms,
+                assignment.attempt_deadline_ms,
+            )
+            .await
+            {
+                tracing::warn!(%error, "worker dispatch stopped");
+                break;
+            }
             let blocking = state
                 .runs
                 .get(&assignment.run)
@@ -1501,14 +2804,47 @@ async fn worker_loop(
                         ))
                 })
                 .is_some_and(|contract| contract.execution == ExecutionKind::Blocking);
+            let context = match LocalHandlerContext::new(
+                assignment.run,
+                assignment.activation,
+                assignment.role,
+                assignment.effect_key.to_hex(),
+                session.expires_ms,
+                assignment.lease_expiry_ms,
+                assignment.attempt_deadline_ms,
+                storage.clock().subscribe_fault(),
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(%error, "local handler clock unavailable");
+                    break;
+                }
+            };
+            if context.is_cancelled() {
+                break;
+            }
             if assignment.role == crate::ids::ExecutionRole::Reconciliation {
-                let outcome = handlers.reconcile(
-                    &assignment.activity_name,
-                    &assignment.input,
-                    Some(assignment.effect_key.to_hex().as_str()),
-                );
+                let handlers = handlers.clone();
+                let name = assignment.activity_name.clone();
+                let input = assignment.input.clone();
+                let effect_key = context.effect_key.clone();
+                let Some(Ok(outcome)) = await_local_handler(
+                    &context,
+                    tokio::task::spawn_blocking(move || {
+                        handlers.reconcile(&name, &input, Some(&effect_key))
+                    }),
+                )
+                .await
+                else {
+                    tracing::warn!(
+                        activation = %assignment.activation,
+                        "local reconciliation outcome unresolved after cancellation"
+                    );
+                    break;
+                };
                 let _ = write_raft(
                     &raft,
+                    &storage,
                     Command {
                         id: CommandId::generate(),
                         time: now(),
@@ -1521,41 +2857,78 @@ async fn worker_loop(
                             outcome: outcome.0,
                             output: outcome.1,
                         },
-                    },
+                    }
+                    .authenticated_context(&auth),
                 )
                 .await;
             } else {
-                let effect_key = assignment.effect_key.to_hex();
                 let ran = if blocking {
                     let handlers = handlers.clone();
                     let name = assignment.activity_name.clone();
                     let version = assignment.activity_version;
                     let input = assignment.input.clone();
-                    let effect_key = effect_key.clone();
+                    let context_for_thread = context.clone();
                     let Ok(permit) = blocking_slots.clone().acquire_owned().await else {
                         continue;
                     };
-                    tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        handlers.run_blocking(&name, version, input, Some(effect_key.as_str()))
-                    })
+                    if let Err(error) = check_dispatch(
+                        &raft,
+                        &storage,
+                        session.expires_ms,
+                        assignment.lease_expiry_ms,
+                        assignment.attempt_deadline_ms,
+                    )
                     .await
-                    .unwrap_or_else(|err| Err(Error::invalid(err.to_string())))
+                    {
+                        tracing::warn!(%error, "blocking activity dispatch stopped");
+                        continue;
+                    }
+                    let Some(result) = await_local_handler(
+                        &context,
+                        tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            handlers.run_blocking_with_context(
+                                &name,
+                                version,
+                                input,
+                                context_for_thread,
+                            )
+                        }),
+                    )
+                    .await
+                    else {
+                        tracing::warn!(
+                            activation = %assignment.activation,
+                            "blocking handler may still be running after clock fault"
+                        );
+                        break;
+                    };
+                    result.unwrap_or_else(|err| Err(Error::invalid(err.to_string())))
                 } else {
-                    handlers
-                        .run(
+                    let Some(result) = await_local_handler(
+                        &context,
+                        handlers.run_with_context(
                             &assignment.activity_name,
                             assignment.activity_version,
                             assignment.input.clone(),
-                            Some(effect_key.as_str()),
-                            false,
-                        )
-                        .await
+                            context.clone(),
+                        ),
+                    )
+                    .await
+                    else {
+                        tracing::warn!(
+                            activation = %assignment.activation,
+                            "async handler outcome unresolved after clock fault"
+                        );
+                        break;
+                    };
+                    result
                 };
                 match ran {
                     Ok(output) => {
                         let _ = write_raft(
                             &raft,
+                            &storage,
                             Command {
                                 id: CommandId::generate(),
                                 time: now(),
@@ -1567,7 +2940,8 @@ async fn worker_loop(
                                     generation: assignment.generation,
                                     revision: assignment.revision,
                                 },
-                            },
+                            }
+                            .authenticated_context(&auth),
                         )
                         .await;
                     }
@@ -1579,6 +2953,7 @@ async fn worker_loop(
                         };
                         let _ = write_raft(
                             &raft,
+                            &storage,
                             Command {
                                 id: CommandId::generate(),
                                 time: now(),
@@ -1588,7 +2963,8 @@ async fn worker_loop(
                                     code,
                                     message,
                                 },
-                            },
+                            }
+                            .authenticated_context(&auth),
                         )
                         .await;
                     }
@@ -1757,6 +3133,190 @@ mod tests {
             ("order_id".to_owned(), Value::String("o1".to_owned())),
             ("amount".to_owned(), Value::Int(1000)),
         ]))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_directory_initializes_store_before_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        assert!(dir.path().join("identity.json").exists());
+        assert!(dir.path().join("member.redb").exists());
+        engine.shutdown().await.unwrap();
+
+        let engine = Engine::local(dir.path()).await.unwrap();
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn existing_identity_with_missing_member_store_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = CommandId::generate();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        engine
+            .publish_catalog_with_command(1, Catalog::default(), id)
+            .await
+            .unwrap();
+        engine.shutdown().await.unwrap();
+
+        let identity = dir.path().join("identity.json");
+        let bytes = std::fs::read(&identity).unwrap();
+        let db_path = dir.path().join("member.redb");
+        std::fs::remove_file(&db_path).unwrap();
+
+        let err = Engine::local(dir.path()).await.err().unwrap();
+        assert_eq!(err.kind, ErrorKind::FailedPrecondition);
+        assert!(err.message.contains("member store missing"));
+        assert!(!db_path.exists());
+        assert_eq!(std::fs::read(identity).unwrap(), bytes);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_catalog_receipt_survives_restart_and_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = CommandId::generate();
+        let bad_catalog = |multiple_of| {
+            let mut catalog = Catalog::default();
+            catalog.schemas.insert(
+                crate::schema::SchemaKey::parse("fraction/v1").unwrap(),
+                serde_json::json!({"type":"number","multipleOf":multiple_of}),
+            );
+            catalog
+        };
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let err = engine
+            .publish_catalog_with_command(1, bad_catalog(0.5), id)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidArgument);
+        let receipt = engine.command_result(id).await.unwrap();
+        assert_eq!(receipt.ensure_applied().unwrap_err().kind, err.kind);
+
+        let retry = engine
+            .publish_catalog_with_command(1, bad_catalog(0.5), id)
+            .await
+            .unwrap_err();
+        assert_eq!(retry, err);
+        assert_eq!(
+            serde_json::to_value(engine.command_result(id).await.unwrap()).unwrap(),
+            serde_json::to_value(&receipt).unwrap()
+        );
+        let conflict = engine
+            .publish_catalog_with_command(1, bad_catalog(0.25), id)
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.kind, ErrorKind::AlreadyExists);
+        engine.publish_catalog(1, Catalog::default()).await.unwrap();
+        engine.shutdown().await.unwrap();
+
+        let engine = Engine::local(dir.path()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(engine.command_result(id).await.unwrap()).unwrap(),
+            serde_json::to_value(&receipt).unwrap()
+        );
+        assert_eq!(
+            engine
+                .publish_catalog_with_command(1, bad_catalog(0.5), id)
+                .await
+                .unwrap_err(),
+            err
+        );
+        assert_eq!(
+            engine
+                .publish_catalog_with_command(1, bad_catalog(0.25), id)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::AlreadyExists
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn published_start_persists_run_records_and_internal_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        engine.publish_catalog(1, catalog()).await.unwrap();
+        engine
+            .publish_definition_yaml(
+                "\
+dsl: graphrun/v1
+id: published_complete
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: finish
+nodes:
+  finish:
+    kind: complete
+    output: {literal: null}
+",
+                1,
+            )
+            .await
+            .unwrap();
+        let command_id = CommandId::generate();
+        let run = engine
+            .start_published_with_command(
+                "published_complete",
+                Some(1),
+                "order-1",
+                Value::Null,
+                command_id,
+            )
+            .await
+            .unwrap();
+        let (_, _, internal_id) =
+            crate::publication::published_start_ids(&engine.publication_auth.key(command_id));
+        let before = engine.storage.query_state().await;
+        assert!(!before.history[&run].is_empty());
+        assert!(before.scopes.values().any(|scope| scope.run == run));
+        engine.shutdown().await.unwrap();
+
+        let persisted =
+            crate::storage::load_domain_readonly(dir.path().join("member.redb")).unwrap();
+        assert_eq!(
+            serde_json::to_value((
+                &before.runs[&run],
+                &before.history[&run],
+                &before.history_records[&run],
+                &before.commands[&internal_id],
+                &before.command_times[&internal_id],
+            ))
+            .unwrap(),
+            serde_json::to_value((
+                &persisted.runs[&run],
+                &persisted.history[&run],
+                &persisted.history_records[&run],
+                &persisted.commands[&internal_id],
+                &persisted.command_times[&internal_id],
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            before
+                .scopes
+                .values()
+                .filter(|scope| scope.run == run)
+                .count(),
+            persisted
+                .scopes
+                .values()
+                .filter(|scope| scope.run == run)
+                .count()
+        );
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let retried = engine
+            .start_published_with_command(
+                "published_complete",
+                Some(1),
+                "order-1",
+                Value::Null,
+                command_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried, run);
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1959,6 +3519,234 @@ nodes:
             .await
             .unwrap();
         assert_eq!(output.pointer("/approved").unwrap(), &Value::Bool(true));
+        let before = engine.storage.query_state().await;
+        engine.shutdown().await.unwrap();
+        let persisted =
+            crate::storage::load_domain_readonly(dir.path().join("member.redb")).unwrap();
+        assert_eq!(
+            serde_json::to_value((&before.inbox, &before.signal_tombstones, &before.waits))
+                .unwrap(),
+            serde_json::to_value((
+                &persisted.inbox,
+                &persisted.signal_tombstones,
+                &persisted.waits
+            ))
+            .unwrap(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_wait_does_not_rescan_ready_index_on_local_renewal() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                r#"
+dsl: graphrun/v1
+id: waiting_without_deadline
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+signals:
+  continue: {schema: unit/v1}
+start: pause
+nodes:
+  pause:
+    kind: wait_signal
+    signal: continue
+    key: {literal: k1}
+    timeout: null
+    next: finish
+  finish:
+    kind: complete
+    output: {literal: null}
+"#,
+                &catalog(),
+                Value::Null,
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = engine.storage.query_state().await;
+            let view = engine.storage.schedule_view().await.unwrap();
+            if state.waits.values().any(|wait| wait.pending)
+                && view.runs.iter().any(|(id, row)| {
+                    *id == run && !row.progress && !row.ready && row.deadline_ms.is_none()
+                })
+                && engine.storage.scheduler_observed_revision() >= view.revision
+                && engine.storage.local_worker_observed_revision() >= view.revision
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "wait did not settle"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let before = engine.storage.schedule_discovery_reads();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(matches!(
+            engine.storage.query_state().await.runs[&run].status,
+            RunStatus::Active
+        ));
+        assert_eq!(engine.storage.schedule_discovery_reads(), before);
+        engine
+            .signal(run, EventId::generate(), "continue", "k1", Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .wait_terminal(run, Duration::from_secs(10))
+                .await
+                .unwrap(),
+            Value::Null
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reserved_signal_survives_restart_and_expired_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::local(dir.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/events.yaml"),
+                &catalog(),
+                Value::Object(BTreeMap::from([(
+                    "key".to_owned(),
+                    Value::String("k1".to_owned()),
+                )])),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if engine
+                .inspect(run)
+                .await
+                .unwrap()
+                .waits
+                .values()
+                .any(|wait| wait.pending)
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "wait did not open");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let scheduler = engine.scheduler.as_mut().expect("local scheduler");
+        scheduler.abort();
+        assert!(scheduler.await.unwrap_err().is_cancelled());
+        let event_id = EventId::generate();
+        engine
+            .signal(
+                run,
+                event_id,
+                "approval",
+                "k1",
+                Value::Object(BTreeMap::from([("approved".to_owned(), Value::Bool(true))])),
+            )
+            .await
+            .unwrap();
+        let accepted = engine.inspect(run).await.unwrap();
+        let reserved = accepted
+            .inbox
+            .iter()
+            .find(|entry| entry.event_id == event_id)
+            .unwrap();
+        assert!(reserved.reserved_wait.is_some());
+        assert!(!reserved.consumed);
+        let expires_ms = reserved.expires_ms;
+        assert!(expires_ms > reserved.accepted_ms);
+        engine.shutdown().await.unwrap();
+
+        let mut persisted = load_domain_readonly(dir.path().join("member.redb")).unwrap();
+        let retained = persisted
+            .inbox
+            .iter()
+            .find(|entry| entry.event_id == event_id)
+            .unwrap();
+        assert_eq!(retained.reserved_wait, reserved.reserved_wait);
+        assert_eq!(retained.expires_ms, expires_ms);
+        let time = crate::time::EngineTime::from_millis(expires_ms + 1);
+        crate::history::prune(&mut persisted, CommandId::generate(), time, 512).unwrap();
+        assert!(
+            persisted
+                .inbox
+                .iter()
+                .any(|entry| entry.event_id == event_id && entry.reserved_wait.is_some())
+        );
+        crate::domain::apply_command(
+            &mut persisted,
+            Command {
+                id: CommandId::generate(),
+                time,
+                body: CommandBody::Progress { run },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            run_output(&persisted, run)
+                .unwrap()
+                .pointer("/approved")
+                .unwrap(),
+            &Value::Bool(true)
+        );
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let output = engine
+            .wait_terminal(run, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(output.pointer("/approved").unwrap(), &Value::Bool(true));
+        let events = engine.history(run).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, crate::domain::DomainEvent::EventReserved { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, crate::domain::DomainEvent::WaitSatisfied { .. }))
+                .count(),
+            1
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_wait_releases_its_activation_for_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::local(dir.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                include_str!("../../samples/10-timeout-recovery/workflow.yaml"),
+                &catalog(),
+                Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(0))])),
+            )
+            .await
+            .unwrap();
+        let output = engine
+            .wait_terminal(run, Duration::from_secs(6))
+            .await
+            .unwrap();
+        assert_eq!(output.pointer("/value").unwrap(), &Value::Int(0));
+        let state = engine.inspect(run).await.unwrap();
+        assert!(state.activations.values().any(|activation| {
+            activation.run == run
+                && activation.node.as_str() == "approval"
+                && activation.status == crate::domain::ActivationStatus::Succeeded
+        }));
+        assert!(state.activations.values().any(|activation| {
+            activation.run == run
+                && activation.node.as_str() == "recover"
+                && activation.status == crate::domain::ActivationStatus::Succeeded
+        }));
+        assert!(crate::domain::ready_activations(&state, run).is_empty());
         engine.shutdown().await.unwrap();
     }
 
@@ -1990,18 +3778,30 @@ nodes:
 
     #[test]
     fn snapshot_controller_threshold() {
-        assert!(!should_snapshot(10, 0, Duration::from_secs(1)));
+        assert!(!should_snapshot(10, 0, 0, Duration::from_secs(1)));
         assert!(should_snapshot(
             SNAPSHOT_ENTRY_THRESHOLD,
             0,
+            0,
             Duration::from_secs(1)
         ));
-        assert!(should_snapshot(5, 0, SNAPSHOT_INTERVAL));
-        assert!(!should_snapshot(0, 0, SNAPSHOT_INTERVAL));
+        assert!(should_snapshot(
+            5,
+            0,
+            SNAPSHOT_BYTE_THRESHOLD,
+            Duration::from_secs(1)
+        ));
+        assert!(!should_snapshot(
+            5,
+            0,
+            SNAPSHOT_BYTE_THRESHOLD - 1,
+            Duration::from_secs(1)
+        ));
+        assert!(should_snapshot(5, 0, 0, SNAPSHOT_INTERVAL));
+        assert!(!should_snapshot(0, 0, 0, SNAPSHOT_INTERVAL));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "applies 20_000 raft entries (~4 min)"]
     async fn snapshot_controller_fires_at_20000_entries() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::local(dir.path()).await.unwrap();
@@ -2119,7 +3919,15 @@ nodes:
             })
             .collect();
         assert_eq!(handlers, ["payment.refund", "inventory.release"]);
+        let before = engine.storage.query_state().await;
         engine.shutdown().await.unwrap();
+        let persisted =
+            crate::storage::load_domain_readonly(dir.path().join("member.redb")).unwrap();
+        assert_eq!(
+            serde_json::to_value((&before.obligations, &before.history_records[&run])).unwrap(),
+            serde_json::to_value((&persisted.obligations, &persisted.history_records[&run]))
+                .unwrap()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2231,6 +4039,91 @@ nodes:
             state.runs.get(&run).unwrap().status,
             RunStatus::Failed { .. }
         ));
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clock_fault_cancels_blocking_wrapper_without_claiming_thread_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(Mutex::new(release_rx));
+        let running = Arc::new(AtomicBool::new(false));
+        let inside = running.clone();
+        let engine = Engine::builder(dir.path())
+            .blocking_with_context(
+                "test.block",
+                move |input: HandlerCounter, context: LocalHandlerContext| {
+                    inside.store(true, Ordering::SeqCst);
+                    entered_tx.send(context).unwrap();
+                    release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(3))
+                        .unwrap();
+                    inside.store(false, Ordering::SeqCst);
+                    Ok(input)
+                },
+            )
+            .unwrap()
+            .open()
+            .await
+            .unwrap();
+        let yaml = r#"
+dsl: graphrun/v1
+id: clock_blocking
+version: 1
+input_schema: counter/v1
+output_schema: counter/v1
+start: block
+nodes:
+  block:
+    kind: activity
+    activity: {name: test.block, version: 1}
+    input: {from: workflow.input}
+    next: done
+  done:
+    kind: complete
+    output: {from: nodes.block.output}
+"#;
+        let run = engine
+            .start_yaml(
+                yaml,
+                &catalog(),
+                Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(1))])),
+            )
+            .await
+            .unwrap();
+        let context = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || entered_rx.recv().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        engine.inject_clock_watermark(crate::time::wall_millis().unwrap() + 10_000);
+        assert_eq!(engine.health().await["clock_safe"], false);
+        context.cancelled().await;
+        assert!(!context.can_start_effect());
+        assert!(
+            running.load(Ordering::SeqCst),
+            "wrapper cannot stop an OS thread"
+        );
+        let state = engine.inspect(run).await.unwrap();
+        assert!(matches!(
+            state.runs.get(&run).unwrap().status,
+            RunStatus::Active
+        ));
+        release_tx.send(()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while running.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "blocking thread did not return"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(run_output(&engine.inspect(run).await.unwrap(), run).is_none());
         engine.shutdown().await.unwrap();
     }
 
@@ -2380,26 +4273,26 @@ nodes:
         let _guard = COMPENSATION_TEST.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::local(dir.path()).await.unwrap();
-        let mut fail_order = order();
-        if let Value::Object(fields) = &mut fail_order {
-            fields.insert("fail_after_payment".to_owned(), Value::Bool(true));
-        }
         let run = engine
             .start_yaml(
-                include_str!("../../docs/specs/v1/examples/saga.yaml"),
+                include_str!("../../docs/specs/v1/examples/saga-cancel.yaml"),
                 &catalog(),
-                fail_order,
+                order(),
             )
             .await
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let state = engine.inspect(run).await.unwrap();
-            if state
-                .obligations
-                .iter()
-                .any(|item| item.handler == "inventory.release")
+            if state.obligations.iter().any(|item| {
+                item.handler == "inventory.release"
+                    && matches!(item.status, crate::domain::ObligationStatus::Open)
+            }) && state
+                .waits
+                .values()
+                .any(|wait| wait.run == run && wait.pending && wait.signal == "continue")
             {
+                assert!(matches!(state.runs[&run].status, RunStatus::Active));
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -2407,14 +4300,7 @@ nodes:
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        if let Err(err) = engine.cancel(run, "stop").await {
-            let state = engine.inspect(run).await.unwrap();
-            let inactive = !matches!(state.runs.get(&run).unwrap().status, RunStatus::Active);
-            assert!(
-                inactive || err.to_string().contains("not active"),
-                "cancel failed: {err}"
-            );
-        }
+        engine.cancel(run, "stop").await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let state = engine.inspect(run).await.unwrap();
@@ -2427,6 +4313,19 @@ nodes:
                     matches!(item.status, crate::domain::ObligationStatus::Compensated)
                 });
             if failed && compensated {
+                assert!(matches!(
+                    &state.runs[&run].status,
+                    RunStatus::Failed { error } if error.code == "run.cancelled"
+                ));
+                assert_eq!(state.obligations.len(), 1);
+                assert_eq!(state.obligations[0].handler, "inventory.release");
+                assert!(state.waits.values().all(|wait| !wait.pending));
+                assert!(state.scopes.values().all(|scope| {
+                    scope.run != run || !matches!(scope.status, crate::domain::ScopeStatus::Open)
+                }));
+                assert!(!state.activations.values().any(
+                    |activation| activation.run == run && activation.node.as_str() == "charge"
+                ));
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -2434,7 +4333,20 @@ nodes:
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert!(
+            engine
+                .history(run)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, crate::domain::DomainEvent::WaitCancelled { .. }))
+        );
         engine.shutdown().await.unwrap();
+        let replayed = replay(dir.path()).unwrap();
+        assert!(replayed.waits.values().all(|wait| !wait.pending));
+        assert!(replayed.scopes.values().all(|scope| {
+            scope.run != run || !matches!(scope.status, crate::domain::ScopeStatus::Open)
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2583,5 +4495,327 @@ nodes:
             .unwrap();
         assert_eq!(output.pointer("/approved").unwrap(), &Value::Bool(true));
         engine.shutdown().await.unwrap();
+
+        assert!(!dest.path().join("restored-domain.json").exists());
+        let identity_path = dest.path().join("identity.json");
+        let identity = std::fs::read(&identity_path).unwrap();
+        let db_path = dest.path().join("member.redb");
+        std::fs::remove_file(&db_path).unwrap();
+        let err = Engine::local(dest.path()).await.err().unwrap();
+        assert_eq!(err.kind, ErrorKind::FailedPrecondition);
+        assert!(!db_path.exists());
+        assert_eq!(std::fs::read(identity_path).unwrap(), identity);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_keeps_source_artifact_identity_and_uses_new_origin_for_signals() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let run = {
+            let engine = Engine::local(source.path()).await.unwrap();
+            let run = engine
+                .start_yaml(
+                    include_str!("../../docs/specs/v1/examples/events.yaml"),
+                    &catalog(),
+                    Value::Object(BTreeMap::from([(
+                        "key".to_owned(),
+                        Value::String("k1".to_owned()),
+                    )])),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if engine
+                        .inspect(run)
+                        .await
+                        .unwrap()
+                        .waits
+                        .values()
+                        .any(|wait| wait.pending)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let state = engine.inspect(run).await.unwrap();
+            validate_history_store(&state).unwrap();
+            assert!(!state.current_cluster_id.is_empty());
+            assert!(
+                state.history_records[&run]
+                    .iter()
+                    .any(|record| record.input_ref.is_some())
+            );
+            assert!(
+                state.history_records[&run]
+                    .iter()
+                    .any(|record| record.output_ref.is_some())
+            );
+            let old_origin = state.current_cluster_id.clone();
+            let old_through = state.history_records[&run].last().unwrap().sequence;
+            let prior = serde_json::to_value(&state.history_records[&run]).unwrap();
+            engine.shutdown().await.unwrap();
+            Engine::backup(source.path(), backup.path()).unwrap();
+            let decoded = Engine::read_backup(backup.path()).unwrap();
+            assert_eq!(decoded.current_cluster_id, old_origin);
+            assert_eq!(
+                serde_json::to_value(&decoded.history_records[&run]).unwrap(),
+                prior
+            );
+            Engine::restore(backup.path(), destination.path(), "drill").unwrap();
+            let restored = Engine::local(destination.path()).await.unwrap();
+            let state = restored.inspect(run).await.unwrap();
+            assert_ne!(state.current_cluster_id, old_origin);
+            assert!(state.artifact_origins.contains(&old_origin));
+            assert!(state.artifact_origins.contains(&state.current_cluster_id));
+            assert_eq!(
+                serde_json::to_value(&state.history_records[&run]).unwrap(),
+                prior
+            );
+            assert_eq!(
+                restored
+                    .reconstruct_at(run, old_through)
+                    .await
+                    .unwrap()
+                    .current_cluster_id,
+                old_origin
+            );
+            restored
+                .acknowledge_recovery("operator verified restored effects")
+                .await
+                .unwrap();
+            restored
+                .signal(
+                    run,
+                    EventId::generate(),
+                    "approval",
+                    "k1",
+                    Value::Object(BTreeMap::from([("approved".to_owned(), Value::Bool(true))])),
+                )
+                .await
+                .unwrap();
+            restored
+                .wait_terminal(run, Duration::from_secs(10))
+                .await
+                .unwrap();
+            let finished = restored.inspect(run).await.unwrap();
+            let accepted = finished.history_records[&run]
+                .iter()
+                .zip(&finished.history[&run])
+                .find(|(_, event)| {
+                    matches!(event, crate::domain::DomainEvent::EventAccepted { .. })
+                })
+                .unwrap()
+                .0;
+            assert_eq!(
+                accepted.input_ref.as_ref().unwrap().cluster_id,
+                finished.current_cluster_id
+            );
+            assert_eq!(
+                restored
+                    .reconstruct_at(run, finished.history_records[&run].len() as u64)
+                    .await
+                    .unwrap()
+                    .current_cluster_id,
+                finished.current_cluster_id
+            );
+            validate_history_store(&finished).unwrap();
+            restored.shutdown().await.unwrap();
+            run
+        };
+        assert_ne!(run.as_bytes(), &[0; 16]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_rejects_corrupt_and_legacy_backups_without_writing_destination() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let engine = Engine::local(source.path()).await.unwrap();
+        engine.shutdown().await.unwrap();
+        Engine::backup(source.path(), backup.path()).unwrap();
+        let manifest: LogicalBackupManifest =
+            serde_json::from_slice(&std::fs::read(backup.path().join("manifest.json")).unwrap())
+                .unwrap();
+        let snapshot_path = backup.path().join(&manifest.snapshot);
+        let mut corrupt = std::fs::read(&snapshot_path).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(&snapshot_path, &corrupt).unwrap();
+        let error = Engine::restore(backup.path(), destination.path(), "recovery")
+            .expect_err("corrupt snapshot must be rejected");
+        assert_eq!(error.kind, ErrorKind::FailedPrecondition);
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), corrupt);
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+
+        for old in ["graphrun.backup/v1", "graphrun.backup/v2"] {
+            std::fs::write(
+                backup.path().join("manifest.json"),
+                format!(r#"{{"format":"{old}","kind":"logical-domain"}}"#),
+            )
+            .unwrap();
+            let error = Engine::restore(backup.path(), destination.path(), "recovery")
+                .expect_err("old backup format must be rejected");
+            assert_eq!(error.kind, ErrorKind::FailedPrecondition);
+            assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_rejects_retained_definition_corruption_with_valid_snapshot_checksums() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let engine = Engine::local(source.path()).await.unwrap();
+        let run = engine
+            .start_yaml(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                &catalog(),
+                order(),
+            )
+            .await
+            .unwrap();
+        engine
+            .wait_terminal(run, Duration::from_secs(10))
+            .await
+            .unwrap();
+        engine.shutdown().await.unwrap();
+        Engine::backup(source.path(), backup.path()).unwrap();
+
+        let verified = Engine::read_backup(backup.path()).unwrap();
+        assert!(verified.runs.contains_key(&run));
+        assert!(!verified.history_records[&run].is_empty());
+        let manifest_path = backup.path().join("manifest.json");
+        let mut manifest: LogicalBackupManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let old_snapshot = backup.path().join(&manifest.snapshot);
+        let (mut framing, _) = verify_snapshot(&old_snapshot).unwrap();
+        let mut raw = Vec::new();
+        copy_payload(&old_snapshot, &mut raw).unwrap();
+        let mut retained: State = serde_json::from_slice(&raw).unwrap();
+        retained
+            .history_dependencies
+            .get_mut(&run)
+            .unwrap()
+            .definition
+            .sha256 = "0".repeat(64);
+        raw = serde_json::to_vec(&retained).unwrap();
+        framing.payload_bytes = raw.len() as u64;
+        let stage = backup.path().join("application-forged.snap.tmp");
+        let digest = write_snapshot(&mut raw.as_slice(), &stage, &framing).unwrap();
+        manifest.snapshot = format!("application-{}.snap", hex::encode(digest));
+        manifest.sha256 = hex::encode(digest);
+        std::fs::rename(stage, backup.path().join(&manifest.snapshot)).unwrap();
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(verify_snapshot(&backup.path().join(&manifest.snapshot)).is_ok());
+        let read_error = Engine::read_backup(backup.path()).unwrap_err();
+        assert_eq!(read_error.kind, ErrorKind::FailedPrecondition);
+        assert!(read_error.message.contains("retained backup artifact"));
+
+        let error = Engine::restore(backup.path(), destination.path(), "drill")
+            .expect_err("retained definition digest must be verified before restore");
+        assert_eq!(error.kind, ErrorKind::FailedPrecondition);
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+        assert!(old_snapshot.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_rejects_unused_publications_with_valid_snapshot_checksums() {
+        let source = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let positive = tempfile::tempdir().unwrap();
+        let engine = Engine::local(source.path()).await.unwrap();
+        engine.publish_catalog(1, catalog()).await.unwrap();
+        engine
+            .publish_definition_yaml(
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+                1,
+            )
+            .await
+            .unwrap();
+        engine.shutdown().await.unwrap();
+        Engine::backup(source.path(), backup.path()).unwrap();
+        let original = Engine::read_backup(backup.path()).unwrap();
+        assert!(original.runs.is_empty());
+        assert_eq!(original.published_catalogs.len(), 1);
+        assert_eq!(original.published_definitions["sequence"].len(), 1);
+        Engine::restore(backup.path(), positive.path(), "control").unwrap();
+        let opened = Engine::local(positive.path()).await.unwrap();
+        let restored = opened.storage.query_state().await;
+        assert_eq!(restored.published_catalogs.len(), 1);
+        assert_eq!(restored.published_definitions["sequence"].len(), 1);
+        opened.shutdown().await.unwrap();
+
+        let manifest_path = backup.path().join("manifest.json");
+        let mut manifest: LogicalBackupManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let original_snapshot = backup.path().join(&manifest.snapshot);
+        let (framing, _) = verify_snapshot(&original_snapshot).unwrap();
+        for variant in [
+            "catalog_digest",
+            "definition_digest",
+            "missing_catalog_version",
+        ] {
+            let mut retained = original.clone();
+            match variant {
+                "catalog_digest" => {
+                    retained.published_catalogs.get_mut(&1).unwrap().digest = "0".repeat(64)
+                }
+                "definition_digest" => {
+                    retained
+                        .published_definitions
+                        .get_mut("sequence")
+                        .unwrap()
+                        .get_mut(&1)
+                        .unwrap()
+                        .digest = "0".repeat(64)
+                }
+                "missing_catalog_version" => {
+                    retained
+                        .published_definitions
+                        .get_mut("sequence")
+                        .unwrap()
+                        .get_mut(&1)
+                        .unwrap()
+                        .catalog_version = 999
+                }
+                _ => unreachable!(),
+            }
+            let raw = serde_json::to_vec(&retained).unwrap();
+            let mut repaired = framing.clone();
+            repaired.payload_bytes = raw.len() as u64;
+            let stage = backup
+                .path()
+                .join(format!("application-{variant}.snap.tmp"));
+            let digest = write_snapshot(&mut raw.as_slice(), &stage, &repaired).unwrap();
+            manifest.snapshot = format!("application-{}.snap", hex::encode(digest));
+            manifest.sha256 = hex::encode(digest);
+            std::fs::rename(stage, backup.path().join(&manifest.snapshot)).unwrap();
+            std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert!(verify_snapshot(&backup.path().join(&manifest.snapshot)).is_ok());
+            let read_error = Engine::read_backup(backup.path()).unwrap_err();
+            assert_eq!(
+                read_error.kind,
+                ErrorKind::FailedPrecondition,
+                "{variant}: {read_error}"
+            );
+            assert!(
+                read_error.message.contains("published"),
+                "{variant} was rejected for the wrong reason: {read_error}"
+            );
+            let destination = tempfile::tempdir().unwrap();
+            let error = Engine::restore(backup.path(), destination.path(), "drill")
+                .expect_err("unused published artifact must be checked before restore");
+            assert_eq!(
+                error.kind,
+                ErrorKind::FailedPrecondition,
+                "{variant}: {error}"
+            );
+            assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+        }
+        assert!(original_snapshot.exists());
     }
 }

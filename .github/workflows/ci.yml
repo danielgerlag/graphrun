@@ -21,6 +21,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: spec traceability
+        run: python3 docs/specs/v1/check-specs.py
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -37,7 +39,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: test
-        run: cargo test --workspace --locked -- --skip snapshot_controller_fires
+        run: cargo test --workspace --locked
       - name: doc tests
         run: cargo test --workspace --doc --locked
       - name: crash cuts
@@ -59,32 +61,38 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.90.0
       - uses: Swatinem/rust-cache@v2
       - name: test 1.90.0
-        run: cargo test --workspace --locked -- --skip snapshot_controller_fires
+        run: cargo +1.90.0 test --workspace --locked
 
   verify:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: release CLI
         run: cargo build --release --locked -p graphrun-cli
+      - name: cluster smoke with independent worker processes
+        run: >
+          cargo run --locked -p graphrun-e2e -- smoke-cluster
+          --cli target/release/graphrun
+          --artifacts /tmp/gr-smoke
       - name: e2e matrix
         run: >
           cargo run --locked -p graphrun-e2e -- verify
           --cli target/release/graphrun
           --matrix docs/specs/v1/verification-matrix.tsv
-          --artifacts target/e2e-artifacts
+          --artifacts /tmp/gr-e2e
       - name: upload e2e artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-artifacts
+          name: e2e-artifacts-${{ matrix.os }}
           path: |
-            target/e2e-artifacts/report.json
-            target/e2e-artifacts/PERF-001-measure.txt
-            target/e2e-artifacts/PERF-002-measure.txt
-            target/e2e-artifacts/cargo-lib.log
-            target/e2e-artifacts/cargo-snapshot.log
+            /tmp/gr-e2e/
+            /tmp/gr-smoke/
           if-no-files-found: warn

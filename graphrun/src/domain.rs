@@ -99,6 +99,10 @@ pub enum DomainEvent {
         run: RunId,
         wait: WaitId,
     },
+    WaitCancelled {
+        run: RunId,
+        wait: WaitId,
+    },
     EventAccepted {
         run: RunId,
         event_id: EventId,
@@ -113,6 +117,10 @@ pub enum DomainEvent {
     },
     EventReserved {
         wait: WaitId,
+        event_id: EventId,
+    },
+    EventExpired {
+        run: RunId,
         event_id: EventId,
     },
     ReservationReleased {
@@ -158,9 +166,28 @@ pub enum DomainEvent {
         capacity: u32,
         expires_ms: u64,
     },
+    WorkerRegistered {
+        session: WorkerSessionId,
+        principal_id: String,
+        capabilities: Vec<crate::worker_contract::WorkerCapability>,
+        capacity: u32,
+        protocol_min: u32,
+        protocol_max: u32,
+        expires_ms: u64,
+    },
+    WorkerSessionRenewed {
+        session: WorkerSessionId,
+        revision: LeaseRevision,
+        expires_ms: u64,
+    },
     ClaimGranted {
         run: RunId,
+        scope: ScopeId,
         activation: ActivationId,
+        handler: String,
+        handler_version: u32,
+        input: Value,
+        attempt: u32,
         session: WorkerSessionId,
         generation: OwnerGeneration,
         revision: LeaseRevision,
@@ -185,6 +212,12 @@ pub enum DomainEvent {
         outcome: ReconcileOutcome,
         output: Option<Value>,
         probes: u32,
+    },
+    ReconciliationFailed {
+        run: RunId,
+        activation: ActivationId,
+        code: String,
+        message: String,
     },
     InterventionRequired {
         run: RunId,
@@ -241,6 +274,15 @@ pub enum ScopeRole {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CommandBody {
+    /// Replicated provenance minted at a verified ingress, not decoded from a client request.
+    Authenticated {
+        principal_id: String,
+        body: Box<CommandBody>,
+    },
+    Publication {
+        key: crate::publication::CommandKey,
+        operation: crate::publication::PublicationOperation,
+    },
     Start {
         run: RunId,
         definition: Box<Definition>,
@@ -286,6 +328,21 @@ pub enum CommandBody {
         activities: Vec<String>,
         capacity: u32,
     },
+    RenewLocalSession {
+        session: WorkerSessionId,
+    },
+    RegisterWorker {
+        session: WorkerSessionId,
+        principal_id: String,
+        capabilities: Vec<crate::worker_contract::WorkerCapability>,
+        capacity: u32,
+        protocol_min: u32,
+        protocol_max: u32,
+    },
+    RenewWorkerSession {
+        session: WorkerSessionId,
+        revision: LeaseRevision,
+    },
     Claim {
         session: WorkerSessionId,
         capacity: u32,
@@ -304,6 +361,15 @@ pub enum CommandBody {
         generation: OwnerGeneration,
         revision: LeaseRevision,
     },
+    ReportWorker {
+        run: RunId,
+        activation: ActivationId,
+        session: WorkerSessionId,
+        generation: OwnerGeneration,
+        revision: LeaseRevision,
+        schema_digest: String,
+        result: WorkerResult,
+    },
     Reconcile {
         run: RunId,
         activation: ActivationId,
@@ -313,12 +379,24 @@ pub enum CommandBody {
         outcome: ReconcileOutcome,
         output: Option<Value>,
     },
+    ReconcileWorker {
+        run: RunId,
+        activation: ActivationId,
+        session: WorkerSessionId,
+        generation: OwnerGeneration,
+        revision: LeaseRevision,
+        schema_digest: String,
+        result: WorkerProbe,
+    },
     AcknowledgeRecovery {
         reason: String,
     },
     AbandonCompensation {
         run: RunId,
         reason: String,
+    },
+    PruneHistory {
+        limit: u32,
     },
 }
 
@@ -331,10 +409,77 @@ pub enum ReconcileOutcome {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkerResult {
+    Success { output: Value },
+    Error { code: String, message: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkerProbe {
+    Observed {
+        outcome: ReconcileOutcome,
+        output: Option<Value>,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Command {
     pub id: CommandId,
     pub body: CommandBody,
     pub time: EngineTime,
+}
+
+impl Command {
+    pub(crate) fn authenticated_peer(mut self, peer: &crate::tls::VerifiedPeerIdentity) -> Self {
+        self.body = CommandBody::Authenticated {
+            principal_id: peer.principal_id().as_str().to_owned(),
+            body: Box::new(self.body),
+        };
+        self
+    }
+
+    pub(crate) fn authenticated_context(mut self, owner: &crate::publication::AuthContext) -> Self {
+        self.body = CommandBody::Authenticated {
+            principal_id: owner.key(self.id).principal_id,
+            body: Box::new(self.body),
+        };
+        self
+    }
+
+    fn into_cause(self) -> Result<(Self, Option<String>)> {
+        let Self { id, body, time } = self;
+        match body {
+            CommandBody::Authenticated { principal_id, body } => {
+                if crate::tls::PrincipalId::parse(principal_id.as_str()).is_err()
+                    || matches!(
+                        *body,
+                        CommandBody::Authenticated { .. }
+                            | CommandBody::Publication { .. }
+                            | CommandBody::PruneHistory { .. }
+                            | CommandBody::Progress { .. }
+                            | CommandBody::ResolveTimer { .. }
+                    )
+                {
+                    return Err(Error::invalid("invalid authenticated command cause"));
+                }
+                Ok((
+                    Self {
+                        id,
+                        body: *body,
+                        time,
+                    },
+                    Some(principal_id),
+                ))
+            }
+            body => Ok((Self { id, body, time }, None)),
+        }
+    }
 }
 
 struct IdGen {
@@ -389,9 +534,13 @@ pub struct RunState {
     pub root: ScopeId,
     pub next_sequence: RunSequence,
     #[serde(default)]
+    pub next_ready_order: u64,
+    #[serde(default)]
     pub admitted_ms: u64,
     #[serde(default)]
     pub terminal_ms: u64,
+    #[serde(default)]
+    pub published: Option<crate::publication::PinnedPublication>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,6 +583,8 @@ pub struct ActivationState {
     pub claim: Option<ClaimState>,
     #[serde(default)]
     pub attempts: u32,
+    #[serde(default)]
+    pub ready_order: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -448,6 +599,8 @@ pub struct ClaimState {
     pub role: ExecutionRole,
     #[serde(default)]
     pub probes: u32,
+    #[serde(default)]
+    pub unknown_reported: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -456,6 +609,16 @@ pub struct WorkerSession {
     pub activities: Vec<String>,
     pub capacity: u32,
     pub expires_ms: u64,
+    #[serde(default)]
+    pub principal_id: String,
+    #[serde(default)]
+    pub capabilities: Vec<crate::worker_contract::WorkerCapability>,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub protocol_min: u32,
+    #[serde(default)]
+    pub protocol_max: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -513,18 +676,55 @@ pub struct InboxEntry {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
+    #[serde(default)]
+    pub current_cluster_id: String,
+    #[serde(default)]
+    pub artifact_origins: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub engine_time_watermark_ms: u64,
     pub runs: HashMap<RunId, RunState>,
     pub scopes: HashMap<ScopeId, ScopeState>,
     pub activations: HashMap<ActivationId, ActivationState>,
     pub waits: HashMap<WaitId, WaitState>,
     pub inbox: Vec<InboxEntry>,
     pub commands: HashMap<CommandId, Vec<DomainEvent>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub command_actors: HashMap<CommandId, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub command_external_ids: HashMap<CommandId, CommandId>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub authenticated_request_digests: HashMap<CommandId, String>,
+    #[serde(default)]
+    pub legacy_start_digests: HashMap<CommandId, String>,
+    #[serde(default)]
+    pub worker_command_digests: HashMap<CommandId, String>,
+    #[serde(default)]
+    pub published_catalogs: BTreeMap<u32, crate::publication::PublishedCatalog>,
+    #[serde(default)]
+    pub published_definitions:
+        BTreeMap<String, BTreeMap<u32, crate::publication::PublishedDefinition>>,
+    #[serde(default)]
+    pub start_keys: BTreeMap<String, BTreeMap<String, crate::publication::StartKeyRecord>>,
+    #[serde(default)]
+    pub command_results: BTreeMap<String, crate::publication::CommandResult>,
     pub loop_carry: HashMap<ActivationId, (Value, u32)>,
     pub foreach_items: HashMap<ActivationId, Vec<Value>>,
     pub foreach_done: HashMap<ActivationId, Vec<(u32, Value)>>,
     pub parallel_done: HashMap<ActivationId, BTreeMap<String, Value>>,
     #[serde(default)]
     pub history: HashMap<RunId, Vec<DomainEvent>>,
+    #[serde(default)]
+    pub history_records: HashMap<RunId, Vec<crate::history::HistoryEntry>>,
+    #[serde(default)]
+    pub history_dependencies: HashMap<RunId, crate::history::RequiredArtifacts>,
+    #[serde(default)]
+    pub checkpoints: HashMap<RunId, crate::history::RunCheckpoint>,
+    #[serde(default)]
+    pub terminal_summaries: HashMap<RunId, crate::history::TerminalSummary>,
+    #[serde(default)]
+    pub signal_tombstones: HashMap<String, crate::history::SignalTombstone>,
+    #[serde(default)]
+    pub command_times: HashMap<CommandId, u64>,
     #[serde(default)]
     pub obligations: Vec<Obligation>,
     #[serde(default)]
@@ -533,6 +733,8 @@ pub struct State {
     pub sessions: HashMap<WorkerSessionId, WorkerSession>,
     #[serde(default)]
     pub next_generation: u64,
+    #[serde(default)]
+    pub fair_cursor: Option<RunId>,
     #[serde(default)]
     pub interventions: HashMap<ActivationId, String>,
     #[serde(default)]
@@ -551,6 +753,7 @@ pub struct Decision {
 }
 
 pub fn decide(state: &State, command: &Command) -> Result<Decision> {
+    verify_command_identity(state, command.id, None, command.id, None)?;
     if let Some(events) = state.commands.get(&command.id) {
         return Ok(Decision {
             events: events.clone(),
@@ -558,6 +761,15 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
     }
     let mut ids = IdGen::new(command.id);
     match &command.body {
+        CommandBody::Authenticated { .. } => Err(Error::invalid(
+            "authenticated cause requires replicated apply",
+        )),
+        CommandBody::Publication { .. } => {
+            Err(Error::invalid("publication requires replicated apply"))
+        }
+        CommandBody::PruneHistory { .. } => {
+            Err(Error::invalid("retention requires replicated apply"))
+        }
         CommandBody::Start {
             run,
             definition,
@@ -629,6 +841,51 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             activities,
             capacity,
         } => decide_register(state, *session, activities, *capacity, command.time),
+        CommandBody::RenewLocalSession { session } => {
+            let worker = state.sessions.get(session).ok_or_else(|| {
+                Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "unknown local session",
+                )
+            })?;
+            if !worker.principal_id.is_empty() || command.time.as_millis() >= worker.expires_ms {
+                return Err(Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "local worker session expired or is not local",
+                ));
+            }
+            Ok(Decision {
+                events: vec![DomainEvent::SessionRegistered {
+                    session: *session,
+                    activities: worker.activities.clone(),
+                    capacity: worker.capacity,
+                    expires_ms: command
+                        .time
+                        .as_millis()
+                        .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64),
+                }],
+            })
+        }
+        CommandBody::RegisterWorker {
+            session,
+            principal_id,
+            capabilities,
+            capacity,
+            protocol_min,
+            protocol_max,
+        } => decide_register_worker(
+            state,
+            *session,
+            principal_id,
+            capabilities,
+            *capacity,
+            *protocol_min,
+            *protocol_max,
+            command.time,
+        ),
+        CommandBody::RenewWorkerSession { session, revision } => {
+            decide_renew_worker_session(state, *session, *revision, command.time)
+        }
         CommandBody::Claim { session, capacity } => {
             if execution_suspended(state) {
                 return Ok(Decision { events: Vec::new() });
@@ -666,6 +923,72 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             command.time,
             &mut ids,
         ),
+        CommandBody::ReportWorker {
+            run,
+            activation,
+            session,
+            generation,
+            revision,
+            schema_digest,
+            result,
+        } => {
+            let claim = validate_claim_owner(
+                state,
+                *run,
+                *activation,
+                *session,
+                *generation,
+                *revision,
+                command.time,
+            )?;
+            if claim.role == ExecutionRole::Reconciliation {
+                return Err(Error::invalid("reconciliation claim must use reconcile"));
+            }
+            let (name, version, _) = activity_key(state, *activation)
+                .ok_or_else(|| Error::invalid("claimed activity unavailable"))?;
+            let catalog = &state
+                .runs
+                .get(run)
+                .ok_or_else(|| Error::invalid("unknown run"))?
+                .catalog;
+            let key = crate::ids::ActivityKey::new(name, version);
+            let capability = crate::worker_contract::capability_for(catalog, &key, claim.role)?;
+            if &capability.output_schema_digest != schema_digest {
+                return Err(Error::invalid("worker result schema digest mismatch"));
+            }
+            match result {
+                WorkerResult::Success { output } => decide_report_assigned(
+                    state,
+                    *run,
+                    *activation,
+                    output.clone(),
+                    *session,
+                    *generation,
+                    *revision,
+                    command.time,
+                    &mut ids,
+                ),
+                WorkerResult::Error { code, message } => {
+                    if message.is_empty()
+                        || (catalog.activity(&key)?.known_code(code).is_none()
+                            && !code.starts_with("worker."))
+                    {
+                        return Err(Error::invalid(format!(
+                            "undeclared handler error code {code}"
+                        )));
+                    }
+                    decide_report_error(
+                        state,
+                        *run,
+                        *activation,
+                        code,
+                        message,
+                        command.time,
+                        &mut ids,
+                    )
+                }
+            }
+        }
         CommandBody::AcknowledgeRecovery { reason } => decide_acknowledge_recovery(state, reason),
         CommandBody::AbandonCompensation { run, reason } => {
             decide_abandon_compensation(state, *run, reason)
@@ -690,6 +1013,76 @@ pub fn decide(state: &State, command: &Command) -> Result<Decision> {
             command.time,
             &mut ids,
         ),
+        CommandBody::ReconcileWorker {
+            run,
+            activation,
+            session,
+            generation,
+            revision,
+            schema_digest,
+            result,
+        } => {
+            let claim = validate_claim_owner(
+                state,
+                *run,
+                *activation,
+                *session,
+                *generation,
+                *revision,
+                command.time,
+            )?;
+            if claim.role != ExecutionRole::Reconciliation {
+                return Err(Error::invalid("claim is not a reconciliation probe"));
+            }
+            let (name, version, _) = activity_key(state, *activation)
+                .ok_or_else(|| Error::invalid("claimed reconciler unavailable"))?;
+            let catalog = &state
+                .runs
+                .get(run)
+                .ok_or_else(|| Error::invalid("unknown run"))?
+                .catalog;
+            let capability = crate::worker_contract::capability_for(
+                catalog,
+                &crate::ids::ActivityKey::new(name, version),
+                claim.role,
+            )?;
+            if &capability.output_schema_digest != schema_digest {
+                return Err(Error::invalid("worker probe schema digest mismatch"));
+            }
+            let (outcome, output, error) = match result {
+                WorkerProbe::Observed { outcome, output } => (*outcome, output.clone(), None),
+                WorkerProbe::Error { code, message } if !code.is_empty() && !message.is_empty() => {
+                    (ReconcileOutcome::Unknown, None, Some((code, message)))
+                }
+                WorkerProbe::Error { .. } => {
+                    return Err(Error::invalid("probe error requires code and message"));
+                }
+            };
+            let mut decision = decide_reconcile(
+                state,
+                *run,
+                *activation,
+                *session,
+                *generation,
+                *revision,
+                outcome,
+                output,
+                command.time,
+                &mut ids,
+            )?;
+            if let Some((code, message)) = error {
+                decision.events.insert(
+                    0,
+                    DomainEvent::ReconciliationFailed {
+                        run: *run,
+                        activation: *activation,
+                        code: code.clone(),
+                        message: message.clone(),
+                    },
+                );
+            }
+            Ok(decision)
+        }
     }
 }
 
@@ -793,6 +1186,7 @@ fn report_success(
         .get(&activation)
         .ok_or_else(|| Error::invalid("unknown activation"))?;
     if act.role == ExecutionRole::Compensation {
+        validate_leaf_output(state, act, &output)?;
         return decide_compensation_result(state, run, activation, output);
     }
     validate_leaf_output(state, act, &output)?;
@@ -1112,12 +1506,223 @@ fn decide_register(
     })
 }
 
+fn decide_register_worker(
+    state: &State,
+    session: WorkerSessionId,
+    principal_id: &str,
+    capabilities: &[crate::worker_contract::WorkerCapability],
+    capacity: u32,
+    protocol_min: u32,
+    protocol_max: u32,
+    time: EngineTime,
+) -> Result<Decision> {
+    use crate::worker_contract::{CODEC_VERSION, PROTOCOL_VERSION};
+    if principal_id.is_empty() || state.sessions.contains_key(&session) {
+        return Err(Error::invalid(
+            "worker session identity must be new and authenticated",
+        ));
+    }
+    if capacity == 0
+        || capacity > crate::limits::MAX_ACTIVE_LEAVES_PER_WORKER
+        || capabilities.is_empty()
+        || protocol_min > PROTOCOL_VERSION
+        || protocol_max < PROTOCOL_VERSION
+    {
+        return Err(Error::invalid(
+            "invalid worker capacity, protocol range, or capabilities",
+        ));
+    }
+    let mut unique = std::collections::HashSet::new();
+    for capability in capabilities {
+        if capability.codec_version != CODEC_VERSION
+            || !unique.insert((
+                &capability.activity_name,
+                capability.activity_version,
+                capability.role as u8,
+            ))
+        {
+            return Err(Error::invalid("duplicate or unsupported worker capability"));
+        }
+    }
+    Ok(Decision {
+        events: vec![DomainEvent::WorkerRegistered {
+            session,
+            principal_id: principal_id.to_owned(),
+            capabilities: capabilities.to_vec(),
+            capacity,
+            protocol_min,
+            protocol_max,
+            expires_ms: time
+                .as_millis()
+                .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64),
+        }],
+    })
+}
+
+fn decide_renew_worker_session(
+    state: &State,
+    session: WorkerSessionId,
+    revision: LeaseRevision,
+    time: EngineTime,
+) -> Result<Decision> {
+    let worker = state.sessions.get(&session).ok_or_else(|| {
+        Error::new(
+            crate::error::ErrorKind::Unauthenticated,
+            "unknown worker session",
+        )
+    })?;
+    if worker.principal_id.is_empty()
+        || worker.revision != revision.get()
+        || time.as_millis() >= worker.expires_ms
+    {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "stale or expired worker session",
+        ));
+    }
+    Ok(Decision {
+        events: vec![DomainEvent::WorkerSessionRenewed {
+            session,
+            revision: revision.next(),
+            expires_ms: time
+                .as_millis()
+                .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64),
+        }],
+    })
+}
+
+fn claimed_activity(
+    state: &State,
+    activation: ActivationId,
+    role: ExecutionRole,
+) -> Result<(crate::ids::ActivityKey, Value)> {
+    let act = state
+        .activations
+        .get(&activation)
+        .ok_or_else(|| Error::invalid("missing activation"))?;
+    let run = state
+        .runs
+        .get(&act.run)
+        .ok_or_else(|| Error::invalid("missing run"))?;
+    match role {
+        ExecutionRole::Forward | ExecutionRole::Reconciliation => {
+            let region = lookup_region(state, act.scope)
+                .ok_or_else(|| Error::invalid("missing activity scope"))?;
+            let Node::Activity {
+                activity, input, ..
+            } = region
+                .nodes
+                .get(act.node.as_str())
+                .ok_or_else(|| Error::invalid("missing activity node"))?
+            else {
+                return Err(Error::invalid("ready node is not an activity"));
+            };
+            let scope = state
+                .scopes
+                .get(&act.scope)
+                .ok_or_else(|| Error::invalid("missing activity scope state"))?;
+            let bound = eval_binding(input, &eval_ctx(state, scope))?;
+            let key = if role == ExecutionRole::Reconciliation {
+                run.catalog
+                    .activity(activity)?
+                    .reconciler
+                    .clone()
+                    .ok_or_else(|| Error::invalid("missing reconciliation contract"))?
+            } else {
+                activity.clone()
+            };
+            Ok((key, bound))
+        }
+        ExecutionRole::Compensation => {
+            let obligation = state.obligations.iter().find(|item| matches!(
+                item.status, ObligationStatus::Compensating { activation: current } if current == activation
+            )).ok_or_else(|| Error::invalid("missing compensation obligation"))?;
+            Ok((
+                crate::ids::ActivityKey::new(&obligation.handler, obligation.handler_version),
+                obligation.input.clone(),
+            ))
+        }
+    }
+}
+
+fn worker_matches(
+    state: &State,
+    worker: &WorkerSession,
+    activation: ActivationId,
+    role: ExecutionRole,
+) -> Result<bool> {
+    let act = state
+        .activations
+        .get(&activation)
+        .ok_or_else(|| Error::invalid("missing activation"))?;
+    let run = state
+        .runs
+        .get(&act.run)
+        .ok_or_else(|| Error::invalid("missing run"))?;
+    let (key, _) = claimed_activity(state, activation, role)?;
+    if worker.principal_id.is_empty() {
+        return Ok(worker
+            .activities
+            .iter()
+            .any(|name| name == "*" || name == &key.name));
+    }
+    let required = crate::worker_contract::capability_for(&run.catalog, &key, role)?;
+    Ok(worker.capabilities.contains(&required))
+}
+
+pub fn worker_has_ready(state: &State, session: WorkerSessionId, time: EngineTime) -> Result<bool> {
+    let worker = state
+        .sessions
+        .get(&session)
+        .ok_or_else(|| Error::invalid("unknown worker session"))?;
+    if time.as_millis() >= worker.expires_ms {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "worker session expired",
+        ));
+    }
+    if worker_in_flight(state, session, time) >= worker.capacity {
+        return Ok(false);
+    }
+    for run in active_runs(state) {
+        for activation in unclaimed_ready(state, run, time) {
+            let act = state
+                .activations
+                .get(&activation)
+                .expect("ready activation");
+            let role = grant_role(state, act, time);
+            if role == ExecutionRole::Forward
+                && (run_past_deadline(state, run, time) || run_is_aborting(state, run))
+            {
+                continue;
+            }
+            if worker_matches(state, worker, activation, role)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn worker_in_flight(state: &State, session: WorkerSessionId, time: EngineTime) -> u32 {
+    state
+        .activations
+        .values()
+        .filter(|act| {
+            act.status == ActivationStatus::Ready
+                && act.claim.as_ref().is_some_and(|claim| {
+                    claim.session == session && claim.lease_expiry_ms > time.as_millis()
+                })
+        })
+        .count() as u32
+}
+
 fn decide_claim(
     state: &State,
     session: WorkerSessionId,
     capacity: u32,
     time: EngineTime,
-    ids: &mut IdGen,
+    _ids: &mut IdGen,
 ) -> Result<Decision> {
     let worker = state
         .sessions
@@ -1129,19 +1734,24 @@ fn decide_claim(
             "session expired",
         ));
     }
-    let activities = worker.activities.clone();
-    let worker_capacity = worker.capacity;
-    let expires_ms = time
-        .as_millis()
-        .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64);
-    let mut events = vec![DomainEvent::SessionRegistered {
-        session,
-        activities,
-        capacity: worker_capacity,
-        expires_ms,
-    }];
+    let mut events = if worker.principal_id.is_empty() {
+        vec![DomainEvent::SessionRegistered {
+            session,
+            activities: worker.activities.clone(),
+            capacity: worker.capacity,
+            expires_ms: time
+                .as_millis()
+                .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64),
+        }]
+    } else {
+        Vec::new()
+    };
     let cap = capacity
-        .min(worker_capacity)
+        .min(
+            worker
+                .capacity
+                .saturating_sub(worker_in_flight(state, session, time)),
+        )
         .min(crate::limits::CLAIM_BATCH);
     let mut granted = 0u32;
     let mut runs = active_runs(state);
@@ -1149,6 +1759,11 @@ fn decide_claim(
         return Ok(Decision { events });
     }
     runs.sort();
+    if let Some(last) = state.fair_cursor {
+        let next = runs.partition_point(|run| *run <= last);
+        let offset = next % runs.len();
+        runs.rotate_left(offset);
+    }
     let mut granted_ids = Vec::new();
     while granted < cap {
         let mut progressed = false;
@@ -1157,26 +1772,53 @@ fn decide_claim(
                 break;
             }
             let mut ready = unclaimed_ready(state, *run, time);
-            ready.sort();
-            let Some(activation) = ready.into_iter().find(|id| {
-                if granted_ids.contains(id) {
-                    return false;
+            ready.sort_by_key(|id| {
+                let act = &state.activations[id];
+                (act.ready_order, *id)
+            });
+            let mut selected = None;
+            for id in ready {
+                if granted_ids.contains(&id) {
+                    continue;
                 }
-                let Some(act) = state.activations.get(id) else {
-                    return false;
+                let Some(act) = state.activations.get(&id) else {
+                    continue;
                 };
                 let role = grant_role(state, act, time);
                 if role == ExecutionRole::Forward && run_past_deadline(state, *run, time) {
-                    return false;
+                    continue;
                 }
-                !(role == ExecutionRole::Forward && run_is_aborting(state, *run))
-            }) else {
+                if role == ExecutionRole::Forward && run_is_aborting(state, *run) {
+                    continue;
+                }
+                if worker_matches(state, worker, id, role)? {
+                    selected = Some(id);
+                    break;
+                }
+            }
+            let Some(activation) = selected else {
                 continue;
             };
             let Some(act) = state.activations.get(&activation) else {
                 continue;
             };
             let role = grant_role(state, act, time);
+            let (handler, input) = claimed_activity(state, activation, role)?;
+            let (input_schema, _) = crate::worker_contract::contract_schemas(
+                &state
+                    .runs
+                    .get(run)
+                    .ok_or_else(|| Error::invalid("missing run"))?
+                    .catalog,
+                &handler,
+                role,
+            )?;
+            state
+                .runs
+                .get(run)
+                .expect("checked run")
+                .catalog
+                .validate_value(input_schema, &input)?;
             let lease_expiry_ms = time
                 .as_millis()
                 .saturating_add(crate::policy::SESSION_LEASE.as_millis() as u64);
@@ -1186,14 +1828,20 @@ fn decide_claim(
                 ExecutionRole::Forward => crate::policy::FORWARD_ATTEMPT_TIMEOUT,
             };
             let attempt_deadline_ms = time.as_millis().saturating_add(timeout.as_millis() as u64);
-            let effect_key = act
-                .claim
-                .as_ref()
-                .map(|claim| claim.effect_key)
-                .unwrap_or_else(|| EffectKey::from_bytes(ids.next_bytes()));
+            let effect_key = if role == ExecutionRole::Reconciliation {
+                act.claim.as_ref().map(|claim| claim.effect_key)
+            } else {
+                None
+            }
+            .unwrap_or_else(|| stable_effect_key(*run, activation, role));
             events.push(DomainEvent::ClaimGranted {
                 run: *run,
+                scope: act.scope,
                 activation,
+                handler: handler.name,
+                handler_version: handler.version,
+                input,
+                attempt: act.attempts.saturating_add(1),
                 session,
                 generation: OwnerGeneration::new(
                     state.next_generation.saturating_add(u64::from(granted) + 1),
@@ -1213,6 +1861,16 @@ fn decide_claim(
         }
     }
     Ok(Decision { events })
+}
+
+fn stable_effect_key(run: RunId, activation: ActivationId, role: ExecutionRole) -> EffectKey {
+    let mut hash = Sha256::new();
+    hash.update(b"graphrun.effect-key/v1\0");
+    hash.update(run.as_bytes());
+    hash.update(activation.as_bytes());
+    hash.update(crate::worker_contract::role_name(role).as_bytes());
+    let bytes: [u8; 16] = hash.finalize()[..16].try_into().expect("sha256 prefix");
+    EffectKey::from_bytes(bytes)
 }
 
 fn uncertain_forwards(state: &State, run: RunId) -> bool {
@@ -1317,31 +1975,7 @@ fn decide_report_assigned(
     time: EngineTime,
     ids: &mut IdGen,
 ) -> Result<Decision> {
-    let act = state
-        .activations
-        .get(&activation)
-        .ok_or_else(|| Error::invalid("unknown activation"))?;
-    if act.status != ActivationStatus::Ready {
-        return Err(Error::invalid("activation is not awaiting a result"));
-    }
-    let Some(claim) = &act.claim else {
-        return Err(Error::new(
-            crate::error::ErrorKind::FailedPrecondition,
-            "no claim",
-        ));
-    };
-    if claim.session != session || claim.generation != generation || claim.revision != revision {
-        return Err(Error::new(
-            crate::error::ErrorKind::FailedPrecondition,
-            "stale claim",
-        ));
-    }
-    if time.as_millis() >= claim.lease_expiry_ms || time.as_millis() >= claim.attempt_deadline_ms {
-        return Err(Error::new(
-            crate::error::ErrorKind::FailedPrecondition,
-            "claim expired",
-        ));
-    }
+    let claim = validate_claim_owner(state, run, activation, session, generation, revision, time)?;
     if claim.role == ExecutionRole::Reconciliation {
         return Err(Error::new(
             crate::error::ErrorKind::FailedPrecondition,
@@ -1349,6 +1983,51 @@ fn decide_report_assigned(
         ));
     }
     report_success(state, run, activation, output, ids)
+}
+
+fn validate_claim_owner(
+    state: &State,
+    run: RunId,
+    activation: ActivationId,
+    session: WorkerSessionId,
+    generation: OwnerGeneration,
+    revision: LeaseRevision,
+    time: EngineTime,
+) -> Result<&ClaimState> {
+    let act = state
+        .activations
+        .get(&activation)
+        .ok_or_else(|| Error::invalid("unknown activation"))?;
+    if act.run != run || act.status != ActivationStatus::Ready {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "activation is not awaiting this result",
+        ));
+    }
+    let claim = act
+        .claim
+        .as_ref()
+        .ok_or_else(|| Error::new(crate::error::ErrorKind::FailedPrecondition, "no claim"))?;
+    if claim.session != session || claim.generation != generation || claim.revision != revision {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "stale claim",
+        ));
+    }
+    let worker = state
+        .sessions
+        .get(&session)
+        .ok_or_else(|| Error::new(crate::error::ErrorKind::Unauthenticated, "unknown session"))?;
+    if time.as_millis() >= worker.expires_ms
+        || time.as_millis() >= claim.lease_expiry_ms
+        || time.as_millis() >= claim.attempt_deadline_ms
+    {
+        return Err(Error::new(
+            crate::error::ErrorKind::FailedPrecondition,
+            "claim or session expired",
+        ));
+    }
+    Ok(claim)
 }
 
 fn grant_role(state: &State, act: &ActivationState, time: EngineTime) -> ExecutionRole {
@@ -1405,28 +2084,25 @@ fn decide_reconcile(
     if act.status != ActivationStatus::Ready {
         return Err(Error::invalid("activation is not awaiting a result"));
     }
-    let Some(claim) = &act.claim else {
-        return Err(Error::new(
-            crate::error::ErrorKind::FailedPrecondition,
-            "no claim",
-        ));
-    };
-    if claim.session != session || claim.generation != generation || claim.revision != revision {
-        return Err(Error::new(
-            crate::error::ErrorKind::FailedPrecondition,
-            "stale claim",
-        ));
-    }
+    let claim = validate_claim_owner(state, run, activation, session, generation, revision, time)?;
     if claim.role != ExecutionRole::Reconciliation {
         return Err(Error::new(
             crate::error::ErrorKind::FailedPrecondition,
             "claim is not a reconciliation probe",
         ));
     }
-    if time.as_millis() >= claim.lease_expiry_ms || time.as_millis() >= claim.attempt_deadline_ms {
+    if (outcome == ReconcileOutcome::Applied) != output.is_some() {
+        return Err(Error::invalid(
+            "applied reconciliation requires output; other outcomes forbid it",
+        ));
+    }
+    if let Some(value) = &output {
+        validate_leaf_output(state, act, value)?;
+    }
+    if outcome == ReconcileOutcome::Unknown && claim.unknown_reported {
         return Err(Error::new(
             crate::error::ErrorKind::FailedPrecondition,
-            "claim expired",
+            "unknown reconciliation already reported for claim",
         ));
     }
     let probes = claim.probes.saturating_add(1);
@@ -1439,7 +2115,7 @@ fn decide_reconcile(
     }];
     match outcome {
         ReconcileOutcome::Applied => {
-            let value = output.unwrap_or(Value::Null);
+            let value = output.expect("validated applied output");
             events.extend(report_success(state, run, activation, value, ids)?.events);
         }
         ReconcileOutcome::NotApplied => {
@@ -1528,23 +2204,6 @@ fn decide_cancel(state: &State, run: RunId, reason: &str, ids: &mut IdGen) -> Re
         code: "run.cancelled".to_owned(),
         message: reason.to_owned(),
     };
-    let mut events = Vec::new();
-    for wait in state
-        .waits
-        .values()
-        .filter(|wait| wait.run == run && wait.pending)
-    {
-        if let Some(entry) = state
-            .inbox
-            .iter()
-            .find(|entry| entry.reserved_wait == Some(wait.id) && !entry.consumed)
-        {
-            events.push(DomainEvent::ReservationReleased {
-                wait: wait.id,
-                event_id: entry.event_id,
-            });
-        }
-    }
     let sagas: Vec<ActivationId> = state
         .activations
         .values()
@@ -1565,14 +2224,41 @@ fn decide_cancel(state: &State, run: RunId, reason: &str, ids: &mut IdGen) -> Re
             .values()
             .find(|scope| scope.run == run && matches!(scope.role, ScopeRole::Root))
         {
-            events.extend(fail_scope(state, root.id, error)?);
+            return Ok(Decision {
+                events: fail_scope(state, root.id, error)?,
+            });
         }
-        return Ok(Decision { events });
+        return Err(Error::invalid("run has no root scope"));
     }
+    let mut events = close_pending_waits(state, run);
     for saga in sagas {
         events.extend(compensate_or_fail(state, saga, error.clone(), ids)?);
     }
     Ok(Decision { events })
+}
+
+fn close_pending_waits(state: &State, run: RunId) -> Vec<DomainEvent> {
+    let mut waits: Vec<_> = state
+        .waits
+        .values()
+        .filter(|wait| wait.run == run && wait.pending)
+        .collect();
+    waits.sort_by_key(|wait| wait.id);
+    let mut events = Vec::new();
+    for wait in waits {
+        if let Some(entry) = state
+            .inbox
+            .iter()
+            .find(|entry| entry.reserved_wait == Some(wait.id) && !entry.consumed)
+        {
+            events.push(DomainEvent::ReservationReleased {
+                wait: wait.id,
+                event_id: entry.event_id,
+            });
+        }
+        events.push(DomainEvent::WaitCancelled { run, wait: wait.id });
+    }
+    events
 }
 
 fn compensation_events(state: &State, act: &ActivationState, output: &Value) -> Vec<DomainEvent> {
@@ -1645,10 +2331,44 @@ fn decide_signal(
     time: EngineTime,
     ids: &mut IdGen,
 ) -> Result<Decision> {
+    if let Some(existing) =
+        state
+            .signal_tombstones
+            .get(&format!("{}:{}", run.to_hex(), event_id.to_hex()))
+    {
+        if existing.signal == signal
+            && existing.key == key
+            && existing.payload
+                == crate::history::ArtifactRef::capture_in(
+                    &existing.payload.cluster_id,
+                    "graphrun.signal-payload/v1",
+                    &payload,
+                )?
+        {
+            return Ok(Decision { events: Vec::new() });
+        }
+        return Err(Error::new(
+            crate::error::ErrorKind::AlreadyExists,
+            "event id payload conflict",
+        ));
+    }
     let run_state = state
         .runs
         .get(&run)
         .ok_or_else(|| Error::invalid("unknown run"))?;
+    if let Some(existing) = state
+        .inbox
+        .iter()
+        .find(|entry| entry.run == Some(run) && entry.event_id == event_id)
+    {
+        if existing.signal == signal && existing.key == key && existing.payload == payload {
+            return Ok(Decision { events: Vec::new() });
+        }
+        return Err(Error::new(
+            crate::error::ErrorKind::AlreadyExists,
+            "event id payload conflict",
+        ));
+    }
     if matches!(
         run_state.status,
         RunStatus::Succeeded { .. } | RunStatus::Failed { .. }
@@ -1657,15 +2377,6 @@ fn decide_signal(
     }
     if !run_state.definition.signals.contains_key(signal) {
         return Err(Error::invalid(format!("unknown signal {signal}")));
-    }
-    if let Some(existing) = state.inbox.iter().find(|entry| entry.event_id == event_id) {
-        if existing.signal == signal && existing.key == key && existing.payload == payload {
-            return Ok(Decision { events: Vec::new() });
-        }
-        return Err(Error::new(
-            crate::error::ErrorKind::AlreadyExists,
-            "event id payload conflict",
-        ));
     }
     let buffered = state
         .inbox
@@ -1691,8 +2402,12 @@ fn decide_signal(
     }
     let sequence = run_state.next_sequence.get();
     let accepted_ms = time.as_millis();
-    let expires_ms = accepted_ms
-        .saturating_add(crate::policy::UNRESERVED_EVENT_DAYS.saturating_mul(24 * 60 * 60 * 1000));
+    let expires_ms = accepted_ms.saturating_add(
+        run_state
+            .policy
+            .unreserved_event_days
+            .saturating_mul(24 * 60 * 60 * 1000),
+    );
     let mut events = vec![DomainEvent::EventAccepted {
         run,
         event_id,
@@ -1838,7 +2553,7 @@ fn decide_progress(
         let Some(next) = next_progress(&working, run, time, ids)? else {
             break;
         };
-        apply_events(&mut working, &next);
+        apply_events(&mut working, &next)?;
         events.extend(next);
     }
     Ok(Decision { events })
@@ -1908,6 +2623,13 @@ fn next_progress(
                 }]));
             }
             Node::WaitUntil { at, next } => {
+                if state
+                    .waits
+                    .values()
+                    .any(|wait| wait.activation == act.id && wait.pending)
+                {
+                    continue;
+                }
                 let scope = state.scopes.get(&act.scope).unwrap();
                 let at = match eval_binding(at, &eval_ctx(state, scope))? {
                     Value::Int(v) if v >= 0 => v as u64,
@@ -1920,6 +2642,15 @@ fn next_progress(
                 if time.as_millis() >= at {
                     return Ok(Some(open_node(state, act.scope, next, ids)?));
                 }
+                return Ok(Some(vec![DomainEvent::WaitOpened {
+                    run,
+                    wait: ids.wait(),
+                    activation: act.id,
+                    signal: "__timer".to_owned(),
+                    key: act.id.to_hex(),
+                    deadline_ms: Some(at),
+                    consume_from: ConsumeFrom::AfterActivation,
+                }]));
             }
             Node::WaitSignal { .. } => {
                 if state
@@ -2097,8 +2828,9 @@ fn due_wait(
     let act = state.activations.get(&wait.activation).unwrap();
     if wait.signal == "__timer" {
         let region = region_for_scope(state, act.scope).unwrap();
-        let Node::Delay { next, .. } = region.nodes.get(act.node.as_str()).unwrap() else {
-            return Err(Error::invalid("timer wait is not a delay"));
+        let next = match region.nodes.get(act.node.as_str()) {
+            Some(Node::Delay { next, .. } | Node::WaitUntil { next, .. }) => next,
+            _ => return Err(Error::invalid("timer wait is not a delay or wait_until")),
         };
         let mut events = vec![DomainEvent::WaitTimedOut { run, wait: wait.id }];
         events.extend(open_node(state, act.scope, next, ids)?);
@@ -2895,11 +3627,15 @@ fn fail_scope(state: &State, scope: ScopeId, error: FailError) -> Result<Vec<Dom
     if matches!(scope_state.status, ScopeStatus::Failed { .. }) {
         return Ok(Vec::new());
     }
-    let mut events = vec![DomainEvent::ScopeFailed {
+    let mut events = Vec::new();
+    if matches!(scope_state.role, ScopeRole::Root) {
+        events.extend(close_pending_waits(state, scope_state.run));
+    }
+    events.push(DomainEvent::ScopeFailed {
         run: scope_state.run,
         scope,
         error: error.clone(),
-    }];
+    });
     if matches!(scope_state.role, ScopeRole::Root) {
         events.push(DomainEvent::RunFailed {
             run: scope_state.run,
@@ -3115,17 +3851,40 @@ fn eval_duration_ms(binding: &Binding, ctx: &EvalCtx) -> Result<u64> {
     }
 }
 
-pub fn apply_events(state: &mut State, events: &[DomainEvent]) {
-    for event in events {
-        if let Some(run) = event_run(event) {
-            state.history.entry(run).or_default().push(event.clone());
-        }
-        evolve(state, event);
-    }
+pub fn apply_events(state: &mut State, events: &[DomainEvent]) -> Result<()> {
+    apply_events_with_cause(state, events, None, None, EngineTime::from_millis(0))
 }
 
-fn event_run(event: &DomainEvent) -> Option<RunId> {
-    Some(match event {
+pub fn apply_events_with_cause(
+    state: &mut State,
+    events: &[DomainEvent],
+    command_id: Option<CommandId>,
+    principal_id: Option<&str>,
+    time: EngineTime,
+) -> Result<()> {
+    for event in events {
+        let run = event_owner(state, event)?;
+        let io_refs = run
+            .map(|run| crate::history::io_references(state, run, event, &state.current_cluster_id))
+            .transpose()?;
+        evolve(state, event);
+        if let Some(run) = run {
+            crate::history::append(
+                state,
+                run,
+                event,
+                command_id,
+                principal_id,
+                time.as_millis(),
+                io_refs.expect("run event has artifact references"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn event_owner(state: &State, event: &DomainEvent) -> Result<Option<RunId>> {
+    let owner = match event {
         DomainEvent::RunAdmitted { run, .. }
         | DomainEvent::ScopeOpened { run, .. }
         | DomainEvent::ScopeCompleted { run, .. }
@@ -3138,7 +3897,9 @@ fn event_run(event: &DomainEvent) -> Option<RunId> {
         | DomainEvent::WaitOpened { run, .. }
         | DomainEvent::WaitSatisfied { run, .. }
         | DomainEvent::WaitTimedOut { run, .. }
+        | DomainEvent::WaitCancelled { run, .. }
         | DomainEvent::EventAccepted { run, .. }
+        | DomainEvent::EventExpired { run, .. }
         | DomainEvent::ObligationRegistered { run, .. }
         | DomainEvent::ObligationBlocked { run, .. }
         | DomainEvent::CompensationStarted { run, .. }
@@ -3147,19 +3908,49 @@ fn event_run(event: &DomainEvent) -> Option<RunId> {
         | DomainEvent::ObligationReleased { run, .. }
         | DomainEvent::ClaimGranted { run, .. }
         | DomainEvent::ReconciliationRecorded { run, .. }
+        | DomainEvent::ReconciliationFailed { run, .. }
         | DomainEvent::InterventionRequired { run, .. }
         | DomainEvent::AbortIntent { run, .. }
         | DomainEvent::CompensationAbandoned { run, .. } => *run,
-        DomainEvent::ObligationTransferred { .. }
-        | DomainEvent::SessionRegistered { .. }
-        | DomainEvent::ClaimRenewed { .. }
-        | DomainEvent::ClaimCleared { .. }
-        | DomainEvent::EventReserved { .. }
-        | DomainEvent::ReservationReleased { .. }
-        | DomainEvent::RecoveryAuthorized { .. } => {
-            return None;
+        DomainEvent::ObligationTransferred { forward, .. } => state
+            .obligations
+            .iter()
+            .find(|item| item.forward == *forward)
+            .map(|item| item.run)
+            .ok_or_else(|| {
+                Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "transferred obligation has no run",
+                )
+            })?,
+        DomainEvent::ClaimRenewed { activation, .. } | DomainEvent::ClaimCleared { activation } => {
+            state
+                .activations
+                .get(activation)
+                .map(|act| act.run)
+                .ok_or_else(|| {
+                    Error::new(
+                        crate::error::ErrorKind::FailedPrecondition,
+                        "claim lifecycle event has no activation",
+                    )
+                })?
         }
-    })
+        DomainEvent::EventReserved { wait, .. } | DomainEvent::ReservationReleased { wait, .. } => {
+            state.waits.get(wait).map(|wait| wait.run).ok_or_else(|| {
+                Error::new(
+                    crate::error::ErrorKind::FailedPrecondition,
+                    "signal reservation has no wait",
+                )
+            })?
+        }
+        DomainEvent::SessionRegistered { .. }
+        | DomainEvent::WorkerRegistered { .. }
+        | DomainEvent::WorkerSessionRenewed { .. }
+        | DomainEvent::RecoveryAuthorized { .. } => {
+            return Ok(None);
+        }
+    };
+    Ok(Some(owner))
 }
 
 pub fn evolve(state: &mut State, event: &DomainEvent) {
@@ -3275,6 +4066,9 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             // Nested bodies need the child region, not the root. Mark activity nodes Ready
             // by scanning the owning scope's region more carefully below.
             let ready = is_activity_node(state, *scope, node);
+            let run_state = state.runs.get_mut(run).expect("activation run missing");
+            run_state.next_ready_order = run_state.next_ready_order.saturating_add(1);
+            let ready_order = run_state.next_ready_order;
             state.activations.insert(
                 *activation,
                 ActivationState {
@@ -3290,6 +4084,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     role: ExecutionRole::Forward,
                     claim: None,
                     attempts: 0,
+                    ready_order,
                 },
             );
             if let Some(scope_state) = state.scopes.get_mut(scope) {
@@ -3385,7 +4180,12 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 act.status = ActivationStatus::Ready;
             }
         }
-        DomainEvent::WaitSatisfied { wait, event_id, .. } => {
+        DomainEvent::WaitSatisfied {
+            run,
+            wait,
+            event_id,
+            ..
+        } => {
             if let Some(wait_state) = state.waits.get_mut(wait) {
                 wait_state.pending = false;
             }
@@ -3397,7 +4197,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             if let Some(entry) = state
                 .inbox
                 .iter_mut()
-                .find(|entry| entry.event_id == *event_id)
+                .find(|entry| entry.run == Some(*run) && entry.event_id == *event_id)
             {
                 entry.consumed = true;
                 entry.reserved_wait = Some(*wait);
@@ -3406,6 +4206,22 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
         DomainEvent::WaitTimedOut { wait, .. } => {
             if let Some(wait_state) = state.waits.get_mut(wait) {
                 wait_state.pending = false;
+            }
+            if let Some(activation) = state
+                .waits
+                .get(wait)
+                .map(|wait_state| wait_state.activation)
+                && let Some(act) = state.activations.get_mut(&activation)
+            {
+                act.status = ActivationStatus::Succeeded;
+            }
+        }
+        DomainEvent::WaitCancelled { wait, .. } => {
+            if let Some(wait_state) = state.waits.get_mut(wait) {
+                wait_state.pending = false;
+                if let Some(act) = state.activations.get_mut(&wait_state.activation) {
+                    act.status = ActivationStatus::Failed;
+                }
             }
         }
         DomainEvent::EventAccepted {
@@ -3434,6 +4250,11 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             if let Some(run_state) = state.runs.get_mut(run) {
                 run_state.next_sequence = RunSequence::new(sequence + 1);
             }
+        }
+        DomainEvent::EventExpired { run, event_id } => {
+            state
+                .inbox
+                .retain(|entry| entry.run != Some(*run) || entry.event_id != *event_id);
         }
         DomainEvent::ObligationRegistered {
             run,
@@ -3488,6 +4309,9 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 .map(|act| act.scope)
                 .or_else(|| state.scopes.values().find(|s| s.run == *run).map(|s| s.id));
             if let Some(scope) = scope {
+                let run_state = state.runs.get_mut(run).expect("compensation run missing");
+                run_state.next_ready_order = run_state.next_ready_order.saturating_add(1);
+                let ready_order = run_state.next_ready_order;
                 state.activations.insert(
                     *activation,
                     ActivationState {
@@ -3499,6 +4323,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                         role: ExecutionRole::Compensation,
                         claim: None,
                         attempts: 0,
+                        ready_order,
                     },
                 );
             }
@@ -3568,19 +4393,21 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             }
         }
         DomainEvent::EventReserved { wait, event_id } => {
+            let run = state.waits.get(wait).map(|entry| entry.run);
             if let Some(entry) = state
                 .inbox
                 .iter_mut()
-                .find(|entry| entry.event_id == *event_id)
+                .find(|entry| entry.run == run && entry.event_id == *event_id)
             {
                 entry.reserved_wait = Some(*wait);
             }
         }
-        DomainEvent::ReservationReleased { event_id, .. } => {
+        DomainEvent::ReservationReleased { wait, event_id } => {
+            let run = state.waits.get(wait).map(|entry| entry.run);
             if let Some(entry) = state
                 .inbox
                 .iter_mut()
-                .find(|entry| entry.event_id == *event_id)
+                .find(|entry| entry.run == run && entry.event_id == *event_id)
             {
                 entry.reserved_wait = None;
             }
@@ -3598,10 +4425,50 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     activities: activities.clone(),
                     capacity: *capacity,
                     expires_ms: *expires_ms,
+                    principal_id: String::new(),
+                    capabilities: Vec::new(),
+                    revision: 0,
+                    protocol_min: 0,
+                    protocol_max: 0,
                 },
             );
         }
+        DomainEvent::WorkerRegistered {
+            session,
+            principal_id,
+            capabilities,
+            capacity,
+            protocol_min,
+            protocol_max,
+            expires_ms,
+        } => {
+            state.sessions.insert(
+                *session,
+                WorkerSession {
+                    id: *session,
+                    activities: Vec::new(),
+                    capacity: *capacity,
+                    expires_ms: *expires_ms,
+                    principal_id: principal_id.clone(),
+                    capabilities: capabilities.clone(),
+                    revision: 1,
+                    protocol_min: *protocol_min,
+                    protocol_max: *protocol_max,
+                },
+            );
+        }
+        DomainEvent::WorkerSessionRenewed {
+            session,
+            revision,
+            expires_ms,
+        } => {
+            if let Some(worker) = state.sessions.get_mut(session) {
+                worker.revision = revision.get();
+                worker.expires_ms = *expires_ms;
+            }
+        }
         DomainEvent::ClaimGranted {
+            run,
             activation,
             session,
             generation,
@@ -3613,6 +4480,7 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
             ..
         } => {
             state.next_generation = state.next_generation.saturating_add(1);
+            state.fair_cursor = Some(*run);
             if let Some(act) = state.activations.get_mut(activation) {
                 act.claim = Some(ClaimState {
                     session: *session,
@@ -3622,7 +4490,12 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                     attempt_deadline_ms: *attempt_deadline_ms,
                     effect_key: *effect_key,
                     role: *role,
-                    probes: 0,
+                    probes: if *role == ExecutionRole::Reconciliation {
+                        act.claim.as_ref().map_or(0, |claim| claim.probes)
+                    } else {
+                        0
+                    },
+                    unknown_reported: false,
                 });
                 act.attempts = act.attempts.saturating_add(1);
             }
@@ -3645,12 +4518,19 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 act.claim = None;
             }
         }
+        DomainEvent::ReconciliationFailed { .. } => {}
         DomainEvent::ReconciliationRecorded {
-            activation, probes, ..
+            activation,
+            outcome,
+            probes,
+            ..
         } => {
             if let Some(act) = state.activations.get_mut(activation) {
                 if let Some(claim) = &mut act.claim {
                     claim.probes = *probes;
+                    if *outcome == ReconcileOutcome::Unknown {
+                        claim.unknown_reported = true;
+                    }
                 }
             }
         }
@@ -3671,6 +4551,18 @@ pub fn evolve(state: &mut State, event: &DomainEvent) {
                 run_state.status = RunStatus::Failed {
                     error: error.clone(),
                 };
+            }
+            for scope in state.scopes.values_mut() {
+                if scope.run == *run && scope.status == ScopeStatus::Open {
+                    scope.status = ScopeStatus::Failed {
+                        error: error.clone(),
+                    };
+                }
+            }
+            for activation in state.activations.values_mut() {
+                if activation.run == *run && activation.status != ActivationStatus::Succeeded {
+                    activation.status = ActivationStatus::Failed;
+                }
             }
         }
         DomainEvent::RecoveryAuthorized { .. } => {
@@ -3714,6 +4606,10 @@ pub fn start_run(
     let CommandBody::Start { run, .. } = &command.body else {
         return Err(Error::invalid("start_run requires Start"));
     };
+    verify_command_identity(state, command.id, None, command.id, None)?;
+    if let Some(events) = state.commands.get(&command.id) {
+        return Ok(events.clone());
+    }
     state.runs.insert(
         *run,
         RunState {
@@ -3725,28 +4621,180 @@ pub fn start_run(
             status: RunStatus::Active,
             root: ScopeId::from_bytes([0; 16]),
             next_sequence: RunSequence::new(1),
+            next_ready_order: 0,
             admitted_ms: 0,
             terminal_ms: 0,
+            published: None,
         },
     );
     let decision = decide(state, &command)?;
-    apply_events(state, &decision.events);
+    apply_events_with_cause(
+        state,
+        &decision.events,
+        Some(command.id),
+        None,
+        command.time,
+    )?;
     state.commands.insert(command.id, decision.events.clone());
+    state
+        .command_times
+        .insert(command.id, command.time.as_millis());
+    crate::history::checkpoint_after_command(state, *run, command.time)?;
     Ok(decision.events)
 }
 
 pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEvent>> {
+    let (command, actor) = command.into_cause()?;
+    let (command, external_id, digest) = prepare_command(state, command, actor.as_deref())?;
+    apply_command_with_actor(state, command, actor.as_deref(), external_id, digest)
+}
+
+pub(crate) fn authenticated_command_id(actor: &str, external_id: CommandId) -> Result<CommandId> {
+    crate::tls::PrincipalId::parse(actor)?;
+    let mut hash = Sha256::new();
+    hash.update(b"graphrun.authenticated-command-id/v1\0");
+    hash.update((actor.len() as u64).to_le_bytes());
+    hash.update(actor.as_bytes());
+    hash.update(external_id.as_bytes());
+    Ok(CommandId::from_bytes(
+        hash.finalize()[..16].try_into().expect("16 bytes"),
+    ))
+}
+
+fn authenticated_request_digest(body: &CommandBody) -> Result<String> {
+    let (logical, kind) = match body {
+        // The inline start run ID is allocated by the server on each submission.
+        CommandBody::Start {
+            definition,
+            input,
+            catalog,
+            ..
+        } => (
+            serde_json::to_value((&**definition, input, &**catalog)),
+            b"start\0".as_slice(),
+        ),
+        body => (serde_json::to_value(body), b"body\0".as_slice()),
+    };
+    let logical = logical.map_err(|err| Error::invalid(err.to_string()))?;
+    let mut hash = Sha256::new();
+    hash.update(b"graphrun.authenticated-request/v1\0");
+    hash.update(kind);
+    hash.update(crate::value::canonical_json(&logical)?);
+    Ok(format!(
+        "graphrun.authenticated-request/v1:{}",
+        hex::encode(hash.finalize())
+    ))
+}
+
+fn verify_command_identity(
+    state: &State,
+    id: CommandId,
+    actor: Option<&str>,
+    external_id: CommandId,
+    digest: Option<&str>,
+) -> Result<()> {
+    if !state.commands.contains_key(&id) {
+        if state.command_actors.contains_key(&id)
+            || state.command_external_ids.contains_key(&id)
+            || state.authenticated_request_digests.contains_key(&id)
+        {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "command identity has no retained receipt",
+            ));
+        }
+        return Ok(());
+    }
+    if state.command_actors.get(&id).map(String::as_str) != actor
+        || actor.is_some() && state.command_external_ids.get(&id) != Some(&external_id)
+        || actor.is_none()
+            && (state.command_external_ids.contains_key(&id)
+                || state.authenticated_request_digests.contains_key(&id))
+    {
+        return Err(Error::new(
+            crate::error::ErrorKind::AlreadyExists,
+            "command ID collides with another command identity",
+        ));
+    }
+    if actor.is_some() {
+        let expected = state.authenticated_request_digests.get(&id);
+        if expected.is_some_and(|value| !value.starts_with("graphrun.authenticated-request/v1:")) {
+            return Err(Error::new(
+                crate::error::ErrorKind::FailedPrecondition,
+                "unsupported authenticated request digest format",
+            ));
+        }
+        if expected.map(String::as_str) != digest {
+            return Err(Error::new(
+                crate::error::ErrorKind::AlreadyExists,
+                "command ID reused with different authenticated request",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_command(
+    state: &State,
+    mut command: Command,
+    actor: Option<&str>,
+) -> Result<(Command, CommandId, Option<String>)> {
+    let external_id = command.id;
+    let digest = actor
+        .map(|_| authenticated_request_digest(&command.body))
+        .transpose()?;
+    if let Some(actor) = actor {
+        command.id = authenticated_command_id(actor, external_id)?;
+    }
+    verify_command_identity(state, command.id, actor, external_id, digest.as_deref())?;
+    Ok((command, external_id, digest))
+}
+
+pub(crate) fn authenticated_receipt<'a>(
+    state: &'a State,
+    external_id: CommandId,
+    actor: &str,
+    body: &CommandBody,
+) -> Result<Option<&'a Vec<DomainEvent>>> {
+    let id = authenticated_command_id(actor, external_id)?;
+    let digest = authenticated_request_digest(body)?;
+    verify_command_identity(state, id, Some(actor), external_id, Some(&digest))?;
+    if state.commands.contains_key(&id) {
+        verify_worker_retry(state, id, worker_request_digest(body)?.as_deref())?;
+    }
+    Ok(state.commands.get(&id))
+}
+
+fn apply_command_with_actor(
+    state: &mut State,
+    command: Command,
+    actor: Option<&str>,
+    external_id: CommandId,
+    authenticated_digest: Option<String>,
+) -> Result<Vec<DomainEvent>> {
+    let worker_digest = worker_request_digest(&command.body)?;
     if let Some(events) = state.commands.get(&command.id) {
+        verify_worker_retry(state, command.id, worker_digest.as_deref())?;
         return Ok(events.clone());
     }
+    let mut command = command;
+    command.time =
+        EngineTime::from_millis(command.time.as_millis().max(state.engine_time_watermark_ms));
+    state.engine_time_watermark_ms = command.time.as_millis();
     let decision = decide(state, &command)?;
-    apply_events(state, &decision.events);
+    apply_events_with_cause(
+        state,
+        &decision.events,
+        Some(external_id),
+        actor,
+        command.time,
+    )?;
     for event in &decision.events {
         if matches!(
             event,
             DomainEvent::RunSucceeded { .. } | DomainEvent::RunFailed { .. }
         ) {
-            if let Some(run) = event_run(event) {
+            if let Some(run) = event_owner(state, event)? {
                 if let Some(run_state) = state.runs.get_mut(&run) {
                     run_state.terminal_ms = command.time.as_millis();
                 }
@@ -3754,10 +4802,131 @@ pub fn apply_command(state: &mut State, command: Command) -> Result<Vec<DomainEv
         }
     }
     state.commands.insert(command.id, decision.events.clone());
+    if let Some(actor) = actor {
+        state.command_actors.insert(command.id, actor.to_owned());
+        state.command_external_ids.insert(command.id, external_id);
+        state.authenticated_request_digests.insert(
+            command.id,
+            authenticated_digest.expect("authenticated command has a request digest"),
+        );
+    }
+    state
+        .command_times
+        .insert(command.id, command.time.as_millis());
+    if let Some(digest) = worker_digest {
+        state.worker_command_digests.insert(command.id, digest);
+    }
+    let mut affected = std::collections::HashSet::new();
+    for event in &decision.events {
+        if let Some(run) = event_owner(state, event)? {
+            affected.insert(run);
+        }
+    }
+    for run in affected {
+        crate::history::checkpoint_after_command(state, run, command.time)?;
+    }
     Ok(decision.events)
 }
 
+pub(crate) fn worker_request_digest(body: &CommandBody) -> Result<Option<String>> {
+    if !matches!(
+        body,
+        CommandBody::RegisterWorker { .. }
+            | CommandBody::RenewWorkerSession { .. }
+            | CommandBody::Claim { .. }
+            | CommandBody::Renew { .. }
+            | CommandBody::ReportAssigned { .. }
+            | CommandBody::ReportWorker { .. }
+            | CommandBody::Reconcile { .. }
+            | CommandBody::ReconcileWorker { .. }
+    ) {
+        return Ok(None);
+    }
+    let json = serde_json::to_value(body).map_err(|err| Error::invalid(err.to_string()))?;
+    Ok(Some(hex::encode(Sha256::digest(
+        crate::value::canonical_json(&json)?,
+    ))))
+}
+
+fn verify_worker_retry(state: &State, id: CommandId, digest: Option<&str>) -> Result<()> {
+    match (state.worker_command_digests.get(&id), digest) {
+        (Some(expected), Some(actual)) if expected == actual => Ok(()),
+        (None, None) => Ok(()),
+        _ => Err(Error::new(
+            crate::error::ErrorKind::AlreadyExists,
+            "worker command ID reused with different request",
+        )),
+    }
+}
+
 pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainEvent>> {
+    let (mut command, actor) = command.into_cause()?;
+    if let CommandBody::PruneHistory { limit } = &command.body {
+        if *limit == 0 || *limit > 1024 {
+            return Err(Error::invalid("retention batch must be 1..=1024"));
+        }
+        verify_command_identity(state, command.id, None, command.id, None)?;
+        if let Some(events) = state.commands.get(&command.id) {
+            return Ok(events.clone());
+        }
+        command.time =
+            EngineTime::from_millis(command.time.as_millis().max(state.engine_time_watermark_ms));
+        crate::history::preflight_prune(state, command.time)?;
+        state.engine_time_watermark_ms = command.time.as_millis();
+        let events = crate::history::prune(state, command.id, command.time, *limit as usize)?;
+        state.commands.insert(command.id, events.clone());
+        state
+            .command_times
+            .insert(command.id, command.time.as_millis());
+        return Ok(events);
+    }
+    if let CommandBody::Publication { key, operation } = &command.body {
+        if key.command_id != command.id || key.cluster_id.is_empty() || key.principal_id.is_empty()
+        {
+            return Err(Error::invalid("invalid authenticated command identity"));
+        }
+        if !state.command_results.contains_key(&key.storage_key()) {
+            command.time = EngineTime::from_millis(
+                command.time.as_millis().max(state.engine_time_watermark_ms),
+            );
+            state.engine_time_watermark_ms = command.time.as_millis();
+        }
+        let receipt = crate::publication::apply(state, &command, key, operation);
+        receipt.ensure_applied()?;
+        return Ok(Vec::new());
+    }
+    let (command, external_id, authenticated_digest) =
+        prepare_command(state, command, actor.as_deref())?;
+    let start_digest = if let CommandBody::Start {
+        definition,
+        input,
+        catalog,
+        ..
+    } = &command.body
+    {
+        let logical = serde_json::to_value((&**definition, input, &**catalog))
+            .map_err(|err| Error::invalid(err.to_string()))?;
+        let bytes = crate::value::canonical_json(&logical)?;
+        Some(hex::encode(Sha256::digest(bytes)))
+    } else {
+        None
+    };
+    let worker_digest = worker_request_digest(&command.body)?;
+    if let Some(events) = state.commands.get(&command.id) {
+        verify_worker_retry(state, command.id, worker_digest.as_deref())?;
+        if let (Some(expected), Some(actual)) = (
+            state.legacy_start_digests.get(&command.id),
+            start_digest.as_ref(),
+        ) {
+            if expected != actual {
+                return Err(Error::new(
+                    crate::error::ErrorKind::AlreadyExists,
+                    "command ID reused with a different inline start request",
+                ));
+            }
+        }
+        return Ok(events.clone());
+    }
     if let CommandBody::Start {
         run,
         definition,
@@ -3777,13 +4946,26 @@ pub fn commit_command(state: &mut State, command: Command) -> Result<Vec<DomainE
                     status: RunStatus::Active,
                     root: ScopeId::from_bytes([0; 16]),
                     next_sequence: RunSequence::new(1),
+                    next_ready_order: 0,
                     admitted_ms: 0,
                     terminal_ms: 0,
+                    published: None,
                 },
             );
         }
     }
-    apply_command(state, command)
+    let id = command.id;
+    let events = apply_command_with_actor(
+        state,
+        command,
+        actor.as_deref(),
+        external_id,
+        authenticated_digest,
+    )?;
+    if let Some(digest) = start_digest {
+        state.legacy_start_digests.insert(id, digest);
+    }
+    Ok(events)
 }
 
 pub fn active_runs(state: &State) -> Vec<RunId> {
@@ -3810,50 +4992,83 @@ pub fn ready_activations(state: &State, run: RunId) -> Vec<ActivationId> {
         .collect()
 }
 
-pub fn assignments_from(state: &State, events: &[DomainEvent]) -> Vec<AssignmentView> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            DomainEvent::ClaimGranted {
-                run,
-                activation,
-                session,
-                generation,
-                revision,
-                lease_expiry_ms,
-                attempt_deadline_ms,
-                effect_key,
-                role,
-            } => {
-                let (name, version, input) = activity_key(state, *activation)?;
-                Some(AssignmentView {
-                    run: *run,
-                    activation: *activation,
-                    activity_name: name,
-                    activity_version: version,
-                    input,
-                    role: *role,
-                    effect_key: *effect_key,
-                    generation: *generation,
-                    revision: *revision,
-                    lease_expiry_ms: *lease_expiry_ms,
-                    attempt_deadline_ms: *attempt_deadline_ms,
-                    session: *session,
-                })
-            }
-            _ => None,
-        })
-        .collect()
+pub fn assignments_from(state: &State, events: &[DomainEvent]) -> Result<Vec<AssignmentView>> {
+    let mut assignments = Vec::new();
+    for event in events {
+        let DomainEvent::ClaimGranted {
+            run,
+            scope,
+            activation,
+            handler,
+            handler_version,
+            input,
+            attempt,
+            session,
+            generation,
+            attempt_deadline_ms,
+            effect_key,
+            role,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        let Some(claim) = state
+            .activations
+            .get(activation)
+            .and_then(|act| act.claim.as_ref())
+        else {
+            continue;
+        };
+        if claim.session != *session
+            || claim.generation != *generation
+            || claim.role != *role
+            || claim.lease_expiry_ms <= crate::write::now().as_millis()
+        {
+            continue;
+        }
+        let catalog = &state
+            .runs
+            .get(run)
+            .ok_or_else(|| Error::invalid("claimed run unavailable"))?
+            .catalog;
+        let capability = crate::worker_contract::capability_for(
+            catalog,
+            &crate::ids::ActivityKey::new(handler, *handler_version),
+            *role,
+        )?;
+        assignments.push(AssignmentView {
+            run: *run,
+            scope: *scope,
+            activation: *activation,
+            activity_name: handler.clone(),
+            activity_version: *handler_version,
+            input: input.clone(),
+            role: *role,
+            capability,
+            attempt: *attempt,
+            effect_key: *effect_key,
+            generation: *generation,
+            revision: claim.revision,
+            lease_expiry_ms: claim.lease_expiry_ms,
+            attempt_deadline_ms: *attempt_deadline_ms,
+            session: *session,
+        });
+    }
+    Ok(assignments)
 }
 
 #[derive(Clone, Debug)]
 pub struct AssignmentView {
     pub run: RunId,
+    pub scope: ScopeId,
     pub activation: ActivationId,
     pub activity_name: String,
     pub activity_version: u32,
     pub input: Value,
     pub role: ExecutionRole,
+    pub capability: crate::worker_contract::WorkerCapability,
+    pub attempt: u32,
     pub effect_key: EffectKey,
     pub generation: OwnerGeneration,
     pub revision: LeaseRevision,
@@ -3943,6 +5158,16 @@ fn validate_leaf_output(state: &State, act: &ActivationState, output: &Value) ->
     let Some(run) = state.runs.get(&act.run) else {
         return Ok(());
     };
+    if act.role == ExecutionRole::Compensation {
+        let obligation = state.obligations.iter().find(|item| matches!(
+            item.status, ObligationStatus::Compensating { activation } if activation == act.id
+        )).ok_or_else(|| Error::invalid("compensation obligation missing"))?;
+        let contract = run.catalog.activity(&crate::ids::ActivityKey::new(
+            &obligation.handler,
+            obligation.handler_version,
+        ))?;
+        return run.catalog.validate_value(&contract.output_schema, output);
+    }
     let Some(region) = lookup_region(state, act.scope) else {
         return Ok(());
     };
@@ -3955,7 +5180,8 @@ fn validate_leaf_output(state: &State, act: &ActivationState, output: &Value) ->
     run.catalog.validate_value(&contract.output_schema, output)
 }
 
-pub fn reconstruct(
+pub fn reconstruct_in(
+    cluster_id: &str,
     definition: Definition,
     catalog: Catalog,
     events: &[DomainEvent],
@@ -3970,7 +5196,13 @@ pub fn reconstruct(
     else {
         return Err(Error::invalid("history must start with run admission"));
     };
-    let mut state = State::default();
+    let mut state = State {
+        current_cluster_id: cluster_id.to_owned(),
+        ..State::default()
+    };
+    if !cluster_id.is_empty() {
+        state.artifact_origins.insert(cluster_id.to_owned());
+    }
     state.runs.insert(
         *run,
         RunState {
@@ -3982,11 +5214,13 @@ pub fn reconstruct(
             status: RunStatus::Active,
             root: *root,
             next_sequence: RunSequence::new(1),
+            next_ready_order: 0,
             admitted_ms: 0,
             terminal_ms: 0,
+            published: None,
         },
     );
-    apply_events(&mut state, events);
+    apply_events(&mut state, events)?;
     Ok(state)
 }
 
@@ -4093,6 +5327,101 @@ mod tests {
         )
         .unwrap();
         (state, run)
+    }
+
+    #[test]
+    fn retrying_start_command_with_different_run_preserves_state() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let id = CommandId::generate();
+        let original_run = RunId::generate();
+        let retry_run = RunId::generate();
+        let events = commit_command(
+            &mut state,
+            Command {
+                id,
+                time: EngineTime::from_millis(10),
+                body: CommandBody::Start {
+                    run: original_run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::String("original".to_owned()),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+        )
+        .unwrap();
+        let Some(DomainEvent::RunAdmitted { run, root, .. }) = events.first() else {
+            panic!("initial start did not admit a run");
+        };
+        assert_eq!(*run, original_run);
+        assert_eq!(state.runs[&original_run].root, *root);
+        assert_eq!(state.scopes[root].run, original_run);
+        assert_eq!(state.history[&original_run], events);
+        assert_eq!(state.commands[&id], events);
+        let before_retry = serde_json::to_value(&state).unwrap();
+
+        let replayed = commit_command(
+            &mut state,
+            Command {
+                id,
+                time: EngineTime::from_millis(20),
+                body: CommandBody::Start {
+                    run: retry_run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::String("original".to_owned()),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(replayed, events);
+        assert_eq!(state.commands[&id], events);
+        assert!(!state.runs.contains_key(&retry_run));
+        assert_eq!(serde_json::to_value(&state).unwrap(), before_retry);
+
+        let conflict = commit_command(
+            &mut state,
+            Command {
+                id,
+                time: EngineTime::from_millis(25),
+                body: CommandBody::Start {
+                    run: retry_run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::String("different".to_owned()),
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(conflict.kind, crate::error::ErrorKind::AlreadyExists);
+        assert!(!state.runs.contains_key(&retry_run));
+        assert_eq!(serde_json::to_value(&state).unwrap(), before_retry);
+
+        let other_run = RunId::generate();
+        let replayed = start_run(
+            &mut state,
+            Command {
+                id,
+                time: EngineTime::from_millis(30),
+                body: CommandBody::Start {
+                    run: other_run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Null,
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        assert_eq!(replayed, events);
+        assert!(!state.runs.contains_key(&other_run));
+        assert_eq!(serde_json::to_value(&state).unwrap(), before_retry);
     }
 
     fn handler(name: &str, input: &Value) -> Value {
@@ -4326,6 +5655,72 @@ mod tests {
     }
 
     #[test]
+    fn wait_until_records_deadline_across_restart() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: absolute_wait
+version: 1
+input_schema: unit/v1
+output_schema: unit/v1
+start: absolute
+nodes:
+  absolute:
+    kind: wait_until
+    at: {literal: 1010000}
+    next: finish
+  finish:
+    kind: complete
+    output: {literal: null}
+"#;
+        let catalog = catalog();
+        let definition = compile_yaml(yaml, &catalog).unwrap();
+        let run = RunId::generate();
+        let mut state = State::default();
+        start_run(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(1_000_000),
+                body: CommandBody::Start {
+                    run,
+                    definition: Box::new(definition.clone()),
+                    input: Value::Null,
+                    catalog: Box::new(catalog.clone()),
+                },
+            },
+            definition,
+            catalog,
+        )
+        .unwrap();
+        let progress = |state: &mut State, at| {
+            apply_command(
+                state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(at),
+                    body: CommandBody::Progress { run },
+                },
+            )
+            .unwrap();
+        };
+        progress(&mut state, 1_000_000);
+        let wait = state.waits.values().find(|wait| wait.pending).unwrap();
+        assert_eq!(wait.deadline_ms, Some(1_010_000));
+        progress(&mut state, 1_000_500);
+        assert_eq!(state.waits.len(), 1);
+        let mut restored: State =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        progress(&mut restored, 1_010_000);
+        assert!(matches!(
+            restored.runs[&run].status,
+            RunStatus::Succeeded {
+                output: Value::Null
+            }
+        ));
+        assert!(restored.waits.values().all(|wait| !wait.pending));
+    }
+
+    #[test]
     fn saga_success_path() {
         let output = drive(
             include_str!("../../docs/specs/v1/examples/saga.yaml"),
@@ -4469,7 +5864,8 @@ mod tests {
         );
         let run = *live.runs.keys().next().unwrap();
         let run_state = live.runs.get(&run).unwrap();
-        let rebuilt = reconstruct(
+        let rebuilt = reconstruct_in(
+            &live.current_cluster_id,
             run_state.definition.clone(),
             run_state.catalog.clone(),
             live.history.get(&run).unwrap(),
@@ -4846,115 +6242,314 @@ nodes:
 
     #[test]
     fn unknown_probes_enter_intervention() {
-        let catalog = catalog();
-        let definition = compile_yaml(manual_yaml(), &catalog).unwrap();
-        let mut state = State::default();
-        let run = RunId::generate();
-        start_run(
-            &mut state,
-            Command {
-                id: CommandId::generate(),
-                time: EngineTime::from_millis(0),
-                body: CommandBody::Start {
-                    run,
-                    definition: Box::new(definition.clone()),
-                    input: Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(1))])),
-                    catalog: Box::new(catalog.clone()),
-                },
-            },
-            definition,
-            catalog,
-        )
-        .unwrap();
-        apply_command(
-            &mut state,
-            Command {
-                id: CommandId::generate(),
-                time: EngineTime::from_millis(1),
-                body: CommandBody::Progress { run },
-            },
-        )
-        .unwrap();
-        let session = WorkerSessionId::generate();
-        apply_command(
-            &mut state,
-            Command {
-                id: CommandId::generate(),
-                time: EngineTime::from_millis(1),
-                body: CommandBody::RegisterSession {
-                    session,
-                    activities: vec!["*".to_owned()],
-                    capacity: 8,
-                },
-            },
-        )
-        .unwrap();
-        apply_command(
-            &mut state,
-            Command {
-                id: CommandId::generate(),
-                time: EngineTime::from_millis(1),
-                body: CommandBody::Claim {
-                    session,
-                    capacity: 8,
-                },
-            },
-        )
-        .unwrap();
-        let activation = ready_activations(&state, run)[0];
-        let later = crate::policy::SESSION_LEASE.as_millis() as u64 + 2;
-        apply_command(
-            &mut state,
-            Command {
-                id: CommandId::generate(),
-                time: EngineTime::from_millis(later),
-                body: CommandBody::RegisterSession {
-                    session,
-                    activities: vec!["*".to_owned()],
-                    capacity: 8,
-                },
-            },
-        )
-        .unwrap();
-        apply_command(
-            &mut state,
-            Command {
-                id: CommandId::generate(),
-                time: EngineTime::from_millis(later),
-                body: CommandBody::Claim {
-                    session,
-                    capacity: 8,
-                },
-            },
-        )
-        .unwrap();
-        for _ in 0..3 {
-            let (generation, revision) = {
-                let claim = state.activations[&activation].claim.clone().unwrap();
-                (claim.generation, claim.revision)
+        let (mut state, run, activation, first_session) = manual_recon_claim();
+        let lease = crate::policy::SESSION_LEASE.as_millis() as u64;
+        let budget = crate::policy::RECONCILIATION_PROBES;
+        assert_eq!(budget, 3);
+        let effect_key = state.activations[&activation]
+            .claim
+            .as_ref()
+            .unwrap()
+            .effect_key;
+        let mut previous = None;
+
+        for probe in 1..=budget {
+            let now = (lease + 2) * u64::from(probe);
+            let session = if probe == 1 {
+                first_session
+            } else {
+                let session = WorkerSessionId::generate();
+                apply(
+                    &mut state,
+                    now,
+                    CommandBody::RegisterSession {
+                        session,
+                        activities: vec!["*".to_owned()],
+                        capacity: 8,
+                    },
+                )
+                .unwrap();
+                apply(
+                    &mut state,
+                    now,
+                    CommandBody::Claim {
+                        session,
+                        capacity: 8,
+                    },
+                )
+                .unwrap();
+                session
             };
-            apply_command(
-                &mut state,
-                Command {
-                    id: CommandId::generate(),
-                    time: EngineTime::from_millis(
-                        crate::policy::SESSION_LEASE.as_millis() as u64 + 2,
-                    ),
-                    body: CommandBody::Reconcile {
+            let claim = state.activations[&activation].claim.clone().unwrap();
+            assert_eq!(claim.role, ExecutionRole::Reconciliation);
+            assert_eq!(claim.probes, probe - 1);
+            assert!(!claim.unknown_reported);
+            assert_eq!(claim.effect_key, effect_key);
+
+            if let Some((old_session, old_generation, old_revision)) = previous {
+                assert_ne!(claim.generation, old_generation);
+                let err = apply(
+                    &mut state,
+                    now,
+                    CommandBody::Reconcile {
                         run,
                         activation,
-                        session,
-                        generation,
-                        revision,
+                        session: old_session,
+                        generation: old_generation,
+                        revision: old_revision,
                         outcome: ReconcileOutcome::Unknown,
                         output: None,
                     },
+                )
+                .unwrap_err();
+                assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+                assert_eq!(
+                    state.activations[&activation]
+                        .claim
+                        .as_ref()
+                        .unwrap()
+                        .probes,
+                    probe - 1
+                );
+            }
+
+            let command = Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(now),
+                body: CommandBody::Reconcile {
+                    run,
+                    activation,
+                    session,
+                    generation: claim.generation,
+                    revision: claim.revision,
+                    outcome: ReconcileOutcome::Unknown,
+                    output: None,
+                },
+            };
+            let events = apply_command(&mut state, command.clone()).unwrap();
+            assert!(matches!(
+                events.as_slice(),
+                [DomainEvent::ReconciliationRecorded {
+                    outcome: ReconcileOutcome::Unknown,
+                    probes,
+                    ..
+                }, ..] if *probes == probe
+            ));
+            assert_eq!(
+                state.interventions.contains_key(&activation),
+                probe == budget
+            );
+            let history_len = state.history[&run].len();
+            assert_eq!(apply_command(&mut state, command).unwrap(), events);
+            assert_eq!(state.history[&run].len(), history_len);
+
+            if probe < budget {
+                assert_eq!(
+                    state.activations[&activation]
+                        .claim
+                        .as_ref()
+                        .unwrap()
+                        .probes,
+                    probe
+                );
+                let err = apply(
+                    &mut state,
+                    now + 1,
+                    CommandBody::Reconcile {
+                        run,
+                        activation,
+                        session,
+                        generation: claim.generation,
+                        revision: claim.revision,
+                        outcome: ReconcileOutcome::Unknown,
+                        output: None,
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(err.kind, crate::error::ErrorKind::FailedPrecondition);
+                assert_eq!(
+                    state.activations[&activation]
+                        .claim
+                        .as_ref()
+                        .unwrap()
+                        .probes,
+                    probe
+                );
+                assert_eq!(state.history[&run].len(), history_len);
+            } else {
+                assert!(state.activations[&activation].claim.is_none());
+            }
+
+            let run_state = &state.runs[&run];
+            let rebuilt = reconstruct_in(
+                &state.current_cluster_id,
+                run_state.definition.clone(),
+                run_state.catalog.clone(),
+                &state.history[&run],
+            )
+            .unwrap();
+            assert_eq!(rebuilt.next_generation, state.next_generation);
+            assert_eq!(rebuilt.interventions, state.interventions);
+            assert_eq!(rebuilt.history[&run], state.history[&run]);
+            assert_eq!(
+                rebuilt.activations[&activation]
+                    .claim
+                    .as_ref()
+                    .map(|claim| claim.probes),
+                state.activations[&activation]
+                    .claim
+                    .as_ref()
+                    .map(|claim| claim.probes)
+            );
+            let snapshot: State =
+                serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+            assert_eq!(
+                snapshot.activations[&activation]
+                    .claim
+                    .as_ref()
+                    .map(|claim| claim.probes),
+                rebuilt.activations[&activation]
+                    .claim
+                    .as_ref()
+                    .map(|claim| claim.probes)
+            );
+            state = rebuilt;
+            previous = Some((session, claim.generation, claim.revision));
+        }
+
+        let history = &state.history[&run];
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event, DomainEvent::ReconciliationRecorded { .. }))
+                .count(),
+            budget as usize
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    DomainEvent::ClaimGranted {
+                        role: ExecutionRole::Forward,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event, DomainEvent::InterventionRequired { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn terminal_reconciliation_after_unknown_does_not_repeat_forward_effect() {
+        for outcome in [ReconcileOutcome::Applied, ReconcileOutcome::NotApplied] {
+            let (mut state, run, activation, first_session) = manual_recon_claim();
+            let now = crate::policy::SESSION_LEASE.as_millis() as u64 + 2;
+            let first_claim = state.activations[&activation].claim.clone().unwrap();
+            apply(
+                &mut state,
+                now,
+                CommandBody::Reconcile {
+                    run,
+                    activation,
+                    session: first_session,
+                    generation: first_claim.generation,
+                    revision: first_claim.revision,
+                    outcome: ReconcileOutcome::Unknown,
+                    output: None,
                 },
             )
             .unwrap();
+
+            let session = WorkerSessionId::generate();
+            let later = now + crate::policy::SESSION_LEASE.as_millis() as u64 + 2;
+            apply(
+                &mut state,
+                later,
+                CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            )
+            .unwrap();
+            apply(
+                &mut state,
+                later,
+                CommandBody::Claim {
+                    session,
+                    capacity: 8,
+                },
+            )
+            .unwrap();
+            let claim = state.activations[&activation].claim.clone().unwrap();
+            assert_eq!(claim.role, ExecutionRole::Reconciliation);
+            assert_eq!(claim.probes, 1);
+            assert_eq!(claim.effect_key, first_claim.effect_key);
+            assert_eq!(
+                state.history[&run]
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        DomainEvent::ClaimGranted {
+                            role: ExecutionRole::Forward,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
+            );
+
+            let output = Value::Object(BTreeMap::from([("value".to_owned(), Value::Int(2))]));
+            let events = apply(
+                &mut state,
+                later,
+                CommandBody::Reconcile {
+                    run,
+                    activation,
+                    session,
+                    generation: claim.generation,
+                    revision: claim.revision,
+                    outcome,
+                    output: (outcome == ReconcileOutcome::Applied).then_some(output.clone()),
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                events.first(),
+                Some(DomainEvent::ReconciliationRecorded { probes: 2, .. })
+            ));
+            assert!(!state.interventions.contains_key(&activation));
+            if outcome == ReconcileOutcome::Applied {
+                apply(&mut state, later + 1, CommandBody::Progress { run }).unwrap();
+                assert_eq!(run_output(&state, run), Some(output));
+            } else {
+                assert!(state.activations[&activation].claim.is_none());
+                assert_eq!(
+                    state.activations[&activation].status,
+                    ActivationStatus::Ready
+                );
+                apply(
+                    &mut state,
+                    later,
+                    CommandBody::Claim {
+                        session,
+                        capacity: 8,
+                    },
+                )
+                .unwrap();
+                let retry = state.activations[&activation].claim.as_ref().unwrap();
+                assert_eq!(retry.role, ExecutionRole::Forward);
+                assert_eq!(retry.probes, 0);
+            }
         }
-        assert!(state.interventions.contains_key(&activation));
-        assert!(state.activations[&activation].claim.is_none());
     }
 
     #[test]
@@ -5417,7 +7012,8 @@ nodes:
             })
             .unwrap();
         assert_eq!(admitted, *policy);
-        let rebuilt = reconstruct(
+        let rebuilt = reconstruct_in(
+            &state.current_cluster_id,
             state.runs.get(&run).unwrap().definition.clone(),
             state.runs.get(&run).unwrap().catalog.clone(),
             state.history.get(&run).unwrap(),
@@ -5736,6 +7332,73 @@ nodes:
         .unwrap();
         let inbox_ids: Vec<_> = state.inbox.iter().map(|entry| entry.event_id).collect();
         assert_eq!(inbox_ids, vec![first, second]);
+    }
+
+    #[test]
+    fn signal_identity_and_expiry_are_scoped_to_the_run() {
+        let catalog = catalog();
+        let definition = compile_yaml(
+            include_str!("../../docs/specs/v1/examples/events.yaml"),
+            &catalog,
+        )
+        .unwrap();
+        let mut state = State::default();
+        let runs = [RunId::from_bytes([35; 16]), RunId::from_bytes([36; 16])];
+        for run in runs {
+            start_run(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Start {
+                        run,
+                        definition: Box::new(definition.clone()),
+                        input: Value::Object(BTreeMap::from([(
+                            "key".to_owned(),
+                            Value::String("k1".to_owned()),
+                        )])),
+                        catalog: Box::new(catalog.clone()),
+                    },
+                },
+                definition.clone(),
+                catalog.clone(),
+            )
+            .unwrap();
+        }
+        let event_id = EventId::from_bytes([37; 16]);
+        for run in runs {
+            let events = apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(2),
+                    body: CommandBody::Signal {
+                        run,
+                        event_id,
+                        signal: "approval".to_owned(),
+                        key: "k1".to_owned(),
+                        payload: Value::Object(BTreeMap::from([(
+                            "approved".to_owned(),
+                            Value::Bool(true),
+                        )])),
+                    },
+                },
+            )
+            .unwrap();
+            assert!(events.iter().any(
+                |event| matches!(event, DomainEvent::EventAccepted { run: owner, .. } if *owner == run)
+            ));
+        }
+        assert_eq!(state.inbox.len(), 2);
+        evolve(
+            &mut state,
+            &DomainEvent::EventExpired {
+                run: runs[0],
+                event_id,
+            },
+        );
+        assert_eq!(state.inbox.len(), 1);
+        assert_eq!(state.inbox[0].run, Some(runs[1]));
     }
 
     #[test]
@@ -6566,6 +8229,7 @@ nodes:
         assert!(state.inbox[0].reserved_wait.is_none());
         assert_eq!(state.inbox[0].expires_ms, expiry);
         assert!(!state.inbox[0].consumed);
+        assert!(state.waits.values().all(|wait| !wait.pending));
     }
 
     #[test]
@@ -6750,6 +8414,99 @@ nodes:
         assert_eq!(claimed_runs.len(), 2);
         assert!(claimed_runs.contains(&runs[0]));
         assert!(claimed_runs.contains(&runs[1]));
+    }
+
+    #[test]
+    fn claim_rotation_and_within_run_fifo_survive_multiple_batches() {
+        let catalog = catalog();
+        let mut state = State::default();
+        let runs = [RunId::from_bytes([1; 16]), RunId::from_bytes([2; 16])];
+        for (run, yaml) in [
+            (
+                runs[0],
+                include_str!("../../docs/specs/v1/examples/parallel.yaml"),
+            ),
+            (
+                runs[1],
+                include_str!("../../docs/specs/v1/examples/sequence.yaml"),
+            ),
+        ] {
+            let definition = compile_yaml(yaml, &catalog).unwrap();
+            start_run(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Start {
+                        run,
+                        definition: Box::new(definition.clone()),
+                        input: order_input(),
+                        catalog: Box::new(catalog.clone()),
+                    },
+                },
+                definition,
+                catalog.clone(),
+            )
+            .unwrap();
+            apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(1),
+                    body: CommandBody::Progress { run },
+                },
+            )
+            .unwrap();
+        }
+        assert!(ready_activations(&state, runs[0]).len() >= 2);
+        let session = WorkerSessionId::generate();
+        apply_command(
+            &mut state,
+            Command {
+                id: CommandId::generate(),
+                time: EngineTime::from_millis(2),
+                body: CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 8,
+                },
+            },
+        )
+        .unwrap();
+        let mut chosen = Vec::new();
+        for time in 3..=5 {
+            let events = apply_command(
+                &mut state,
+                Command {
+                    id: CommandId::generate(),
+                    time: EngineTime::from_millis(time),
+                    body: CommandBody::Claim {
+                        session,
+                        capacity: 1,
+                    },
+                },
+            )
+            .unwrap();
+            let (run, activation) = events
+                .iter()
+                .find_map(|event| match event {
+                    DomainEvent::ClaimGranted {
+                        run, activation, ..
+                    } => Some((*run, *activation)),
+                    _ => None,
+                })
+                .expect("one ready activation per claim");
+            chosen.push(run);
+            if time == 3 {
+                let scope = &state.scopes[&state.activations[&activation].scope];
+                assert!(matches!(
+                    &scope.role,
+                    ScopeRole::ParallelBranch { name, .. } if name == "tax"
+                ));
+            }
+        }
+        assert_eq!(chosen, [runs[0], runs[1], runs[0]]);
+        assert_eq!(state.fair_cursor, Some(runs[0]));
     }
 
     fn order_input() -> Value {
@@ -7345,6 +9102,147 @@ nodes:
         assert!(matches!(
             state.obligations[0].status,
             ObligationStatus::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn default_compensation_retry_exhausts_without_claiming_rollback() {
+        let yaml = r#"
+dsl: graphrun/v1
+id: default_compensation
+version: 1
+input_schema: order/v1
+output_schema: reserved_order/v1
+start: fulfill
+nodes:
+  fulfill:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: order/v1
+      output_schema: reserved_order/v1
+      start: reserve
+      nodes:
+        reserve:
+          kind: activity
+          activity: {name: inventory.reserve, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: inventory.release, version: 1}
+            input: {from: forward.output}
+          next: abort
+        abort:
+          kind: fail
+          error: {code: fixture.failed, message: force compensation}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.fulfill.output}
+"#;
+        let (mut state, run) = start_yaml(yaml, order_input());
+        for i in 0..16 {
+            apply(&mut state, 1 + i, CommandBody::Progress { run }).unwrap();
+            for activation in ready_activations(&state, run) {
+                if state.activations[&activation].role == ExecutionRole::Compensation {
+                    continue;
+                }
+                let Some((name, _, input)) = activity_key(&state, activation) else {
+                    continue;
+                };
+                apply(
+                    &mut state,
+                    1 + i,
+                    CommandBody::ReportLeaf {
+                        run,
+                        activation,
+                        output: handler(&name, &input),
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let activation = state
+            .activations
+            .values()
+            .find(|act| act.role == ExecutionRole::Compensation)
+            .expect("default compensation opens")
+            .id;
+        let Node::Saga { body, .. } = &state.runs[&run].definition.root.nodes["fulfill"] else {
+            panic!("expected saga");
+        };
+        let Node::Activity {
+            compensation:
+                Some(crate::ir::Compensation::Activity {
+                    retry: Some(policy),
+                    ..
+                }),
+            ..
+        } = &body.nodes["reserve"]
+        else {
+            panic!("expected captured compensation retry policy");
+        };
+        assert_eq!(policy.errors, ["inventory.release_unavailable"]);
+        assert_eq!(policy.max_attempts, 10);
+        let max_attempts = policy.max_attempts;
+        for attempt in 1..=max_attempts {
+            let session = WorkerSessionId::generate();
+            let time = u64::from(attempt) * 600_000;
+            apply(
+                &mut state,
+                time,
+                CommandBody::RegisterSession {
+                    session,
+                    activities: vec!["*".to_owned()],
+                    capacity: 1,
+                },
+            )
+            .unwrap();
+            let granted = apply(
+                &mut state,
+                time + 1,
+                CommandBody::Claim {
+                    session,
+                    capacity: 1,
+                },
+            )
+            .unwrap();
+            assert!(granted.iter().any(|event| matches!(
+                event,
+                DomainEvent::ClaimGranted {
+                    activation: current,
+                    attempt: claimed,
+                    role: ExecutionRole::Compensation,
+                    ..
+                } if *current == activation && *claimed == attempt
+            )));
+            let reported = apply(
+                &mut state,
+                time + 2,
+                CommandBody::ReportError {
+                    run,
+                    activation,
+                    code: "inventory.release_unavailable".to_owned(),
+                    message: "still unavailable".to_owned(),
+                },
+            )
+            .unwrap();
+            assert!(reported.iter().any(|event| matches!(
+                event,
+                DomainEvent::LeafFailed {
+                    retry,
+                    code,
+                    ..
+                } if *retry == (attempt < max_attempts) && code == "inventory.release_unavailable"
+            )));
+        }
+        assert!(matches!(
+            state.obligations[0].status,
+            ObligationStatus::Blocked { .. }
+        ));
+        assert!(!matches!(
+            state.runs[&run].status,
+            RunStatus::Succeeded { .. }
         ));
     }
 
@@ -7965,7 +9863,8 @@ nodes:
         let events =
             history_or_unavailable(&state, run, EngineTime::from_millis(terminal)).unwrap();
         assert!(!events.is_empty());
-        let rebuilt = reconstruct(
+        let rebuilt = reconstruct_in(
+            &state.current_cluster_id,
             state.runs.get(&run).unwrap().definition.clone(),
             state.runs.get(&run).unwrap().catalog.clone(),
             events,

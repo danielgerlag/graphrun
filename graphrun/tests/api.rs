@@ -1,9 +1,14 @@
 use graphrun::binding::{Binding, Condition, Reference};
-use graphrun::builder::{Case, RegionBuilder, RegionGraphBuilder, SignalRef, WorkflowBuilder};
+use graphrun::builder::{
+    ActivityRef, Branch, Case, NodeRef, Region, RegionBuilder, RegionGraphBuilder, SignalRef,
+    WorkflowBuilder,
+};
 use graphrun::catalog::Catalog;
 use graphrun::compile_yaml;
+use graphrun::ir::Node;
+use graphrun::policy::{Backoff, RetryPolicy};
 use graphrun::schema::{DurablePayload, SchemaRef};
-use graphrun::workflow;
+use graphrun::{region, workflow};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -67,11 +72,57 @@ impl DurablePayload for Approval {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct Tax {
+    cents: i64,
+}
+
+impl DurablePayload for Tax {
+    fn schema_ref() -> SchemaRef {
+        SchemaRef::named("tax", 1).unwrap()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Shipping {
+    cents: i64,
+}
+
+impl DurablePayload for Shipping {
+    fn schema_ref() -> SchemaRef {
+        SchemaRef::named("shipping", 1).unwrap()
+    }
+}
+
 fn catalog() -> Catalog {
     Catalog::from_json(include_bytes!(
         "../../docs/specs/v1/examples/activity-catalog.json"
     ))
     .unwrap()
+}
+
+fn quotes_catalog() -> Catalog {
+    Catalog::from_json(include_bytes!("../../samples/07-parallel/catalog.json")).unwrap()
+}
+
+fn quote<T: DurablePayload>(activity: &ActivityRef<Order, T>) -> Region<Order, T> {
+    region::<Order>()
+        .activity("quote", activity)
+        .unwrap()
+        .finish()
+        .unwrap()
+}
+
+fn assert_node_output<T: DurablePayload>(_: &NodeRef<T>) {}
+
+fn parallel_branches<'a>(
+    definition: &'a graphrun::Definition,
+    key: &str,
+) -> &'a [graphrun::ir::ParallelBranch] {
+    match &definition.root.nodes[key] {
+        Node::Parallel { branches, .. } => branches,
+        _ => panic!("{key} is not parallel"),
+    }
 }
 
 #[test]
@@ -130,6 +181,256 @@ fn repeat_builder_compiles() {
         .unwrap();
     let root = root.complete("finish", repeated.output()).unwrap();
     WorkflowBuilder::new("repeat_counter", 1, root)
+        .build(&catalog)
+        .unwrap();
+}
+
+#[test]
+fn do_while_builder_compiles() {
+    let catalog = catalog();
+    let increment = catalog
+        .activity_ref::<Counter, Counter>("counter.increment", 1)
+        .unwrap();
+    let mut body = RegionBuilder::<Counter>::new();
+    let bumped = body
+        .activity("increment", &increment, body.input())
+        .unwrap();
+    let body = body.complete("iteration_done", bumped.output()).unwrap();
+    let mut root = RegionBuilder::<Counter>::new();
+    let looped = root
+        .do_while(
+            "do_while",
+            root.input(),
+            Condition::lt_loop("/value", 3),
+            body,
+            10,
+        )
+        .unwrap();
+    let root = root.complete("finish", looped.output()).unwrap();
+    WorkflowBuilder::new("do_while_counter", 1, root)
+        .build(&catalog)
+        .unwrap();
+}
+
+#[test]
+fn foreach_builder_compiles() {
+    let catalog = catalog();
+    let increment = catalog
+        .activity_ref::<Counter, Counter>("counter.increment", 1)
+        .unwrap();
+    let mut body = RegionBuilder::<Counter>::new();
+    let bumped = body
+        .activity("increment", &increment, body.input())
+        .unwrap();
+    let body = body.complete("iteration_done", bumped.output()).unwrap();
+    let mut root = RegionBuilder::<Vec<Counter>>::new();
+    let foreach = root.foreach("each", root.input(), body, 100, 4).unwrap();
+    let root = root.complete("finish", foreach.output()).unwrap();
+    WorkflowBuilder::new("foreach_counter", 1, root)
+        .build(&catalog)
+        .unwrap();
+}
+
+#[test]
+fn saga_builder_compiles() {
+    let catalog = catalog();
+    let reserve = catalog
+        .activity_ref::<Order, ReservedOrder>("inventory.reserve", 1)
+        .unwrap();
+    let release = catalog
+        .activity_ref::<ReservedOrder, ()>("inventory.release", 1)
+        .unwrap();
+    let mut body = RegionBuilder::<Order>::new();
+    let reserved = body.activity("reserve", &reserve, body.input()).unwrap();
+    body.compensate(&reserved, &release).unwrap();
+    let body = body.complete("done", reserved.output()).unwrap();
+    let mut root = RegionBuilder::<Order>::new();
+    let saga = root.saga("saga", root.input(), body).unwrap();
+    let root = root.complete("finish", saga.output()).unwrap();
+    WorkflowBuilder::new("saga_order", 1, root)
+        .build(&catalog)
+        .unwrap();
+}
+
+#[test]
+fn explicit_compensation_policy_matches_yaml() {
+    let catalog = catalog();
+    let charge = catalog
+        .activity_v1::<ReservedOrder, Receipt>("payment.charge")
+        .unwrap();
+    let refund = catalog
+        .activity_v1::<Receipt, ()>("payment.refund")
+        .unwrap();
+    let retry = RetryPolicy {
+        errors: vec!["payment.refund_unavailable".to_owned()],
+        max_attempts: 3,
+        backoff: Backoff {
+            initial_ms: 1_000,
+            multiplier_millis: 2_000,
+            max_ms: 30_000,
+        },
+    };
+    let body = region::<ReservedOrder>()
+        .activity("charge", &charge)
+        .unwrap()
+        .compensate_with_retry(&refund, retry, Duration::from_secs(120))
+        .unwrap()
+        .finish()
+        .unwrap();
+    let built = workflow::<ReservedOrder>("custom_compensation")
+        .saga("saga", body)
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+    let yaml = compile_yaml(
+        r#"
+dsl: graphrun/v1
+id: custom_compensation
+version: 1
+input_schema: reserved_order/v1
+output_schema: receipt/v1
+start: saga
+nodes:
+  saga:
+    kind: saga
+    input: {from: workflow.input}
+    body:
+      input_schema: reserved_order/v1
+      output_schema: receipt/v1
+      start: charge
+      nodes:
+        charge:
+          kind: activity
+          activity: {name: payment.charge, version: 1}
+          input: {from: scope.input}
+          compensation:
+            kind: activity
+            activity: {name: payment.refund, version: 1}
+            input: {from: forward.output}
+            timeout: "2m"
+            retry:
+              errors: [payment.refund_unavailable]
+              max_attempts: 3
+              backoff: {initial: "1s", multiplier: 2, max: "30s"}
+          next: done
+        done:
+          kind: complete
+          output: {from: nodes.charge.output}
+    next: finish
+  finish:
+    kind: complete
+    output: {from: nodes.saga.output}
+"#,
+        &catalog,
+    )
+    .unwrap();
+    assert_eq!(execution_ir(&yaml), execution_ir(&built));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn docs_saga_yaml_and_typed_builder_match() {
+    let catalog = catalog();
+    let reserve = catalog
+        .activity_v1::<Order, ReservedOrder>("inventory.reserve")
+        .unwrap();
+    let release = catalog
+        .activity_v1::<ReservedOrder, ()>("inventory.release")
+        .unwrap();
+    let charge = catalog
+        .activity_v1::<ReservedOrder, Receipt>("payment.charge")
+        .unwrap();
+    let refund = catalog
+        .activity_v1::<Receipt, ()>("payment.refund")
+        .unwrap();
+    let abort = region::<Receipt>()
+        .fail("abort", "fixture.failed", "Failure after recorded payment.")
+        .unwrap();
+    let accept = region::<Receipt>().complete("accept").unwrap();
+    let body = region::<Order>()
+        .activity("reserve", &reserve)
+        .unwrap()
+        .compensate(&release)
+        .unwrap()
+        .activity("charge", &charge)
+        .unwrap()
+        .compensate_with_retry(
+            &refund,
+            RetryPolicy {
+                errors: vec!["payment.refund_unavailable".to_owned()],
+                max_attempts: 3,
+                backoff: Backoff {
+                    initial_ms: 1_000,
+                    multiplier_millis: 2_000,
+                    max_ms: 30_000,
+                },
+            },
+            Duration::from_secs(120),
+        )
+        .unwrap()
+        .choose("decide")
+        .when_true("force_failure", "/fail_after_payment", abort)
+        .otherwise(accept)
+        .unwrap()
+        .complete("done")
+        .unwrap();
+    let built = workflow::<Order>("compensating_fulfillment")
+        .saga("fulfill", body)
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+    let yaml = compile_yaml(
+        include_str!("../../docs/specs/v1/examples/saga.yaml"),
+        &catalog,
+    )
+    .unwrap();
+    assert_eq!(execution_ir(&yaml), execution_ir(&built));
+    let dir = tempfile::tempdir().unwrap();
+    let engine = graphrun::Engine::local(dir.path()).await.unwrap();
+    let input = graphrun::Value::from_json(serde_json::json!({
+        "order_id": "o1",
+        "amount": 1000,
+        "fail_after_payment": true
+    }))
+    .unwrap();
+    for definition in [yaml, built] {
+        let run = engine
+            .start(definition, catalog.clone(), input.clone())
+            .await
+            .unwrap();
+        let failure = engine
+            .wait_terminal(run, Duration::from_secs(15))
+            .await
+            .unwrap_err();
+        assert!(failure.message.contains("fixture.failed"), "{failure}");
+        let view = engine.inspect_json(run).await.unwrap();
+        assert_eq!(view["status"], "failed");
+        let obligations = view["obligations"].as_array().unwrap();
+        assert_eq!(obligations.len(), 2);
+        assert!(
+            obligations
+                .iter()
+                .all(|obligation| obligation["status"] == "compensated")
+        );
+    }
+    engine.shutdown().await.unwrap();
+}
+
+#[test]
+fn delay_wait_and_fail_builder_compiles() {
+    let catalog = catalog();
+    let mut root = RegionBuilder::<Counter>::new();
+    root.delay("delay", Duration::from_millis(1)).unwrap();
+    root.wait_until("deadline", 42).unwrap();
+    let input = root.workflow_input();
+    let root = root.complete("finish", input).unwrap();
+    WorkflowBuilder::new("delayed_counter", 1, root)
+        .build(&catalog)
+        .unwrap();
+
+    let fail = RegionBuilder::<Counter>::new()
+        .fail::<Counter>("abort", "fixture.failed", "expected")
+        .unwrap();
+    WorkflowBuilder::new("failed_counter", 1, fail)
         .build(&catalog)
         .unwrap();
 }
@@ -375,4 +676,500 @@ fn yaml_and_builder_choose_match() {
         .build(&catalog)
         .unwrap();
     assert_eq!(execution_ir(&yaml), execution_ir(&built));
+}
+
+#[test]
+fn parallel_two_preserves_fluent_chain_and_matches_yaml() {
+    let catalog = quotes_catalog();
+    let yaml = compile_yaml(
+        include_str!("../../samples/07-parallel/workflow.yaml"),
+        &catalog,
+    )
+    .unwrap();
+    let tax = catalog.activity_v1::<Order, Tax>("tax.quote").unwrap();
+    let shipping = catalog
+        .activity_v1::<Order, Shipping>("shipping.quote")
+        .unwrap();
+    let old = workflow::<Order>("parallel_quotes")
+        .parallel("quotes")
+        .branch("tax", quote(&tax))
+        .branch("shipping", quote(&shipping))
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+    let tuple = workflow::<Order>("parallel_quotes")
+        .parallel("quotes")
+        .branches((("tax", quote(&tax)), ("shipping", quote(&shipping))))
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+
+    let mut graph = RegionGraphBuilder::<Order>::new();
+    let input = graph.workflow_input().binding().clone();
+    let node = graph
+        .declare_parallel(
+            "quotes",
+            (
+                Branch {
+                    name: "tax".into(),
+                    input: input.clone(),
+                    body: quote(&tax),
+                },
+                Branch {
+                    name: "shipping".into(),
+                    input,
+                    body: quote(&shipping),
+                },
+            ),
+        )
+        .unwrap();
+    assert_node_output::<(Tax, Shipping)>(&node);
+    let finish = graph.declare_complete("finish", node.output()).unwrap();
+    graph.start_at(node.entry()).unwrap();
+    graph.connect(node.exit(), finish.entry()).unwrap();
+    let explicit = WorkflowBuilder::new(
+        "parallel_quotes",
+        1,
+        graph.finish::<(Tax, Shipping)>().unwrap(),
+    )
+    .build(&catalog)
+    .unwrap();
+
+    let mut legacy = RegionBuilder::<Order>::new();
+    let input = legacy.workflow_input().binding().clone();
+    let node = legacy
+        .parallel2(
+            "quotes",
+            Branch {
+                name: "tax".into(),
+                input: input.clone(),
+                body: quote(&tax),
+            },
+            Branch {
+                name: "shipping".into(),
+                input,
+                body: quote(&shipping),
+            },
+        )
+        .unwrap();
+    let legacy = WorkflowBuilder::new(
+        "parallel_quotes",
+        1,
+        legacy.complete("finish", node.output()).unwrap(),
+    )
+    .build(&catalog)
+    .unwrap();
+
+    assert_eq!(execution_ir(&yaml), execution_ir(&old));
+    assert_eq!(execution_ir(&yaml), execution_ir(&tuple));
+    assert_eq!(execution_ir(&yaml), execution_ir(&explicit));
+    assert_eq!(execution_ir(&yaml), execution_ir(&legacy));
+}
+
+#[test]
+fn parallel_one_and_three_preserve_tuple_order() {
+    let catalog = quotes_catalog();
+    let tax = catalog.activity_v1::<Order, Tax>("tax.quote").unwrap();
+    let shipping = catalog
+        .activity_v1::<Order, Shipping>("shipping.quote")
+        .unwrap();
+
+    let mut root = RegionBuilder::<Order>::new();
+    let only = root
+        .parallel(
+            "quotes",
+            (Branch {
+                name: "tax".into(),
+                input: root.workflow_input().binding().clone(),
+                body: quote(&tax),
+            },),
+        )
+        .unwrap();
+    assert_node_output::<(Tax,)>(&only);
+    let one = WorkflowBuilder::new(
+        "one_quote",
+        1,
+        root.complete("finish", only.output()).unwrap(),
+    )
+    .build(&catalog)
+    .unwrap();
+    assert_eq!(one.output_schema, <(Tax,)>::schema_ref());
+    assert_eq!(parallel_branches(&one, "quotes")[0].name, "tax");
+
+    let fluent_one = workflow::<Order>("one_quote")
+        .parallel("quotes")
+        .branches((("tax", quote(&tax)),))
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+    assert_eq!(execution_ir(&one), execution_ir(&fluent_one));
+
+    let mut root = RegionBuilder::<Order>::new();
+    let input = root.workflow_input().binding().clone();
+    let three = root
+        .parallel(
+            "quotes",
+            (
+                Branch {
+                    name: "tax".into(),
+                    input: input.clone(),
+                    body: quote(&tax),
+                },
+                Branch {
+                    name: "shipping".into(),
+                    input: input.clone(),
+                    body: quote(&shipping),
+                },
+                Branch {
+                    name: "original".into(),
+                    input,
+                    body: region::<Order>().finish().unwrap(),
+                },
+            ),
+        )
+        .unwrap();
+    assert_node_output::<(Tax, Shipping, Order)>(&three);
+    let three = WorkflowBuilder::new(
+        "three_quotes",
+        1,
+        root.complete("finish", three.output()).unwrap(),
+    )
+    .build(&catalog)
+    .unwrap();
+    let fluent_three = workflow::<Order>("three_quotes")
+        .parallel("quotes")
+        .branches((
+            ("tax", quote(&tax)),
+            ("shipping", quote(&shipping)),
+            ("original", region::<Order>().finish().unwrap()),
+        ))
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+    assert_eq!(execution_ir(&three), execution_ir(&fluent_three));
+    assert_eq!(three.output_schema, <(Tax, Shipping, Order)>::schema_ref());
+    assert_eq!(
+        parallel_branches(&three, "quotes")
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>(),
+        ["tax", "shipping", "original"]
+    );
+
+    let yaml = include_str!("../../samples/07-parallel/workflow.yaml")
+        .replace("\r\n", "\n")
+        .replacen("id: parallel_quotes", "id: three_quotes", 1)
+        .replacen(
+            "output_schema: {tuple: [tax/v1, shipping/v1]}",
+            "output_schema: {tuple: [tax/v1, shipping/v1, order/v1]}",
+            1,
+        )
+        .replacen(
+            "    next: finish\n  finish:",
+            "      - name: original\n        input: {from: workflow.input}\n        body:\n          input_schema: order/v1\n          output_schema: order/v1\n          start: done\n          nodes:\n            done:\n              kind: complete\n              output: {from: scope.input}\n    next: finish\n  finish:",
+            1,
+        );
+    assert_eq!(
+        execution_ir(&compile_yaml(&yaml, &catalog).unwrap()),
+        execution_ir(&three)
+    );
+}
+
+#[test]
+fn parallel_sixteen_is_heterogeneous_on_both_surfaces() {
+    type Wide = (
+        Tax,
+        Shipping,
+        Tax,
+        Shipping,
+        Tax,
+        Shipping,
+        Tax,
+        Shipping,
+        Tax,
+        Shipping,
+        Tax,
+        Shipping,
+        Tax,
+        Shipping,
+        Tax,
+        Shipping,
+    );
+    let catalog = quotes_catalog();
+    let tax = catalog.activity_v1::<Order, Tax>("tax.quote").unwrap();
+    let shipping = catalog
+        .activity_v1::<Order, Shipping>("shipping.quote")
+        .unwrap();
+    let mut root = RegionGraphBuilder::<Order>::new();
+    let input = root.workflow_input().binding().clone();
+    macro_rules! branch {
+        ($name:literal, $activity:expr) => {
+            Branch {
+                name: $name.into(),
+                input: input.clone(),
+                body: quote($activity),
+            }
+        };
+    }
+    let node = root
+        .declare_parallel(
+            "quotes",
+            (
+                branch!("b00", &tax),
+                branch!("b01", &shipping),
+                branch!("b02", &tax),
+                branch!("b03", &shipping),
+                branch!("b04", &tax),
+                branch!("b05", &shipping),
+                branch!("b06", &tax),
+                branch!("b07", &shipping),
+                branch!("b08", &tax),
+                branch!("b09", &shipping),
+                branch!("b10", &tax),
+                branch!("b11", &shipping),
+                branch!("b12", &tax),
+                branch!("b13", &shipping),
+                branch!("b14", &tax),
+                branch!("b15", &shipping),
+            ),
+        )
+        .unwrap();
+    assert_node_output::<Wide>(&node);
+    let finish = root.declare_complete("finish", node.output()).unwrap();
+    root.start_at(node.entry()).unwrap();
+    root.connect(node.exit(), finish.entry()).unwrap();
+    let explicit = WorkflowBuilder::new("wide_quotes", 1, root.finish::<Wide>().unwrap())
+        .build(&catalog)
+        .unwrap();
+    let fluent = workflow::<Order>("wide_quotes")
+        .parallel("quotes")
+        .branches((
+            ("b00", quote(&tax)),
+            ("b01", quote(&shipping)),
+            ("b02", quote(&tax)),
+            ("b03", quote(&shipping)),
+            ("b04", quote(&tax)),
+            ("b05", quote(&shipping)),
+            ("b06", quote(&tax)),
+            ("b07", quote(&shipping)),
+            ("b08", quote(&tax)),
+            ("b09", quote(&shipping)),
+            ("b10", quote(&tax)),
+            ("b11", quote(&shipping)),
+            ("b12", quote(&tax)),
+            ("b13", quote(&shipping)),
+            ("b14", quote(&tax)),
+            ("b15", quote(&shipping)),
+        ))
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+    assert_eq!(explicit.output_schema, Wide::schema_ref());
+    assert_eq!(execution_ir(&explicit), execution_ir(&fluent));
+    assert_eq!(
+        parallel_branches(&explicit, "quotes")
+            .iter()
+            .map(|branch| branch.name.as_str())
+            .collect::<Vec<_>>(),
+        (0..16).map(|i| format!("b{i:02}")).collect::<Vec<_>>()
+    );
+    match &explicit.output_schema {
+        SchemaRef::Tuple { elements } => {
+            assert_eq!(elements.len(), 16);
+            for (index, schema) in elements.iter().enumerate() {
+                assert_eq!(
+                    schema,
+                    &if index % 2 == 0 {
+                        Tax::schema_ref()
+                    } else {
+                        Shipping::schema_ref()
+                    }
+                );
+            }
+        }
+        _ => panic!("expected tuple schema"),
+    }
+}
+
+#[test]
+fn parallel_regions_nest_and_reject_duplicate_names() {
+    let catalog = quotes_catalog();
+    let tax = catalog.activity_v1::<Order, Tax>("tax.quote").unwrap();
+    let inner = region::<Order>()
+        .parallel("inside")
+        .branches((("original", region::<Order>().finish().unwrap()),))
+        .unwrap()
+        .finish_region()
+        .unwrap();
+    let mut outer = RegionBuilder::<Order>::new();
+    let binding = outer.workflow_input().binding().clone();
+    let nested = outer
+        .parallel(
+            "outside",
+            (
+                Branch {
+                    name: "nested".into(),
+                    input: binding.clone(),
+                    body: inner,
+                },
+                Branch {
+                    name: "tax".into(),
+                    input: binding,
+                    body: quote(&tax),
+                },
+            ),
+        )
+        .unwrap();
+    assert_node_output::<((Order,), Tax)>(&nested);
+    let nested = WorkflowBuilder::new(
+        "nested_quotes",
+        1,
+        outer.complete("finish", nested.output()).unwrap(),
+    )
+    .build(&catalog)
+    .unwrap();
+    assert_eq!(nested.output_schema, <((Order,), Tax)>::schema_ref());
+    assert_eq!(
+        parallel_branches(&nested, "outside")[0].body.output_schema,
+        <(Order,)>::schema_ref()
+    );
+
+    let mut invalid = RegionGraphBuilder::<Order>::new();
+    let input = invalid.workflow_input().binding().clone();
+    let err = invalid
+        .declare_parallel(
+            "quotes",
+            (
+                Branch {
+                    name: "same".into(),
+                    input: input.clone(),
+                    body: quote(&tax),
+                },
+                Branch {
+                    name: "same".into(),
+                    input,
+                    body: quote(&tax),
+                },
+            ),
+        )
+        .err()
+        .expect("duplicate branch name must fail");
+    assert!(err.to_string().contains("duplicate branch name"), "{err}");
+}
+
+#[test]
+fn parallel_explicit_branches_can_have_different_input_types() {
+    let catalog = quotes_catalog();
+    let mut root = RegionBuilder::<Order>::new();
+    let number = root.literal(17_i64).unwrap();
+    let node = root
+        .parallel(
+            "mixed",
+            (
+                Branch {
+                    name: "original".into(),
+                    input: root.workflow_input().binding().clone(),
+                    body: region::<Order>().finish().unwrap(),
+                },
+                Branch {
+                    name: "number".into(),
+                    input: number.binding().clone(),
+                    body: region::<i64>().finish().unwrap(),
+                },
+            ),
+        )
+        .unwrap();
+    assert_node_output::<(Order, i64)>(&node);
+    let definition = WorkflowBuilder::new(
+        "mixed_inputs",
+        1,
+        root.complete("finish", node.output()).unwrap(),
+    )
+    .build(&catalog)
+    .unwrap();
+    assert_eq!(definition.output_schema, <(Order, i64)>::schema_ref());
+}
+
+#[tokio::test]
+async fn parallel_outputs_follow_declaration_not_name_order() {
+    let catalog = quotes_catalog();
+    let tax = catalog.activity_v1::<Order, Tax>("tax.quote").unwrap();
+    let shipping = catalog
+        .activity_v1::<Order, Shipping>("shipping.quote")
+        .unwrap();
+    let one = workflow::<Order>("one_ordered_quote")
+        .parallel("quotes")
+        .branches((("z_shipping", quote(&shipping)),))
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+    let three = workflow::<Order>("three_ordered_quotes")
+        .parallel("quotes")
+        .branches((
+            ("z_shipping", quote(&shipping)),
+            ("a_tax", quote(&tax)),
+            ("m_shipping", quote(&shipping)),
+        ))
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+    let wide = workflow::<Order>("sixteen_ordered_quotes")
+        .parallel("quotes")
+        .branches((
+            ("z15", quote(&shipping)),
+            ("y14", quote(&tax)),
+            ("x13", quote(&shipping)),
+            ("w12", quote(&tax)),
+            ("v11", quote(&shipping)),
+            ("u10", quote(&tax)),
+            ("t09", quote(&shipping)),
+            ("s08", quote(&tax)),
+            ("r07", quote(&shipping)),
+            ("q06", quote(&tax)),
+            ("p05", quote(&shipping)),
+            ("o04", quote(&tax)),
+            ("n03", quote(&shipping)),
+            ("m02", quote(&tax)),
+            ("l01", quote(&shipping)),
+            ("a00", quote(&tax)),
+        ))
+        .unwrap()
+        .finish(&catalog)
+        .unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let engine = graphrun::Engine::local(data_dir.path()).await.unwrap();
+    let input = graphrun::Value::from_json(serde_json::json!({
+        "order_id": "o1", "amount": 1000
+    }))
+    .unwrap();
+    let wide_expected = serde_json::Value::Array(
+        (0..16)
+            .map(|index| {
+                if index % 2 == 0 {
+                    serde_json::json!({"cents": 500})
+                } else {
+                    serde_json::json!({"cents": 100})
+                }
+            })
+            .collect(),
+    );
+    for (definition, expected) in [
+        (one, serde_json::json!([{"cents": 500}])),
+        (
+            three,
+            serde_json::json!([{"cents": 500}, {"cents": 100}, {"cents": 500}]),
+        ),
+        (wide, wide_expected),
+    ] {
+        let run = engine
+            .start(definition, catalog.clone(), input.clone())
+            .await
+            .unwrap();
+        let output = engine
+            .wait_terminal(run, Duration::from_secs(15))
+            .await
+            .unwrap();
+        assert_eq!(output.to_json(), expected);
+    }
+    engine.shutdown().await.unwrap();
 }

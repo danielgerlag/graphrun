@@ -4,6 +4,14 @@ This is a release gate, not a suggested test list. Implement the executable veri
 
 Compilation, mocked execution, matching two projections produced by the same bug, or screenshots alone do not establish completion.
 
+`CONTRACT-001` must run on a fresh local member and authenticated three-voter
+cluster. It checks publication conflicts, committed receipts and event ranges
+against independently read histories, and original-cluster artifact digests
+after v3 backup and restore. The control restores an untouched backup first,
+then changes the retained definition digest inside a snapshot with valid
+recomputed frame, footer, and outer-manifest checksums. Only a semantic
+artifact rejection before destination writes satisfies the corrupt control.
+
 ## Test layers
 
 | Layer | Required coverage |
@@ -41,6 +49,14 @@ Compile examples for every primitive and nested combinations. YAML-equivalent Ru
 Compile-fail cases must include wrong activity input type, wrong loop-body carry type, wrong region output, invalid compensation input type for the typed direct form, and incompatible parallel tuple use.
 
 String JSON pointers and dynamic bindings must fail through a clear build-time error where static Rust cannot prove them. Do not claim such cases are compile-time checked.
+
+The Rust builder captures a compensator's retryable codes from its catalog
+contract when it attaches the default compensation policy. An explicit
+typed retry policy and attempt timeout must normalize to the same IR as
+equivalent YAML. `E2E-001` runs all ten sample binaries in the fresh
+verification invocation, retains each binary SHA-256 and execution log,
+and combines their YAML/Rust IR and outcome checks with production-CLI YAML
+execution.
 
 Before implementing the whole engine, build a compilable API prototype sufficient to compile these cases. Correct incidental signatures if necessary without dropping capabilities or using public `Any`, unchecked casts, or runtime workflow closures.
 
@@ -113,6 +129,18 @@ Instrument all ready-index discovery reads and scheduler wake causes. Assert tha
 
 Consensus heartbeats, clock-health probes, active lease renewal, and known retention deadlines are separate categories. They must not re-enumerate workflow readiness as a side effect.
 
+`E2E-002` starts three voting members and two independent workers, then leaves a
+run active at an indefinite signal wait. Before observing it, the driver
+requires caught-up voters, a healthy leader, live worker PIDs, and an
+observed scheduler revision. It reads each member's
+`ready_index_discovery_reads`, `schedule_revision`, and
+`scheduler_wake_causes` through its local control socket. After 60 seconds,
+the run must still have its pending wait, the workers must still be alive,
+the revisions must match, wake counters cannot reset, and no member's
+ready-index discovery reads may increase. Applied log progress confirms that
+the observation did not merely stop all activity. A completed local run
+cannot satisfy this case.
+
 ## Required commands
 
 The implementation must provide these commands or update this document and the implementation prompt together with an equally explicit replacement.
@@ -126,26 +154,102 @@ cargo build --release --locked -p graphrun-cli
 cargo run --locked -p graphrun-e2e -- verify \
 	--cli target/release/graphrun \
 	--matrix docs/specs/v1/verification-matrix.tsv \
-	--artifacts target/e2e-artifacts
+	--artifacts /tmp/gr-e2e
 ```
+
+Use a short artifacts path on a native Unix filesystem: process tests create
+control sockets beneath each run directory, and long checkout paths can exceed
+the Unix socket limit. CI uploads evidence from `/tmp/gr-e2e` and `/tmp/gr-smoke`.
+
+For final release signoff add `--release-certification` to `verify`. The
+default verification mode still rejects any functional `FAIL`, `BLOCKED`, or
+missing case; it allows only measured `PERF-*` hardware blockers and reports
+`release_certified=false`. Strict release certification also exits nonzero on
+any blocked performance case or a substituted/incomplete matrix.
+
+This foundation PR checks 90 cases. Production writer activation and
+`CONTRACT-002` belong to the dependent PR. The report names `CONTRACT-002`
+under `deferred_release_contracts` and sets `release_scope_complete=false`
+and `release_certified=false`. `--release-certification` fails while that
+contract is deferred, even if both `PERF-*` cases pass on reference hardware.
+The dependent PR must restore `CONTRACT-002` to the mandatory matrix and
+prove it with independently built release binaries before v1 release signoff.
 
 Also run the workspace on the selected minimum toolchain. If the pinned dependencies cannot meet it, resolve and document the compatibility change instead of asserting untested support.
 
 The release build command must not enable test-only features through workspace feature unification. Assert that the resulting binary exposes no test fault controls.
 
+`GATE-003` rebuilds the release CLI in a separate Cargo invocation, compares
+its SHA-256 with `--cli`, rejects `fault-injection` and `fixture-worker` in
+that package's feature graph, and runs a workflow with the fault environment
+variable set. It also requires two independent worker PIDs in a three-voter
+run. A debug CLI or a test-feature build does not satisfy this case.
+
+For a focused, non-certifying process check, run one of these after building
+the release CLI:
+
+```sh
+cargo run --locked -p graphrun-e2e -- smoke-release \
+	--cli target/release/graphrun --artifacts target/release-smoke
+cargo run --locked -p graphrun-e2e -- smoke-provider \
+	--cli target/release/graphrun --artifacts target/provider-smoke
+cargo run --locked -p graphrun-e2e -- smoke-reconciliation \
+	--cli target/release/graphrun --artifacts target/reconciliation-smoke
+cargo run --locked -p graphrun-e2e -- smoke-saga-settlement \
+	--cli target/release/graphrun --artifacts target/saga-smoke
+cargo run --locked -p graphrun-e2e -- smoke-cancellation \
+	--cli target/release/graphrun --artifacts /tmp/gr-saga-cancel
+cargo run --locked -p graphrun-e2e -- smoke-security \
+	--cli target/release/graphrun --artifacts target/security-smoke
+cargo run --locked -p graphrun-e2e -- smoke-forged-worker \
+	--cli target/release/graphrun --artifacts target/worker-smoke
+cargo run --locked -p graphrun-e2e -- smoke-application \
+	--cli target/release/graphrun --artifacts target/application-smoke
+```
+
+These commands do not produce a matrix report. `verify` must run all cases in
+the same fresh invocation; CI does not skip the snapshot-controller test.
+The foundation matrix does not claim `CONTRACT-002` coverage. The dependent PR
+must build its current and old release binaries in the same run, validate
+their identities and build logs, and observe reader-first rollout through
+real members.
+
 ## Evidence format
 
-The driver writes a machine-readable report with one result per matrix ID.
+The driver writes a machine-readable report with one result per matrix ID in
+a fresh invocation-specific directory under `--artifacts`, plus a latest
+`report.json` at the requested artifacts root. Reusing the same artifacts
+root must never reuse old case evidence. The report records unique run ID,
+source and binary fingerprints, certification flag, and per-case status.
 
 Each result records status, command/configuration, binary/version identifiers, duration, expected and actual observations, and artifact paths.
 
 The final `verify` command must be self-contained. It runs the required test targets or collects their per-case evidence within the same fresh verification run. It must not infer unit/property/compile coverage from an unrelated earlier Cargo exit code.
 
-Give each test case its own evidence file and aggregate afterward. Bind evidence to a fresh run ID and current source/binary fingerprints. Stale, missing, ignored, or mismatched evidence fails the coverage gate.
+The driver runs `graphrun` library, API, compile-fail UI, fault-cut,
+publication, history, signed-history, and worker SDK tests, plus its own gate
+tests, in that invocation. `GATE-001` rejects a failed integration suite even
+when no other matrix row names its failing test.
+
+`STORE-003` through `STORE-006` require the commit-cut, snapshot-generation,
+log-GC, and admission tests that match each matrix row. `STORE-006` also
+requires the 20,000-entry snapshot-controller test in the same unfiltered
+library run.
+
+Give each test case its own evidence file and aggregate afterward. Bind
+evidence to a fresh run ID and current source/binary fingerprints. Require
+successful test processes and executed named tests, not matching log text
+alone. Stale, missing, ignored, filtered, or mismatched evidence fails the
+coverage gate. Preserve every result even when a different case fails.
 
 Retain node and worker logs, provider effect records, queried run/history JSON, snapshot metadata, process exit statuses, and failing seeds/traces.
 
-The report must distinguish `PASS`, `FAIL`, and `BLOCKED`. Missing, filtered-out, ignored, or silently skipped mandatory cases are not pass.
+The report must distinguish `PASS`, `FAIL`, and `BLOCKED`. Missing,
+filtered-out, ignored, or silently skipped mandatory cases are not pass.
+Only `PERF-*` may be `BLOCKED`, and only for unavailable reference hardware
+after actual measurements and observed hardware details are retained.
+Missing measurements or a failed performance scenario are `FAIL`, not
+`BLOCKED`. A report with any `BLOCKED` result cannot be release-certified.
 
 A nonzero scenario outcome produces a nonzero driver exit status. The driver validates matrix coverage, not merely the scenarios its author remembered to register.
 
@@ -158,6 +262,17 @@ The full matrix and fault campaign are required before declaring end-to-end impl
 Performance targets use the declared reference configuration. If that configuration is unavailable, report the performance gate blocked and record actual hardware. Do not relabel a weaker measurement as the target.
 
 The reference target is 1,000 committed engine commands/second with p95 receipt latency below 100 ms on three same-region four-vCPU/8-GiB members with local durable SSDs and 1 KiB payloads. Exclude slow application activity time from command latency.
+
+The current one-host diagnostic measures 1,000 locally committed start
+commands with 1 KiB input, pure 512-node compilation, and reopening that
+existing store. `PERF-002` also records nested and parallel execution,
+history paging, snapshot publication time and bytes, replay time, and store
+bytes. These values are
+not a three-host receipt benchmark or a complete snapshot-throughput claim.
+Do not infer SSD class or separate machines from three local processes.
+The local 1,000-command measurement has a ten-minute deadline. If it stops
+early, the case records the confirmed command count and elapsed time as
+`FAIL`; an incomplete workload is not a hardware `BLOCKED` result.
 
 Target local readiness below one second for an existing store with at most 10,000 events and 1 KiB payloads. Target compilation below 100 ms for a 512-node definition on the same reference machine class. Also report snapshot, replay, retained-history, and nested-control resource costs.
 

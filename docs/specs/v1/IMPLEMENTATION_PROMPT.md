@@ -22,6 +22,7 @@ The normative documents are:
 - `08-testing-and-verification.md`
 - `09-implementation-plan.md`
 - `10-policies-and-defaults.md`
+- `11-foundational-contracts.md`
 
 Use `docs/specs/v1/examples/` as required fixtures and build equivalent Rust definitions.
 
@@ -111,7 +112,7 @@ cargo build --release --locked -p graphrun-cli
 cargo run --locked -p graphrun-e2e -- verify \
 	--cli target/release/graphrun \
 	--matrix docs/specs/v1/verification-matrix.tsv \
-	--artifacts target/e2e-artifacts
+	--artifacts /tmp/gr-e2e
 ```
 
 Run the selected minimum toolchain as well as the supported current toolchain. Establish the full dependency resolution and commit its lockfile. If compatibility is genuinely impossible, document the exact evidence and smallest justified adjustment rather than claiming support.
