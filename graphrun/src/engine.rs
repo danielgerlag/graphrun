@@ -4792,7 +4792,10 @@ nodes:
         };
         SLOW_RELEASE.store(false, Ordering::SeqCst);
         let engine = Engine::local(dir.path()).await.unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        // Shutdown aborts the worker while the release claim is still leased.
+        // A new process can reclaim that activation only after the claim lease.
+        let deadline =
+            tokio::time::Instant::now() + crate::policy::SESSION_LEASE + Duration::from_secs(10);
         loop {
             let state = engine.inspect(run).await.unwrap();
             let done = !state.obligations.is_empty()
