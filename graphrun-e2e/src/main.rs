@@ -1100,7 +1100,15 @@ fn validate_related_binaries(
             || hash != binary.sha256_after
             || !built_path.starts_with(&target_dir)
             || (binary.role == "old_reader" && built_path != path)
-            || hash_file(&built_path)? != hash
+            || {
+                let built_hash = hash_file(&built_path)?;
+                // Two cargo target directories are not bit-identical on macOS.
+                if built_path == path {
+                    built_hash != hash
+                } else {
+                    built_hash == hash_file(&old_path)?
+                }
+            }
             || !result
                 .artifacts
                 .iter()
