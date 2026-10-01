@@ -21,6 +21,8 @@ path = "src/lib.rs"
 default = []
 fault-injection = []
 fixture-worker = []
+format-proof = []
+format-proof-new = ["format-proof"]
 
 [dependencies]
 bytes.workspace = true
