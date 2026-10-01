@@ -7811,6 +7811,7 @@ fn contract_format_rollout(
         let driver = release(&current_target, "graphrun-format-rollout");
         let old_hash = hash_file(&bridge)?;
         let writer_hash = hash_file(&writer)?;
+        let current_hash = hash_file(&built_cli)?;
         if old_hash == writer_hash {
             return Err(format!(
                 "bridge and writer release builds are identical: {old_hash}"
